@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use futures_util::StreamExt as _;
 use zally_chain::{BlockHeightRange, ChainSource, ChainSourceError, ChainState, ShieldedPool};
 use zally_core::BlockHeight;
-use zally_storage::ScanRequest;
+use zally_storage::{ScanRequest, StorageError};
 
 use crate::event::WalletEvent;
 use crate::retry::with_breaker_and_retry;
@@ -163,11 +163,20 @@ impl Wallet {
             reorgs_observed,
         } = context;
         let timestamps_by_height = block_timestamp_index(&blocks);
-        let outcome = self
+        let outcome = match self
             .inner
             .storage
             .scan_blocks(ScanRequest::new(blocks, scanned_from, from_state))
-            .await?;
+            .await
+        {
+            Ok(outcome) => outcome,
+            Err(StorageError::ChainReorgDetected { at_height }) => {
+                return self
+                    .roll_back_after_reorg(at_height, target_height, reorgs_observed)
+                    .await;
+            }
+            Err(other) => return Err(WalletError::from(other)),
+        };
 
         let newly_confirmed = self
             .inner
@@ -211,6 +220,43 @@ impl Wallet {
             scanned_to_height: outcome.scanned_to_height,
             block_count,
             reorgs_observed,
+        })
+    }
+}
+
+impl Wallet {
+    /// Recovers from a chain-source-side reorg observed during scan.
+    ///
+    /// `scan_cached_blocks` rejected the batch because the parent hash of the next block did
+    /// not match the wallet's view at `at_height`. Truncate the wallet to one block below
+    /// the divergence, emit `ReorgDetected`, and return a no-op outcome for this sync. The
+    /// next sync iteration will re-fetch from the new fully-scanned height, pull fresh
+    /// `ChainState` from the chain source, and resume cleanly.
+    async fn roll_back_after_reorg(
+        &self,
+        at_height: BlockHeight,
+        target_height: BlockHeight,
+        prior_reorgs: u32,
+    ) -> Result<SyncOutcome, WalletError> {
+        let rollback_to = BlockHeight::from(at_height.as_u32().saturating_sub(1));
+        let new_fully_scanned = self.inner.storage.truncate_to_height(rollback_to).await?;
+        tracing::warn!(
+            target: "zally::wallet::sync",
+            event = "wallet_reorg_recovered",
+            at_height = at_height.as_u32(),
+            rolled_back_to_height = new_fully_scanned.as_u32(),
+            target_height = target_height.as_u32(),
+            "rolled wallet back after chain reorg; next sync will re-fetch"
+        );
+        self.publish_event(WalletEvent::ReorgDetected {
+            rolled_back_to_height: new_fully_scanned,
+            new_tip_height: target_height,
+        });
+        Ok(SyncOutcome {
+            scanned_from_height: new_fully_scanned,
+            scanned_to_height: new_fully_scanned,
+            block_count: 0,
+            reorgs_observed: prior_reorgs.saturating_add(1),
         })
     }
 }

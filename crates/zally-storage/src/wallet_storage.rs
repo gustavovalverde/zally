@@ -383,6 +383,19 @@ pub trait WalletStorage: Send + Sync + 'static {
         target_height: BlockHeight,
     ) -> Result<Vec<UnspentShieldedNoteRow>, StorageError>;
 
+    /// Rolls the wallet back so that no scanned block above `max_height` is retained.
+    ///
+    /// Used by the sync loop to recover from a chain reorg: when
+    /// [`Self::scan_blocks`] returns [`StorageError::ChainReorgDetected`], the wallet
+    /// must truncate to before the divergence point, refresh its `ChainState` from the
+    /// chain source, and retry. Returns the new fully-scanned height after truncation.
+    ///
+    /// `not_retryable` on schema errors; `retryable` on transient I/O.
+    async fn truncate_to_height(
+        &self,
+        max_height: BlockHeight,
+    ) -> Result<BlockHeight, StorageError>;
+
     /// Returns every Sapling and Orchard note received in the inclusive height range
     /// `[from_height, to_height]`, regardless of current spent state.
     ///

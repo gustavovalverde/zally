@@ -86,6 +86,17 @@ pub enum StorageError {
          prior tx_id was recorded for this key"
     )]
     IdempotencyKeyConflict,
+
+    /// `scan_blocks` rejected the batch because the chain rolled back. The wallet's view at
+    /// `at_height` does not match the parent hash of the next block the chain source served,
+    /// so a reorg has occurred between the last successful scan and this attempt.
+    ///
+    /// `retryable`: callers truncate the wallet to before `at_height` and re-run the sync.
+    #[error("chain reorg detected at height {at_height}; wallet state must roll back")]
+    ChainReorgDetected {
+        /// Height at which the proposed-block parent hash diverged from the wallet's view.
+        at_height: zally_core::BlockHeight,
+    },
 }
 
 impl StorageError {
@@ -94,7 +105,7 @@ impl StorageError {
     pub const fn is_retryable(&self) -> bool {
         match self {
             Self::SqliteFailed { is_retryable, .. } => *is_retryable,
-            Self::BlockingTaskFailed { .. } => true,
+            Self::BlockingTaskFailed { .. } | Self::ChainReorgDetected { .. } => true,
             Self::NotOpened
             | Self::MigrationFailed { .. }
             | Self::AccountNotFound
@@ -112,7 +123,7 @@ mod tests {
 
     #[test]
     fn storage_error_retryable_match_complete() {
-        let variants: [StorageError; 9] = [
+        let variants: [StorageError; 10] = [
             StorageError::NotOpened,
             StorageError::MigrationFailed { reason: "x".into() },
             StorageError::SqliteFailed {
@@ -125,6 +136,9 @@ mod tests {
             StorageError::KeyDerivationFailed { reason: "x".into() },
             StorageError::ProverUnavailable,
             StorageError::IdempotencyKeyConflict,
+            StorageError::ChainReorgDetected {
+                at_height: zally_core::BlockHeight::from(1),
+            },
         ];
         for e in variants {
             let _ = e.is_retryable();

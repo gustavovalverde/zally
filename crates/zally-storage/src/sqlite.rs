@@ -340,10 +340,7 @@ impl WalletStorage for SqliteWalletStorage {
                 &from_state,
                 limit,
             )
-            .map_err(|err| StorageError::SqliteFailed {
-                reason: format!("scan_cached_blocks failed: {err}"),
-                is_retryable: false,
-            })
+            .map_err(|err| map_scan_error(&err))
             .map(|summary| {
                 let scanned_to_u32 = u32::from(summary.scanned_range().end.saturating_sub(1));
                 crate::wallet_storage::ScanResult {
@@ -351,6 +348,22 @@ impl WalletStorage for SqliteWalletStorage {
                     block_count,
                 }
             })
+        })
+        .await
+    }
+
+    async fn truncate_to_height(
+        &self,
+        max_height: BlockHeight,
+    ) -> Result<BlockHeight, StorageError> {
+        let target = zcash_protocol::consensus::BlockHeight::from(max_height.as_u32());
+        self.with_db_mut(move |db| {
+            zcash_client_backend::data_api::WalletWrite::truncate_to_height(db, target)
+                .map(|new_height| BlockHeight::from(u32::from(new_height)))
+                .map_err(|err| StorageError::SqliteFailed {
+                    reason: format!("truncate_to_height failed: {err}"),
+                    is_retryable: false,
+                })
         })
         .await
     }
@@ -1071,6 +1084,32 @@ impl zcash_client_backend::data_api::chain::BlockSource for InMemoryBlockSource 
             taken += 1;
         }
         Ok(())
+    }
+}
+
+/// Maps the upstream `scan_cached_blocks` error into a storage-vocabulary error.
+///
+/// `ScanError::PrevHashMismatch` (and other continuity errors) mean the chain rolled back
+/// between the wallet's last successful scan and this call; the caller must roll the
+/// wallet back to before `at_height` and retry. Everything else is opaque sqlite failure.
+fn map_scan_error<DbErr, BlockSourceErr>(
+    err: &zcash_client_backend::data_api::chain::error::Error<DbErr, BlockSourceErr>,
+) -> StorageError
+where
+    DbErr: std::fmt::Display,
+    BlockSourceErr: std::fmt::Display,
+{
+    use zcash_client_backend::data_api::chain::error::Error as ChainError;
+    if let ChainError::Scan(scan) = err
+        && scan.is_continuity_error()
+    {
+        return StorageError::ChainReorgDetected {
+            at_height: BlockHeight::from(u32::from(scan.at_height())),
+        };
+    }
+    StorageError::SqliteFailed {
+        reason: format!("scan_cached_blocks failed: {err}"),
+        is_retryable: false,
     }
 }
 
