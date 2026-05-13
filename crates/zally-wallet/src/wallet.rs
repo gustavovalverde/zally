@@ -171,6 +171,72 @@ impl Wallet {
         Ok((Self { inner }, account_id))
     }
 
+    /// Opens an existing wallet, or restores its single account from the sealed seed.
+    ///
+    /// Behaves like [`Wallet::open`] when storage already has an account that matches the
+    /// unsealed seed. On a fresh persistent volume (storage is initialized but the account
+    /// row is missing) the call creates the account at `birthday` from the unsealed seed,
+    /// then returns the same handle. Idempotent across boots: once the account exists,
+    /// `birthday` is ignored.
+    ///
+    /// The intended caller is a deployment whose sealed seed is provisioned through a
+    /// secret store and whose persistent volume can be re-created from scratch. Operators
+    /// who run the wallet on the same machine that ran `Wallet::create` should keep using
+    /// [`Wallet::open`].
+    ///
+    /// Returns [`WalletError::NoSealedSeed`] if no sealed seed exists. Returns
+    /// [`WalletError::NetworkMismatch`] if `network != storage.network()`.
+    ///
+    /// `requires_operator` on `NoSealedSeed`. `retryable` on transient I/O.
+    pub async fn open_or_restore<S, St>(
+        network: Network,
+        sealing: S,
+        storage: St,
+        birthday: BlockHeight,
+    ) -> Result<(Self, AccountId), WalletError>
+    where
+        S: SeedSealing,
+        St: WalletStorage,
+    {
+        let sealing_capability = capability_for_sealing::<S>();
+        let storage_capability = capability_for_storage::<St>();
+
+        if storage.network() != network {
+            return Err(WalletError::NetworkMismatch {
+                storage: storage.network(),
+                requested: network,
+            });
+        }
+
+        storage.open_or_create().await?;
+
+        let seed = match sealing.unseal_seed().await {
+            Ok(s) => s,
+            Err(SealingError::NoSealedSeed) => return Err(WalletError::NoSealedSeed),
+            Err(e) => return Err(WalletError::from(e)),
+        };
+
+        let account_id = match storage.find_account_for_seed(&seed).await? {
+            Some(account_id) => account_id,
+            None => storage.create_account_for_seed(&seed, birthday).await?,
+        };
+
+        let capabilities = build_capabilities(network, sealing_capability, storage_capability);
+        emit_plaintext_warning_if_needed(&capabilities, "open_or_restore");
+
+        let (event_tx, _rx_keepalive) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
+        let inner = Arc::new(WalletInner {
+            network,
+            sealing: Box::new(sealing),
+            storage: Box::new(storage),
+            base_capabilities: capabilities,
+            event_tx,
+            retry_policy: Mutex::new(RetryPolicy::default_v1()),
+            circuit_breaker: CircuitBreaker::new(CircuitBreakerConfig::default_v1()),
+        });
+        Ok((Self { inner }, account_id))
+    }
+
     /// Returns the network this wallet is bound to.
     #[must_use]
     pub fn network(&self) -> Network {
