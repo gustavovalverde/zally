@@ -22,8 +22,9 @@ async fn open_or_restore_recovers_account_on_fresh_storage() -> Result<(), TestE
     let storage = SqliteWalletStorage::new(SqliteWalletStorageOptions::for_local_tests(
         origin.db_path(),
     ));
+    let chain = zally_testkit::MockChainSource::new(network);
     let (_wallet, original_account_id, _mnemonic) =
-        Wallet::create(network, sealing, storage, BlockHeight::from(1)).await?;
+        Wallet::create(&chain, network, sealing, storage, BlockHeight::from(1)).await?;
 
     let restored = TempWalletPath::create()?;
     fs::copy(origin.seed_path(), restored.seed_path())?;
@@ -36,8 +37,9 @@ async fn open_or_restore_recovers_account_on_fresh_storage() -> Result<(), TestE
     let storage = SqliteWalletStorage::new(SqliteWalletStorageOptions::for_local_tests(
         restored.db_path(),
     ));
+    let chain = zally_testkit::MockChainSource::new(network);
     let (restored_wallet, restored_account_id) =
-        Wallet::open_or_restore(network, sealing, storage, BlockHeight::from(1)).await?;
+        Wallet::open_or_restore(&chain, network, sealing, storage, BlockHeight::from(1)).await?;
     assert_ne!(
         original_account_id, restored_account_id,
         "AccountId is a fresh per-row UUID; restoring across separate storages must allocate \
@@ -63,14 +65,17 @@ async fn open_or_restore_is_idempotent_on_warm_storage() -> Result<(), TestError
     let sealing = AgeFileSealing::new(AgeFileSealingOptions::at_path(temp.seed_path()));
     let storage =
         SqliteWalletStorage::new(SqliteWalletStorageOptions::for_local_tests(temp.db_path()));
+    let chain = zally_testkit::MockChainSource::new(network);
     let (_wallet, original_account_id, _mnemonic) =
-        Wallet::create(network, sealing, storage, BlockHeight::from(1)).await?;
+        Wallet::create(&chain, network, sealing, storage, BlockHeight::from(1)).await?;
 
     let sealing = AgeFileSealing::new(AgeFileSealingOptions::at_path(temp.seed_path()));
     let storage =
         SqliteWalletStorage::new(SqliteWalletStorageOptions::for_local_tests(temp.db_path()));
+    let chain = zally_testkit::MockChainSource::new(network);
     let (_, reopened_account_id) =
-        Wallet::open_or_restore(network, sealing, storage, BlockHeight::from(99_999)).await?;
+        Wallet::open_or_restore(&chain, network, sealing, storage, BlockHeight::from(99_999))
+            .await?;
     assert_eq!(
         original_account_id, reopened_account_id,
         "second open_or_restore must surface the existing account, ignoring the birthday arg"
@@ -86,7 +91,9 @@ async fn open_or_restore_without_seal_returns_no_sealed_seed() -> Result<(), Tes
     let sealing = AgeFileSealing::new(AgeFileSealingOptions::at_path(temp.seed_path()));
     let storage =
         SqliteWalletStorage::new(SqliteWalletStorageOptions::for_local_tests(temp.db_path()));
-    let outcome = Wallet::open_or_restore(network, sealing, storage, BlockHeight::from(1)).await;
+    let chain = zally_testkit::MockChainSource::new(network);
+    let outcome =
+        Wallet::open_or_restore(&chain, network, sealing, storage, BlockHeight::from(1)).await;
     assert!(matches!(outcome, Err(WalletError::NoSealedSeed)));
     Ok(())
 }

@@ -76,8 +76,9 @@ async fn bootstrap_wallet(
         db_path.to_path_buf(),
     ));
 
+    let chain = zally_testkit::MockChainSource::new(network);
     let (wallet, account_id, mnemonic) =
-        Wallet::create(network, sealing, storage, BlockHeight::from(1)).await?;
+        Wallet::create(&chain, network, sealing, storage, BlockHeight::from(1)).await?;
 
     // The operator must record the mnemonic out-of-band. Zally does not back it up.
     warn!(
@@ -121,8 +122,9 @@ async fn plaintext_demo(network: Network, dir: &std::path::Path) -> Result<(), W
     let sealing = PlaintextSealing::new(seed_path);
     let storage =
         SqliteWalletStorage::new(SqliteWalletStorageOptions::for_network(network, db_path));
+    let chain = zally_testkit::MockChainSource::new(network);
     let (wallet, account_id, _mnemonic) =
-        Wallet::create(network, sealing, storage, BlockHeight::from(1)).await?;
+        Wallet::create(&chain, network, sealing, storage, BlockHeight::from(1)).await?;
     let _ua = wallet.derive_next_address(account_id).await?;
     warn!(
         target: "zally::example",

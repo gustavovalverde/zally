@@ -38,8 +38,9 @@ async fn main() -> Result<(), ExampleError> {
         network,
         temp.path().join("wallet.db"),
     ));
+    let chain = zally_testkit::MockChainSource::new(network);
     let (wallet, account_id, _mnemonic) =
-        Wallet::create(network, sealing, storage, BlockHeight::from(1)).await?;
+        Wallet::create(&chain, network, sealing, storage, BlockHeight::from(1)).await?;
 
     let params = network.to_parameters();
     let customer_addresses = vec!["customer-001", "customer-002", "customer-003"];

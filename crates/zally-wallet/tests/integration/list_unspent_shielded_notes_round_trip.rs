@@ -20,8 +20,9 @@ async fn list_unspent_shielded_notes_returns_empty_on_fresh_wallet() -> Result<(
     let sealing = AgeFileSealing::new(AgeFileSealingOptions::at_path(temp.seed_path()));
     let storage =
         SqliteWalletStorage::new(SqliteWalletStorageOptions::for_local_tests(temp.db_path()));
+    let chain = zally_testkit::MockChainSource::new(network);
     let (wallet, account_id, _mnemonic) =
-        Wallet::create(network, sealing, storage, BlockHeight::from(1)).await?;
+        Wallet::create(&chain, network, sealing, storage, BlockHeight::from(1)).await?;
 
     let notes = wallet.list_unspent_shielded_notes(account_id).await?;
     assert!(notes.is_empty(), "fresh wallet must have no unspent notes");
@@ -36,8 +37,9 @@ async fn list_unspent_shielded_notes_uses_observed_tip_after_sync() -> Result<()
     let sealing = AgeFileSealing::new(AgeFileSealingOptions::at_path(temp.seed_path()));
     let storage =
         SqliteWalletStorage::new(SqliteWalletStorageOptions::for_local_tests(temp.db_path()));
+    let chain = zally_testkit::MockChainSource::new(network);
     let (wallet, account_id, _mnemonic) =
-        Wallet::create(network, sealing, storage, BlockHeight::from(1)).await?;
+        Wallet::create(&chain, network, sealing, storage, BlockHeight::from(1)).await?;
 
     // Advance the wallet's observed tip via sync; the MockChainSource returns an empty
     // block stream so no notes get persisted, but observed_tip lands.

@@ -18,7 +18,6 @@ use zcash_client_sqlite::util::SystemClock;
 use zcash_client_sqlite::wallet::init::WalletMigrator;
 use zcash_keys::address::UnifiedAddress;
 use zcash_keys::keys::UnifiedAddressRequest;
-use zcash_primitives::block::BlockHash;
 
 use crate::storage_error::StorageError;
 use crate::wallet_storage::WalletStorage;
@@ -229,15 +228,15 @@ impl WalletStorage for SqliteWalletStorage {
     async fn create_account_for_seed(
         &self,
         seed: &SeedMaterial,
-        birthday: BlockHeight,
+        prior_chain_state: ChainState,
     ) -> Result<AccountId, StorageError> {
         let account_name = self.options.account_name.clone();
         let seed_bytes = seed.expose_secret().to_vec();
         let secret = SecretVec::new(seed_bytes);
 
         self.with_db_mut(move |db| {
-            let birthday_height: zcash_protocol::consensus::BlockHeight = birthday.into();
-            let account_birthday = build_birthday(birthday);
+            let birthday_height = prior_chain_state.block_height() + 1;
+            let account_birthday = AccountBirthday::from_parts(prior_chain_state, None);
             let (account, _usk) = db
                 .import_account_hd(
                     &account_name,
@@ -247,9 +246,6 @@ impl WalletStorage for SqliteWalletStorage {
                     None,
                 )
                 .map_err(|e| map_sqlite_error(&e))?;
-            // Seed the wallet's view of the chain tip at the birthday height. Without this,
-            // `get_next_available_address` rejects with "Chain height unknown". Slice 2's
-            // sync loop advances the tip as blocks are scanned.
             db.update_chain_tip(birthday_height)
                 .map_err(|e| map_sqlite_error(&e))?;
             Ok(account_uuid_to_zally(account.id()))
@@ -976,12 +972,6 @@ fn account_uuid_to_zally(uuid: AccountUuid) -> AccountId {
 
 fn zally_to_account_uuid(id: AccountId) -> AccountUuid {
     AccountUuid::from_uuid(id.as_uuid())
-}
-
-fn build_birthday(height: BlockHeight) -> AccountBirthday {
-    let prior_height: zcash_protocol::consensus::BlockHeight = height.saturating_sub(1).into();
-    let chain_state = ChainState::empty(prior_height, BlockHash([0u8; 32]));
-    AccountBirthday::from_parts(chain_state, None)
 }
 
 fn map_sqlite_error<E: std::fmt::Display>(err: &E) -> StorageError {

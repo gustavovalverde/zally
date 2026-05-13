@@ -14,8 +14,9 @@ async fn create_then_open_round_trip() -> Result<(), TestError> {
     let sealing = AgeFileSealing::new(AgeFileSealingOptions::at_path(temp.seed_path()));
     let storage =
         SqliteWalletStorage::new(SqliteWalletStorageOptions::for_local_tests(temp.db_path()));
+    let chain = zally_testkit::MockChainSource::new(network);
     let (wallet, account_id, _mnemonic) =
-        Wallet::create(network, sealing, storage, BlockHeight::from(1)).await?;
+        Wallet::create(&chain, network, sealing, storage, BlockHeight::from(1)).await?;
     let params = network.to_parameters();
     let ua_first = wallet
         .derive_next_address(account_id)

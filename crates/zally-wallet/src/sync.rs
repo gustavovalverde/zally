@@ -14,7 +14,6 @@ use futures_util::StreamExt as _;
 use zally_chain::{BlockHeightRange, ChainSource, ChainSourceError, ChainState};
 use zally_core::BlockHeight;
 use zally_storage::ScanRequest;
-use zcash_primitives::block::BlockHash;
 
 use crate::event::WalletEvent;
 use crate::retry::with_breaker_and_retry;
@@ -99,13 +98,17 @@ impl Wallet {
         if blocks.is_empty() {
             return Ok(self.emit_already_caught_up(scanned_from, target_height, reorg));
         }
-        self.scan_and_emit(ScanContext {
-            blocks,
-            scanned_from,
-            target_height,
-            block_count,
-            reorgs_observed: reorg,
-        })
+        let from_state = fetch_prior_chain_state(chain, scanned_from).await?;
+        self.scan_and_emit(
+            ScanContext {
+                blocks,
+                scanned_from,
+                target_height,
+                block_count,
+                reorgs_observed: reorg,
+            },
+            from_state,
+        )
         .await
     }
 
@@ -145,7 +148,11 @@ impl Wallet {
         }
     }
 
-    async fn scan_and_emit(&self, context: ScanContext) -> Result<SyncOutcome, WalletError> {
+    async fn scan_and_emit(
+        &self,
+        context: ScanContext,
+        from_state: ChainState,
+    ) -> Result<SyncOutcome, WalletError> {
         let ScanContext {
             blocks,
             scanned_from,
@@ -153,9 +160,6 @@ impl Wallet {
             block_count,
             reorgs_observed,
         } = context;
-        let from_state_height: zcash_protocol::consensus::BlockHeight =
-            scanned_from.as_u32().saturating_sub(1).into();
-        let from_state = ChainState::empty(from_state_height, BlockHash([0_u8; 32]));
         let outcome = self
             .inner
             .storage
@@ -217,4 +221,24 @@ fn map_chain_source_error(err: &ChainSourceError) -> WalletError {
         reason: err.to_string(),
         is_retryable: err.is_retryable(),
     }
+}
+
+async fn fetch_prior_chain_state(
+    chain: &dyn ChainSource,
+    scanned_from: BlockHeight,
+) -> Result<ChainState, WalletError> {
+    let prior_height = BlockHeight::from(scanned_from.as_u32().saturating_sub(1));
+    let tree_state = chain
+        .tree_state_at(prior_height)
+        .await
+        .map_err(|e| map_chain_source_error(&e))?;
+    tree_state
+        .to_chain_state()
+        .map_err(|io| WalletError::ChainSource {
+            reason: format!(
+                "invalid tree state at height {}: {io}",
+                prior_height.as_u32()
+            ),
+            is_retryable: false,
+        })
 }

@@ -13,7 +13,9 @@ async fn sync_network_mismatch_fails_closed() -> Result<(), TestError> {
     let sealing = InMemorySealing::new();
     let storage =
         SqliteWalletStorage::new(SqliteWalletStorageOptions::for_local_tests(temp.db_path()));
-    let (wallet, _, _) = Wallet::create(regtest, sealing, storage, BlockHeight::from(1)).await?;
+    let chain = zally_testkit::MockChainSource::new(regtest);
+    let (wallet, _, _) =
+        Wallet::create(&chain, regtest, sealing, storage, BlockHeight::from(1)).await?;
 
     let chain = MockChainSource::new(Network::Mainnet);
     let outcome = wallet.sync(&chain).await;

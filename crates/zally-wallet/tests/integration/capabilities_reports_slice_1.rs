@@ -15,7 +15,9 @@ async fn capabilities_reports_slice_1() -> Result<(), TestError> {
     let sealing = InMemorySealing::new();
     let storage =
         SqliteWalletStorage::new(SqliteWalletStorageOptions::for_local_tests(temp.db_path()));
-    let (wallet, _, _) = Wallet::create(network, sealing, storage, BlockHeight::from(1)).await?;
+    let chain = zally_testkit::MockChainSource::new(network);
+    let (wallet, _, _) =
+        Wallet::create(&chain, network, sealing, storage, BlockHeight::from(1)).await?;
 
     let caps: WalletCapabilities = wallet.capabilities();
     assert_eq!(caps.sealing, SealingCapability::InMemory);

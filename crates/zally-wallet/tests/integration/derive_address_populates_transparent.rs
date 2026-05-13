@@ -15,8 +15,9 @@ async fn derive_address_populates_transparent() -> Result<(), TestError> {
     let sealing = AgeFileSealing::new(AgeFileSealingOptions::at_path(temp.seed_path()));
     let storage =
         SqliteWalletStorage::new(SqliteWalletStorageOptions::for_local_tests(temp.db_path()));
+    let chain = zally_testkit::MockChainSource::new(network);
     let (wallet, account_id, _mnemonic) =
-        Wallet::create(network, sealing, storage, BlockHeight::from(1)).await?;
+        Wallet::create(&chain, network, sealing, storage, BlockHeight::from(1)).await?;
 
     // The upstream BIP-44 transparent gap limit defaults to 10 and pre-generates the gap
     // ahead of the reserved address, so a single

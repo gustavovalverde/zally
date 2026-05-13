@@ -15,7 +15,15 @@ async fn network_mismatch_fails_closed() -> Result<(), std::io::Error> {
         temp.db_path(),
     ));
 
-    let outcome = Wallet::create(Network::Testnet, sealing, storage, BlockHeight::from(1)).await;
+    let chain = zally_testkit::MockChainSource::new(Network::Testnet);
+    let outcome = Wallet::create(
+        &chain,
+        Network::Testnet,
+        sealing,
+        storage,
+        BlockHeight::from(1),
+    )
+    .await;
     assert!(matches!(
         outcome,
         Err(WalletError::NetworkMismatch {

@@ -16,8 +16,9 @@ async fn sync_emits_reorg_when_tip_regresses() -> Result<(), TestError> {
     let sealing = AgeFileSealing::new(AgeFileSealingOptions::at_path(temp.seed_path()));
     let storage =
         SqliteWalletStorage::new(SqliteWalletStorageOptions::for_local_tests(temp.db_path()));
+    let chain = zally_testkit::MockChainSource::new(network);
     let (wallet, _account_id, _mnemonic) =
-        Wallet::create(network, sealing, storage, BlockHeight::from(1)).await?;
+        Wallet::create(&chain, network, sealing, storage, BlockHeight::from(1)).await?;
     let mut events = wallet.observe();
 
     let chain = MockChainSource::new(network);

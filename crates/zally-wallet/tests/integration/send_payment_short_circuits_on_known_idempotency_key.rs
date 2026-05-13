@@ -26,8 +26,9 @@ async fn send_payment_short_circuits_on_known_idempotency_key() -> Result<(), Te
         .record_idempotent_submission(known_key.clone(), prior_tx_id)
         .await?;
 
+    let chain = zally_testkit::MockChainSource::new(network);
     let (wallet, account_id, _mnemonic) =
-        Wallet::create(network, sealing, storage, BlockHeight::from(1)).await?;
+        Wallet::create(&chain, network, sealing, storage, BlockHeight::from(1)).await?;
 
     let recipient_ua = wallet.derive_next_address(account_id).await?;
     let encoded = recipient_ua.encode(&network.to_parameters());

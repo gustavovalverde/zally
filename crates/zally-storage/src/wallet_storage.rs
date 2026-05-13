@@ -153,7 +153,14 @@ pub trait WalletStorage: Send + Sync + 'static {
     /// `retryable` on transient I/O. `requires_operator` on schema migration failure.
     async fn open_or_create(&self) -> Result<(), StorageError>;
 
-    /// Creates the wallet's first account for `seed` at `birthday`.
+    /// Creates the wallet's first account for `seed`, anchored at `prior_chain_state`.
+    ///
+    /// `prior_chain_state` is the note commitment tree state at the block immediately before
+    /// the operator-chosen birthday height. It carries the real Sapling and Orchard frontiers
+    /// fetched from the chain source; passing empty frontiers at a non-genesis birthday
+    /// makes the first call to [`WalletStorage::scan_blocks`] fail closed with
+    /// `NonSequentialBlocks` because the wallet's commitment tree progression no longer
+    /// matches the chain.
     ///
     /// The Slice 1 invariant is one account per wallet: a second call returns
     /// [`StorageError::AccountAlreadyExists`].
@@ -163,7 +170,7 @@ pub trait WalletStorage: Send + Sync + 'static {
     async fn create_account_for_seed(
         &self,
         seed: &SeedMaterial,
-        birthday: BlockHeight,
+        prior_chain_state: ChainState,
     ) -> Result<AccountId, StorageError>;
 
     /// Looks up the [`AccountId`] for the account whose UFVK matches the seed.

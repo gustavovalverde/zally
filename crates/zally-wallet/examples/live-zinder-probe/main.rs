@@ -73,6 +73,7 @@ async fn main() -> Result<(), ExampleError> {
         temp.path().join("wallet.db"),
     ));
     let (wallet, account_id, _mnemonic) = Wallet::create(
+        &chain,
         network,
         sealing,
         storage,

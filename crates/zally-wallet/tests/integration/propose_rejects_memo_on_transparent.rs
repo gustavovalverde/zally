@@ -12,8 +12,9 @@ async fn propose_rejects_memo_on_transparent_recipient() -> Result<(), TestError
     let sealing = InMemorySealing::new();
     let storage =
         SqliteWalletStorage::new(SqliteWalletStorageOptions::for_local_tests(temp.db_path()));
+    let chain = zally_testkit::MockChainSource::new(network);
     let (wallet, account, _) =
-        Wallet::create(network, sealing, storage, BlockHeight::from(1)).await?;
+        Wallet::create(&chain, network, sealing, storage, BlockHeight::from(1)).await?;
 
     let recipient = PaymentRecipient::TransparentAddress {
         encoded: "t1example".into(),

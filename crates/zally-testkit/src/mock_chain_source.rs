@@ -188,7 +188,7 @@ impl ChainSource for MockChainSource {
         Ok(TreeState {
             network: format!("{:?}", self.state.lock().network),
             height: u64::from(block_height.as_u32()),
-            hash: String::new(),
+            hash: "00".repeat(32),
             time: 0,
             sapling_tree: String::new(),
             orchard_tree: String::new(),

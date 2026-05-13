@@ -12,8 +12,9 @@ async fn propose_rejects_network_mismatch() -> Result<(), TestError> {
     let sealing = InMemorySealing::new();
     let storage =
         SqliteWalletStorage::new(SqliteWalletStorageOptions::for_local_tests(temp.db_path()));
+    let chain = zally_testkit::MockChainSource::new(network);
     let (wallet, account, _) =
-        Wallet::create(network, sealing, storage, BlockHeight::from(1)).await?;
+        Wallet::create(&chain, network, sealing, storage, BlockHeight::from(1)).await?;
 
     let recipient = PaymentRecipient::UnifiedAddress {
         encoded: "u1mainnet-example".into(),

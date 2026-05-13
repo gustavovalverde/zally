@@ -26,7 +26,8 @@ async fn unsafe_plaintext_seed_warns() -> Result<(), TestError> {
     let sealing = PlaintextSealing::new(temp.seed_path());
     let storage =
         SqliteWalletStorage::new(SqliteWalletStorageOptions::for_local_tests(temp.db_path()));
-    let _ = Wallet::create(network, sealing, storage, BlockHeight::from(1)).await?;
+    let chain = zally_testkit::MockChainSource::new(network);
+    let _ = Wallet::create(&chain, network, sealing, storage, BlockHeight::from(1)).await?;
 
     let sealing = PlaintextSealing::new(temp.seed_path());
     let storage =

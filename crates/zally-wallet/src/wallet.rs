@@ -5,9 +5,11 @@ use std::sync::Arc;
 
 use parking_lot::Mutex;
 use tokio::sync::broadcast;
+use zally_chain::{ChainSource, ChainSourceError};
 use zally_core::{AccountId, BlockHeight, Network};
 use zally_keys::{Mnemonic, SealingError, SeedMaterial, SeedSealing};
 use zally_storage::{StorageError, WalletStorage};
+use zcash_client_backend::data_api::chain::ChainState;
 use zcash_keys::address::UnifiedAddress;
 
 use crate::capabilities::{Capability, SealingCapability, StorageCapability, WalletCapabilities};
@@ -59,6 +61,7 @@ impl Wallet {
     ///
     /// `requires_operator` on `AccountAlreadyExists`. `retryable` on transient I/O.
     pub async fn create<S, St>(
+        chain: &dyn ChainSource,
         network: Network,
         sealing: S,
         storage: St,
@@ -71,6 +74,12 @@ impl Wallet {
         let sealing_capability = capability_for_sealing::<S>();
         let storage_capability = capability_for_storage::<St>();
 
+        if chain.network() != network {
+            return Err(WalletError::NetworkMismatch {
+                storage: chain.network(),
+                requested: network,
+            });
+        }
         if storage.network() != network {
             return Err(WalletError::NetworkMismatch {
                 storage: storage.network(),
@@ -95,7 +104,10 @@ impl Wallet {
         let mnemonic = Mnemonic::generate();
         let seed = SeedMaterial::from_mnemonic(&mnemonic, "");
         sealing.seal_seed(&seed).await?;
-        let account_id = storage.create_account_for_seed(&seed, birthday).await?;
+        let prior_chain_state = fetch_prior_chain_state(chain, birthday).await?;
+        let account_id = storage
+            .create_account_for_seed(&seed, prior_chain_state)
+            .await?;
 
         let capabilities = build_capabilities(network, sealing_capability, storage_capability);
         emit_plaintext_warning_if_needed(&capabilities, "create");
@@ -189,6 +201,7 @@ impl Wallet {
     ///
     /// `requires_operator` on `NoSealedSeed`. `retryable` on transient I/O.
     pub async fn open_or_restore<S, St>(
+        chain: &dyn ChainSource,
         network: Network,
         sealing: S,
         storage: St,
@@ -201,6 +214,12 @@ impl Wallet {
         let sealing_capability = capability_for_sealing::<S>();
         let storage_capability = capability_for_storage::<St>();
 
+        if chain.network() != network {
+            return Err(WalletError::NetworkMismatch {
+                storage: chain.network(),
+                requested: network,
+            });
+        }
         if storage.network() != network {
             return Err(WalletError::NetworkMismatch {
                 storage: storage.network(),
@@ -216,9 +235,13 @@ impl Wallet {
             Err(e) => return Err(WalletError::from(e)),
         };
 
-        let account_id = match storage.find_account_for_seed(&seed).await? {
-            Some(account_id) => account_id,
-            None => storage.create_account_for_seed(&seed, birthday).await?,
+        let account_id = if let Some(existing) = storage.find_account_for_seed(&seed).await? {
+            existing
+        } else {
+            let prior_chain_state = fetch_prior_chain_state(chain, birthday).await?;
+            storage
+                .create_account_for_seed(&seed, prior_chain_state)
+                .await?
         };
 
         let capabilities = build_capabilities(network, sealing_capability, storage_capability);
@@ -360,6 +383,33 @@ impl Wallet {
     /// Returns the number of subscribers currently attached to [`Wallet::observe`].
     pub(crate) fn observer_count(&self) -> u32 {
         u32::try_from(self.inner.event_tx.receiver_count()).unwrap_or(u32::MAX)
+    }
+}
+
+async fn fetch_prior_chain_state(
+    chain: &dyn ChainSource,
+    birthday: BlockHeight,
+) -> Result<ChainState, WalletError> {
+    let prior_height = BlockHeight::from(birthday.as_u32().saturating_sub(1));
+    let tree_state = chain
+        .tree_state_at(prior_height)
+        .await
+        .map_err(|err| map_chain_source_to_wallet_error(&err))?;
+    tree_state
+        .to_chain_state()
+        .map_err(|io| WalletError::ChainSource {
+            reason: format!(
+                "invalid tree state for birthday {}: {io}",
+                birthday.as_u32()
+            ),
+            is_retryable: false,
+        })
+}
+
+fn map_chain_source_to_wallet_error(err: &ChainSourceError) -> WalletError {
+    WalletError::ChainSource {
+        reason: err.to_string(),
+        is_retryable: err.is_retryable(),
     }
 }
 

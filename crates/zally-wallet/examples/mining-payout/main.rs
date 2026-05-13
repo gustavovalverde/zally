@@ -46,8 +46,9 @@ async fn main() -> Result<(), ExampleError> {
         network,
         temp.path().join("wallet.db"),
     ));
+    let chain = zally_testkit::MockChainSource::new(network);
     let (wallet, account_id, _mnemonic) =
-        Wallet::create(network, sealing, storage, BlockHeight::from(1)).await?;
+        Wallet::create(&chain, network, sealing, storage, BlockHeight::from(1)).await?;
 
     let mining = ReceiverPurpose::Mining;
     let hot_dispense = ReceiverPurpose::HotDispense;

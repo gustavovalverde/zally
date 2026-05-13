@@ -12,7 +12,9 @@ async fn metrics_snapshot_reports_network_and_account_count() -> Result<(), Test
     let sealing = InMemorySealing::new();
     let storage =
         SqliteWalletStorage::new(SqliteWalletStorageOptions::for_local_tests(temp.db_path()));
-    let (wallet, _, _) = Wallet::create(network, sealing, storage, BlockHeight::from(1)).await?;
+    let chain = zally_testkit::MockChainSource::new(network);
+    let (wallet, _, _) =
+        Wallet::create(&chain, network, sealing, storage, BlockHeight::from(1)).await?;
 
     let snapshot = wallet.metrics_snapshot().await?;
     assert_eq!(snapshot.network, network);

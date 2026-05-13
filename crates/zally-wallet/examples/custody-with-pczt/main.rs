@@ -67,8 +67,9 @@ async fn bootstrap_wallet(network: Network) -> Result<TempDir, ExampleError> {
         network,
         temp.path().join("wallet.db"),
     ));
+    let chain = zally_testkit::MockChainSource::new(network);
     let (_wallet, _account_id, _mnemonic) =
-        Wallet::create(network, sealing, storage, BlockHeight::from(1)).await?;
+        Wallet::create(&chain, network, sealing, storage, BlockHeight::from(1)).await?;
     Ok(temp)
 }
 

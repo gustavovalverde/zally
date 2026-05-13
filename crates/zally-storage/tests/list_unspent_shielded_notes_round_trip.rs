@@ -13,6 +13,8 @@ use tempfile::TempDir;
 use zally_core::{AccountId, BlockHeight};
 use zally_keys::{Mnemonic, SeedMaterial};
 use zally_storage::{SqliteWalletStorage, SqliteWalletStorageOptions, StorageError, WalletStorage};
+use zcash_client_backend::data_api::chain::ChainState;
+use zcash_primitives::block::BlockHash;
 
 #[tokio::test]
 async fn list_unspent_shielded_notes_round_trip_empty_account() -> Result<(), TestError> {
@@ -25,7 +27,7 @@ async fn list_unspent_shielded_notes_round_trip_empty_account() -> Result<(), Te
     let mnemonic = Mnemonic::generate();
     let seed = SeedMaterial::from_mnemonic(&mnemonic, "");
     let account_id = storage
-        .create_account_for_seed(&seed, BlockHeight::from(1))
+        .create_account_for_seed(&seed, ChainState::empty(0.into(), BlockHash([0u8; 32])))
         .await?;
 
     let rows = storage

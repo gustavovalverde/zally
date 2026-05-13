@@ -17,8 +17,9 @@ async fn circuit_breaker_opens_after_threshold_failures() -> Result<(), TestErro
     let sealing = AgeFileSealing::new(AgeFileSealingOptions::at_path(temp.seed_path()));
     let storage =
         SqliteWalletStorage::new(SqliteWalletStorageOptions::for_local_tests(temp.db_path()));
+    let chain = zally_testkit::MockChainSource::new(network);
     let (wallet, _account_id, _mnemonic) =
-        Wallet::create(network, sealing, storage, BlockHeight::from(1)).await?;
+        Wallet::create(&chain, network, sealing, storage, BlockHeight::from(1)).await?;
     // No retries: each sync surfaces the first error immediately. The breaker then sees the
     // same flat-out failure on each attempt and trips after the default threshold of 5.
     wallet.set_retry_policy(RetryPolicy::none());

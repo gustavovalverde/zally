@@ -16,8 +16,15 @@ async fn create_then_open_round_trip_in_memory() -> Result<(), TestError> {
 
     let storage =
         SqliteWalletStorage::new(SqliteWalletStorageOptions::for_local_tests(temp.db_path()));
-    let (wallet, account_id, _mnemonic) =
-        Wallet::create(network, sealing_primary, storage, BlockHeight::from(1)).await?;
+    let chain = zally_testkit::MockChainSource::new(network);
+    let (wallet, account_id, _mnemonic) = Wallet::create(
+        &chain,
+        network,
+        sealing_primary,
+        storage,
+        BlockHeight::from(1),
+    )
+    .await?;
     let params = network.to_parameters();
     let ua_first = wallet
         .derive_next_address(account_id)
