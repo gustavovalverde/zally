@@ -5010,12 +5010,14 @@ version = "0.1.0"
 dependencies = [
  "orchard 0.13.1",
  "pczt",
+ "secp256k1",
  "thiserror 2.0.18",
  "tokio",
  "zally-core",
  "zally-keys",
  "zcash_keys",
  "zcash_proofs",
+ "zcash_transparent 0.7.0",
  "zip32",
 ]
 

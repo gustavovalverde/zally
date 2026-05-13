@@ -12,13 +12,17 @@ Every item below names:
 
 **Surface:** [`Wallet::propose_pczt`](../../crates/zally-wallet/src/pczt.rs), [`Wallet::sign_pczt`](../../crates/zally-wallet/src/pczt.rs), [`Wallet::extract_and_submit_pczt`](../../crates/zally-wallet/src/pczt.rs) + the four `zally_pczt` roles.
 
-**Status:** all three wallet methods ship and validate the full path against a freshly-scanned regtest and testnet WalletDb via `live-zinder-probe`. `Extractor::extract` wires `pczt::roles::tx_extractor::TransactionExtractor` with Sapling VKs from `LocalTxProver`. Storage exposes `create_pczt` and `extract_and_store_pczt` against the upstream `create_pczt_from_proposal` + `extract_and_store_transaction_from_pczt`. Pending: transparent-spend signing, and end-to-end execution against a funded wallet.
+**Status:** all three wallet methods ship and validate the full path against a freshly-scanned regtest and testnet WalletDb via `live-zinder-probe`. `Extractor::extract` wires `pczt::roles::tx_extractor::TransactionExtractor` with Sapling VKs from `LocalTxProver`. Storage exposes `create_pczt` and `extract_and_store_pczt` against the upstream `create_pczt_from_proposal` + `extract_and_store_transaction_from_pczt`. Transparent-spend signing is wired in `zally_pczt::Signer::sign_with_seed` via address matching: each transparent input's `script_pubkey` is matched against external- and internal-scope P2PKH addresses derived from the sealed seed within the BIP-44 gap limit, and the matching `secp256k1::SecretKey` is fed to the upstream `Signer::sign_transparent`. End-to-end execution against a funded wallet is the remaining piece.
 
-**Blocker:** transparent signing requires per-input scriptCode + sighash plumbing in the upstream pczt 0.6 transparent signer. End-to-end execution requires operator-coordinated funding (Zebra `generate N` with miner_address = Zally UA + ZIP-213 100-block maturity).
+**Accepted contract for the transparent signer:**
+- Account zero only.
+- BIP-44 gap limit of 20 per scope (external and internal).
+- P2PKH only; P2SH transparent inputs are not signed.
+
+These constraints match Zally's v1 single-account, single-receiver shape; downstream consumers that need to exceed them open a v2 RFC.
 
 **Acceptance:**
 - The custody-with-pczt example produces a real `tx_id` against a funded operator-owned wallet.
-- Transparent spends sign cleanly through `Wallet::sign_pczt` rather than returning `NoMatchingKeys`.
 - The runbook in [`docs/runbooks/sweep-with-pczt.md`](../runbooks/sweep-with-pczt.md) is executable end-to-end.
 
 ## 2. `LightwalletdChainSource` (optional)
