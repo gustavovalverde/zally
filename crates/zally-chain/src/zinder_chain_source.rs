@@ -91,6 +91,15 @@ impl ZinderChainSource {
     pub fn from_chain_index(inner: Arc<dyn ChainIndex>, network: Network) -> Self {
         Self { inner, network }
     }
+
+    /// Returns a [`crate::ZinderSubmitter`] backed by the same gRPC channel as this chain
+    /// source. Use this when the same in-process consumer needs both the read plane
+    /// (`ChainSource`) and the broadcast plane (`Submitter`) against the same Zinder
+    /// endpoint; sharing the channel avoids opening a second TCP connection.
+    #[must_use]
+    pub fn submitter(&self) -> crate::ZinderSubmitter {
+        crate::ZinderSubmitter::from_chain_index(Arc::clone(&self.inner), self.network)
+    }
 }
 
 #[async_trait]
