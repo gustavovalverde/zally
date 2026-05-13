@@ -6,6 +6,7 @@ mod create_then_create_returns_already_exists;
 mod create_then_open_round_trip;
 mod create_then_open_round_trip_in_memory;
 mod derive_address_populates_transparent;
+mod list_unspent_shielded_notes_round_trip;
 mod metrics_snapshot_round_trip;
 mod network_mismatch_fails_closed;
 mod observe_emits_scan_progress;

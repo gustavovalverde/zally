@@ -58,4 +58,9 @@ allow-git = [
     # tree pulled in transitively via zebra-chain resolves cleanly. Mirrors
     # the same pin in zinder's workspace.
     "https://github.com/bbqsrc/core2",
+    # Zinder is Zally's default chain-read backend. The dev-time path-dep was
+    # switched to a git source so external consumers (fauzec) can build Zally
+    # without a sibling zinder checkout. Pin a specific commit rather than
+    # tracking a branch.
+    "https://github.com/gustavovalverde/zinder",
 ]

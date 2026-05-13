@@ -246,6 +246,39 @@ impl Wallet {
             .map_err(lift_storage_to_wallet_error)
     }
 
+    /// Returns every unspent Sapling and Orchard note owned by `account_id`.
+    ///
+    /// The wallet uses its persisted observed chain tip (the highest tip reported to it by
+    /// [`Wallet::sync`]) to compute the `confirmations` field. Operators that need a fresh
+    /// confirmation count should call [`Wallet::sync`] before this method.
+    ///
+    /// When the wallet has not yet observed a tip (no prior `sync`), `confirmations` is set
+    /// to `0` and `mined_height` carries the note's actual mined height.
+    ///
+    /// `not_retryable` on unknown account; `retryable` on transient storage I/O.
+    pub async fn list_unspent_shielded_notes(
+        &self,
+        account_id: AccountId,
+    ) -> Result<Vec<crate::unspent_note::UnspentShieldedNote>, WalletError> {
+        let observed_tip = self
+            .inner
+            .storage
+            .lookup_observed_tip()
+            .await
+            .map_err(lift_storage_to_wallet_error)?;
+        let target = observed_tip.unwrap_or_else(|| BlockHeight::from(0));
+        let rows = self
+            .inner
+            .storage
+            .list_unspent_shielded_notes(account_id, target)
+            .await
+            .map_err(lift_storage_to_wallet_error)?;
+        Ok(rows
+            .into_iter()
+            .map(|row| translate_unspent_note(row, observed_tip))
+            .collect())
+    }
+
     /// Subscribes to wallet events. The returned stream stays valid until either the wallet
     /// is dropped or the consumer drops the stream.
     #[must_use]
@@ -337,6 +370,33 @@ fn capability_for_storage<St: WalletStorage>() -> StorageCapability {
         StorageCapability::Sqlite
     } else {
         StorageCapability::Custom
+    }
+}
+
+fn translate_unspent_note(
+    row: zally_storage::UnspentShieldedNoteRow,
+    observed_tip: Option<BlockHeight>,
+) -> crate::unspent_note::UnspentShieldedNote {
+    let pool = match row.protocol {
+        zcash_protocol::ShieldedProtocol::Sapling => zally_chain::ShieldedPool::Sapling,
+        zcash_protocol::ShieldedProtocol::Orchard => zally_chain::ShieldedPool::Orchard,
+    };
+    let amount = zally_core::Zatoshis::try_from(row.value_zat)
+        .unwrap_or_else(|_| zally_core::Zatoshis::zero());
+    let confirmations = match observed_tip {
+        Some(tip) if tip.as_u32() >= row.mined_height.as_u32() => tip
+            .as_u32()
+            .saturating_sub(row.mined_height.as_u32())
+            .saturating_add(1),
+        _ => 0,
+    };
+    crate::unspent_note::UnspentShieldedNote {
+        pool,
+        value: amount,
+        tx_id: row.tx_id,
+        output_index: row.output_index,
+        mined_height: row.mined_height,
+        confirmations,
     }
 }
 

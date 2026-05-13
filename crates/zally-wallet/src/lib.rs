@@ -8,6 +8,7 @@ mod pczt;
 mod retry;
 mod spend;
 mod sync;
+mod unspent_note;
 mod wallet;
 mod wallet_error;
 
@@ -21,5 +22,6 @@ pub use spend::{
     SendPaymentPlan,
 };
 pub use sync::SyncOutcome;
+pub use unspent_note::UnspentShieldedNote;
 pub use wallet::Wallet;
 pub use wallet_error::WalletError;

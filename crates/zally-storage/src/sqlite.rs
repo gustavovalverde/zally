@@ -862,6 +862,61 @@ impl WalletStorage for SqliteWalletStorage {
         })
         .await
     }
+
+    async fn list_unspent_shielded_notes(
+        &self,
+        account_id: AccountId,
+        target_height: BlockHeight,
+    ) -> Result<Vec<crate::wallet_storage::UnspentShieldedNoteRow>, StorageError> {
+        let account_uuid = zally_to_account_uuid(account_id);
+        let target = zcash_client_backend::data_api::wallet::TargetHeight::from(
+            zcash_protocol::consensus::BlockHeight::from(target_height.as_u32()),
+        );
+        self.with_db(move |db| {
+            let received = zcash_client_backend::data_api::InputSource::select_unspent_notes(
+                db,
+                account_uuid,
+                &[
+                    zcash_protocol::ShieldedProtocol::Sapling,
+                    zcash_protocol::ShieldedProtocol::Orchard,
+                ],
+                target,
+                &[],
+            )
+            .map_err(|err| StorageError::SqliteFailed {
+                reason: format!("select_unspent_notes failed: {err}"),
+                is_retryable: false,
+            })?;
+
+            let mut rows = Vec::new();
+            for note in received.sapling() {
+                let Some(mined_height) = note.mined_height() else {
+                    continue;
+                };
+                rows.push(crate::wallet_storage::UnspentShieldedNoteRow {
+                    protocol: zcash_protocol::ShieldedProtocol::Sapling,
+                    value_zat: note.note().value().inner(),
+                    tx_id: zally_core::TxId::from_bytes(*note.txid().as_ref()),
+                    output_index: u32::from(note.output_index()),
+                    mined_height: BlockHeight::from(u32::from(mined_height)),
+                });
+            }
+            for note in received.orchard() {
+                let Some(mined_height) = note.mined_height() else {
+                    continue;
+                };
+                rows.push(crate::wallet_storage::UnspentShieldedNoteRow {
+                    protocol: zcash_protocol::ShieldedProtocol::Orchard,
+                    value_zat: note.note().value().inner(),
+                    tx_id: zally_core::TxId::from_bytes(*note.txid().as_ref()),
+                    output_index: u32::from(note.output_index()),
+                    mined_height: BlockHeight::from(u32::from(mined_height)),
+                });
+            }
+            Ok(rows)
+        })
+        .await
+    }
 }
 
 struct InMemoryBlockSource {

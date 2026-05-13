@@ -105,6 +105,27 @@ impl PreparedTransaction {
     }
 }
 
+/// One unspent shielded note row returned by [`WalletStorage::list_unspent_shielded_notes`].
+///
+/// Carries the upstream `zcash_protocol::ShieldedProtocol` directly so storage stays free of
+/// chain-vocabulary deps. The wallet layer maps `protocol` onto its own `ShieldedPool`
+/// vocabulary before returning to operators.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub struct UnspentShieldedNoteRow {
+    /// Pool this note lives on.
+    pub protocol: zcash_protocol::ShieldedProtocol,
+    /// Value in zatoshis.
+    pub value_zat: u64,
+    /// Transaction that created the note.
+    pub tx_id: TxId,
+    /// Output index within the producing transaction (Sapling output index or Orchard
+    /// action index, depending on `protocol`).
+    pub output_index: u32,
+    /// Height at which the note's producing transaction was mined.
+    pub mined_height: BlockHeight,
+}
+
 /// Summary of a successful [`WalletStorage::propose_payment`] call.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
@@ -307,4 +328,19 @@ pub trait WalletStorage: Send + Sync + 'static {
     ///
     /// `not_retryable` on schema errors; `retryable` on transient I/O.
     async fn record_observed_tip(&self, new_tip: BlockHeight) -> Result<(), StorageError>;
+
+    /// Returns every unspent Sapling and Orchard note owned by `account_id` against
+    /// `target_height` (typically the wallet's current chain tip). Spent notes, locked
+    /// notes, and notes whose producing transaction has not yet mined are excluded.
+    ///
+    /// Wraps `zcash_client_backend::data_api::InputSource::select_unspent_notes`. Confirmation
+    /// count is not computed here; callers derive it from `mined_height` against their own
+    /// tip-of-interest.
+    ///
+    /// `not_retryable` on unknown account or schema errors; `retryable` on transient I/O.
+    async fn list_unspent_shielded_notes(
+        &self,
+        account_id: AccountId,
+        target_height: BlockHeight,
+    ) -> Result<Vec<UnspentShieldedNoteRow>, StorageError>;
 }
