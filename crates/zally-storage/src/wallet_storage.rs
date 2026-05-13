@@ -217,6 +217,14 @@ pub trait WalletStorage: Send + Sync + 'static {
     /// Returns the height the wallet has been fully scanned to, or `None` for a fresh wallet.
     async fn fully_scanned_height(&self) -> Result<Option<BlockHeight>, StorageError>;
 
+    /// Returns the wallet's birthday height, the earliest block the operator-configured
+    /// account expects to receive funds at. `Wallet::sync` starts from this height on a
+    /// fresh wallet (rather than genesis) to keep cold sync proportional to the operator's
+    /// real receive window.
+    ///
+    /// Returns `Ok(None)` for a wallet with no initialised account.
+    async fn wallet_birthday(&self) -> Result<Option<BlockHeight>, StorageError>;
+
     /// Builds a ZIP-317 conventional-fee proposal for `request`, creates the signed
     /// transactions via `zcash_client_backend::data_api::wallet::create_proposed_transactions`,
     /// and returns the raw transaction bytes (one per step) for the caller to submit via

@@ -371,6 +371,15 @@ impl WalletStorage for SqliteWalletStorage {
         .await
     }
 
+    async fn wallet_birthday(&self) -> Result<Option<BlockHeight>, StorageError> {
+        self.with_db(move |db| {
+            let height = zcash_client_backend::data_api::WalletRead::get_wallet_birthday(db)
+                .map_err(|e| map_sqlite_error(&e))?;
+            Ok(height.map(|h| BlockHeight::from(u32::from(h))))
+        })
+        .await
+    }
+
     async fn propose_payment(
         &self,
         request: crate::wallet_storage::ProposalPaymentRequest,

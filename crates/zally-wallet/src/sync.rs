@@ -77,10 +77,15 @@ impl Wallet {
             .await?;
 
         let prior_fully_scanned_height = self.inner.storage.fully_scanned_height().await?;
-        let scanned_from = prior_fully_scanned_height.map_or_else(
-            || BlockHeight::from(1),
-            |h| BlockHeight::from(h.as_u32().saturating_add(1)),
-        );
+        let scanned_from = match prior_fully_scanned_height {
+            Some(h) => BlockHeight::from(h.as_u32().saturating_add(1)),
+            None => self
+                .inner
+                .storage
+                .wallet_birthday()
+                .await?
+                .unwrap_or_else(|| BlockHeight::from(1)),
+        };
         self.publish_event(WalletEvent::ScanProgress {
             scanned_height: scanned_from,
             target_height,
