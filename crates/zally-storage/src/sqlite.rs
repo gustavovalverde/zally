@@ -935,13 +935,13 @@ impl WalletStorage for SqliteWalletStorage {
                 .prepare(
                     "SELECT a.uuid, t.txid, srn.output_index, srn.value, t.mined_height, 'sapling' AS pool \
                      FROM sapling_received_notes srn \
-                     JOIN transactions t ON srn.tx = t.id_tx \
+                     JOIN transactions t ON srn.transaction_id = t.id_tx \
                      JOIN accounts a ON srn.account_id = a.id \
                      WHERE t.mined_height BETWEEN ?1 AND ?2 \
                      UNION ALL \
                      SELECT a.uuid, t.txid, orn.action_index, orn.value, t.mined_height, 'orchard' AS pool \
                      FROM orchard_received_notes orn \
-                     JOIN transactions t ON orn.tx = t.id_tx \
+                     JOIN transactions t ON orn.transaction_id = t.id_tx \
                      JOIN accounts a ON orn.account_id = a.id \
                      WHERE t.mined_height BETWEEN ?1 AND ?2 \
                      ORDER BY mined_height ASC, txid ASC, output_index ASC, pool ASC",
