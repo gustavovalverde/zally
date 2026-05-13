@@ -922,6 +922,114 @@ impl WalletStorage for SqliteWalletStorage {
         })
         .await
     }
+
+    async fn received_shielded_notes_mined_in_range(
+        &self,
+        from_height: BlockHeight,
+        to_height: BlockHeight,
+    ) -> Result<Vec<crate::wallet_storage::ReceivedShieldedNoteRow>, StorageError> {
+        let from_h = i64::from(from_height.as_u32());
+        let to_h = i64::from(to_height.as_u32());
+        self.with_ledger(move |conn| {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT a.uuid, t.txid, srn.output_index, srn.value, t.mined_height, 'sapling' AS pool \
+                     FROM sapling_received_notes srn \
+                     JOIN transactions t ON srn.tx = t.id_tx \
+                     JOIN accounts a ON srn.account_id = a.id \
+                     WHERE t.mined_height BETWEEN ?1 AND ?2 \
+                     UNION ALL \
+                     SELECT a.uuid, t.txid, orn.action_index, orn.value, t.mined_height, 'orchard' AS pool \
+                     FROM orchard_received_notes orn \
+                     JOIN transactions t ON orn.tx = t.id_tx \
+                     JOIN accounts a ON orn.account_id = a.id \
+                     WHERE t.mined_height BETWEEN ?1 AND ?2 \
+                     ORDER BY mined_height ASC, txid ASC, output_index ASC, pool ASC",
+                )
+                .map_err(|err| StorageError::SqliteFailed {
+                    reason: format!("received_shielded_notes prepare failed: {err}"),
+                    is_retryable: false,
+                })?;
+            let mapped = stmt
+                .query_map([from_h, to_h], |row| {
+                    let account_uuid_bytes: Vec<u8> = row.get(0)?;
+                    let txid_bytes: Vec<u8> = row.get(1)?;
+                    let output_index: i64 = row.get(2)?;
+                    let value_zat: i64 = row.get(3)?;
+                    let mined_height: i64 = row.get(4)?;
+                    let pool: String = row.get(5)?;
+                    Ok((
+                        account_uuid_bytes,
+                        txid_bytes,
+                        output_index,
+                        value_zat,
+                        mined_height,
+                        pool,
+                    ))
+                })
+                .map_err(|err| StorageError::SqliteFailed {
+                    reason: format!("received_shielded_notes query failed: {err}"),
+                    is_retryable: false,
+                })?;
+            let mut rows = Vec::new();
+            for raw in mapped {
+                let (account_uuid_bytes, txid_bytes, output_index, value_zat, mined_height, pool) =
+                    raw.map_err(|err| StorageError::SqliteFailed {
+                        reason: format!("received_shielded_notes row decode failed: {err}"),
+                        is_retryable: false,
+                    })?;
+                let txid_array: [u8; 32] = txid_bytes.try_into().map_err(|raw: Vec<u8>| {
+                    StorageError::SqliteFailed {
+                        reason: format!("transactions.txid had wrong byte length: {}", raw.len()),
+                        is_retryable: false,
+                    }
+                })?;
+                let account_uuid_array: [u8; 16] = account_uuid_bytes.try_into().map_err(
+                    |raw: Vec<u8>| StorageError::SqliteFailed {
+                        reason: format!("accounts.uuid had wrong byte length: {}", raw.len()),
+                        is_retryable: false,
+                    },
+                )?;
+                let account_uuid = uuid::Uuid::from_bytes(account_uuid_array);
+                let output_index = u32::try_from(output_index).map_err(|_| {
+                    StorageError::SqliteFailed {
+                        reason: format!("received note output_index out of u32 range: {output_index}"),
+                        is_retryable: false,
+                    }
+                })?;
+                let value_zat =
+                    u64::try_from(value_zat).map_err(|_| StorageError::SqliteFailed {
+                        reason: format!("received note value out of u64 range: {value_zat}"),
+                        is_retryable: false,
+                    })?;
+                let mined_height_u32 =
+                    u32::try_from(mined_height).map_err(|_| StorageError::SqliteFailed {
+                        reason: format!("transactions.mined_height out of u32 range: {mined_height}"),
+                        is_retryable: false,
+                    })?;
+                let protocol = match pool.as_str() {
+                    "sapling" => zcash_protocol::ShieldedProtocol::Sapling,
+                    "orchard" => zcash_protocol::ShieldedProtocol::Orchard,
+                    other => {
+                        return Err(StorageError::SqliteFailed {
+                            reason: format!("unknown pool tag: {other}"),
+                            is_retryable: false,
+                        });
+                    }
+                };
+                rows.push(crate::wallet_storage::ReceivedShieldedNoteRow {
+                    account_id: AccountId::from_uuid(account_uuid),
+                    protocol,
+                    value_zat,
+                    tx_id: zally_core::TxId::from_bytes(txid_array),
+                    output_index,
+                    mined_height: BlockHeight::from(mined_height_u32),
+                });
+            }
+            Ok(rows)
+        })
+        .await
+    }
 }
 
 struct InMemoryBlockSource {

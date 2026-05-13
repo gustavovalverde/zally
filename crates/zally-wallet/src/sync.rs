@@ -10,8 +10,10 @@
 //! follow-up; the current implementation rebuilds the `ChainState` from the embedded
 //! genesis frontier on every call, which is correct but linear-in-tip-height.
 
+use std::collections::HashMap;
+
 use futures_util::StreamExt as _;
-use zally_chain::{BlockHeightRange, ChainSource, ChainSourceError, ChainState};
+use zally_chain::{BlockHeightRange, ChainSource, ChainSourceError, ChainState, ShieldedPool};
 use zally_core::BlockHeight;
 use zally_storage::ScanRequest;
 
@@ -160,6 +162,7 @@ impl Wallet {
             block_count,
             reorgs_observed,
         } = context;
+        let timestamps_by_height = block_timestamp_index(&blocks);
         let outcome = self
             .inner
             .storage
@@ -178,6 +181,27 @@ impl Wallet {
             });
         }
 
+        let received_notes = self
+            .inner
+            .storage
+            .received_shielded_notes_mined_in_range(scanned_from, outcome.scanned_to_height)
+            .await?;
+        for note in received_notes {
+            let block_timestamp_ms = timestamps_by_height
+                .get(&note.mined_height.as_u32())
+                .copied()
+                .unwrap_or(0);
+            self.publish_event(WalletEvent::ShieldedReceiveObserved {
+                account_id: note.account_id,
+                tx_id: note.tx_id,
+                output_index: note.output_index,
+                value_zat: note.value_zat,
+                mined_height: note.mined_height,
+                block_timestamp_ms,
+                pool: shielded_pool_for(note.protocol),
+            });
+        }
+
         self.publish_event(WalletEvent::ScanProgress {
             scanned_height: outcome.scanned_to_height,
             target_height,
@@ -188,6 +212,26 @@ impl Wallet {
             block_count,
             reorgs_observed,
         })
+    }
+}
+
+fn block_timestamp_index(
+    blocks: &[zcash_client_backend::proto::compact_formats::CompactBlock],
+) -> HashMap<u32, u64> {
+    blocks
+        .iter()
+        .map(|block| {
+            let height = u32::try_from(block.height).unwrap_or(u32::MAX);
+            let timestamp_ms = u64::from(block.time).saturating_mul(1_000);
+            (height, timestamp_ms)
+        })
+        .collect()
+}
+
+const fn shielded_pool_for(protocol: zcash_protocol::ShieldedProtocol) -> ShieldedPool {
+    match protocol {
+        zcash_protocol::ShieldedProtocol::Sapling => ShieldedPool::Sapling,
+        zcash_protocol::ShieldedProtocol::Orchard => ShieldedPool::Orchard,
     }
 }
 

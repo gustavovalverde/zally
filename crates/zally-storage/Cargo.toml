@@ -31,11 +31,11 @@ zcash_primitives.workspace = true
 zcash_proofs.workspace = true
 zcash_protocol.workspace = true
 zip32.workspace = true
+uuid.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
-uuid.workspace = true
 
 [lints]
 workspace = true

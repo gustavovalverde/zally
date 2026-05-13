@@ -126,6 +126,30 @@ pub struct UnspentShieldedNoteRow {
     pub mined_height: BlockHeight,
 }
 
+/// One shielded note received by an account, in the form returned by
+/// [`WalletStorage::received_shielded_notes_mined_in_range`].
+///
+/// Distinguishes itself from [`UnspentShieldedNoteRow`] by including notes that may have
+/// been spent after they were received: the row reports the receive event, not the current
+/// spendability state. Used by the wallet event stream to emit one
+/// `ShieldedReceiveObserved` per note seen in the scanned block range.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub struct ReceivedShieldedNoteRow {
+    /// Account that owns the note.
+    pub account_id: AccountId,
+    /// Pool this note lives on.
+    pub protocol: zcash_protocol::ShieldedProtocol,
+    /// Value in zatoshis.
+    pub value_zat: u64,
+    /// Transaction that created the note.
+    pub tx_id: TxId,
+    /// Output index within the producing transaction.
+    pub output_index: u32,
+    /// Height at which the note's producing transaction was mined.
+    pub mined_height: BlockHeight,
+}
+
 /// Summary of a successful [`WalletStorage::propose_payment`] call.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
@@ -358,4 +382,20 @@ pub trait WalletStorage: Send + Sync + 'static {
         account_id: AccountId,
         target_height: BlockHeight,
     ) -> Result<Vec<UnspentShieldedNoteRow>, StorageError>;
+
+    /// Returns every Sapling and Orchard note received in the inclusive height range
+    /// `[from_height, to_height]`, regardless of current spent state.
+    ///
+    /// Powers the wallet's event stream: after a successful `scan_blocks` call the wallet
+    /// looks up notes newly mined in the scanned range and emits one
+    /// `ShieldedReceiveObserved` per row. Spent state is intentionally not filtered here
+    /// so consumers see every receive that ever happened in the range, suitable for
+    /// donation indexing and historical aggregation.
+    ///
+    /// `not_retryable` on schema errors; `retryable` on transient I/O.
+    async fn received_shielded_notes_mined_in_range(
+        &self,
+        from_height: BlockHeight,
+        to_height: BlockHeight,
+    ) -> Result<Vec<ReceivedShieldedNoteRow>, StorageError>;
 }

@@ -9,9 +9,12 @@ use zally_core::{AccountId, BlockHeight, TxId};
 
 /// Push notification from the wallet's sync loop.
 ///
-/// Slice 2 emits [`WalletEvent::ScanProgress`], [`WalletEvent::ReorgDetected`], and
-/// [`WalletEvent::Lagged`]. Slice 5 adds [`WalletEvent::TransactionConfirmed`] and
-/// [`WalletEvent::ReceiverObserved`] when block scanning lands.
+/// Every `Wallet::sync` run emits [`WalletEvent::ScanProgress`] at the start and end of
+/// the run; [`WalletEvent::ReorgDetected`] when the upstream chain rolls back; one
+/// [`WalletEvent::TransactionConfirmed`] per newly confirmed wallet transaction; and one
+/// [`WalletEvent::ShieldedReceiveObserved`] per newly observed shielded note that the
+/// wallet owns. [`WalletEvent::Lagged`] is injected by the subscription stream when a
+/// consumer drops events; the sync loop never emits it directly.
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[non_exhaustive]
@@ -32,21 +35,32 @@ pub enum WalletEvent {
         new_tip_height: BlockHeight,
     },
     /// A transaction belonging to the wallet was confirmed at `confirmed_at_height`.
-    /// Emitted by Slice 5's scan loop.
     TransactionConfirmed {
         /// Confirmed transaction identifier.
         tx_id: TxId,
         /// Height at which it was confirmed.
         confirmed_at_height: BlockHeight,
     },
-    /// A note for `account_id` was observed at `seen_at_height` on `pool`. Emitted by
-    /// Slice 5's scan loop.
-    ReceiverObserved {
-        /// Account whose receive observed the note.
+    /// A shielded note owned by `account_id` was observed at `mined_height` on `pool`.
+    ///
+    /// Emitted once per note as `Wallet::sync` advances past the block carrying the
+    /// receive. `block_timestamp_ms` is the upstream `CompactBlock` header's mined
+    /// timestamp converted to milliseconds; consumers should treat it as the authoritative
+    /// receive time for window queries (instead of wall clock at observation).
+    ShieldedReceiveObserved {
+        /// Account that owns the received note.
         account_id: AccountId,
-        /// Block height the note was found in.
-        seen_at_height: BlockHeight,
-        /// Shielded pool the note was on.
+        /// Transaction the note was created in.
+        tx_id: TxId,
+        /// Output index of the note within its transaction's bundle.
+        output_index: u32,
+        /// Note value in zatoshis.
+        value_zat: u64,
+        /// Block height the note was mined at.
+        mined_height: BlockHeight,
+        /// Block header timestamp in milliseconds (Unix epoch).
+        block_timestamp_ms: u64,
+        /// Shielded pool the note was created on.
         pool: ShieldedPool,
     },
     /// Consumer fell behind; `dropped_count` events were skipped before this notification.
