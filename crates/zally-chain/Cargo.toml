@@ -1,0 +1,38 @@
+[package]
+name = "zally-chain"
+version = "0.1.0"
+description = "Zally chain-read and broadcast plane: ChainSource, Submitter, ZinderChainSource"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[features]
+default = []
+serde = ["dep:serde", "zally-core/serde"]
+zinder = ["dep:zinder-client", "dep:zinder-core", "dep:tokio", "dep:prost", "dep:serde_json"]
+
+[dependencies]
+async-trait.workspace = true
+futures-util.workspace = true
+serde = { workspace = true, optional = true }
+thiserror.workspace = true
+prost = { version = "0.14", optional = true }
+serde_json = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true }
+zally-core = { path = "../zally-core", version = "0.1" }
+zcash_client_backend = { workspace = true, features = ["orchard", "transparent-inputs"] }
+zcash_protocol.workspace = true
+zinder-client = { workspace = true, optional = true }
+zinder-core = { workspace = true, optional = true }
+
+[dev-dependencies]
+thiserror.workspace = true
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
+zally-testkit = { path = "../zally-testkit", version = "0.1" }
+
+[lints]
+workspace = true

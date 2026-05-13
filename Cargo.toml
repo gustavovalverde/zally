@@ -1,0 +1,114 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/zally-core",
+    "crates/zally-keys",
+    "crates/zally-storage",
+    "crates/zally-chain",
+    "crates/zally-pczt",
+    "crates/zally-wallet",
+    "crates/zally-testkit",
+]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.91"
+license = "MIT"
+repository = "https://github.com/gustavovalverde/zally"
+authors = []
+readme = "README.md"
+keywords = ["zcash", "wallet", "cryptocurrency", "shielded", "headless"]
+categories = ["cryptography::cryptocurrencies"]
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+warnings = "deny"
+missing_docs = "deny"
+unreachable_pub = "deny"
+unnameable_types = "deny"
+unused_must_use = "deny"
+trivial_numeric_casts = "deny"
+unused_extern_crates = "deny"
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+cargo = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+dbg_macro = "deny"
+print_stderr = "deny"
+print_stdout = "deny"
+wildcard_enum_match_arm = "deny"
+allow_attributes_without_reason = "deny"
+missing_const_for_fn = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+module_name_repetitions = "allow"
+multiple_crate_versions = "allow"
+redundant_pub_crate = "allow"
+
+[workspace.dependencies]
+# Foundation: librustzcash crates. Pin minor versions; bump deliberately in a
+# dedicated ADR. Zally absorbs the upstream churn behind its own surface;
+# operators do not see these version numbers in Zally's public API.
+zcash_client_backend = "0.22"
+zcash_client_sqlite = "0.20"
+zcash_keys = "0.13"
+zcash_primitives = "0.27"
+zcash_protocol = { version = "0.8", features = ["local-consensus"] }
+zcash_address = "0.11"
+zcash_proofs = "0.27"
+pczt = { version = "0.6", features = ["orchard", "sapling", "transparent", "signer", "prover", "tx-extractor"] }
+orchard = "0.13"
+zip321 = "0.7"
+zip32 = "0.2"
+
+# Foundation: ecosystem chain plane. Zally path-depends on the sibling zinder workspace
+# so the wallet integration tracks zinder's evolving typed-client surface directly.
+# The [patch.crates-io] core2 pin below resolves the yanked equihash-transitive dep.
+zinder-client = { git = "https://github.com/gustavovalverde/zinder", rev = "0a8c266011baba03aa3aeab52820f76b5e315789" }
+zinder-core = { git = "https://github.com/gustavovalverde/zinder", rev = "0a8c266011baba03aa3aeab52820f76b5e315789" }
+
+# Async runtime and concurrency.
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "fs", "io-util"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+futures-util = "0.3"
+async-trait = "0.1"
+parking_lot = "0.12"
+
+# Error handling and serialization.
+thiserror = "2.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Identifiers and BIP-39 mnemonics.
+uuid = { version = "1", features = ["v4", "serde"] }
+bip0039 = { version = "0.12", features = ["all-languages"] }
+
+# Cryptography and key sealing.
+age = "0.10"
+secrecy = "0.8"
+zeroize = "1.8"
+rand = "0.8"
+
+# Storage.
+rusqlite = { version = "0.37", features = ["bundled"] }
+
+# Telemetry.
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Test infrastructure.
+proptest = "1.5"
+tempfile = "3.13"
+
+[patch.crates-io]
+# Zebra 6.0.2 (pulled through zinder-client) resolves through equihash 0.2.2, whose
+# core2 0.3.x dependency was yanked on crates.io. Mirror zinder's pin to the last
+# published source rev until equihash or Zebra publishes a clean resolution path.
+core2 = { git = "https://github.com/bbqsrc/core2", rev = "7bf2611" }

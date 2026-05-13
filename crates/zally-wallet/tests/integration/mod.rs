@@ -1,0 +1,21 @@
+//! Slice 1 integration tests.
+
+mod capabilities_reports_slice_1;
+mod circuit_breaker_opens_after_threshold;
+mod create_then_create_returns_already_exists;
+mod create_then_open_round_trip;
+mod create_then_open_round_trip_in_memory;
+mod derive_address_populates_transparent;
+mod metrics_snapshot_round_trip;
+mod network_mismatch_fails_closed;
+mod observe_emits_scan_progress;
+mod open_without_seal_returns_no_sealed_seed;
+mod propose_rejects_memo_on_transparent;
+mod propose_rejects_network_mismatch;
+mod send_payment_short_circuits_on_known_idempotency_key;
+mod sync_catches_up_to_tip;
+mod sync_emits_reorg_when_tip_regresses;
+mod sync_network_mismatch;
+mod sync_retries_retryable_chain_failures;
+#[cfg(feature = "unsafe_plaintext_seed")]
+mod unsafe_plaintext_seed_warns;

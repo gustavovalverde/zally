@@ -1,0 +1,36 @@
+[package]
+name = "zally-keys"
+version = "0.1.0"
+description = "Zally seed lifecycle: SeedSealing trait, AgeFileSealing, Mnemonic, UFVK derivation"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[features]
+default = []
+# Exposes PlaintextSealing. Never enable in production binaries.
+unsafe_plaintext_seed = []
+serde = ["zally-core/serde"]
+
+[dependencies]
+age.workspace = true
+async-trait.workspace = true
+bip0039.workspace = true
+secrecy.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["fs", "io-util", "sync"] }
+zally-core = { path = "../zally-core", version = "0.1" }
+zcash_keys = { workspace = true, features = ["orchard", "sapling", "transparent-inputs"] }
+zeroize.workspace = true
+zip32.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
+
+[lints]
+workspace = true

@@ -1,0 +1,33 @@
+# Cargo build artifacts
+/target
+**/target
+Cargo.lock.bak
+
+# Generated wallet stores
+*.zally-store/
+*.zally-wallet.sqlite
+*.zally-wallet.sqlite-journal
+*.zally-wallet.sqlite-shm
+*.zally-wallet.sqlite-wal
+
+# Sealed seed material (never commit)
+secrets/
+*.age
+*.identity
+
+# Tooling
+.claude/
+.tmp/
+mutants.out/
+mutants.out.old/
+coverage/
+*.profraw
+lcov.info
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/*
+!.vscode/extensions.json
+*.swp
+*.swo

@@ -1,0 +1,20 @@
+# Cargo nextest profiles for Zally.
+#
+# The default validation gate runs the `ci` profile; live-node tests live in
+# `ci-live` and are gated behind `ZALLY_TEST_LIVE=1` plus `--run-ignored=all`.
+
+[profile.ci]
+fail-fast = false
+slow-timeout = { period = "60s", terminate-after = 6 }
+test-threads = "num-cpus"
+failure-output = "immediate-final"
+final-status-level = "skip"
+retries = 0
+
+[profile.ci-live]
+fail-fast = false
+slow-timeout = { period = "120s", terminate-after = 6 }
+test-threads = 1
+failure-output = "immediate-final"
+final-status-level = "all"
+retries = 0

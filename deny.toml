@@ -1,0 +1,61 @@
+[graph]
+all-features = true
+
+[advisories]
+yanked = "deny"
+ignore = [
+    # time 0.3 stack overflow on extremely large datetime parse input. Pulled transitively
+    # via rusqlite -> schemerz-rusqlite -> zcash_client_sqlite. Zally does not parse
+    # untrusted datetime input. Track upstream release of time >=0.3.47.
+    "RUSTSEC-2026-0009",
+    # proc-macro-error unmaintained advisory; pulled transitively through age's i18n stack.
+    # Not a vulnerability; tracking upstream replacement.
+    "RUSTSEC-2024-0370",
+]
+
+[licenses]
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+    "MPL-2.0",
+    # CC0-1.0 is FSF Free/Libre and OSI-approved. Used by upstream crypto crates
+    # (bounded-vec, secp256k1) pulled transitively through librustzcash.
+    "CC0-1.0",
+    # CDLA-Permissive-2.0 is a Linux Foundation permissive license used by the
+    # webpki-root-certs crate that ships the Mozilla root CA bundle. Pulled
+    # transitively via tonic + rustls when the zinder integration is enabled.
+    "CDLA-Permissive-2.0",
+]
+confidence-threshold = 0.93
+
+[bans]
+multiple-versions = "warn"
+# Wildcards in workspace deps are checked at warn level rather than denied.
+# The zinder sibling workspace exposes its public crates through
+# `<dep>.workspace = true`, which cargo-deny classifies as wildcard even though
+# the resolution is path-pinned. Treat as warning so a wildcard in a
+# Zally-owned manifest still surfaces while sibling workspaces are not blocked.
+wildcards = "warn"
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = [
+    # librustzcash and adjacent ecosystem repositories pinned to specific
+    # commits are added here as the dependency set is locked. Never add a
+    # branch reference; always pin a commit so supply-chain review has a
+    # fixed artifact to evaluate.
+    #
+    # core2 0.3.x was yanked from crates.io; the last published source rev is
+    # pinned in [patch.crates-io] so the equihash 0.2.2 -> core2 -> ... dep
+    # tree pulled in transitively via zebra-chain resolves cleanly. Mirrors
+    # the same pin in zinder's workspace.
+    "https://github.com/bbqsrc/core2",
+]

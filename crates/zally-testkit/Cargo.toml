@@ -1,0 +1,33 @@
+[package]
+name = "zally-testkit"
+version = "0.1.0"
+description = "Deterministic wallet fixtures for Zally tests"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+
+[features]
+default = []
+unsafe_plaintext_seed = ["zally-keys/unsafe_plaintext_seed"]
+
+[dependencies]
+async-trait.workspace = true
+futures-util.workspace = true
+parking_lot.workspace = true
+tempfile.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["sync"] }
+tokio-stream.workspace = true
+tracing-subscriber.workspace = true
+zally-chain = { path = "../zally-chain", version = "0.1" }
+zally-core = { path = "../zally-core", version = "0.1" }
+zally-keys = { path = "../zally-keys", version = "0.1" }
+zcash_client_backend.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }
+
+[lints]
+workspace = true

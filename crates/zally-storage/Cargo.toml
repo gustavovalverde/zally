@@ -1,0 +1,41 @@
+[package]
+name = "zally-storage"
+version = "0.1.0"
+description = "Zally wallet storage trait and SQLite implementation"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[features]
+default = []
+serde = ["zally-core/serde"]
+
+[dependencies]
+async-trait.workspace = true
+rand.workspace = true
+rusqlite.workspace = true
+secrecy.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["sync", "rt"] }
+zally-core = { path = "../zally-core", version = "0.1" }
+zally-keys = { path = "../zally-keys", version = "0.1" }
+pczt = { workspace = true }
+zcash_client_backend = { workspace = true, features = ["orchard", "transparent-inputs", "pczt"] }
+zcash_client_sqlite = { workspace = true, features = ["orchard", "transparent-inputs", "serde"] }
+zcash_keys = { workspace = true, features = ["orchard", "sapling", "transparent-inputs"] }
+zcash_primitives.workspace = true
+zcash_proofs.workspace = true
+zcash_protocol.workspace = true
+zip32.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
+uuid.workspace = true
+
+[lints]
+workspace = true

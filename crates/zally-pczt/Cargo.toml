@@ -1,0 +1,31 @@
+[package]
+name = "zally-pczt"
+version = "0.1.0"
+description = "Zally PCZT roles: Creator, Signer, Combiner, Extractor"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[features]
+default = []
+serde = ["zally-core/serde"]
+
+[dependencies]
+orchard.workspace = true
+pczt.workspace = true
+thiserror.workspace = true
+zally-core = { path = "../zally-core", version = "0.1" }
+zally-keys = { path = "../zally-keys", version = "0.1" }
+zcash_keys = { workspace = true, features = ["orchard", "sapling", "transparent-inputs"] }
+zcash_proofs.workspace = true
+zip32.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
+
+[lints]
+workspace = true

@@ -1,0 +1,79 @@
+[package]
+name = "zally-wallet"
+version = "0.1.0"
+description = "Zally operator-facing wallet API"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[features]
+default = []
+unsafe_plaintext_seed = [
+    "zally-keys/unsafe_plaintext_seed",
+    "zally-testkit/unsafe_plaintext_seed",
+]
+serde = [
+    "dep:serde",
+    "zally-chain/serde",
+    "zally-core/serde",
+    "zally-keys/serde",
+]
+zinder = ["zally-chain/zinder"]
+
+[dependencies]
+futures-util.workspace = true
+parking_lot.workspace = true
+serde = { workspace = true, optional = true }
+thiserror.workspace = true
+tokio = { workspace = true, features = ["sync"] }
+tokio-stream.workspace = true
+tracing.workspace = true
+zally-chain = { path = "../zally-chain", version = "0.1" }
+zally-core = { path = "../zally-core", version = "0.1" }
+zally-keys = { path = "../zally-keys", version = "0.1" }
+zally-pczt = { path = "../zally-pczt", version = "0.1" }
+zally-storage = { path = "../zally-storage", version = "0.1" }
+zcash_client_backend = { workspace = true, features = ["orchard", "transparent-inputs"] }
+zcash_keys.workspace = true
+zcash_primitives.workspace = true
+zcash_protocol.workspace = true
+zip321.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
+tracing-subscriber.workspace = true
+zally-testkit = { path = "../zally-testkit", version = "0.1" }
+
+[[example]]
+name = "open-wallet"
+path = "examples/open-wallet/main.rs"
+
+[[example]]
+name = "exchange-deposit"
+path = "examples/exchange-deposit/main.rs"
+
+[[example]]
+name = "payment-processor"
+path = "examples/payment-processor/main.rs"
+
+[[example]]
+name = "custody-with-pczt"
+path = "examples/custody-with-pczt/main.rs"
+
+[[example]]
+name = "mining-payout"
+path = "examples/mining-payout/main.rs"
+
+[[example]]
+name = "live-zinder-probe"
+path = "examples/live-zinder-probe/main.rs"
+required-features = ["zinder"]
+
+[lints]
+workspace = true
