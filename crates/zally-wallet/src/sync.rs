@@ -24,6 +24,14 @@ use crate::wallet_error::WalletError;
 
 const MAX_BLOCKS_PER_SYNC: u32 = 1_000;
 
+/// Blocks to roll back past a divergence reported by `scan_cached_blocks`.
+///
+/// Must exceed the chain source's reorg window so recovery always makes forward progress,
+/// even when the divergence is detected at `fully_scanned_height + 1` (where an
+/// `at_height - 1` rollback would be a no-op). Zinder's reorg window is 100 blocks; 160
+/// leaves comfortable margin.
+const REORG_ROLLBACK_DEPTH_BLOCKS: u32 = 160;
+
 struct ScanContext {
     blocks: Vec<zcash_client_backend::proto::compact_formats::CompactBlock>,
     scanned_from: BlockHeight,
@@ -48,7 +56,11 @@ pub struct SyncOutcome {
 }
 
 impl Wallet {
-    /// Advances the wallet from its last-scanned height to `chain.chain_tip()`.
+    /// Advances the wallet from its last-scanned height up to `chain.finalized_height()`.
+    ///
+    /// The wallet never scans into the chain source's reorg window, so it cannot cache an
+    /// orphaned block. The raw `chain_tip()` is fetched as well, but only to detect a tip
+    /// regress and to report scan progress — never as a scan ceiling.
     ///
     /// Fails closed on network mismatch. Emits `ScanProgress` events at the start and end of
     /// the run; per-block events are emitted by the storage scanner.
@@ -62,7 +74,9 @@ impl Wallet {
             });
         }
         let policy = self.retry_policy();
-        let target_height = with_breaker_and_retry(
+        // Raw tip: drives reorg detection and `ScanProgress` reporting only. It can still be
+        // reorged away, so it is never used as a scan ceiling.
+        let raw_tip_height = with_breaker_and_retry(
             &self.inner.circuit_breaker,
             policy,
             "sync.chain_tip",
@@ -70,11 +84,21 @@ impl Wallet {
             |e| map_chain_source_error(&e),
         )
         .await?;
+        // Finalized height: the immutable scan ceiling. Scanning only at or below this
+        // height means a reorg can never invalidate a block the wallet has already cached.
+        let finalized_height = with_breaker_and_retry(
+            &self.inner.circuit_breaker,
+            policy,
+            "sync.finalized_height",
+            || chain.finalized_height(),
+            |e| map_chain_source_error(&e),
+        )
+        .await?;
         let prior_observed_tip = self.inner.storage.lookup_observed_tip().await?;
-        let reorg = self.detect_tip_regress(prior_observed_tip, target_height);
+        let reorg = self.detect_tip_regress(prior_observed_tip, raw_tip_height);
         self.inner
             .storage
-            .record_observed_tip(target_height)
+            .record_observed_tip(raw_tip_height)
             .await?;
 
         let prior_fully_scanned_height = self.inner.storage.fully_scanned_height().await?;
@@ -89,23 +113,23 @@ impl Wallet {
         };
         self.publish_event(WalletEvent::ScanProgress {
             scanned_height: scanned_from,
-            target_height,
+            target_height: finalized_height,
         });
 
-        if scanned_from.as_u32() > target_height.as_u32() {
-            return Ok(self.emit_already_caught_up(scanned_from, target_height, reorg));
+        if scanned_from.as_u32() > finalized_height.as_u32() {
+            return Ok(self.emit_already_caught_up(scanned_from, finalized_height, reorg));
         }
-        let blocks = fetch_compact_blocks(chain, scanned_from, target_height).await?;
+        let blocks = fetch_compact_blocks(chain, scanned_from, finalized_height).await?;
         let block_count = u64::try_from(blocks.len()).unwrap_or(u64::MAX);
         if blocks.is_empty() {
-            return Ok(self.emit_already_caught_up(scanned_from, target_height, reorg));
+            return Ok(self.emit_already_caught_up(scanned_from, finalized_height, reorg));
         }
         let from_state = fetch_prior_chain_state(chain, scanned_from).await?;
         self.scan_and_emit(
             ScanContext {
                 blocks,
                 scanned_from,
-                target_height,
+                target_height: finalized_height,
                 block_count,
                 reorgs_observed: reorg,
             },
@@ -228,17 +252,28 @@ impl Wallet {
     /// Recovers from a chain-source-side reorg observed during scan.
     ///
     /// `scan_cached_blocks` rejected the batch because the parent hash of the next block did
-    /// not match the wallet's view at `at_height`. Truncate the wallet to one block below
-    /// the divergence, emit `ReorgDetected`, and return a no-op outcome for this sync. The
-    /// next sync iteration will re-fetch from the new fully-scanned height, pull fresh
-    /// `ChainState` from the chain source, and resume cleanly.
+    /// not match the wallet's view at `at_height`. Truncate the wallet back by a full reorg
+    /// window below the divergence (floored at the wallet birthday), emit `ReorgDetected`,
+    /// and return a no-op outcome for this sync. The next sync iteration re-fetches from the
+    /// new fully-scanned height, pulls fresh `ChainState` from the chain source, and resumes.
+    ///
+    /// Rolling back a window rather than a single block is what guarantees forward progress:
+    /// `scan_cached_blocks` reports the divergence at `fully_scanned_height + 1`, so an
+    /// `at_height - 1` rollback would leave the wallet exactly where it was and the next sync
+    /// would re-attack the identical poisoned range forever.
     async fn roll_back_after_reorg(
         &self,
         at_height: BlockHeight,
         target_height: BlockHeight,
         prior_reorgs: u32,
     ) -> Result<SyncOutcome, WalletError> {
-        let rollback_to = BlockHeight::from(at_height.as_u32().saturating_sub(1));
+        let birthday = self
+            .inner
+            .storage
+            .wallet_birthday()
+            .await?
+            .unwrap_or(BlockHeight::GENESIS);
+        let rollback_to = reorg_rollback_target(at_height, birthday);
         let new_fully_scanned = self.inner.storage.truncate_to_height(rollback_to).await?;
         tracing::warn!(
             target: "zally::wallet::sync",
@@ -259,6 +294,20 @@ impl Wallet {
             reorgs_observed: prior_reorgs.saturating_add(1),
         })
     }
+}
+
+/// Computes the height to truncate the wallet to after `scan_cached_blocks` reports a
+/// divergence at `at_height`.
+///
+/// Rolls back a full reorg window below the divergence so the next sync re-fetches a fresh
+/// range and makes forward progress — `scan_cached_blocks` reports the divergence at
+/// `fully_scanned_height + 1`, so a single-block rollback would leave the wallet exactly
+/// where it was. Floored at the wallet birthday so a deep-height wallet never re-scans from
+/// genesis.
+fn reorg_rollback_target(at_height: BlockHeight, birthday: BlockHeight) -> BlockHeight {
+    at_height
+        .saturating_sub(REORG_ROLLBACK_DEPTH_BLOCKS)
+        .max(birthday)
 }
 
 fn block_timestamp_index(
@@ -331,4 +380,46 @@ async fn fetch_prior_chain_state(
             ),
             is_retryable: false,
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{REORG_ROLLBACK_DEPTH_BLOCKS, reorg_rollback_target};
+    use zally_core::BlockHeight;
+
+    #[test]
+    fn rollback_target_lands_a_window_below_a_boundary_divergence() {
+        // The wedge: scan_cached_blocks reports the divergence at `fully_scanned_height + 1`.
+        // The rollback must land strictly below `fully_scanned_height` so the next sync
+        // re-fetches a fresh range instead of re-attacking the identical poisoned block.
+        let fully_scanned_height = 4_009_770;
+        let at_height = BlockHeight::from(fully_scanned_height + 1);
+        let birthday = BlockHeight::from(4_009_000);
+        let target = reorg_rollback_target(at_height, birthday);
+        assert!(
+            target.as_u32() < fully_scanned_height,
+            "rollback target {} must be below fully_scanned_height {fully_scanned_height}",
+            target.as_u32(),
+        );
+        assert_eq!(
+            target.as_u32(),
+            at_height.as_u32() - REORG_ROLLBACK_DEPTH_BLOCKS,
+        );
+    }
+
+    #[test]
+    fn rollback_target_is_floored_at_birthday() {
+        // A divergence within the rollback window of the birthday must not roll back below it.
+        let at_height = BlockHeight::from(4_009_010);
+        let birthday = BlockHeight::from(4_009_000);
+        assert_eq!(reorg_rollback_target(at_height, birthday), birthday);
+    }
+
+    #[test]
+    fn rollback_target_saturates_to_birthday_floor() {
+        // A low-height divergence saturates at the birthday rather than underflowing.
+        let at_height = BlockHeight::from(50);
+        let birthday = BlockHeight::from(1);
+        assert_eq!(reorg_rollback_target(at_height, birthday), birthday);
+    }
 }

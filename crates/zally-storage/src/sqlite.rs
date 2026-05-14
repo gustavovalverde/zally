@@ -868,8 +868,7 @@ impl WalletStorage for SqliteWalletStorage {
         self.with_ledger(move |conn| {
             conn.execute(
                 "INSERT INTO ext_zally_observed_tip (id, tip_height) VALUES (0, ?1) \
-                 ON CONFLICT(id) DO UPDATE SET tip_height = excluded.tip_height \
-                     WHERE excluded.tip_height > ext_zally_observed_tip.tip_height",
+                 ON CONFLICT(id) DO UPDATE SET tip_height = excluded.tip_height",
                 [new_tip_i64],
             )
             .map_err(|err| StorageError::SqliteFailed {

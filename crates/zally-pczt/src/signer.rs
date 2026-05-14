@@ -18,9 +18,11 @@ use crate::pczt_bytes::PcztBytes;
 use crate::pczt_error::PcztError;
 
 /// Maximum number of non-hardened child indices to enumerate per scope when matching
-/// transparent inputs to wallet-owned keys. ZIP-32 and BIP-44 use 20 as the conventional
-/// address gap limit; for fauzec's single-receiver mining setup index 0 is the only one
-/// actually populated, but the wider search keeps the signer general-purpose.
+/// transparent inputs to wallet-owned keys.
+///
+/// ZIP-32 and BIP-44 use 20 as the conventional address gap limit; for fauzec's
+/// single-receiver mining setup index 0 is the only one actually populated, but the wider
+/// search keeps the signer general-purpose.
 const TRANSPARENT_ADDRESS_GAP_LIMIT: u32 = 20;
 
 /// Signs a PCZT with keys derived from a sealed seed.

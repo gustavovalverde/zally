@@ -33,6 +33,7 @@ const EVENT_CHANNEL_CAPACITY: usize = 256;
 struct MockState {
     network: Network,
     tip_height: BlockHeight,
+    finalized_height: Option<BlockHeight>,
     chain_tip_failures: Vec<ChainSourceError>,
     failures_consumed: u32,
 }
@@ -52,6 +53,7 @@ impl MockChainSource {
             state: Arc::new(Mutex::new(MockState {
                 network,
                 tip_height: BlockHeight::GENESIS,
+                finalized_height: None,
                 chain_tip_failures: Vec::new(),
                 failures_consumed: 0,
             })),
@@ -123,6 +125,13 @@ impl MockChainSourceHandle {
         self.state.lock().tip_height
     }
 
+    /// Sets the finalized height the mock reports from `ChainSource::finalized_height`.
+    /// When unset, the mock reports its visible tip as finalized (every block treated as
+    /// final), matching the trait's default behavior.
+    pub fn set_finalized_height(&self, finalized_height: BlockHeight) {
+        self.state.lock().finalized_height = Some(finalized_height);
+    }
+
     /// Queues `count` consecutive failures for `chain_tip` calls. Each subsequent call pops
     /// one failure off the queue; once empty, calls succeed normally. Failures are returned
     /// in the order they were queued.
@@ -159,6 +168,11 @@ impl ChainSource for MockChainSource {
             return Err(injected);
         }
         Ok(guard.tip_height)
+    }
+
+    async fn finalized_height(&self) -> Result<BlockHeight, ChainSourceError> {
+        let guard = self.state.lock();
+        Ok(guard.finalized_height.unwrap_or(guard.tip_height))
     }
 
     async fn compact_blocks(

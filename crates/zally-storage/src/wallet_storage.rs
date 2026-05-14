@@ -350,8 +350,8 @@ pub trait WalletStorage: Send + Sync + 'static {
         end: BlockHeight,
     ) -> Result<Vec<(TxId, BlockHeight)>, StorageError>;
 
-    /// Returns the highest chain tip the wallet has observed across all prior syncs, or
-    /// `None` for a fresh wallet that has never recorded a tip.
+    /// Returns the chain tip recorded by the most recent sync, or `None` for a fresh wallet
+    /// that has never recorded a tip.
     ///
     /// Decoupled from `fully_scanned_height`: a sync that fetched zero compact blocks still
     /// records an observed tip if the chain source reported one. Used to detect reorgs by
@@ -360,10 +360,12 @@ pub trait WalletStorage: Send + Sync + 'static {
     /// `not_retryable` on schema errors; `retryable` on transient I/O.
     async fn lookup_observed_tip(&self) -> Result<Option<BlockHeight>, StorageError>;
 
-    /// Records `new_tip` as the latest observed chain tip. Idempotent: if the recorded tip
-    /// is already greater than or equal to `new_tip`, the call is a no-op and the prior
-    /// value is preserved. Callers detect reorgs by reading [`Self::lookup_observed_tip`]
-    /// and comparing against the chain source's current tip before this call.
+    /// Records `new_tip` as the most recently observed chain tip, unconditionally — the
+    /// stored value always reflects the last observation, even when `new_tip` is lower than
+    /// a previously recorded tip. Reorg detection depends on this: a monotonic high-water
+    /// mark would hide a tip regress. Callers detect reorgs by reading
+    /// [`Self::lookup_observed_tip`] and comparing against the chain source's current tip
+    /// before this call.
     ///
     /// `not_retryable` on schema errors; `retryable` on transient I/O.
     async fn record_observed_tip(&self, new_tip: BlockHeight) -> Result<(), StorageError>;

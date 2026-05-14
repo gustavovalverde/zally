@@ -155,7 +155,23 @@ pub trait ChainSource: Send + Sync + 'static {
     fn network(&self) -> Network;
 
     /// Current visible chain tip height.
+    ///
+    /// This is the raw tip and may still be reorged away. Wallets that must never cache an
+    /// orphaned block scan to [`Self::finalized_height`] instead and use this only for
+    /// reorg detection and progress reporting.
     async fn chain_tip(&self) -> Result<BlockHeight, ChainSourceError>;
+
+    /// Highest block height the chain source considers finalized — immutable under reorg.
+    ///
+    /// Finalized blocks sit below the chain source's reorg window, so a wallet that scans
+    /// only at or below this height can never cache an orphaned block. Implementations that
+    /// cannot distinguish a finalized prefix fall back to [`Self::chain_tip`], treating every
+    /// visible block as final.
+    ///
+    /// `retryable` on transient chain-source failures.
+    async fn finalized_height(&self) -> Result<BlockHeight, ChainSourceError> {
+        self.chain_tip().await
+    }
 
     /// Streams compact blocks in `block_range` (inclusive on both ends).
     async fn compact_blocks(
