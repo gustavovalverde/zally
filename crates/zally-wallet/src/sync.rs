@@ -100,6 +100,13 @@ impl Wallet {
             .storage
             .record_observed_tip(raw_tip_height)
             .await?;
+        // Tell the WalletDb the raw chain tip so transaction proposals compute a valid
+        // expiry height against the live chain. Scanning below still stops at the finalized
+        // height; only the proposal/expiry tip notion follows the raw tip.
+        self.inner
+            .storage
+            .update_chain_tip(raw_tip_height)
+            .await?;
 
         let prior_fully_scanned_height = self.inner.storage.fully_scanned_height().await?;
         let scanned_from = match prior_fully_scanned_height {

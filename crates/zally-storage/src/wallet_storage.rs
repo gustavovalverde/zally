@@ -370,6 +370,18 @@ pub trait WalletStorage: Send + Sync + 'static {
     /// `not_retryable` on schema errors; `retryable` on transient I/O.
     async fn record_observed_tip(&self, new_tip: BlockHeight) -> Result<(), StorageError>;
 
+    /// Informs the underlying `WalletDb` of the raw chain tip so transaction proposals
+    /// compute a valid `expiry_height` against the live chain.
+    ///
+    /// This sets the chain tip used for proposal and expiry math only; it does not scan
+    /// blocks. The wallet still scans only up to the chain source's finalized height (see
+    /// [`Self::scan_blocks`]). Without this call the `WalletDb` would believe the tip is the
+    /// last scanned (finalized) height and build transactions whose expiry has already
+    /// passed by the time they reach the network.
+    ///
+    /// `not_retryable` on schema errors; `retryable` on transient I/O.
+    async fn update_chain_tip(&self, tip_height: BlockHeight) -> Result<(), StorageError>;
+
     /// Returns every unspent Sapling and Orchard note owned by `account_id` against
     /// `target_height` (typically the wallet's current chain tip). Spent notes, locked
     /// notes, and notes whose producing transaction has not yet mined are excluded.

@@ -368,6 +368,19 @@ impl WalletStorage for SqliteWalletStorage {
         .await
     }
 
+    async fn update_chain_tip(&self, tip_height: BlockHeight) -> Result<(), StorageError> {
+        let target = zcash_protocol::consensus::BlockHeight::from(tip_height.as_u32());
+        self.with_db_mut(move |db| {
+            zcash_client_backend::data_api::WalletWrite::update_chain_tip(db, target).map_err(
+                |err| StorageError::SqliteFailed {
+                    reason: format!("update_chain_tip failed: {err}"),
+                    is_retryable: false,
+                },
+            )
+        })
+        .await
+    }
+
     async fn fully_scanned_height(&self) -> Result<Option<BlockHeight>, StorageError> {
         self.with_db(move |db| {
             let summary = db
