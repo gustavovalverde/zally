@@ -1,11 +1,11 @@
 //! Custody-with-PCZT cookbook example.
 //!
-//! Walks an operator through the Slice 4 [`Creator`] → [`Signer`] → [`Combiner`] →
-//! [`Extractor`] role surface that backs Zally's cold-custody story. The example demonstrates:
+//! Walks an operator through the [`Creator`], [`Signer`], [`Combiner`], and [`Extractor`]
+//! role surface that backs Zally's cold-custody story. The example demonstrates:
 //!
 //! 1. The network-mismatch guard that every role enforces *before* touching key material.
-//! 2. The Slice 4 stub responses (`NoMatchingKeys`, `NotFinalized`) that document where the
-//!    deep proposal-to-PCZT wiring lands in the v1 follow-up.
+//! 2. The signer's `NoMatchingKeys` and the extractor's `NotFinalized` short-circuits when a
+//!    role is handed a PCZT that its seed cannot authorise or that has not been signed.
 //! 3. The Combiner's empty-input rejection (`CombineConflict`) for the FROST/multi-sig path.
 //!
 //! Operators in production substitute their own `PcztBytes::from_serialized` source: a watch
@@ -105,7 +105,7 @@ async fn demonstrate_sign_short_circuit(
             warn!(
                 target: "zally::example",
                 event = "sign_short_circuited",
-                "signer short-circuited; v1 follow-up wires real ZIP-32 derivation per spend"
+                "signer refused: the seed cannot authorise any spend in this PCZT"
             );
             Ok(())
         }
@@ -114,7 +114,7 @@ async fn demonstrate_sign_short_circuit(
             warn!(
                 target: "zally::example",
                 event = "sign_returned_signed_pczt",
-                "signer returned signed PCZT (post-v1-follow-up runtime)"
+                "signer authorised every matching spend in the PCZT"
             );
             Ok(())
         }
@@ -138,7 +138,7 @@ fn demonstrate_extractor_short_circuit(extractor: &Extractor, pczt: PcztBytes) {
             target: "zally::example",
             event = "extract_short_circuited",
             reason = %reason,
-            "extractor short-circuited; v1 follow-up wires upstream tx_extractor"
+            "extractor refused: the PCZT is not finalised"
         );
     }
 }

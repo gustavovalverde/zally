@@ -4,7 +4,7 @@
 //! integration by:
 //!
 //! 1. Reading the chain tip.
-//! 2. Driving `Wallet::sync` against the live endpoint and printing the [`SyncOutcome`].
+//! 2. Driving `Wallet::sync` against the live endpoint and printing the sync outcome.
 //! 3. Reading one tree-state artifact at the tip.
 //!
 //! ```sh
@@ -12,10 +12,6 @@
 //!   ZALLY_NETWORK=regtest \
 //!   cargo run --example live-zinder-probe --features zinder
 //! ```
-//!
-//! Slice 2's deep wiring (live block scanning via `scan_cached_blocks`) lands once the
-//! storage-side scan adapter is in place; until then, this example demonstrates that the
-//! `ChainSource` trait surface is fully wired to a real indexer.
 
 use std::env;
 use std::io;

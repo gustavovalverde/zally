@@ -53,8 +53,9 @@ impl Signer {
     /// any spend in the PCZT.
     #[allow(
         clippy::unused_async,
-        reason = "async surface is the v1 contract; ZIP-32 derivation runs on the caller's \
-                  thread today but moves into spawn_blocking once the prover wire-up lands"
+        reason = "async surface matches the rest of zally-pczt; ZIP-32 derivation runs on \
+                  the caller's thread and moves into spawn_blocking when the prover wire-up \
+                  needs it"
     )]
     pub async fn sign_with_seed(
         &self,

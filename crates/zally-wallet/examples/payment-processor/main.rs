@@ -1,9 +1,9 @@
 //! Payment-processor cookbook example.
 //!
-//! Parses a ZIP-321 payment URI, validates the recipient + memo + amount, and proposes a
-//! payment. Slice 5 stops at `WalletError::InsufficientBalance` against the empty test
-//! storage; the surface exercised is the ZIP-321 → `ProposalPlan` → `Wallet::propose` path
-//! that operators wire into their merchant-side flow.
+//! Parses a ZIP-321 payment URI, validates the recipient, memo, and amount, then proposes a
+//! payment. The example exercises the ZIP-321 to `ProposalPlan` to `Wallet::propose` path
+//! that operators wire into their merchant-side flow. Against an empty test wallet the
+//! proposal short-circuits with `WalletError::InsufficientBalance`.
 
 use std::io;
 
@@ -79,7 +79,7 @@ async fn main() -> Result<(), ExampleError> {
                 event = "proposal_short_circuited_insufficient_balance",
                 requested_zat,
                 spendable_zat,
-                "proposal short-circuited; v1 follow-up wires live balance"
+                "proposal rejected: wallet has no spendable balance against the empty test storage"
             );
         }
         Err(other) => return Err(other.into()),

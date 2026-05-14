@@ -67,14 +67,17 @@ impl std::fmt::Debug for ZinderChainSource {
 }
 
 impl ZinderChainSource {
-    /// Connects to a remote `zinder-query` endpoint over gRPC.
-    pub async fn connect_remote(options: ZinderRemoteOptions) -> Result<Self, ChainSourceError> {
+    /// Builds a chain-source handle pointed at a `zinder-query` gRPC endpoint.
+    ///
+    /// The gRPC channel is lazy: only URI parsing can fail here; the
+    /// connection is established on the first chain-source call and
+    /// re-established automatically after a transport failure.
+    pub fn connect_remote(options: ZinderRemoteOptions) -> Result<Self, ChainSourceError> {
         let zinder_network = zally_network_to_zinder(options.network)?;
         let remote = RemoteChainIndex::connect(RemoteOpenOptions {
             endpoint: options.endpoint,
             network: zinder_network,
         })
-        .await
         .map_err(zinder_error_to_chain_source)?;
 
         Ok(Self {
@@ -337,10 +340,9 @@ fn decode_compact_block(
 /// Translates zinder's stored `z_gettreestate` JSON payload into the lightwalletd
 /// `TreeState` protobuf shape that `zcash_client_backend` consumes.
 ///
-/// Zinder stores Zebra's `z_gettreestate` JSON response verbatim
-/// (`zinder-source/src/zebra_json_rpc.rs`). The fields map directly:
+/// Zinder stores Zebra's `z_gettreestate` JSON response verbatim. The fields map directly:
 /// `height`, `hash`, `time` are top-level; `sapling.commitments.finalState` and
-/// `orchard.commitments.finalState` become the hex-encoded `sapling_tree` /
+/// `orchard.commitments.finalState` become the hex-encoded `sapling_tree` and
 /// `orchard_tree` fields on the protobuf.
 fn decode_tree_state(
     payload_bytes: &[u8],

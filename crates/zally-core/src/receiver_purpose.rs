@@ -2,8 +2,8 @@
 
 /// Purpose for which an operator allocates a receiver inside their wallet.
 ///
-/// Used to configure confirmation depth per receiver (REQ-SYNC-4): coinbase receives need
-/// 100-block maturity per ZIP-213; other receives may use a smaller depth.
+/// Used to configure confirmation depth per receiver: coinbase receives need 100-block
+/// maturity per ZIP-213; other receives may use a smaller depth.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[non_exhaustive]

@@ -16,11 +16,11 @@ pub struct WalletMetrics {
     /// Network this wallet is bound to.
     pub network: Network,
     /// Highest block height the wallet has scanned, if any. `None` until the first
-    /// successful [`Wallet::sync`] call records progress (Slice 5 follow-up).
+    /// successful [`Wallet::sync`] call records progress.
     pub scanned_height: Option<BlockHeight>,
     /// Chain tip the wallet's most recent sync observed, if any.
     pub chain_tip_height: Option<BlockHeight>,
-    /// Number of accounts the wallet manages. v1 fixes this at 1.
+    /// Number of accounts the wallet manages. Always 1: Zally holds one account per wallet.
     pub account_count: u32,
     /// Number of subscribers currently attached to [`Wallet::observe`].
     pub event_subscriber_count: u32,
@@ -29,13 +29,13 @@ pub struct WalletMetrics {
 impl Wallet {
     /// Returns a typed metrics snapshot.
     ///
-    /// `not_retryable` only for catastrophic storage failures; otherwise infallible. Slice 5
-    /// keeps `scanned_height` and `chain_tip_height` as `None` because live scanning is on
-    /// the v1 follow-up list; the surface is stable.
+    /// `not_retryable` only for catastrophic storage failures; otherwise infallible.
+    /// `scanned_height` and `chain_tip_height` stay `None` until storage exposes the
+    /// awaited lookups; the surface is stable across that addition.
     #[allow(
         clippy::unused_async,
-        reason = "async surface is the v1 contract; later slices fill the body with awaited \
-                  storage and chain-tip lookups"
+        reason = "async surface matches the rest of Wallet; the body composes awaited \
+                  storage and chain-tip lookups once they land in WalletStorage"
     )]
     pub async fn metrics_snapshot(&self) -> Result<WalletMetrics, WalletError> {
         Ok(WalletMetrics {

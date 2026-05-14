@@ -1,6 +1,6 @@
-//! Slice 1 integration tests.
+//! Integration tests.
 
-mod capabilities_reports_slice_1;
+mod capabilities_reports;
 mod circuit_breaker_opens_after_threshold;
 mod create_then_create_returns_already_exists;
 mod create_then_open_round_trip;

@@ -123,9 +123,9 @@ Traits exposing pluggable boundaries (`ChainSource`, `Submitter`, `WalletStorage
 
 Each error variant has a documented retry posture in its rustdoc:
 
-- **`retryable`** — same call with the same arguments may succeed on retry. Transient network failure, mempool eviction, RocksDB lock contention.
-- **`not_retryable`** — same call will fail the same way. Invalid input, protocol violation, exhausted balance.
-- **`requires_operator`** — caller cannot fix; an operator must intervene. Sealed-seed integrity failure, schema mismatch, lost wallet database.
+- **`retryable`**: same call with the same arguments may succeed on retry. Transient network failure, mempool eviction, RocksDB lock contention.
+- **`not_retryable`**: same call will fail the same way. Invalid input, protocol violation, exhausted balance.
+- **`requires_operator`**: caller cannot fix; an operator must intervene. Sealed-seed integrity failure, schema mismatch, lost wallet database.
 
 The full enum is recorded in `docs/reference/error-vocabulary.md` (added as the first crate's errors land). A new error variant requires an entry there before merging.
 
@@ -148,7 +148,7 @@ When operators integrating Zally do construct their own TOML or env-var layout, 
 
 ## File and module conventions
 
-Per [identifier-naming](https://github.com/gustavovalverde/zinder/blob/main/docs/architecture/public-interfaces.md) and the Zally codebase-structure rules:
+Per the Zally identifier-naming and codebase-structure rules:
 
 - File names match the primary export. `wallet.rs` exports `Wallet`; `chain_source.rs` exports the `ChainSource` trait and its default implementation.
 - No `mod.rs` files in new code. Use `{module_name}.rs` siblings.
@@ -162,9 +162,9 @@ When two domains use the same word, prefix with the bounded context or rename to
 
 The same word that means different things in Zally vs librustzcash gets disambiguated in Zally:
 
-- librustzcash's `WalletRead`/`WalletWrite` → Zally's `WalletStorage` (single trait wrapping both).
-- librustzcash's `BlockSource`/`BlockCache` → Zally's `ChainSource` (extended with tree state, transparent UTXO reads, transaction lookup, mempool peek; broader than librustzcash's minimal contract).
-- librustzcash's `UnifiedSpendingKey` → Zally re-exports as-is (canonical name; not renamed).
+- librustzcash's `WalletRead`/`WalletWrite` becomes Zally's `WalletStorage` (single trait wrapping both).
+- librustzcash's `BlockSource`/`BlockCache` becomes Zally's `ChainSource` (extended with tree state, transparent UTXO reads, transaction lookup, mempool peek; broader than librustzcash's minimal contract).
+- librustzcash's `UnifiedSpendingKey` is re-exported as-is (canonical name; not renamed).
 
 ## Stability
 
@@ -176,10 +176,112 @@ Zally's public API is the contract; librustzcash version churn behind Zally is n
 
 Internal modules (`pub(crate)`, private), test code, fixtures, and rustdoc examples are not covered by semver.
 
+## Capability surface
+
+The contract surface Zally publishes, grouped by domain. Each item is a guarantee the public API enforces.
+
+### Wallet core (CORE)
+
+- **CORE-1**: Generate a fresh wallet (mnemonic plus ZIP-32 derivation) for any network. Single async call.
+- **CORE-2**: Open an existing wallet from a sealed seed; fail closed on integrity error.
+- **CORE-3**: One operator identity per process; the wallet has one account per `Wallet::create`.
+- **CORE-4**: UA derivation per ZIP-316; UFVK and UIVK export.
+- **CORE-5**: Idempotent send by `IdempotencyKey`.
+- **CORE-6**: Network-tagged types throughout; compile error if a network is missing.
+
+### Key management (KEYS)
+
+- **KEYS-1**: `SeedSealing` trait with `AgeFileSealing` as default.
+- **KEYS-2**: `unsafe_plaintext_seed` opt-in with `WARN`-level log on every open.
+- **KEYS-3**: USK derived from seed at signing time; zeroized after use.
+- **KEYS-4**: UFVK / UIVK export with stable serialization; spending key never serialized through Zally's public API.
+
+### Chain source and submission (CHAIN)
+
+- **CHAIN-1**: `ChainSource` trait with methods for compact-block range fetch, latest tree state, transaction lookup, address-UTXO read, mempool peek.
+- **CHAIN-2**: `Submitter` trait with a single `submit(raw_tx) -> SubmitOutcome` method.
+- **CHAIN-3**: Reconnect, retry, and circuit-breaker logic at the trait boundary, not duplicated in each implementation.
+
+### Sync and scanning (SYNC)
+
+- **SYNC-1**: Catch up to chain tip on `Wallet::sync(...)`.
+- **SYNC-2**: Incremental sync emits `tracing` events with scan progress and per-pool note counts.
+- **SYNC-3**: Reorg handling: on continuity error, automatic rollback to the longest common prefix; emit `WalletEvent::ReorgDetected`.
+- **SYNC-4**: Configurable confirmation depth per receiver purpose (default 1 for non-coinbase, mandatory 100 for coinbase per ZIP-213).
+- **SYNC-5**: `WalletEvent` async stream for `ShieldedReceiveObserved`, `TransactionConfirmed`, `ReorgDetected`, `ScanProgress`.
+
+### Spending (SPEND)
+
+- **SPEND-1**: `Wallet::send_payment(SendPaymentPlan) -> SendOutcome`. Transparent and shielded recipients both supported.
+- **SPEND-2**: Refuse memo on transparent recipient (ZIP-302) at API call; typed error variant.
+- **SPEND-3**: TEX address support per ZIP-320: refuse shielded inputs when paying TEX recipient.
+- **SPEND-4**: Conventional fee per ZIP-317 by default; `FeeStrategy::Custom(Zatoshis)` for advanced operators.
+- **SPEND-5**: `nExpiryHeight` set per ZIP-203.
+- **SPEND-6**: ZIP-321 payment URI parsing through `PaymentRequest::from_uri`.
+
+### PCZT and external signing (PCZT)
+
+- **PCZT-1**: `Wallet::propose_pczt(plan) -> PcztBytes`: build an unsigned PCZT without holding spending keys.
+- **PCZT-2**: PCZT serialization to bytes for export to HSM, FROST coordinator, air-gapped signer.
+- **PCZT-3**: `Wallet::sign_pczt(pczt) -> PcztBytes`: sign in-process (uses USK).
+- **PCZT-4**: `Wallet::extract_and_submit_pczt(signed, submitter) -> SendOutcome`: extract the transaction from a fully-signed PCZT and submit.
+- **PCZT-5**: PCZT support covers transparent, Sapling, and Orchard bundles.
+
+### Observability (OBS)
+
+- **OBS-1**: `tracing` spans on every public async method with documented field schema.
+- **OBS-2**: `Wallet::metrics_snapshot() -> WalletMetrics` returns a typed snapshot.
+- **OBS-3**: `WalletEvent` async stream documented as the canonical push notification channel for state changes.
+
+### Documentation and DX (DOC)
+
+- **DOC-1**: Every public item has rustdoc. CI enforces with `RUSTDOCFLAGS='-D warnings'`.
+- **DOC-2**: `examples/` directory contains cookbook entries: `open-wallet`, `exchange-deposit`, `payment-processor`, `custody-with-pczt`, `mining-payout`, `live-zinder-probe`. Each example compiles and runs.
+
+### Agent experience (AX)
+
+- **AX-1**: `WalletCapabilities` descriptor exposing typed feature flags; new capabilities are additive enum variants under `#[non_exhaustive]`.
+- **AX-2**: Every error variant has a documented retry posture (`retryable`, `not_retryable`, `requires_operator`).
+- **AX-3**: Examples are self-contained; each `examples/<name>/main.rs` runs end-to-end without external prerequisite shell scripts.
+
+## ZIP compliance surface
+
+Which ZIPs Zally implements, which are designed-for-forward-compatibility, and which are out of scope.
+
+### Implemented
+
+- **ZIP-32**: Shielded HD wallets. Multi-account derivation under standard paths.
+- **ZIP-200**: Network upgrade mechanism. Active branch ID consulted at transaction construction time.
+- **ZIP-203**: Transaction expiry. `nExpiryHeight` set on every transaction.
+- **ZIP-212**: `rseed` note plaintext encoding. Inherited from librustzcash.
+- **ZIP-213**: Shielded coinbase plus 100-block maturity rule. Enforced at spending input selection.
+- **ZIP-225**: v5 transaction format. The default on every supported network.
+- **ZIP-244**: Non-malleable TxID. Tracked in wallet state; exposed via `WalletEvent` and `SendOutcome`.
+- **ZIP-302**: Memo encoding (current 512-byte format). Encoded and decoded per spec.
+- **ZIP-315**: Wallet best practices. Auto-shielding policy, trusted vs untrusted TXO accounting, confirmation-depth defaults aligned with the ZIP.
+- **ZIP-316**: Unified Addresses, UFVKs, UIVKs. First-class address type; UFVK export.
+- **ZIP-317**: Conventional fee mechanism. Default fee strategy.
+- **ZIP-320**: TEX addresses. Recognised, refused-on-shielded-input enforced at spend.
+- **ZIP-321**: Payment request URIs. First-class `PaymentRequest` type.
+- **ZIP-401**: Mempool DoS protection. Submission retries respect mempool eviction.
+
+### Designed-for-forward-compatibility (API hooks; not enforced today)
+
+- **ZIP-230**: v6 transaction format (NU7, OrchardZSA). Builder API structured so a v6 path lands as an additive enum variant.
+- **ZIP-231**: Memo bundles. Memo API takes an opaque `Memo` value; ZIP-231 memo bundle variants slot in when ratified.
+- **ZIP-312**: FROST spend authorisation. PCZT signer trait designed so FROST coordinator integration lands as an alternative `Signer` implementation.
+
+### Out of scope
+
+- **ZIP-48**: Transparent multisig wallets.
+- **ZIP-211**: Sprout pool sunset. Sprout is dead; Zally never deposits to Sprout. Sprout sweeps are out of scope.
+- **ZIP-308**: Sprout-to-Sapling migration (see ZIP-211).
+- **ZIP-311**: Payment disclosures.
+
 ## When in doubt
 
 The priority order: **honesty > specificity > vocabulary match > brevity**.
 
-Prefer a longer name that is honest (`unseal_seed_with_age_identity`) over a shorter one that lies (`load_seed`). Prefer a specific verb from the table (`derive`) over a shorter generic one (`get`). Prefer match-existing-convention even when a competing convention is technically defensible — consistency beats local optimality.
+Prefer a longer name that is honest (`unseal_seed_with_age_identity`) over a shorter one that lies (`load_seed`). Prefer a specific verb from the table (`derive`) over a shorter generic one (`get`). Prefer match-existing-convention even when a competing convention is technically defensible; consistency beats local optimality.
 
 If a name cannot be chosen without violating one of these rules, the abstraction is wrong, not the name. Reshape the abstraction.

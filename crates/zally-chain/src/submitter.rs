@@ -29,8 +29,8 @@ pub enum SubmitOutcome {
 
 /// Transaction broadcast plane.
 ///
-/// Implementations call into a `zinder-client::ChainIndex::broadcast_transaction` or an
-/// equivalent submitter. Network mismatch fails closed at construction or at call time.
+/// Implementations forward `submit` to whatever broadcast endpoint the operator runs.
+/// Network mismatch fails closed at construction or at call time.
 #[async_trait]
 pub trait Submitter: Send + Sync + 'static {
     /// Network this submitter is bound to.

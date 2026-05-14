@@ -5647,7 +5647,7 @@ dependencies = [
 [[package]]
 name = "zinder-client"
 version = "0.1.0"
-source = "git+https://github.com/gustavovalverde/zinder?rev=df03361a346443a226527ab8ed2c68aa6ad3bd59#df03361a346443a226527ab8ed2c68aa6ad3bd59"
+source = "git+https://github.com/gustavovalverde/zinder?rev=65316ecfc280ab4833b72d7a6ff5ddd7e524be89#65316ecfc280ab4833b72d7a6ff5ddd7e524be89"
 dependencies = [
  "async-trait",
  "thiserror 2.0.18",
@@ -5665,7 +5665,7 @@ dependencies = [
 [[package]]
 name = "zinder-core"
 version = "0.1.0"
-source = "git+https://github.com/gustavovalverde/zinder?rev=df03361a346443a226527ab8ed2c68aa6ad3bd59#df03361a346443a226527ab8ed2c68aa6ad3bd59"
+source = "git+https://github.com/gustavovalverde/zinder?rev=65316ecfc280ab4833b72d7a6ff5ddd7e524be89#65316ecfc280ab4833b72d7a6ff5ddd7e524be89"
 dependencies = [
  "hex",
  "sha2 0.10.9",
@@ -5675,7 +5675,7 @@ dependencies = [
 [[package]]
 name = "zinder-proto"
 version = "0.1.0"
-source = "git+https://github.com/gustavovalverde/zinder?rev=df03361a346443a226527ab8ed2c68aa6ad3bd59#df03361a346443a226527ab8ed2c68aa6ad3bd59"
+source = "git+https://github.com/gustavovalverde/zinder?rev=65316ecfc280ab4833b72d7a6ff5ddd7e524be89#65316ecfc280ab4833b72d7a6ff5ddd7e524be89"
 dependencies = [
  "prost",
  "prost-build",
@@ -5687,7 +5687,7 @@ dependencies = [
 [[package]]
 name = "zinder-source"
 version = "0.1.0"
-source = "git+https://github.com/gustavovalverde/zinder?rev=df03361a346443a226527ab8ed2c68aa6ad3bd59#df03361a346443a226527ab8ed2c68aa6ad3bd59"
+source = "git+https://github.com/gustavovalverde/zinder?rev=65316ecfc280ab4833b72d7a6ff5ddd7e524be89#65316ecfc280ab4833b72d7a6ff5ddd7e524be89"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -5712,7 +5712,7 @@ dependencies = [
 [[package]]
 name = "zinder-store"
 version = "0.1.0"
-source = "git+https://github.com/gustavovalverde/zinder?rev=df03361a346443a226527ab8ed2c68aa6ad3bd59#df03361a346443a226527ab8ed2c68aa6ad3bd59"
+source = "git+https://github.com/gustavovalverde/zinder?rev=65316ecfc280ab4833b72d7a6ff5ddd7e524be89#65316ecfc280ab4833b72d7a6ff5ddd7e524be89"
 dependencies = [
  "base64 0.22.1",
  "bytes",

@@ -13,7 +13,7 @@ Zally fills the missing rung: typed, in-process, non-interactive, multi-receiver
 ## Approach
 
 - **librustzcash as the foundation, not a fork.** Bug fixes and protocol changes flow upstream. Zally absorbs the API churn behind its own surface so operators see stable contracts across librustzcash releases.
-- **Pluggable boundaries.** Chain source, transaction submission, and storage are each behind a trait. Defaults target [Zinder](https://github.com/gustavovalverde/zinder); operators with legacy lightwalletd topologies or alternative storage backends swap implementations without forking Zally.
+- **Pluggable boundaries.** Chain source, transaction submission, and storage are each behind a trait. Operators swap implementations without forking Zally.
 - **Operator-grade key custody by default.** Seeds encrypted at rest. Spending keys held in memory only during signing. Optional PCZT export for HSMs, FROST quorums, and air-gapped signers.
 - **ZIP compliance enforced at the API boundary.** Memo on a transparent recipient is a typed error. Shielded input paying a TEX address is a typed error. Coinbase note below maturity is a typed error. Operators cannot accidentally violate protocol invariants.
 - **Anti-entropy by construction.** Strict workspace lints (`unsafe = "forbid"`, `unwrap_used = "deny"`, full clippy `pedantic`). Network-tagged types throughout. Typed errors with documented retry posture. No filler nouns, no generic suffixes, no temporal adjectives in identifiers.
@@ -44,26 +44,27 @@ Zally fills the missing rung: typed, in-process, non-interactive, multi-receiver
                 │                                                          │
                 └──────────────────────────────────────────────────────────┘
                                                │
-                                               │ ChainSource default impl
+                                               │ pluggable ChainSource + Submitter
                                                ▼
                                   ┌──────────────────────────┐
-                                  │          Zinder          │
-                                  │   (chain-read plane,     │
-                                  │    transaction broadcast)│
+                                  │  Operator-chosen backend │
+                                  │  (a zinder-backed impl   │
+                                  │   ships behind a feature │
+                                  │   flag; bring your own.) │
                                   └──────────────────────────┘
 ```
 
 ## Workspace
 
-Crate boundaries are recorded in [ADR-0001](docs/adrs/0001-workspace-crate-boundaries.md). Empty crates are not pre-created; each crate's `Cargo.toml` lands when its first real code does.
+Crate boundaries are recorded in [ADR-0001](docs/adrs/0001-workspace-crate-boundaries.md).
 
-- `zally-core` — domain types (`Network`, `Zatoshis`, `BlockHeight`, `AccountId`, `ReceiverPurpose`, error enums). Zero domain-foreign dependencies.
-- `zally-keys` — seed lifecycle, encryption-at-rest (`SeedSealing` trait), USK/UFVK/UIVK derivation, zeroization discipline.
-- `zally-storage` — `WalletStorage` trait wrapping librustzcash's `WalletRead`/`WalletWrite`; default `SqliteWalletStorage` over `zcash_client_sqlite`.
-- `zally-chain` — `ChainSource` and `Submitter` traits; default Zinder implementation; alternative lightwalletd implementation for legacy operators.
-- `zally-pczt` — PCZT roles (`Creator`, `Signer`, `Combiner`, `Extractor`) for HSM and multi-party signing.
-- `zally-wallet` — high-level operator API. Includes the scan-loop module (orchestrating `ChainSource` + `WalletStorage`).
-- `zally-testkit` — fixtures, mock chain sources, in-memory storage, regtest helpers. Behind a feature flag so it never lands in operator binaries.
+- `zally-core`: domain types (`Network`, `Zatoshis`, `BlockHeight`, `AccountId`, `ReceiverPurpose`, error enums). Zero domain-foreign dependencies.
+- `zally-keys`: seed lifecycle, encryption-at-rest (`SeedSealing` trait), USK/UFVK/UIVK derivation, zeroization discipline.
+- `zally-storage`: `WalletStorage` trait wrapping librustzcash's `WalletRead`/`WalletWrite`; default `SqliteWalletStorage` over `zcash_client_sqlite`.
+- `zally-chain`: `ChainSource` and `Submitter` traits. A `ZinderChainSource` plus `ZinderSubmitter` implementation ships behind the `zinder` cargo feature; operators with a different chain plane provide their own implementation of the traits.
+- `zally-pczt`: PCZT roles (`Creator`, `Signer`, `Combiner`, `Extractor`) for HSM and multi-party signing.
+- `zally-wallet`: high-level operator API. Includes the scan-loop module (orchestrating `ChainSource` plus `WalletStorage`).
+- `zally-testkit`: fixtures, mock chain sources, in-memory storage, regtest helpers. Behind a feature flag so it never lands in operator binaries.
 
 ## Validation gate
 
@@ -89,10 +90,10 @@ ZALLY_TEST_LIVE=1 ZALLY_NETWORK=regtest cargo nextest run --profile=ci-live --ru
 
 Start here:
 
-- [PRD-0001](docs/prd-0001-zally-headless-wallet-library.md) — product requirements, user stories, capability surface
-- [Public interfaces](docs/architecture/public-interfaces.md) — the vocabulary spine. Naming rules, error vocabulary, type conventions, config rules. Read before writing any public type.
-- [ADR-0001](docs/adrs/0001-workspace-crate-boundaries.md) — workspace crate boundaries
-- [Documentation index](docs/README.md) — full index with lifecycle rules
+- [Public interfaces](docs/architecture/public-interfaces.md): the vocabulary spine. Naming rules, error vocabulary, type conventions, config rules, capability surface, ZIP coverage. Read before writing any public type.
+- [ADR-0001](docs/adrs/0001-workspace-crate-boundaries.md): workspace crate boundaries.
+- [ADR-0002](docs/adrs/0002-implementation-patterns.md): implementation patterns shared by every crate.
+- [Documentation index](docs/README.md): full index with lifecycle rules.
 
 ## License
 

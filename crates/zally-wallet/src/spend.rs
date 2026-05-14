@@ -1,10 +1,9 @@
 //! Spend flow: payment-request parsing, proposal, send.
 //!
-//! Slice 3 ships the public surface plus the ZIP-302 / ZIP-320 / ZIP-321 guards. Real
-//! note-selection, transaction construction, and submission integration land when balance
-//! tracking and the chain-integration test plane are in place (Slice 5). Today the proposal
-//! and send paths short-circuit on `InsufficientBalance` against the empty test storage; the
-//! API surface remains the v1 contract.
+//! Carries the ZIP-302, ZIP-320, and ZIP-321 guards on the wallet layer. `Wallet::propose`
+//! drives `propose_standard_transfer_to_address` against the live `WalletDb`;
+//! `Wallet::send_payment` adds signing and submission through the caller-supplied
+//! `Submitter`.
 
 use zally_chain::Submitter;
 use zally_core::{
@@ -119,9 +118,9 @@ impl ParsedPayment {
 }
 
 fn classify_recipient(encoded: &str, network: Network) -> PaymentRecipient {
-    // Slice 3 takes the encoded string at face value and relies on the recipient classifier
-    // in `zcash_address` to disambiguate at proposal time. The Zally guards distinguish the
-    // four shapes below based on the encoded prefix; classification is best-effort here.
+    // Best-effort classification by encoded prefix. Authoritative disambiguation happens
+    // in `zcash_address` at proposal time; the Zally guards distinguish the four shapes
+    // below based on the encoded prefix.
     if encoded.starts_with("tex") {
         PaymentRecipient::TexAddress {
             encoded: encoded.to_owned(),
@@ -151,9 +150,7 @@ fn memo_from_memo_bytes(bytes: &MemoBytes) -> Result<Memo, WalletError> {
     })
 }
 
-/// A spend proposal. Slice 3 returns `Proposal` only as part of a future-facing surface;
-/// real proposals are built by `Wallet::propose` when balance and note selection land in
-/// Slice 5.
+/// A spend proposal returned by `Wallet::propose`.
 #[derive(Clone, Debug)]
 pub struct Proposal {
     total_zat: Zatoshis,
@@ -382,8 +379,7 @@ impl Proposal {
 
 /// Inputs to [`Wallet::propose`].
 ///
-/// Slice 3 introduces this struct so the proposal API has a stable shape; new fields land as
-/// additive `pub` members under `#[non_exhaustive]`.
+/// New fields land as additive `pub` members under `#[non_exhaustive]`.
 #[derive(Clone, Debug)]
 #[non_exhaustive]
 pub struct ProposalPlan {

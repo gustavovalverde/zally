@@ -1,14 +1,13 @@
 //! Wallet sync loop.
 //!
-//! Slice 5 wires `Wallet::sync` against `zcash_client_backend::data_api::chain::scan_cached_blocks`
-//! via the storage-side `WalletStorage::scan_blocks` extension. The chain source streams
-//! compact blocks; the wallet drains them, builds a `ChainState`, and hands both to the
-//! storage layer which drives the upstream scanner against the live `WalletDb`.
+//! `Wallet::sync` drives `zcash_client_backend::data_api::chain::scan_cached_blocks` through
+//! the storage-side `WalletStorage::scan_blocks` extension. The chain source streams compact
+//! blocks; the wallet drains them, builds a `ChainState`, and hands both to the storage layer,
+//! which runs the upstream scanner against the live `WalletDb`.
 //!
-//! v1 invariant: each call re-scans from the wallet's last fully-scanned height up to the
-//! current chain tip. Incremental sync with cross-call commitment-tree continuity is a v1
-//! follow-up; the current implementation rebuilds the `ChainState` from the embedded
-//! genesis frontier on every call, which is correct but linear-in-tip-height.
+//! Each call re-scans from the wallet's last fully-scanned height up to the current chain
+//! tip. The `ChainState` is rebuilt from the embedded genesis frontier on every call: correct,
+//! linear-in-tip-height.
 
 use std::collections::HashMap;
 
@@ -28,8 +27,9 @@ const MAX_BLOCKS_PER_SYNC: u32 = 1_000;
 ///
 /// Must exceed the chain source's reorg window so recovery always makes forward progress,
 /// even when the divergence is detected at `fully_scanned_height + 1` (where an
-/// `at_height - 1` rollback would be a no-op). Zinder's reorg window is 100 blocks; 160
-/// leaves comfortable margin.
+/// `at_height - 1` rollback would be a no-op). 160 blocks leaves comfortable margin above
+/// typical Zcash reorg windows (100 blocks for shielded coinbase maturity, lower in
+/// practice on testnet and regtest).
 const REORG_ROLLBACK_DEPTH_BLOCKS: u32 = 160;
 
 struct ScanContext {
@@ -291,7 +291,7 @@ impl Wallet {
 /// divergence at `at_height`.
 ///
 /// Rolls back a full reorg window below the divergence so the next sync re-fetches a fresh
-/// range and makes forward progress — `scan_cached_blocks` reports the divergence at
+/// range and makes forward progress: `scan_cached_blocks` reports the divergence at
 /// `fully_scanned_height + 1`, so a single-block rollback would leave the wallet exactly
 /// where it was. Floored at the wallet birthday so a deep-height wallet never re-scans from
 /// genesis.

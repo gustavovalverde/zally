@@ -1,4 +1,4 @@
-//! REQ-OBS-2 — `Wallet::metrics_snapshot` returns a typed snapshot of wallet state.
+//! `Wallet::metrics_snapshot` returns a typed snapshot of wallet state (OBS-2).
 
 use zally_core::{BlockHeight, Network};
 use zally_storage::{SqliteWalletStorage, SqliteWalletStorageOptions};

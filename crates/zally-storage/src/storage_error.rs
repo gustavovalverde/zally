@@ -41,10 +41,8 @@ pub enum StorageError {
     /// An account already exists in this wallet.
     ///
     /// `not_retryable`: call [`crate::WalletStorage::find_account_for_seed`] or
-    /// `Wallet::open` instead. The Slice 1 invariant is one account per wallet.
-    #[error(
-        "an account already exists in this wallet; one-account-per-wallet is the Slice 1 invariant"
-    )]
+    /// `Wallet::open` instead. Zally holds one account per wallet.
+    #[error("an account already exists in this wallet; one account per wallet")]
     AccountAlreadyExists,
 
     /// A background task panicked or was cancelled.

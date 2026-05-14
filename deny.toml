@@ -36,10 +36,10 @@ confidence-threshold = 0.93
 [bans]
 multiple-versions = "warn"
 # Wildcards in workspace deps are checked at warn level rather than denied.
-# The zinder sibling workspace exposes its public crates through
+# The optional zinder backend exposes its public crates through
 # `<dep>.workspace = true`, which cargo-deny classifies as wildcard even though
-# the resolution is path-pinned. Treat as warning so a wildcard in a
-# Zally-owned manifest still surfaces while sibling workspaces are not blocked.
+# the resolution is git-pinned. Treat as warning so a wildcard in a
+# Zally-owned manifest still surfaces while the pinned backend is not blocked.
 wildcards = "warn"
 allow-wildcard-paths = true
 
@@ -58,9 +58,9 @@ allow-git = [
     # tree pulled in transitively via zebra-chain resolves cleanly. Mirrors
     # the same pin in zinder's workspace.
     "https://github.com/bbqsrc/core2",
-    # Zinder is Zally's default chain-read backend. The dev-time path-dep was
-    # switched to a git source so external consumers (fauzec) can build Zally
-    # without a sibling zinder checkout. Pin a specific commit rather than
+    # zinder-client and zinder-core back the optional `zinder` feature on
+    # zally-chain. Pulled from a pinned git revision so external consumers can
+    # build Zally without a local checkout. Pin a specific commit rather than
     # tracking a branch.
     "https://github.com/gustavovalverde/zinder",
 ]

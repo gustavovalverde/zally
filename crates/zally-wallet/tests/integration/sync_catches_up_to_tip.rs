@@ -1,4 +1,4 @@
-//! REQ-SYNC-1 — `Wallet::sync` advances scan progress to the chain tip.
+//! `Wallet::sync` advances scan progress to the chain tip (SYNC-1).
 
 use zally_core::{BlockHeight, Network};
 use zally_storage::{SqliteWalletStorage, SqliteWalletStorageOptions};

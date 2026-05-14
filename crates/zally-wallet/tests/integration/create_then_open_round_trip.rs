@@ -1,4 +1,4 @@
-//! REQ-CORE-1, REQ-CORE-2, REQ-CORE-4 — full vertical slice round trip via `AgeFileSealing`.
+//! Full round-trip via `AgeFileSealing`: create, derive, drop, re-open (CORE-1, CORE-2, CORE-4).
 
 use zally_core::{BlockHeight, Network};
 use zally_keys::{AgeFileSealing, AgeFileSealingOptions};

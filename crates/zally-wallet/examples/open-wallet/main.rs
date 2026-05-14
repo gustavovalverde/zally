@@ -1,11 +1,11 @@
-//! Slice 1 cookbook example.
+//! Open-wallet cookbook example.
 //!
 //! Creates a wallet, derives the first Unified Address, drops the wallet handle, re-opens
 //! from the sealed seed, derives another Unified Address, and asserts the second address
 //! differs from the first (the wallet walks forward through diversifier indices per
 //! ZIP-316).
 //!
-//! Run against regtest (no live node needed in Slice 1):
+//! Run against regtest (no live node needed):
 //!
 //! ```sh
 //! cargo run --example open-wallet

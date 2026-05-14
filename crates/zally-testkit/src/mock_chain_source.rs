@@ -1,10 +1,11 @@
 //! Programmable in-memory `ChainSource` fixture.
 //!
-//! Used by Slice 2 integration tests. `MockChainSource` lets a test:
+//! `MockChainSource` lets a test:
 //!
 //! - set the visible chain tip via [`MockChainSourceHandle::advance_tip`],
 //! - emit a [`ChainEvent::ChainReorged`] via [`MockChainSourceHandle::trigger_reorg`],
-//! - stream empty compact blocks (real scanning lands when Slice 5 wires live data).
+//! - stream empty compact blocks (the fixture covers sync orchestration; tests that need
+//!   real note decryption point `Wallet::sync` at a live `ChainSource` instead).
 //!
 //! The handle returned by [`MockChainSource::handle`] is `Clone` and shares state with the
 //! original mock; tests drive the mock through the handle while passing the mock itself to
@@ -172,8 +173,8 @@ impl ChainSource for MockChainSource {
                 tip_height: tip,
             });
         }
-        // Slice 2 mock returns an empty stream: tests cover sync orchestration, not the
-        // scan loop's note decryption (that lands in Slice 5).
+        // Mock returns an empty stream: tests cover sync orchestration. Tests that need
+        // the scan loop's note decryption point `Wallet::sync` at a live `ChainSource`.
         let empty: Pin<Box<dyn Stream<Item = Result<CompactBlock, ChainSourceError>> + Send>> =
             Box::pin(tokio_stream::iter(Vec::<
                 Result<CompactBlock, ChainSourceError>,

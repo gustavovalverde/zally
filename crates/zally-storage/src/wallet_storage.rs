@@ -11,7 +11,7 @@ use crate::storage_error::StorageError;
 
 /// Request body for [`WalletStorage::scan_blocks`].
 ///
-/// Slice 5 wraps `zcash_client_backend::data_api::chain::scan_cached_blocks`. The storage
+/// Wraps `zcash_client_backend::data_api::chain::scan_cached_blocks`. The storage
 /// implementation owns access to the internal `WalletDb`; the caller supplies the compact
 /// blocks (typically drained from a `ChainSource`), the height the first block is at, and
 /// the `ChainState` valid for the block just before `from_height`.
@@ -54,8 +54,8 @@ pub struct ScanResult {
 ///
 /// Wraps `zcash_client_backend::data_api::wallet::propose_standard_transfer_to_address` so
 /// the wallet layer can build a Zally proposal without depending on the upstream proposal
-/// generics. The single-output ZIP-317 conventional fee path is the v1 contract; richer
-/// multi-output and custom-fee plans land alongside their own request constructors.
+/// generics. Carries the single-output ZIP-317 conventional fee path; richer multi-output
+/// and custom-fee plans land alongside their own request constructors.
 pub struct ProposalPaymentRequest {
     /// Spending account.
     pub account_id: AccountId,
@@ -166,9 +166,8 @@ pub struct ProposalSummary {
 
 /// Trait abstracting the wallet database.
 ///
-/// Slice 1 exposes the subset needed to open, create, and derive the first address. Later
-/// slices extend with sync, balance, spend, and event APIs. Every implementation returns
-/// [`StorageError`]; backends with a native error type translate inside their impl.
+/// Every implementation returns [`StorageError`]; backends with a native error type translate
+/// inside their impl.
 #[async_trait]
 pub trait WalletStorage: Send + Sync + 'static {
     /// Opens or creates the wallet database. Runs schema migrations before returning.
@@ -186,7 +185,7 @@ pub trait WalletStorage: Send + Sync + 'static {
     /// `NonSequentialBlocks` because the wallet's commitment tree progression no longer
     /// matches the chain.
     ///
-    /// The Slice 1 invariant is one account per wallet: a second call returns
+    /// Zally holds one account per wallet: a second call returns
     /// [`StorageError::AccountAlreadyExists`].
     ///
     /// `not_retryable` on `AccountAlreadyExists`. `retryable` on transient I/O.
@@ -237,10 +236,10 @@ pub trait WalletStorage: Send + Sync + 'static {
     /// Scans `request.blocks` into the wallet, persisting decrypted notes and updating the
     /// chain tip.
     ///
-    /// Slice 5 implementation drives `zcash_client_backend::data_api::chain::scan_cached_blocks`
-    /// against the wallet's internal database. The caller drains compact blocks from a
-    /// `ChainSource` and supplies the corresponding `ChainState` for the block immediately
-    /// below `request.from_height`.
+    /// Drives `zcash_client_backend::data_api::chain::scan_cached_blocks` against the
+    /// wallet's internal database. The caller drains compact blocks from a `ChainSource`
+    /// and supplies the corresponding `ChainState` for the block immediately below
+    /// `request.from_height`.
     ///
     /// `not_retryable` on malformed blocks or chain-state mismatch; `retryable` on transient I/O.
     async fn scan_blocks(&self, request: ScanRequest) -> Result<ScanResult, StorageError>;
@@ -360,7 +359,7 @@ pub trait WalletStorage: Send + Sync + 'static {
     /// `not_retryable` on schema errors; `retryable` on transient I/O.
     async fn lookup_observed_tip(&self) -> Result<Option<BlockHeight>, StorageError>;
 
-    /// Records `new_tip` as the most recently observed chain tip, unconditionally — the
+    /// Records `new_tip` as the most recently observed chain tip, unconditionally: the
     /// stored value always reflects the last observation, even when `new_tip` is lower than
     /// a previously recorded tip. Reorg detection depends on this: a monotonic high-water
     /// mark would hide a tip regress. Callers detect reorgs by reading

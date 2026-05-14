@@ -1,7 +1,7 @@
 [package]
 name = "zally-chain"
 version = "0.1.0"
-description = "Zally chain-read and broadcast plane: ChainSource, Submitter, ZinderChainSource"
+description = "Zally chain-read and broadcast plane: ChainSource and Submitter traits, with a zinder-backed implementation available behind a feature flag"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true

@@ -145,10 +145,9 @@ pub type ChainEventStream =
 
 /// Chain-read plane.
 ///
-/// Testkit consumers use `zally_testkit::MockChainSource`. The default `ZinderChainSource`
-/// implementation lands when Zinder's workspace stops pulling yanked transitive
-/// dependencies. Implementations route blocking work through `tokio::task::spawn_blocking`
-/// and emit Zally-vocabulary errors.
+/// Testkit consumers use `zally_testkit::MockChainSource`. A `ZinderChainSource`
+/// implementation is available behind the `zinder` cargo feature. Implementations route
+/// blocking work through `tokio::task::spawn_blocking` and emit Zally-vocabulary errors.
 #[async_trait]
 pub trait ChainSource: Send + Sync + 'static {
     /// Network this chain source is bound to.
@@ -185,8 +184,8 @@ pub trait ChainSource: Send + Sync + 'static {
 
     /// Returns confirmed UTXOs for a transparent address at the source's current tip.
     ///
-    /// Slice 2 takes the address as raw `scriptPubKey` bytes; Slice 3 introduces a typed
-    /// `TransparentAddress` when the spend flow needs it.
+    /// Takes the address as raw `scriptPubKey` bytes so implementations stay free of any
+    /// particular address-encoding crate.
     async fn transparent_utxos(
         &self,
         script_pub_key: &[u8],

@@ -1,5 +1,5 @@
 //! `WalletStorage::record_observed_tip` records the most recently observed tip
-//! unconditionally. A regress must overwrite a higher prior value — a monotonic high-water
+//! unconditionally. A regress must overwrite a higher prior value: a monotonic high-water
 //! mark would hide a tip regress and break reorg detection.
 
 use tempfile::TempDir;

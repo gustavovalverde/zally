@@ -7,8 +7,8 @@
 //! cargo run --example exchange-deposit
 //! ```
 //!
-//! The example uses the testkit `MockChainSource` and `MockSubmitter`; replace with
-//! `ZinderChainSource` and the matching submitter when the v1 follow-up infrastructure lands.
+//! The example uses the testkit `MockChainSource` and `MockSubmitter`. Operators swap in
+//! their preferred `ChainSource` and `Submitter` implementations in production.
 
 use std::io;
 

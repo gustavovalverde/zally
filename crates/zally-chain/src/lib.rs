@@ -1,12 +1,9 @@
 //! Zally chain-read and broadcast plane.
 //!
 //! Defines the [`ChainSource`] and [`Submitter`] trait surfaces consumed by
-//! [`zally_wallet`](https://docs.rs/zally-wallet). Slice 2 ships the trait surface plus the
-//! `zally_testkit::MockChainSource` fixture; the default `ZinderChainSource` implementation
-//! lands in a later slice once Zinder's workspace stops pulling yanked transitive
-//! dependencies. `LightwalletdChainSource` lands with the same later slice.
-//!
-//! See RFC-0002 for design rationale.
+//! [`zally_wallet`](https://docs.rs/zally-wallet). A `ZinderChainSource` plus
+//! `ZinderSubmitter` implementation is available behind the `zinder` cargo feature;
+//! `zally_testkit::MockChainSource` and `MockSubmitter` cover unit-test wiring.
 
 mod buffered_block_source;
 mod chain_error;

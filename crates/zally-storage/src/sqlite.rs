@@ -1,13 +1,28 @@
 //! `SQLite`-backed wallet storage.
+//!
+//! Every wallet-db call funnels through a single-threaded **wallet-db actor**.
+//! One owned thread owns the [`WalletDb`] and the ledger [`rusqlite::Connection`];
+//! callers send type-erased [`DbWork`] closures over a bounded `mpsc` channel and
+//! await a `oneshot` reply. This shape replaces the older
+//! `Arc<Mutex<Option<Db>>> + spawn_blocking + blocking_lock()` design, which
+//! parked an OS thread per call and serialised every operation behind the
+//! multi-second proving window held by `prepare_payment` (zk-SNARK proof
+//! generation runs while the wallet-db mutex is held). With the actor, that
+//! same serialisation still happens (`rusqlite::Connection` is `!Sync` and
+//! wants one thread), but the request queue is bounded, observable, and
+//! visible to backpressure instead of saturating the tokio blocking pool with
+//! 512 parked threads.
+//!
+//! [`SqliteWalletStorage`] is a cheap [`Clone`] handle holding only the
+//! channel sender; the actor lives until every clone is dropped.
 
 use std::path::PathBuf;
-use std::sync::Arc;
 
 use async_trait::async_trait;
 use rand::rngs::OsRng;
 use rusqlite::OptionalExtension as _;
 use secrecy::{ExposeSecret as _, SecretVec};
-use tokio::sync::Mutex;
+use tokio::sync::{mpsc, oneshot};
 use zally_core::{AccountId, BlockHeight, IdempotencyKey, Network, NetworkParameters, TxId};
 use zally_keys::{KeyDerivationError, SeedMaterial, derive_ufvk};
 use zcash_client_backend::data_api::chain::ChainState;
@@ -25,6 +40,33 @@ use crate::wallet_storage::WalletStorage;
 type Db = WalletDb<rusqlite::Connection, NetworkParameters, SystemClock, OsRng>;
 
 const DEFAULT_ACCOUNT_NAME: &str = "primary";
+
+/// Bounded capacity of the wallet-db actor's request queue.
+///
+/// Sized above the runtime's steady-state concurrency (one wallet-sync loop,
+/// one dispense reaper, one donation reconciler, and a handful of in-flight
+/// dispense and balance reads). Hitting the bound back-pressures the sender
+/// instead of letting an unbounded queue silently grow.
+const WALLET_DB_QUEUE_CAPACITY: usize = 256;
+
+/// Work item sent to the wallet-db actor. The closure owns its own reply
+/// channel and the typed result; the actor just calls it. This is the
+/// type-erasure that lets one `mpsc` channel carry every `with_db`,
+/// `with_db_mut`, `with_ledger`, and `open_or_create` request without a
+/// per-method message variant.
+type DbWork = Box<dyn FnOnce(&mut WalletDbState, &SqliteWalletStorageOptions) + Send>;
+
+/// State held on the actor thread. `NotOpened` is the initial state; the
+/// first successful [`WalletStorage::open_or_create`] transitions to
+/// `Opened`. Every other request errors with [`StorageError::NotOpened`]
+/// while the state is `NotOpened`, matching the prior lazy-open contract.
+enum WalletDbState {
+    NotOpened,
+    Opened {
+        db: Db,
+        ledger: rusqlite::Connection,
+    },
+}
 
 /// Options for [`SqliteWalletStorage`].
 #[derive(Clone, Debug)]
@@ -62,97 +104,171 @@ impl SqliteWalletStorageOptions {
 
 /// `SQLite`-backed [`WalletStorage`] implementation.
 ///
-/// Wraps [`zcash_client_sqlite::WalletDb`]. The wallet database is opened lazily; until
-/// [`SqliteWalletStorage::open_or_create`] runs, the inner `Option<Db>` is `None`. Every
-/// public method routes blocking sqlite work through [`tokio::task::spawn_blocking`] via
-/// per-call internal helpers (`with_db` / `with_db_mut`); later slices add methods by
-/// composing through the same shape.
+/// Wraps [`zcash_client_sqlite::WalletDb`]. The wallet database is opened lazily;
+/// the first [`SqliteWalletStorage::open_or_create`] call transitions the
+/// actor's state from `NotOpened` to `Opened`. Every public method routes its
+/// blocking sqlite work through the wallet-db actor described in the module
+/// docs.
+///
+/// Cloning yields another handle to the same actor; the actor lives until all
+/// clones are dropped.
+#[derive(Clone)]
 pub struct SqliteWalletStorage {
     options: SqliteWalletStorageOptions,
-    inner: Arc<Mutex<Option<Db>>>,
-    ledger: Arc<Mutex<Option<rusqlite::Connection>>>,
+    request_tx: mpsc::Sender<DbWork>,
 }
 
 impl SqliteWalletStorage {
-    /// Constructs a new storage handle. The database is not opened until
-    /// [`SqliteWalletStorage::open_or_create`] is called.
+    /// Constructs a new storage handle and spawns the wallet-db actor. The
+    /// database is not opened until [`SqliteWalletStorage::open_or_create`] is
+    /// called (the actor starts in [`WalletDbState::NotOpened`]).
+    ///
+    /// Must be called from within a tokio runtime; the actor lives on the
+    /// runtime's blocking pool until all handles are dropped.
     #[must_use]
     pub fn new(options: SqliteWalletStorageOptions) -> Self {
+        let (request_tx, request_rx) = mpsc::channel(WALLET_DB_QUEUE_CAPACITY);
+        let actor_options = options.clone();
+        drop(tokio::task::spawn_blocking(move || {
+            run_wallet_db_actor(&actor_options, request_rx);
+        }));
         Self {
             options,
-            inner: Arc::new(Mutex::new(None)),
-            ledger: Arc::new(Mutex::new(None)),
+            request_tx,
         }
     }
 
-    #[allow(
-        clippy::significant_drop_tightening,
-        reason = "the guard must live for the duration of `work` because `conn` borrows from it"
-    )]
+    /// Current number of work items queued on the actor. Exposed for the
+    /// runtime's `fauzec_wallet_db_queue_depth` metric: a depth that stays
+    /// near `WALLET_DB_QUEUE_CAPACITY` means the actor cannot keep up with
+    /// incoming load.
+    #[must_use]
+    pub fn queue_depth(&self) -> usize {
+        WALLET_DB_QUEUE_CAPACITY - self.request_tx.capacity()
+    }
+
+    async fn dispatch<F, T>(&self, run_on_actor: F) -> Result<T, StorageError>
+    where
+        F: FnOnce(&mut WalletDbState, &SqliteWalletStorageOptions) -> Result<T, StorageError>
+            + Send
+            + 'static,
+        T: Send + 'static,
+    {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let work: DbWork = Box::new(move |state, options| {
+            let outcome = run_on_actor(state, options);
+            // The receiver is dropped only if the caller's future was
+            // cancelled mid-flight; ignore the send failure in that case so
+            // the actor stays healthy for the next request.
+            drop(reply_tx.send(outcome));
+        });
+        self.request_tx
+            .send(work)
+            .await
+            .map_err(|_| StorageError::BlockingTaskFailed {
+                reason: "wallet-db actor channel closed".to_owned(),
+            })?;
+        reply_rx
+            .await
+            .map_err(|_| StorageError::BlockingTaskFailed {
+                reason: "wallet-db actor dropped the reply".to_owned(),
+            })?
+    }
+
     async fn with_ledger<F, T>(&self, work: F) -> Result<T, StorageError>
     where
         F: FnOnce(&rusqlite::Connection) -> Result<T, StorageError> + Send + 'static,
         T: Send + 'static,
     {
-        let ledger = Arc::clone(&self.ledger);
-        tokio::task::spawn_blocking(move || {
-            let guard = ledger.blocking_lock();
-            let conn = guard.as_ref().ok_or(StorageError::NotOpened)?;
-            let outcome = work(conn);
-            drop(guard);
-            outcome
+        self.dispatch(move |state, _options| match state {
+            WalletDbState::NotOpened => Err(StorageError::NotOpened),
+            WalletDbState::Opened { ledger, .. } => work(ledger),
         })
         .await
-        .map_err(|e| StorageError::BlockingTaskFailed {
-            reason: e.to_string(),
-        })?
     }
 
-    #[allow(
-        clippy::significant_drop_tightening,
-        reason = "the guard must live for the duration of `work` because `db` borrows from it"
-    )]
     async fn with_db<F, T>(&self, work: F) -> Result<T, StorageError>
     where
         F: FnOnce(&Db) -> Result<T, StorageError> + Send + 'static,
         T: Send + 'static,
     {
-        let inner = Arc::clone(&self.inner);
-        tokio::task::spawn_blocking(move || {
-            let guard = inner.blocking_lock();
-            let db = guard.as_ref().ok_or(StorageError::NotOpened)?;
-            let outcome = work(db);
-            drop(guard);
-            outcome
+        self.dispatch(move |state, _options| match state {
+            WalletDbState::NotOpened => Err(StorageError::NotOpened),
+            WalletDbState::Opened { db, .. } => work(db),
         })
         .await
-        .map_err(|e| StorageError::BlockingTaskFailed {
-            reason: e.to_string(),
-        })?
     }
 
-    #[allow(
-        clippy::significant_drop_tightening,
-        reason = "the guard must live for the duration of `work` because `db` borrows from it"
-    )]
     async fn with_db_mut<F, T>(&self, work: F) -> Result<T, StorageError>
     where
         F: FnOnce(&mut Db) -> Result<T, StorageError> + Send + 'static,
         T: Send + 'static,
     {
-        let inner = Arc::clone(&self.inner);
-        tokio::task::spawn_blocking(move || {
-            let mut guard = inner.blocking_lock();
-            let db = guard.as_mut().ok_or(StorageError::NotOpened)?;
-            let outcome = work(db);
-            drop(guard);
-            outcome
+        self.dispatch(move |state, _options| match state {
+            WalletDbState::NotOpened => Err(StorageError::NotOpened),
+            WalletDbState::Opened { db, .. } => work(db),
         })
         .await
-        .map_err(|e| StorageError::BlockingTaskFailed {
-            reason: e.to_string(),
-        })?
     }
+}
+
+fn run_wallet_db_actor(
+    options: &SqliteWalletStorageOptions,
+    mut request_rx: mpsc::Receiver<DbWork>,
+) {
+    let mut state = WalletDbState::NotOpened;
+    while let Some(work) = request_rx.blocking_recv() {
+        work(&mut state, options);
+    }
+}
+
+/// Opens (or creates on first run) the underlying `WalletDb` and the Zally
+/// ledger connection backing the `ext_zally_*` tables. Runs on the actor
+/// thread; the file I/O and the schema migration happen here.
+fn open_wallet_db(options: &SqliteWalletStorageOptions) -> Result<WalletDbState, StorageError> {
+    if let Some(parent) = options.db_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| StorageError::SqliteFailed {
+            reason: format!("could not create database directory: {e}"),
+            is_retryable: false,
+        })?;
+    }
+    let params = options.network.to_parameters();
+    let mut db =
+        WalletDb::for_path(&options.db_path, params, SystemClock, OsRng).map_err(|e| {
+            StorageError::SqliteFailed {
+                reason: e.to_string(),
+                is_retryable: false,
+            }
+        })?;
+    WalletMigrator::new().init_or_migrate(&mut db).map_err(|e| {
+        StorageError::MigrationFailed {
+            reason: e.to_string(),
+        }
+    })?;
+
+    let ledger =
+        rusqlite::Connection::open(&options.db_path).map_err(|e| StorageError::SqliteFailed {
+            reason: format!("ledger connection open failed: {e}"),
+            is_retryable: false,
+        })?;
+    ledger
+        .execute_batch(
+            "CREATE TABLE IF NOT EXISTS ext_zally_idempotency (\
+                 idempotency_key TEXT PRIMARY KEY NOT NULL,\
+                 tx_id_bytes BLOB NOT NULL,\
+                 recorded_at_unix INTEGER NOT NULL\
+             ); \
+             CREATE TABLE IF NOT EXISTS ext_zally_observed_tip (\
+                 id INTEGER PRIMARY KEY CHECK (id = 0),\
+                 tip_height INTEGER NOT NULL\
+             );",
+        )
+        .map_err(|e| StorageError::SqliteFailed {
+            reason: format!("ext_zally schema init failed: {e}"),
+            is_retryable: false,
+        })?;
+
+    Ok(WalletDbState::Opened { db, ledger })
 }
 
 #[allow(
@@ -163,66 +279,15 @@ impl SqliteWalletStorage {
 #[async_trait]
 impl WalletStorage for SqliteWalletStorage {
     async fn open_or_create(&self) -> Result<(), StorageError> {
-        let inner = Arc::clone(&self.inner);
-        let ledger = Arc::clone(&self.ledger);
-        let db_path = self.options.db_path.clone();
-        let params = self.options.network.to_parameters();
-
-        tokio::task::spawn_blocking(move || -> Result<(), StorageError> {
-            let mut db_guard = inner.blocking_lock();
-            let mut ledger_guard = ledger.blocking_lock();
-            if db_guard.is_some() && ledger_guard.is_some() {
+        self.dispatch(|state, options| {
+            if matches!(state, WalletDbState::Opened { .. }) {
                 return Ok(());
             }
-            if let Some(parent) = db_path.parent() {
-                std::fs::create_dir_all(parent).map_err(|e| StorageError::SqliteFailed {
-                    reason: format!("could not create database directory: {e}"),
-                    is_retryable: false,
-                })?;
-            }
-            let mut db = WalletDb::for_path(&db_path, params, SystemClock, OsRng).map_err(|e| {
-                StorageError::SqliteFailed {
-                    reason: e.to_string(),
-                    is_retryable: false,
-                }
-            })?;
-            WalletMigrator::new()
-                .init_or_migrate(&mut db)
-                .map_err(|e| StorageError::MigrationFailed {
-                    reason: e.to_string(),
-                })?;
-            *db_guard = Some(db);
-
-            let conn =
-                rusqlite::Connection::open(&db_path).map_err(|e| StorageError::SqliteFailed {
-                    reason: format!("ledger connection open failed: {e}"),
-                    is_retryable: false,
-                })?;
-            conn.execute_batch(
-                "CREATE TABLE IF NOT EXISTS ext_zally_idempotency (\
-                     idempotency_key TEXT PRIMARY KEY NOT NULL,\
-                     tx_id_bytes BLOB NOT NULL,\
-                     recorded_at_unix INTEGER NOT NULL\
-                 ); \
-                 CREATE TABLE IF NOT EXISTS ext_zally_observed_tip (\
-                     id INTEGER PRIMARY KEY CHECK (id = 0),\
-                     tip_height INTEGER NOT NULL\
-                 );",
-            )
-            .map_err(|e| StorageError::SqliteFailed {
-                reason: format!("ext_zally schema init failed: {e}"),
-                is_retryable: false,
-            })?;
-            *ledger_guard = Some(conn);
-
-            drop(db_guard);
-            drop(ledger_guard);
+            let opened = open_wallet_db(options)?;
+            *state = opened;
             Ok(())
         })
         .await
-        .map_err(|e| StorageError::BlockingTaskFailed {
-            reason: e.to_string(),
-        })?
     }
 
     async fn create_account_for_seed(

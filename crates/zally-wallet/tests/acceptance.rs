@@ -1,6 +1,6 @@
 //! Integration test entry point.
 //!
-//! Aggregates the `integration/` submodules per the AGENTS.md test layout. T3 live tests
-//! land in a sibling `live/` module in Slice 2.
+//! Aggregates the `integration/` submodules per the AGENTS.md test layout. The companion
+//! `live/` module aggregates T3 live tests when they land.
 
 mod integration;

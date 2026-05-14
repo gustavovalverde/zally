@@ -43,9 +43,10 @@ impl Wallet {
 
     /// Signs `pczt` with the seed unsealed from this wallet's `SeedSealing`.
     ///
-    /// Single-key path: derives the account-zero `UnifiedSpendingKey` and applies Sapling
-    /// and Orchard spend authorizations. Transparent signing is a v1 follow-up; PCZTs whose
-    /// only spends are transparent currently return [`zally_pczt::PcztError::NoMatchingKeys`].
+    /// Single-key path: derives the account-zero `UnifiedSpendingKey` and applies Sapling,
+    /// Orchard, and transparent spend authorizations. Returns
+    /// [`zally_pczt::PcztError::NoMatchingKeys`] when the wallet's seed cannot authorize any
+    /// spend in the PCZT.
     ///
     /// `not_retryable` on no-matching-keys or upstream signer error; `retryable` on transient
     /// sealing I/O.

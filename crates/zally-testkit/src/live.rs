@@ -1,6 +1,6 @@
 //! Live-node test gating.
 //!
-//! Tests that touch a real Zcash node or zinder endpoint call [`require_live`] from their
+//! Tests that touch a real Zcash node or chain-source endpoint call [`require_live`] from their
 //! `#[ignore = LIVE_TEST_IGNORE_REASON]` body. The gate consults `ZALLY_TEST_LIVE=1` so the
 //! validation-gate profile (no env var set) skips them via `--no-run-ignored`, and the
 //! live-test profile picks them up via `--run-ignored=all`.
@@ -28,7 +28,7 @@ pub const ALLOW_MAINNET_ENV: &str = "ZALLY_TEST_ALLOW_MAINNET";
 /// Installs a global `tracing_subscriber` if one is not already installed.
 ///
 /// Holds a `Drop` guard so callers can keep it alive for the test's lifetime. The guard is
-/// currently a no-op marker; future slices may use it for log capture.
+/// a no-op marker; callers that want log capture extend it in place.
 #[must_use = "hold the returned guard for the duration of the test"]
 pub fn init() -> InitGuard {
     static ONCE: Once = Once::new();

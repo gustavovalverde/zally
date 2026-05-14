@@ -70,11 +70,12 @@ orchard = "0.13"
 zip321 = "0.7"
 zip32 = "0.2"
 
-# Foundation: ecosystem chain plane. Zally path-depends on the sibling zinder workspace
-# so the wallet integration tracks zinder's evolving typed-client surface directly.
-# The [patch.crates-io] core2 pin below resolves the yanked equihash-transitive dep.
-zinder-client = { git = "https://github.com/gustavovalverde/zinder", rev = "df03361a346443a226527ab8ed2c68aa6ad3bd59" }
-zinder-core = { git = "https://github.com/gustavovalverde/zinder", rev = "df03361a346443a226527ab8ed2c68aa6ad3bd59" }
+# Optional chain-plane backend. The `zinder` cargo feature on zally-chain pulls these
+# crates from a pinned git revision so the wallet integration tracks the zinder typed-
+# client surface directly. The [patch.crates-io] core2 pin below resolves the yanked
+# equihash-transitive dep.
+zinder-client = { git = "https://github.com/gustavovalverde/zinder", rev = "65316ecfc280ab4833b72d7a6ff5ddd7e524be89" }
+zinder-core = { git = "https://github.com/gustavovalverde/zinder", rev = "65316ecfc280ab4833b72d7a6ff5ddd7e524be89" }
 
 # Async runtime and concurrency.
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "fs", "io-util"] }

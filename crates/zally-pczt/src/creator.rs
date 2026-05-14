@@ -1,9 +1,8 @@
-//! `Creator` role: builds an unsigned PCZT from a Zally proposal.
+//! `Creator` role: wraps a pre-built `pczt::Pczt` as a network-tagged [`PcztBytes`].
 //!
-//! Slice 4 ships the role wrapper. Real proposal-to-PCZT construction lands in Slice 5
-//! when balance and note selection are in place; until then the wallet-side helper
-//! `Wallet::propose_pczt` short-circuits with `WalletError::ProposalRejected` per
-//! RFC-0003 §5 OQ-1.
+//! Operators construct the inner `pczt::Pczt` through `pczt::roles::creator::Creator` or
+//! through `Wallet::propose_pczt`, which composes the upstream `create_pczt_from_proposal`
+//! flow.
 
 use zally_core::Network;
 
@@ -31,8 +30,8 @@ impl Creator {
 
     /// Wraps an already-built `pczt::Pczt` as `PcztBytes` for this network.
     ///
-    /// Slice 4 exposes this as the entry point for callers (typically `Wallet::propose_pczt`)
-    /// that have constructed a `pczt::Pczt` via the upstream `pczt::roles::creator::Creator`.
+    /// Entry point for callers (typically `Wallet::propose_pczt`) that have constructed a
+    /// `pczt::Pczt` via the upstream `pczt::roles::creator::Creator`.
     #[must_use]
     pub fn wrap(&self, pczt: &pczt::Pczt) -> PcztBytes {
         PcztBytes::from_pczt(pczt, self.network)

@@ -1,4 +1,4 @@
-//! REQ-KEYS-2 — opening a wallet with plaintext sealing emits a WARN-level event.
+//! Opening a wallet with plaintext sealing emits a WARN-level event (KEYS-2).
 //!
 //! Gated behind `unsafe_plaintext_seed`.
 

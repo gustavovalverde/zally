@@ -1,4 +1,4 @@
-//! REQ-SPEND-2 — `Wallet::propose` refuses memos on transparent recipients (ZIP-302).
+//! `Wallet::propose` refuses memos on transparent recipients per ZIP-302 (SPEND-2).
 
 use zally_core::{BlockHeight, Memo, Network, PaymentRecipient, Zatoshis};
 use zally_storage::{SqliteWalletStorage, SqliteWalletStorageOptions};

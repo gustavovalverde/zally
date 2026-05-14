@@ -23,9 +23,8 @@ const EVENT_CHANNEL_CAPACITY: usize = 1024;
 /// Operator-facing wallet handle.
 ///
 /// Cheap to clone; cloning shares the inner sealing and storage handles via `Arc`. All async
-/// methods are cancellation-safe. Zally v1 commits to one account per wallet (see RFC-0001
-/// §10); the `AccountId` returned by [`Wallet::create`] and [`Wallet::open`] names that
-/// single account.
+/// methods are cancellation-safe. Zally holds one account per wallet; the `AccountId`
+/// returned by [`Wallet::create`] and [`Wallet::open`] names that single account.
 #[derive(Clone)]
 pub struct Wallet {
     pub(crate) inner: Arc<WalletInner>,
@@ -33,11 +32,6 @@ pub struct Wallet {
 
 pub(crate) struct WalletInner {
     pub(crate) network: Network,
-    #[allow(
-        dead_code,
-        reason = "Slice 1 does not call back into the sealing after wallet construction; \
-                  Slice 3 uses it at signing time"
-    )]
     pub(crate) sealing: Box<dyn SeedSealing>,
     pub(crate) storage: Box<dyn WalletStorage>,
     pub(crate) base_capabilities: WalletCapabilities,

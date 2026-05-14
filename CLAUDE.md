@@ -4,12 +4,7 @@ Claude Code specifics for Zally. Read [AGENTS.md](AGENTS.md) first; this file on
 
 ## Working directories
 
-Zally develops alongside three sibling repositories. Add them to your session if you need to read them:
-
-- `/Users/gustavovalverde/dev/zfnd/librustzcash` — cryptographic and wallet-state foundation. Zally is a versioned consumer; never fork.
-- `/Users/gustavovalverde/dev/zfnd/zinder` — chain-read plane; default `ChainSource` implementation targets it.
-- `/Users/gustavovalverde/dev/zfnd/fauzec` — primary first consumer; integration testbed for Zally's public API.
-- `/Users/gustavovalverde/dev/zfnd/zips` — Zcash Improvement Proposals corpus; Zally's compliance ceiling.
+Zally consumes [librustzcash](https://github.com/zcash/librustzcash) as a versioned dependency; never fork it. ZIP-compliance work cross-references the [Zcash ZIPs](https://github.com/zcash/zips) corpus.
 
 ## Reading the spine before edits
 
@@ -70,17 +65,17 @@ Mainnet requires `ZALLY_TEST_ALLOW_MAINNET=1` in addition. Never run against an 
 
 ## Skills that match common Zally work
 
-- `/init` — fresh checkout only. Already done here; do not re-run.
-- `/review` — review a Zally PR.
-- `/security-review` — pre-merge security review on the current branch. Mandatory for any change affecting key custody, signing, or transaction construction.
-- `/identifier-naming` — apply the naming guard before declaring any new identifier.
-- `/codebase-structure` — apply the structure guard before adding any file or directory.
+- `/init`: fresh checkout only. Already done here; do not re-run.
+- `/review`: review a Zally PR.
+- `/security-review`: pre-merge security review on the current branch. Mandatory for any change affecting key custody, signing, or transaction construction.
+- `/identifier-naming`: apply the naming guard before declaring any new identifier.
+- `/codebase-structure`: apply the structure guard before adding any file or directory.
 
 ## Tools
 
 Prefer `Edit` for surgical changes; reserve `Write` for new files or full rewrites. Never run `git push`, `gh pr create`, `gh pr review --approve`, `gh pr review --request-changes`, or any destructive git command (`reset --hard`, `clean -f`, `branch -D`, force-push) without explicit confirmation in the same turn.
 
-When investigating across sibling repositories (librustzcash, zinder, fauzec, zips), dispatch the `Explore` subagent rather than reading every file inline. Cite file paths and line numbers in findings.
+When investigating across upstream repositories (librustzcash, zips), dispatch the `Explore` subagent rather than reading every file inline. Cite file paths and line numbers in findings.
 
 ## When you are done
 

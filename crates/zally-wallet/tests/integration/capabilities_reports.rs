@@ -1,4 +1,4 @@
-//! REQ-AX-1 — `Wallet::capabilities()` reports the Slice 1 surface.
+//! `Wallet::capabilities()` reports the wallet's standing feature surface.
 
 use zally_core::{BlockHeight, Network};
 use zally_storage::{SqliteWalletStorage, SqliteWalletStorageOptions};
@@ -8,7 +8,7 @@ use zally_wallet::{
 };
 
 #[tokio::test]
-async fn capabilities_reports_slice_1() -> Result<(), TestError> {
+async fn capabilities_reports_standing_surface() -> Result<(), TestError> {
     let temp = TempWalletPath::create()?;
     let network = Network::regtest_all_at_genesis();
 

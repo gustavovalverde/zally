@@ -1,8 +1,8 @@
 //! `Combiner` role: merges multiple signed PCZTs.
 //!
-//! Used for FROST quorum signatures and multi-party signer flows. Slice 4 wires the
-//! upstream `pczt::roles::combiner::Combiner` and validates that every input PCZT shares
-//! the same network before delegating to the upstream combiner.
+//! Used for FROST quorum signatures and multi-party signer flows. Validates that every
+//! input PCZT shares the same network before delegating to the upstream
+//! `pczt::roles::combiner::Combiner`.
 
 use zally_core::Network;
 

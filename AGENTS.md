@@ -4,29 +4,26 @@ These conventions apply to every contributor, human or AI agent, working on Zall
 
 ## Project structure and module organisation
 
-Zally is a Rust 2024 workspace. Crates live under `crates/` (added as code lands; see [ADR-0001](docs/adrs/0001-workspace-crate-boundaries.md) for the planned boundary set). There is no `services/` directory; Zally is library-shaped. There is no `utils/`, `helpers/`, `shared/`, or `common/` directory at any level — code with no bounded context has nowhere to live.
+Zally is a Rust 2024 workspace. Crates live under `crates/` (see [ADR-0001](docs/adrs/0001-workspace-crate-boundaries.md) for the boundary set). There is no `services/` directory; Zally is library-shaped. There is no `utils/`, `helpers/`, `shared/`, or `common/` directory at any level: code with no bounded context has nowhere to live.
 
 Documentation is under `docs/` with this layout:
 
-- `docs/prd-NNNN-<slug>.md` — product requirements (numbered, present tense)
-- `docs/architecture/public-interfaces.md` — vocabulary spine (mandatory; first thing to read)
-- `docs/architecture/<topic>.md` — boundary contracts (living, edited in place)
-- `docs/adrs/NNNN-<slug>.md` — accepted decisions (numbered, present tense)
-- `docs/rfcs/NNNN-<slug>.md` — pre-decision contracts (accepted RFCs become the spine)
-- `docs/reference/<topic>.md` — living external constraints, audit findings, prior-art summaries
-- `docs/runbooks/<task>.md` — operational procedures with explicit commands
+- `docs/architecture/public-interfaces.md`: vocabulary spine (mandatory; first thing to read).
+- `docs/architecture/<topic>.md`: boundary contracts (living, edited in place).
+- `docs/adrs/NNNN-<slug>.md`: accepted decisions (numbered, present tense).
+- `docs/runbooks/<task>.md`: operational procedures with explicit commands.
 
 ## Build, test, and development commands
 
 The default validation gate (every PR; matches [README §Validation gate](README.md#validation-gate)):
 
-- `cargo fmt --all --check` — verify formatting.
-- `cargo check --workspace --all-targets --all-features` — type-check every crate and test target.
-- `cargo clippy --workspace --all-targets --all-features -- -D warnings` — strict lint gate.
-- `cargo nextest run --profile=ci` — T0 unit and T1 integration tests.
-- `RUSTDOCFLAGS='-D warnings' cargo doc --workspace --all-features --no-deps` — validate rustdoc.
-- `cargo deny check` — dependency policy.
-- `cargo machete` — unused dependencies.
+- `cargo fmt --all --check`: verify formatting.
+- `cargo check --workspace --all-targets --all-features`: type-check every crate and test target.
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings`: strict lint gate.
+- `cargo nextest run --profile=ci`: T0 unit and T1 integration tests.
+- `RUSTDOCFLAGS='-D warnings' cargo doc --workspace --all-features --no-deps`: validate rustdoc.
+- `cargo deny check`: dependency policy.
+- `cargo machete`: unused dependencies.
 
 Live (T3) tests run on demand:
 
@@ -54,11 +51,11 @@ Test naming: T3 live test function names are plain `snake_case_describing_behavi
 
 ## Error vocabulary
 
-`thiserror` v2 throughout. Each public boundary returns a typed enum; no `Box<dyn Error>`, no `anyhow`, no `Other(String)` catch-alls. Each error variant has a documented retry posture (`retryable`, `not_retryable`, `requires_operator`) in its rustdoc. The vocabulary is recorded in `docs/reference/error-vocabulary.md` (added as the first crate's errors land); a new error variant requires an entry there before merging.
+`thiserror` v2 throughout. Each public boundary returns a typed enum; no `Box<dyn Error>`, no `anyhow`, no `Other(String)` catch-alls. Each error variant has a documented retry posture (`retryable`, `not_retryable`, `requires_operator`) in its rustdoc.
 
 ## Testing guidelines
 
-Tier organisation matches Zinder's ADR-0006:
+Tier organisation:
 
 | Tier | Location | Nextest profile |
 |------|----------|----------------|
@@ -89,12 +86,6 @@ Pull requests:
 - Network mismatches must fail closed at construction time, not at signing time.
 - Mainnet operations require an explicit `--mainnet` config or builder call; defaults are testnet-first.
 
-## Sibling repositories
+## Ecosystem position
 
-Zally lives in an ecosystem with three sibling projects:
-
-- [zinder](https://github.com/gustavovalverde/zinder) — service-oriented Zcash indexer; Zally's default chain-read plane.
-- [fauzec](https://github.com/gustavovalverde/fauzec) — Zcash testnet faucet; primary first consumer of Zally.
-- [zallet](https://github.com/zcash/wallet) — Zcash wallet daemon; the sibling product Zally is the library shape of.
-
-Conventions inherit from Zinder where applicable; deviations are explicit and justified in an ADR.
+Zally is the library-shaped peer to [Zallet](https://github.com/zcash/wallet) (Zcash wallet daemon). Both consume librustzcash and produce ZIP-compliant transactions; they differ in product shape. Operators who want a daemon run Zallet; operators who want an in-process Rust library link Zally.
