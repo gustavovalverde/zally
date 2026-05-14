@@ -117,15 +117,6 @@ impl ChainSource for ZinderChainSource {
         Ok(BlockHeight::from(block_id.height.value()))
     }
 
-    async fn finalized_height(&self) -> Result<BlockHeight, ChainSourceError> {
-        let epoch = self
-            .inner
-            .current_epoch()
-            .await
-            .map_err(zinder_error_to_chain_source)?;
-        Ok(BlockHeight::from(epoch.finalized_height.value()))
-    }
-
     async fn compact_blocks(
         &self,
         block_range: BlockHeightRange,

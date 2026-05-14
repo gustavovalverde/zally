@@ -56,11 +56,14 @@ pub struct SyncOutcome {
 }
 
 impl Wallet {
-    /// Advances the wallet from its last-scanned height up to `chain.finalized_height()`.
+    /// Advances the wallet from its last-scanned height up to `chain.chain_tip()`.
     ///
-    /// The wallet never scans into the chain source's reorg window, so it cannot cache an
-    /// orphaned block. The raw `chain_tip()` is fetched as well, but only to detect a tip
-    /// regress and to report scan progress — never as a scan ceiling.
+    /// Scanning reaches the chain tip so the commitment tree, note witnesses, and the
+    /// WalletDb chain-tip notion all agree: `zcash_client_backend` only treats a note as
+    /// spendable when its witness is anchored within a fully-scanned tip, and transaction
+    /// expiry heights are computed against that same tip. Reorg safety comes from the
+    /// spend-time confirmation depth (ZIP 315) and from `roll_back_after_reorg` recovery, not
+    /// from withholding recent blocks from the scan.
     ///
     /// Fails closed on network mismatch. Emits `ScanProgress` events at the start and end of
     /// the run; per-block events are emitted by the storage scanner.
@@ -74,9 +77,7 @@ impl Wallet {
             });
         }
         let policy = self.retry_policy();
-        // Raw tip: drives reorg detection and `ScanProgress` reporting only. It can still be
-        // reorged away, so it is never used as a scan ceiling.
-        let raw_tip_height = with_breaker_and_retry(
+        let chain_tip = with_breaker_and_retry(
             &self.inner.circuit_breaker,
             policy,
             "sync.chain_tip",
@@ -84,29 +85,12 @@ impl Wallet {
             |e| map_chain_source_error(&e),
         )
         .await?;
-        // Finalized height: the immutable scan ceiling. Scanning only at or below this
-        // height means a reorg can never invalidate a block the wallet has already cached.
-        let finalized_height = with_breaker_and_retry(
-            &self.inner.circuit_breaker,
-            policy,
-            "sync.finalized_height",
-            || chain.finalized_height(),
-            |e| map_chain_source_error(&e),
-        )
-        .await?;
         let prior_observed_tip = self.inner.storage.lookup_observed_tip().await?;
-        let reorg = self.detect_tip_regress(prior_observed_tip, raw_tip_height);
-        self.inner
-            .storage
-            .record_observed_tip(raw_tip_height)
-            .await?;
-        // Tell the WalletDb the raw chain tip so transaction proposals compute a valid
-        // expiry height against the live chain. Scanning below still stops at the finalized
-        // height; only the proposal/expiry tip notion follows the raw tip.
-        self.inner
-            .storage
-            .update_chain_tip(raw_tip_height)
-            .await?;
+        let reorg = self.detect_tip_regress(prior_observed_tip, chain_tip);
+        self.inner.storage.record_observed_tip(chain_tip).await?;
+        // Pin the WalletDb chain tip to the height this run scans to, so transaction
+        // proposals compute expiry and anchor heights against a fully-scanned tip.
+        self.inner.storage.update_chain_tip(chain_tip).await?;
 
         let prior_fully_scanned_height = self.inner.storage.fully_scanned_height().await?;
         let scanned_from = match prior_fully_scanned_height {
@@ -120,23 +104,23 @@ impl Wallet {
         };
         self.publish_event(WalletEvent::ScanProgress {
             scanned_height: scanned_from,
-            target_height: finalized_height,
+            target_height: chain_tip,
         });
 
-        if scanned_from.as_u32() > finalized_height.as_u32() {
-            return Ok(self.emit_already_caught_up(scanned_from, finalized_height, reorg));
+        if scanned_from.as_u32() > chain_tip.as_u32() {
+            return Ok(self.emit_already_caught_up(scanned_from, chain_tip, reorg));
         }
-        let blocks = fetch_compact_blocks(chain, scanned_from, finalized_height).await?;
+        let blocks = fetch_compact_blocks(chain, scanned_from, chain_tip).await?;
         let block_count = u64::try_from(blocks.len()).unwrap_or(u64::MAX);
         if blocks.is_empty() {
-            return Ok(self.emit_already_caught_up(scanned_from, finalized_height, reorg));
+            return Ok(self.emit_already_caught_up(scanned_from, chain_tip, reorg));
         }
         let from_state = fetch_prior_chain_state(chain, scanned_from).await?;
         self.scan_and_emit(
             ScanContext {
                 blocks,
                 scanned_from,
-                target_height: finalized_height,
+                target_height: chain_tip,
                 block_count,
                 reorgs_observed: reorg,
             },

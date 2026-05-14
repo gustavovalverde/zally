@@ -19,6 +19,5 @@ mod sync_catches_up_to_tip;
 mod sync_emits_reorg_when_tip_regresses;
 mod sync_network_mismatch;
 mod sync_retries_retryable_chain_failures;
-mod sync_stops_at_finalized_height;
 #[cfg(feature = "unsafe_plaintext_seed")]
 mod unsafe_plaintext_seed_warns;

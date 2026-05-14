@@ -385,7 +385,7 @@ impl WalletStorage for SqliteWalletStorage {
         self.with_db(move |db| {
             let summary = db
                 .get_wallet_summary(
-                    zcash_client_backend::data_api::wallet::ConfirmationsPolicy::MIN,
+                    zcash_client_backend::data_api::wallet::ConfirmationsPolicy::default(),
                 )
                 .map_err(|e| map_sqlite_error(&e))?;
             Ok(summary.map(|s| BlockHeight::from(u32::from(s.fully_scanned_height()))))
@@ -444,7 +444,7 @@ impl WalletStorage for SqliteWalletStorage {
                     &params,
                     zcash_client_backend::fees::StandardFeeRule::Zip317,
                     account_uuid,
-                    zcash_client_backend::data_api::wallet::ConfirmationsPolicy::MIN,
+                    zcash_client_backend::data_api::wallet::ConfirmationsPolicy::default(),
                     &recipient,
                     amount,
                     memo_bytes,
@@ -531,7 +531,7 @@ impl WalletStorage for SqliteWalletStorage {
                     &params,
                     zcash_client_backend::fees::StandardFeeRule::Zip317,
                     account_uuid,
-                    zcash_client_backend::data_api::wallet::ConfirmationsPolicy::MIN,
+                    zcash_client_backend::data_api::wallet::ConfirmationsPolicy::default(),
                     &recipient,
                     amount,
                     memo_bytes,
@@ -632,7 +632,7 @@ impl WalletStorage for SqliteWalletStorage {
                     &params,
                     zcash_client_backend::fees::StandardFeeRule::Zip317,
                     account_uuid,
-                    zcash_client_backend::data_api::wallet::ConfirmationsPolicy::MIN,
+                    zcash_client_backend::data_api::wallet::ConfirmationsPolicy::default(),
                     &recipient,
                     amount,
                     memo_bytes,
