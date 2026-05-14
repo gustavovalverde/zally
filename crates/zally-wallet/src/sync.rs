@@ -211,10 +211,14 @@ impl Wallet {
             .received_shielded_notes_mined_in_range(scanned_from, outcome.scanned_to_height)
             .await?;
         for note in received_notes {
-            let block_timestamp_ms = timestamps_by_height
-                .get(&note.mined_height.as_u32())
-                .copied()
-                .unwrap_or(0);
+            let block_timestamp_ms = if note.block_timestamp_ms != 0 {
+                note.block_timestamp_ms
+            } else {
+                timestamps_by_height
+                    .get(&note.mined_height.as_u32())
+                    .copied()
+                    .unwrap_or(0)
+            };
             self.publish_event(WalletEvent::ShieldedReceiveObserved {
                 account_id: note.account_id,
                 tx_id: note.tx_id,
@@ -223,6 +227,8 @@ impl Wallet {
                 mined_height: note.mined_height,
                 block_timestamp_ms,
                 pool: shielded_pool_for(note.protocol),
+                is_change: note.is_change,
+                spent_our_inputs: note.spent_our_inputs,
             });
         }
 

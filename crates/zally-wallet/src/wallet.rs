@@ -362,6 +362,29 @@ impl Wallet {
             .collect())
     }
 
+    /// Returns every Sapling and Orchard note ever received by `account_id`, spent or
+    /// unspent. Each record carries the provenance fields (`is_change`, `spent_our_inputs`)
+    /// that let a downstream observer classify the receive identically to the matching
+    /// [`WalletEvent::ShieldedReceiveObserved`] from the live event stream.
+    ///
+    /// Powers operator-side replays that rebuild downstream observation tables from chain
+    /// truth without coupling to the wallet's event stream. Idempotent on the upstream
+    /// side: callers should deduplicate by `(tx_id, output_index, pool)`.
+    ///
+    /// `not_retryable` on unknown account; `retryable` on transient storage I/O.
+    pub async fn list_shielded_receives(
+        &self,
+        account_id: AccountId,
+    ) -> Result<Vec<crate::received_note::ShieldedReceiveRecord>, WalletError> {
+        let rows = self
+            .inner
+            .storage
+            .list_shielded_receives_for_account(account_id)
+            .await
+            .map_err(lift_storage_to_wallet_error)?;
+        Ok(rows.into_iter().map(translate_received_note).collect())
+    }
+
     /// Subscribes to wallet events. The returned stream stays valid until either the wallet
     /// is dropped or the consumer drops the stream.
     #[must_use]
@@ -480,6 +503,27 @@ fn capability_for_storage<St: WalletStorage>() -> StorageCapability {
         StorageCapability::Sqlite
     } else {
         StorageCapability::Custom
+    }
+}
+
+fn translate_received_note(
+    row: zally_storage::ReceivedShieldedNoteRow,
+) -> crate::received_note::ShieldedReceiveRecord {
+    let pool = match row.protocol {
+        zcash_protocol::ShieldedProtocol::Sapling => zally_chain::ShieldedPool::Sapling,
+        zcash_protocol::ShieldedProtocol::Orchard => zally_chain::ShieldedPool::Orchard,
+    };
+    let amount = zally_core::Zatoshis::try_from(row.value_zat)
+        .unwrap_or_else(|_| zally_core::Zatoshis::zero());
+    crate::received_note::ShieldedReceiveRecord {
+        pool,
+        value: amount,
+        tx_id: row.tx_id,
+        output_index: row.output_index,
+        mined_height: row.mined_height,
+        block_timestamp_ms: row.block_timestamp_ms,
+        is_change: row.is_change,
+        spent_our_inputs: row.spent_our_inputs,
     }
 }
 

@@ -47,6 +47,12 @@ pub enum WalletEvent {
     /// receive. `block_timestamp_ms` is the upstream `CompactBlock` header's mined
     /// timestamp converted to milliseconds; consumers should treat it as the authoritative
     /// receive time for window queries (instead of wall clock at observation).
+    ///
+    /// `is_change` and `spent_our_inputs` together let a consumer classify the receive
+    /// without re-fetching the producing transaction. A self-funded change output sets
+    /// both true; a transparent or shielded sweep of the wallet's own funds sets
+    /// `spent_our_inputs` true without `is_change`; a third-party transfer leaves both
+    /// false.
     ShieldedReceiveObserved {
         /// Account that owns the received note.
         account_id: AccountId,
@@ -62,6 +68,11 @@ pub enum WalletEvent {
         block_timestamp_ms: u64,
         /// Shielded pool the note was created on.
         pool: ShieldedPool,
+        /// `zcash_client_sqlite` marked this note as change for the receiving account.
+        is_change: bool,
+        /// The producing transaction spent at least one input owned by the receiving
+        /// account, across Sapling, Orchard, or transparent pools.
+        spent_our_inputs: bool,
     },
     /// Consumer fell behind; `dropped_count` events were skipped before this notification.
     Lagged {

@@ -127,12 +127,19 @@ pub struct UnspentShieldedNoteRow {
 }
 
 /// One shielded note received by an account, in the form returned by
-/// [`WalletStorage::received_shielded_notes_mined_in_range`].
+/// [`WalletStorage::received_shielded_notes_mined_in_range`] and
+/// [`WalletStorage::list_shielded_receives_for_account`].
 ///
 /// Distinguishes itself from [`UnspentShieldedNoteRow`] by including notes that may have
 /// been spent after they were received: the row reports the receive event, not the current
 /// spendability state. Used by the wallet event stream to emit one
-/// `ShieldedReceiveObserved` per note seen in the scanned block range.
+/// `ShieldedReceiveObserved` per note seen in the scanned block range, and by the inflow
+/// classifier to attribute receives to one of three provenance categories.
+///
+/// `is_change` and `spent_our_inputs` together let a consumer label whether the wallet
+/// itself produced this receive. A self-funded change output sets both true; a transparent
+/// or shielded sweep of the wallet's own funds sets `spent_our_inputs` true without
+/// `is_change`; a third-party transfer leaves both false.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub struct ReceivedShieldedNoteRow {
@@ -148,6 +155,18 @@ pub struct ReceivedShieldedNoteRow {
     pub output_index: u32,
     /// Height at which the note's producing transaction was mined.
     pub mined_height: BlockHeight,
+    /// Block header timestamp in milliseconds (Unix epoch), sourced from the
+    /// `blocks.time` column at the row's `mined_height`. The authoritative receive
+    /// time across both the live event path and historical replay.
+    pub block_timestamp_ms: u64,
+    /// True when `zcash_client_sqlite` marked this note as change for the receiving
+    /// account, meaning the receiving account also spent notes in the producing
+    /// transaction and the note is internally-scoped.
+    pub is_change: bool,
+    /// True when the producing transaction's input set includes any UTXO or shielded
+    /// note owned by the receiving account, across the Sapling, Orchard, and
+    /// transparent pools. False for third-party transfers.
+    pub spent_our_inputs: bool,
 }
 
 /// Summary of a successful [`WalletStorage::propose_payment`] call.
@@ -423,5 +442,19 @@ pub trait WalletStorage: Send + Sync + 'static {
         &self,
         from_height: BlockHeight,
         to_height: BlockHeight,
+    ) -> Result<Vec<ReceivedShieldedNoteRow>, StorageError>;
+
+    /// Returns every Sapling and Orchard note ever received by `account_id`, regardless
+    /// of current spent state and regardless of when the note was mined.
+    ///
+    /// Powers operator-side replays that rebuild a downstream observation table from
+    /// chain truth without coupling to the wallet's event stream. Each row carries the
+    /// same provenance fields (`is_change`, `spent_our_inputs`) as the event-stream
+    /// path, so the consumer can classify historical receives identically to live ones.
+    ///
+    /// `not_retryable` on unknown account or schema errors; `retryable` on transient I/O.
+    async fn list_shielded_receives_for_account(
+        &self,
+        account_id: AccountId,
     ) -> Result<Vec<ReceivedShieldedNoteRow>, StorageError>;
 }
