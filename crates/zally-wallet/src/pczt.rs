@@ -10,7 +10,7 @@ use zally_chain::Submitter;
 use zally_core::{BlockHeight, Network};
 use zally_pczt::{PcztBytes, Prover, Signer};
 
-use crate::spend::{FeeStrategy, ProposalPlan, SendOutcome};
+use crate::spend::{ProposalPlan, SendOutcome};
 use crate::wallet::Wallet;
 use crate::wallet_error::WalletError;
 
@@ -143,11 +143,6 @@ fn validate_proposal_plan(plan: &ProposalPlan, wallet_network: Network) -> Resul
     if plan.amount_zat.as_u64() == 0 {
         return Err(WalletError::ProposalRejected {
             reason: "amount must be positive".into(),
-        });
-    }
-    if !matches!(plan.fee, FeeStrategy::Conventional) {
-        return Err(WalletError::ProposalRejected {
-            reason: "only ZIP-317 conventional fee is wired in v1".into(),
         });
     }
     Ok(())

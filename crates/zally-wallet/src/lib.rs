@@ -21,8 +21,8 @@ pub use metrics::WalletMetrics;
 pub use received_note::ShieldedReceiveRecord;
 pub use retry::{IsRetryable, RetryPolicy, with_retry};
 pub use spend::{
-    FeeStrategy, ParsedPayment, PaymentRequest, Proposal, ProposalPlan, SendOutcome,
-    SendPaymentPlan, ShieldTransparentPlan,
+    ParsedPayment, PaymentRequest, Proposal, ProposalPlan, SendOutcome, SendPaymentPlan,
+    ShieldTransparentPlan,
 };
 pub use status::{SyncStatus, WalletStatus};
 pub use sync::{

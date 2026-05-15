@@ -7,7 +7,7 @@ Zally is library-shaped. It does not own a process, RPC listener, config file, s
 | Crate | Operational responsibility |
 |-------|----------------------------|
 | `zally-chain` | Source-neutral chain reads, chain-event envelopes, and transaction submission. |
-| `zally-storage` | Durable wallet state and scanner persistence. |
+| `zally-storage` | Durable wallet state, scanner persistence, proposal construction, and wallet-db queueing. |
 | `zally-wallet` | Wallet lifecycle, status, sync driver, proposal, signing, submission orchestration, and wallet events. |
 | `zally-testkit` | In-process mocks, live-test gates, and live-test environment conventions. |
 
@@ -24,6 +24,12 @@ Zinder remains a `ChainSource` and `Submitter` implementation. Zally public wall
 - `circuit_breaker`: current outbound IO breaker state.
 
 `Wallet::metrics_snapshot()` is a metrics adapter source. It must be derivable from `WalletStatus` and must not invent a second truth for scan progress.
+
+## Storage Execution
+
+`SqliteWalletStorage` is a cheap clone handle over one wallet-db actor. The actor owns the `zcash_client_sqlite::WalletDb` and the Zally ledger connection on one blocking thread. Public storage methods send bounded work items to that actor and await a typed reply.
+
+The actor gives Zally one storage serialization point, one queue-depth signal, and one place where blocking librustzcash wallet operations run. Callers observe pressure through `SqliteWalletStorage::queue_depth()`. Queue depth near capacity means storage cannot keep up with wallet sync, proposal construction, or balance reads.
 
 ## Sync Driver
 

@@ -14,30 +14,6 @@ use zally_core::{
 use crate::wallet::Wallet;
 use crate::wallet_error::WalletError;
 
-/// Fee strategy for proposal construction.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-#[non_exhaustive]
-pub enum FeeStrategy {
-    /// ZIP-317 conventional fee. The default.
-    Conventional,
-    /// Flat fee in zatoshis. Operator opt-in for advanced cases.
-    Custom {
-        /// Flat fee value.
-        fee_zat: Zatoshis,
-    },
-}
-
-#[allow(
-    clippy::derivable_impls,
-    reason = "explicit Default keeps the variant name in scope"
-)]
-impl Default for FeeStrategy {
-    fn default() -> Self {
-        Self::Conventional
-    }
-}
-
 /// Parsed ZIP-321 payment request.
 #[derive(Clone, Debug)]
 pub struct PaymentRequest {
@@ -208,11 +184,6 @@ impl Wallet {
         validate_recipient_network(&plan.recipient, self.network())?;
         validate_memo_against_recipient(plan.memo.as_ref(), &plan.recipient)?;
         validate_non_zero(plan.amount_zat)?;
-        if !matches!(plan.fee, FeeStrategy::Conventional) {
-            return Err(WalletError::ProposalRejected {
-                reason: "only ZIP-317 conventional fee is wired in v1".into(),
-            });
-        }
         let recipient_encoded = plan.recipient.encoded().to_owned();
         let memo_bytes = plan.memo.as_ref().map(memo_to_wire_bytes);
         let summary = self
@@ -246,11 +217,6 @@ impl Wallet {
         validate_recipient_network(&plan.recipient, self.network())?;
         validate_memo_against_recipient(plan.memo.as_ref(), &plan.recipient)?;
         validate_non_zero(plan.amount_zat)?;
-        if !matches!(plan.fee, FeeStrategy::Conventional) {
-            return Err(WalletError::ProposalRejected {
-                reason: "only ZIP-317 conventional fee is wired in v1".into(),
-            });
-        }
         if plan.submitter.network() != self.network() {
             return Err(WalletError::NetworkMismatch {
                 storage: self.network(),
@@ -476,12 +442,10 @@ pub struct ProposalPlan {
     pub amount_zat: Zatoshis,
     /// Optional memo (rejected for transparent recipients).
     pub memo: Option<Memo>,
-    /// Fee strategy.
-    pub fee: FeeStrategy,
 }
 
 impl ProposalPlan {
-    /// Constructs a plan with the conventional ZIP-317 fee strategy.
+    /// Constructs a ZIP-317 conventional-fee proposal plan.
     #[must_use]
     pub fn conventional(
         account_id: AccountId,
@@ -494,7 +458,6 @@ impl ProposalPlan {
             recipient,
             amount_zat,
             memo,
-            fee: FeeStrategy::Conventional,
         }
     }
 }
@@ -512,8 +475,6 @@ pub struct SendPaymentPlan<'submitter> {
     pub amount_zat: Zatoshis,
     /// Optional memo (rejected for transparent recipients).
     pub memo: Option<Memo>,
-    /// Fee strategy.
-    pub fee: FeeStrategy,
     /// Submitter that delivers the signed transaction.
     pub submitter: &'submitter dyn Submitter,
 }
@@ -550,7 +511,7 @@ impl<'submitter> ShieldTransparentPlan<'submitter> {
 }
 
 impl<'submitter> SendPaymentPlan<'submitter> {
-    /// Constructs a plan with the conventional ZIP-317 fee strategy and no memo.
+    /// Constructs a ZIP-317 conventional-fee send plan with no memo.
     #[must_use]
     pub fn conventional(
         account_id: AccountId,
@@ -565,7 +526,6 @@ impl<'submitter> SendPaymentPlan<'submitter> {
             recipient,
             amount_zat,
             memo: None,
-            fee: FeeStrategy::Conventional,
             submitter,
         }
     }

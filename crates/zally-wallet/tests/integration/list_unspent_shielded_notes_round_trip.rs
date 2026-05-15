@@ -2,8 +2,7 @@
 //! and computes confirmations against the persisted observed tip.
 //!
 //! The test bypasses the scanner: a fresh wallet has no on-chain notes, so we verify the
-//! method returns an empty list and does not error. End-to-end coverage with a funded note
-//! lands once an operator-funded fixture is plumbed (fauzec phase 2 staging soak).
+//! method returns an empty list and does not error.
 
 use zally_chain::ChainSource as _;
 use zally_core::{BlockHeight, Network};

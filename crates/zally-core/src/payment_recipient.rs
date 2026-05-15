@@ -18,7 +18,7 @@ pub enum PaymentRecipient {
         /// Network the address is bound to.
         network: Network,
     },
-    /// Encoded Sapling z-address. Legacy operator support; UAs are preferred.
+    /// Encoded Sapling z-address.
     SaplingAddress {
         /// Bech32-encoded address.
         encoded: String,

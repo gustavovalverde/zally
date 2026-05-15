@@ -2,12 +2,9 @@
 //! wallet returns `Ok(vec![])` and propagates the configured target height into the
 //! upstream query without panicking.
 //!
-//! Funded-wallet coverage (a real Sapling/Orchard unspent note round-tripping through the
-//! upstream `InputSource::select_unspent_notes` query) lands once fauzec's phase 2 staging
-//! soak provides a deterministic on-chain fixture. Inserting synthetic rows directly into
-//! `sapling_received_notes` / `orchard_received_notes` would bypass the upstream's
-//! account-membership invariants and produce false positives, so this slice tests the
-//! empty-account branch only and defers funded coverage to phase 2.
+//! This test intentionally covers the empty-account branch only. Inserting synthetic
+//! rows directly into `sapling_received_notes` / `orchard_received_notes` would bypass
+//! upstream account-membership invariants and produce false positives.
 
 use tempfile::TempDir;
 use zally_core::{AccountId, BlockHeight};

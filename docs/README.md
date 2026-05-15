@@ -5,13 +5,11 @@ This documentation set defines Zally's product scope, library boundaries, and na
 ## Architecture
 
 - [Public interfaces](architecture/public-interfaces.md): the vocabulary spine. Every other doc, ADR, type, and config field defers to the conventions here. Read this before writing any public type.
-- [Operational surfaces](architecture/operational-surfaces.md): wallet status, sync driver, bootstrap outcome, and live-proof contracts.
+- [Operational surfaces](architecture/operational-surfaces.md): wallet status, storage execution, sync driver, bootstrap outcome, and live-proof contracts.
 
 ## ADRs
 
 - [ADR-0001: Workspace crate boundaries](adrs/0001-workspace-crate-boundaries.md)
-- [ADR-0002: Implementation patterns](adrs/0002-implementation-patterns.md)
-- [ADR-0003: Embeddable wallet operations](adrs/0003-embeddable-wallet-operations.md)
 
 ## Reference
 
@@ -27,8 +25,8 @@ Operational procedures for running Zally against the workspace and external syst
 
 ## Document lifecycles
 
-Each tree under `docs/` has its own retire-on-ship rule.
+Each tree under `docs/` has its own lifecycle.
 
-- **Architecture**: the durable spine. Explains why each contract exists, what its invariants are, and where its boundary lives. Edited in place when the contract changes. Updated in the same PR as the code that alters the contract. References other architecture docs and at most one ADR per topic.
-- **ADRs**: numbered, present-tense records of accepted decisions. Edited in place for clarifications; substantive design changes get a new ADR with a contiguous number that supersedes the old.
+- **Architecture**: the durable spine. Explains each contract, its invariants, and its boundary. Edited in place when the contract changes. Updated in the same PR as the code that alters the contract. References other architecture docs and at most one ADR per topic.
+- **ADRs**: numbered, present-tense records of accepted decisions that still explain the current code shape. Edited in place for clarifications; substantive design changes get a new ADR with a contiguous number.
 - **Runbooks**: operational procedures with explicit prereqs, command lines, and expected outcomes. Edited in place as procedures evolve; reference architecture docs and ADRs but do not describe architectural intent.

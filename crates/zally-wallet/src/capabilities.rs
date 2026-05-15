@@ -59,7 +59,7 @@ pub enum Capability {
     Zip316UnifiedAddresses,
     /// ZIP-302 memo encoding and the memo-on-transparent guard.
     Zip302Memos,
-    /// ZIP-320 TEX address handling and the no-shielded-input guard.
+    /// ZIP-320 TEX address recognition at the API boundary.
     Zip320TexAddresses,
     /// ZIP-317 conventional-fee default.
     Zip317ConventionalFee,

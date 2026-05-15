@@ -64,7 +64,7 @@ Crate boundaries are recorded in [ADR-0001](docs/adrs/0001-workspace-crate-bound
 - `zally-chain`: `ChainSource` and `Submitter` traits. A `ZinderChainSource` plus `ZinderSubmitter` implementation ships behind the `zinder` cargo feature; operators with a different chain plane provide their own implementation of the traits.
 - `zally-pczt`: PCZT roles (`Creator`, `Prover`, `Signer`, `Combiner`, `Extractor`) for HSM and multi-party signing.
 - `zally-wallet`: high-level operator API. Includes the scan-loop module (orchestrating `ChainSource` plus `WalletStorage`).
-- `zally-testkit`: fixtures, mock chain sources, in-memory storage, regtest helpers. Behind a feature flag so it never lands in operator binaries.
+- `zally-testkit`: fixtures, mock chain sources, mock submitters, live-test guards, and regtest helpers. Behind a feature flag so it never lands in operator binaries.
 
 ## Validation gate
 
@@ -92,7 +92,6 @@ Start here:
 
 - [Public interfaces](docs/architecture/public-interfaces.md): the vocabulary spine. Naming rules, error vocabulary, type conventions, config rules, capability surface, ZIP coverage. Read before writing any public type.
 - [ADR-0001](docs/adrs/0001-workspace-crate-boundaries.md): workspace crate boundaries.
-- [ADR-0002](docs/adrs/0002-implementation-patterns.md): implementation patterns shared by every crate.
 - [Documentation index](docs/README.md): full index with lifecycle rules.
 
 ## License

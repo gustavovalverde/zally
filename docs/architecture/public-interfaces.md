@@ -14,7 +14,7 @@ These words carry no bounded context. If a name needs them to be intelligible, t
 - `data`, `info`, `item`, `result`, `stuff`, `thing`, `tmp`, `value`, `payload`
 - `obj`, `foo`, `bar`
 
-As suffixes on type names: `*Service`, `*Server`, `*Api`, `*Manager`, `*Processor`, `*Helper`, `*Util`, `*Data`, `*Info`. Kept: `*Error` (standard trait extension), `*Strategy` (rule bundle, e.g., `FeeStrategy`), `*Source` (read seam, e.g., `ChainSource`), `*Storage` (write seam, e.g., `WalletStorage`).
+As suffixes on type names: `*Service`, `*Server`, `*Api`, `*Manager`, `*Processor`, `*Helper`, `*Util`, `*Data`, `*Info`. Kept: `*Error` (standard trait extension), `*Source` (read seam, e.g., `ChainSource`), `*Storage` (write seam, e.g., `WalletStorage`).
 
 ### Required suffixes on numeric and lifecycle identifiers
 
@@ -64,7 +64,7 @@ Forbidden verbs for domain operations: `handle_*`, `process_*`, `manage_*`, `do_
 
 A name must survive a change of its implementation.
 
-- Banned patterns: `new_x`, `x2`, `legacy_x`, `x_old`, `x_final`, `x_real`, `x_actual`, `x_improved`. These are migration scars.
+- Banned patterns: `new_x`, `x2`, `legacy_x`, `x_old`, `x_final`, `x_real`, `x_actual`, `x_improved`. These names describe history instead of domain meaning.
 - Banned implementation leaks: `sqlite_storage` (the implementation is `WalletStorage` with `SqliteWalletStorage` as one impl, not `SqliteStorage`), `zinder_chain` (`ChainSource` with `ZinderChainSource` as one impl).
 - Protocol names are domain, not implementation, and stay: `pczt`, `frost`, `zip32`, `zip316`, `zip321`, `zip317`, `zip320`, `tex`. These appear verbatim in identifiers.
 
@@ -123,7 +123,7 @@ Traits exposing pluggable boundaries (`ChainSource`, `Submitter`, `WalletStorage
 - Trait-associated `Error` type, always typed.
 - `async fn` methods where I/O is involved; no blocking-await on async-runtime threads.
 - Documented retry posture per method (in rustdoc): does the method retry internally, expect the caller to retry, or fail fast?
-- A reference implementation in the same crate that exercises every method and is used by `zally-testkit` for fixtures.
+- A reference implementation in the same crate that exercises every method.
 
 ## Error vocabulary
 
@@ -135,7 +135,7 @@ Each error variant has a documented retry posture in its rustdoc:
 - **`not_retryable`**: same call will fail the same way. Invalid input, protocol violation, exhausted balance.
 - **`requires_operator`**: caller cannot fix; an operator must intervene. Sealed-seed integrity failure, schema mismatch, lost wallet database.
 
-The full enum is recorded in `docs/reference/error-vocabulary.md` (added as the first crate's errors land). A new error variant requires an entry there before merging.
+The full enum is recorded in `docs/reference/error-vocabulary.md`. A new error variant requires an entry there before merging.
 
 Error names are `{Domain}Error`:
 
@@ -145,11 +145,11 @@ Variants describe *what failed*, not *how*. `WalletError::MemoOnTransparentRecip
 
 ## Config and env var conventions
 
-Zally is library-shaped today and does not own a TOML config. Crates that surface configuration (e.g., `ZinderChainSource` connection settings) do so through typed Rust builders, not through a config file Zally owns.
+Zally is library-shaped and does not own a TOML config. Crates that surface configuration (e.g., `ZinderChainSource` connection settings) do so through typed Rust builders, not through a config file Zally owns.
 
 When operators integrating Zally do construct their own TOML or env-var layout, the recommended conventions match Zinder's:
 
-- Env var prefix per consumer: a faucet might use `FAUZEC_`, a payment processor `PAY_`. Zally itself does not prescribe one.
+- Env var prefix per consumer: for example, `WALLET_` or an application-specific product prefix. Zally itself does not prescribe one.
 - Test-only env vars (read by `zally-testkit`) use `ZALLY_TEST_*`. Production binaries strip these.
 - Live-node gate: `ZALLY_TEST_LIVE=1`. Mainnet allowance: `ZALLY_TEST_ALLOW_MAINNET=1`.
 - Sensitive leaves (`password`, `secret`, `token`, `key`, `seed`, `wif`) are never set via env var on their own; they come from a secret manager or sealed at-rest material.
@@ -159,7 +159,7 @@ When operators integrating Zally do construct their own TOML or env-var layout, 
 Per the Zally identifier-naming and codebase-structure rules:
 
 - File names match the primary export. `wallet.rs` exports `Wallet`; `chain_source.rs` exports the `ChainSource` trait and its default implementation.
-- No `mod.rs` files in new code. Use `{module_name}.rs` siblings.
+- No `mod.rs` files. Use `{module_name}.rs` siblings.
 - No `index.rs`, no `lib_internal.rs`, no other barrel-shaped names. Each file declares what it exports.
 - No stuttering paths: inside the `keys/` directory the file is `sealing.rs`, not `keys_sealing.rs`.
 - No single-file directories. If `keys/` contains only `sealing.rs`, promote to `keys_sealing.rs` at the crate root.
@@ -227,8 +227,8 @@ The contract surface Zally publishes, grouped by domain. Each item is a guarante
 
 - **SPEND-1**: `Wallet::send_payment(SendPaymentPlan) -> SendOutcome`. Transparent and shielded recipients both supported.
 - **SPEND-2**: Refuse memo on transparent recipient (ZIP-302) at API call; typed error variant.
-- **SPEND-3**: TEX address support per ZIP-320: refuse shielded inputs when paying TEX recipient.
-- **SPEND-4**: Conventional fee per ZIP-317 by default; `FeeStrategy::Custom(Zatoshis)` for advanced operators.
+- **SPEND-3**: TEX address support per ZIP-320: model TEX recipients distinctly and reject memos as transparent recipients.
+- **SPEND-4**: Conventional fee per ZIP-317.
 - **SPEND-5**: `nExpiryHeight` set per ZIP-203.
 - **SPEND-6**: ZIP-321 payment URI parsing through `PaymentRequest::from_uri`.
 - **SPEND-7**: `Wallet::shield_transparent_funds(ShieldTransparentPlan) -> SendOutcome` explicitly shields wallet-owned transparent UTXOs before shielded spending.
@@ -244,7 +244,7 @@ The contract surface Zally publishes, grouped by domain. Each item is a guarante
 
 ### Observability (OBS)
 
-- **OBS-1**: `tracing` spans on every public async method with documented field schema.
+- **OBS-1**: explicit `tracing` events at meaningful state transitions with documented event names and fields. No blanket method-entry instrumentation.
 - **OBS-2**: `Wallet::metrics_snapshot() -> WalletMetrics` returns a typed metrics snapshot derived from the same persisted progress as `WalletStatus`.
 - **OBS-3**: `WalletEvent` async stream documented as the canonical push notification channel for state changes.
 - **OBS-4**: `SyncHandle::observe_status() -> SyncSnapshotStream` is the canonical push channel for sync-driver lifecycle state.
@@ -262,7 +262,7 @@ The contract surface Zally publishes, grouped by domain. Each item is a guarante
 
 ## ZIP compliance surface
 
-Which ZIPs Zally implements, which are designed-for-forward-compatibility, and which are out of scope.
+Which ZIPs Zally implements directly, which it inherits through librustzcash, and which are out of scope.
 
 ### Implemented
 
@@ -276,16 +276,16 @@ Which ZIPs Zally implements, which are designed-for-forward-compatibility, and w
 - **ZIP-302**: Memo encoding (current 512-byte format). Encoded and decoded per spec.
 - **ZIP-315**: Wallet best practices. Explicit transparent shielding, trusted vs untrusted TXO accounting, confirmation-depth defaults aligned with the ZIP.
 - **ZIP-316**: Unified Addresses, UFVKs, UIVKs. First-class address type; UFVK export.
-- **ZIP-317**: Conventional fee mechanism. Default fee strategy.
-- **ZIP-320**: TEX addresses. Recognised, refused-on-shielded-input enforced at spend.
+- **ZIP-317**: Conventional fee mechanism.
+- **ZIP-320**: TEX addresses. Recognised as transparent recipients at the API boundary.
 - **ZIP-321**: Payment request URIs. First-class `PaymentRequest` type.
 - **ZIP-401**: Mempool DoS protection. Submission retries respect mempool eviction.
 
-### Designed-for-forward-compatibility (API hooks; not enforced today)
+### Reserved By Shape
 
-- **ZIP-230**: v6 transaction format (NU7, OrchardZSA). Builder API structured so a v6 path lands as an additive enum variant.
-- **ZIP-231**: Memo bundles. Memo API takes an opaque `Memo` value; ZIP-231 memo bundle variants slot in when ratified.
-- **ZIP-312**: FROST spend authorisation. PCZT signer trait designed so FROST coordinator integration lands as an alternative `Signer` implementation.
+- **ZIP-230**: v6 transaction format (NU7, OrchardZSA). Transaction construction stays behind wallet/storage methods so a v6 path does not leak librustzcash internals.
+- **ZIP-231**: Memo bundles. Memo API takes an opaque `Memo` value rather than exposing a Zally-owned memo enum.
+- **ZIP-312**: FROST spend authorisation. PCZT signing stays in `zally-pczt`, separate from wallet sync and storage.
 
 ### Out of scope
 

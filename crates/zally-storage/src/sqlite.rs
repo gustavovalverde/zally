@@ -3,15 +3,9 @@
 //! Every wallet-db call funnels through a single-threaded **wallet-db actor**.
 //! One owned thread owns the [`WalletDb`] and the ledger [`rusqlite::Connection`];
 //! callers send type-erased [`DbWork`] closures over a bounded `mpsc` channel and
-//! await a `oneshot` reply. This shape replaces the older
-//! `Arc<Mutex<Option<Db>>> + spawn_blocking + blocking_lock()` design, which
-//! parked an OS thread per call and serialised every operation behind the
-//! multi-second proving window held by `prepare_payment` (zk-SNARK proof
-//! generation runs while the wallet-db mutex is held). With the actor, that
-//! same serialisation still happens (`rusqlite::Connection` is `!Sync` and
-//! wants one thread), but the request queue is bounded, observable, and
-//! visible to backpressure instead of saturating the tokio blocking pool with
-//! 512 parked threads.
+//! await a `oneshot` reply. `rusqlite::Connection` is `!Sync`, and librustzcash
+//! proposal construction can hold wallet-db access while proving. The actor makes
+//! that serialization explicit, bounded, and observable.
 //!
 //! [`SqliteWalletStorage`] is a cheap [`Clone`] handle holding only the
 //! channel sender; the actor lives until every clone is dropped.
@@ -139,10 +133,9 @@ impl SqliteWalletStorage {
         }
     }
 
-    /// Current number of work items queued on the actor. Exposed for the
-    /// runtime's `fauzec_wallet_db_queue_depth` metric: a depth that stays
-    /// near `WALLET_DB_QUEUE_CAPACITY` means the actor cannot keep up with
-    /// incoming load.
+    /// Current number of work items queued on the actor. A depth that stays
+    /// near the queue capacity means the actor cannot keep up with incoming
+    /// load.
     #[must_use]
     pub fn queue_depth(&self) -> usize {
         WALLET_DB_QUEUE_CAPACITY - self.request_tx.capacity()

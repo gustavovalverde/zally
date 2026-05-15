@@ -2,11 +2,8 @@
 //! an empty wallet returns `Ok(vec![])` and accepts both a freshly-created account and an
 //! unknown account UUID without panicking.
 //!
-//! Funded coverage (real Sapling/Orchard receives round-tripping through the new query
-//! with `is_change` and `spent_our_inputs` populated) lands once fauzec's staging soak
-//! provides a deterministic on-chain fixture, for the same reason
-//! `list_unspent_shielded_notes_round_trip.rs` defers funded coverage: inserting synthetic
-//! rows directly into the per-pool received-notes tables would bypass the upstream's
+//! This test intentionally covers the empty-account branch only. Inserting synthetic
+//! rows directly into the per-pool received-notes tables would bypass upstream
 //! account-membership and spend-tracking invariants and produce false positives.
 
 use tempfile::TempDir;

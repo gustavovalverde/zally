@@ -5,8 +5,8 @@ use uuid::Uuid;
 /// Opaque identifier for an account within a wallet.
 ///
 /// Backed by a UUID v4 generated when the account is first created. For the default sqlite
-/// storage backend, translation to `zcash_client_sqlite::AccountUuid` is the identity function
-/// on the inner `Uuid` (see ADR-0002 Decision 3).
+/// storage backend, translation to `zcash_client_sqlite::AccountUuid` is the identity
+/// function on the inner `Uuid`.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct AccountId(Uuid);
