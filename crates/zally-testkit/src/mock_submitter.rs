@@ -157,7 +157,7 @@ mod tests {
 
     #[tokio::test]
     async fn mock_submitter_accepts_and_records() -> Result<(), SubmitterError> {
-        let submitter = MockSubmitter::accepting(Network::regtest_all_at_genesis());
+        let submitter = MockSubmitter::accepting(Network::regtest());
         let handle = submitter.handle();
         let outcome = submitter.submit(&[1, 2, 3]).await?;
         assert!(matches!(outcome, SubmitOutcome::Accepted { .. }));

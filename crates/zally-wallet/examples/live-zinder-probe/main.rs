@@ -49,7 +49,6 @@ async fn main() -> Result<(), ExampleError> {
         endpoint: endpoint.clone(),
         network,
     })
-    .await
     .map_err(ExampleError::Chain)?;
 
     let tip = chain.chain_tip().await.map_err(ExampleError::Chain)?;
@@ -210,7 +209,7 @@ fn network_from_env() -> Result<Network, ExampleError> {
     match env::var("ZALLY_NETWORK").as_deref() {
         Ok("mainnet") => Ok(Network::Mainnet),
         Ok("testnet") => Ok(Network::Testnet),
-        Ok("regtest") | Err(_) => Ok(Network::regtest_all_at_genesis()),
+        Ok("regtest") | Err(_) => Ok(Network::regtest()),
         Ok(other) => Err(ExampleError::UnknownNetwork(other.to_owned())),
     }
 }

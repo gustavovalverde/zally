@@ -54,7 +54,7 @@ mod tests {
 
     #[test]
     fn creator_round_trips_network() {
-        let creator = Creator::new(Network::regtest_all_at_genesis());
-        assert_eq!(creator.network(), Network::regtest_all_at_genesis());
+        let creator = Creator::new(Network::regtest());
+        assert_eq!(creator.network(), Network::regtest());
     }
 }

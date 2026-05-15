@@ -59,7 +59,7 @@ mod tests {
     fn derive_ufvk_deterministic() -> Result<(), KeyDerivationError> {
         let mnemonic = Mnemonic::generate();
         let seed = SeedMaterial::from_mnemonic(&mnemonic, "");
-        let network = Network::regtest_all_at_genesis();
+        let network = Network::regtest();
         let index = zip32::AccountId::ZERO;
 
         let ufvk1 = derive_ufvk(network, &seed, index)?;

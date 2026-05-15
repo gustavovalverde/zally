@@ -8,11 +8,13 @@ use zally_wallet::{Wallet, WalletError, WalletEvent};
 #[tokio::test]
 async fn observe_emits_scan_progress() -> Result<(), TestError> {
     let temp = TempWalletPath::create()?;
-    let network = Network::regtest_all_at_genesis();
+    let network = Network::regtest();
 
     let sealing = InMemorySealing::new();
-    let storage =
-        SqliteWalletStorage::new(SqliteWalletStorageOptions::for_local_tests(temp.db_path()));
+    let storage = SqliteWalletStorage::new(SqliteWalletStorageOptions::for_network(
+        network,
+        temp.db_path(),
+    ));
     let chain = zally_testkit::MockChainSource::new(network);
     let (wallet, _, _) =
         Wallet::create(&chain, network, sealing, storage, BlockHeight::from(1)).await?;

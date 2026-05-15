@@ -1,4 +1,4 @@
-//! `Combiner` role: merges multiple signed PCZTs.
+//! `Combiner` role: merges multiple authorized PCZTs.
 //!
 //! Used for FROST quorum signatures and multi-party signer flows. Validates that every
 //! input PCZT shares the same network before delegating to the upstream
@@ -9,7 +9,7 @@ use zally_core::Network;
 use crate::pczt_bytes::PcztBytes;
 use crate::pczt_error::PcztError;
 
-/// Merges multiple signed PCZTs.
+/// Merges multiple authorized PCZTs.
 #[derive(Debug, Default)]
 pub struct Combiner;
 

@@ -177,22 +177,25 @@ Domain-specific scalar fields use `snake_case` with spine unit suffixes (`tip_he
 - *`#[tracing::instrument]` on every async method.* Cons: pollutes logs with entry/exit; risks capturing sensitive arguments; obscures what an event *means*. **Rejected**.
 - *No tracing in library code; let the operator instrument.* Cons: operators consistently want structured progress events; making them add the events ex-post defeats the observability contract. **Rejected**.
 
-### 7. Builder discipline: no `Default` for prod/test divergent options
+### 7. Builder discipline: network-explicit options
 
-Options structs that carry production-vs-test divergence (sync fsync policy, retry budgets, log levels, anchor depth defaults) have no `Default` impl. Constructors are explicit:
+Options structs that bind to chain state take the network explicitly. Tests use the same
+constructor as production code so hidden regtest defaults cannot drift away from the live stack:
 
 ```rust
 pub struct SqliteWalletStorageOptions { /* ... */ }
 
 impl SqliteWalletStorageOptions {
-    pub const fn for_network(network: Network) -> Self { /* production-safe defaults */ }
-    pub const fn for_local_tests() -> Self { /* fast, fsync=false, regtest anchor */ }
+    pub fn for_network(network: Network, db_path: PathBuf) -> Self { /* ... */ }
 }
 ```
 
-`..Default::default()` cannot accidentally inherit test-safe options in production code because there is no `Default` impl to spread.
+`Network::regtest()` is the local Zebra/Zinder topology. Custom regtest topologies construct
+`Network::Regtest(LocalNetwork)` directly from the node's activation table.
 
-**Why this:** prevents the production-vs-test contamination class of bug. An options struct that ships test defaults in production is the kind of mistake that survives code review (the defaults look reasonable in isolation) but fails in deployment.
+**Why this:** prevents the production-vs-test contamination class of bug. An options struct that
+silently chooses a regtest network in tests can make the runtime constructor look simpler while
+teaching callers the wrong habit.
 
 **Alternatives considered:**
 
@@ -271,7 +274,7 @@ The feature is gated rather than always-on because not every consumer wants the 
 
 - Does every public async method that touches librustzcash use `spawn_blocking`?
 - Does every retryable error variant carry `is_retryable: bool`? Does every enum expose `is_retryable()`? Does every variant's rustdoc tag the posture?
-- Does every options struct with prod/test divergence have `for_network` and `for_local_tests` (and no `Default`)?
+- Does every options struct that binds to chain state require an explicit `Network`?
 - Does every public capability addition land as a `#[non_exhaustive]` enum variant?
 - Does every new example compile under `-D warnings` with no `unwrap`?
 

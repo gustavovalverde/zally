@@ -2,8 +2,8 @@
 
 use zally_core::Network;
 
-/// Error returned by [`crate::Creator`], [`crate::Signer`], [`crate::Combiner`], or
-/// [`crate::Extractor`].
+/// Error returned by [`crate::Creator`], [`crate::Prover`], [`crate::Signer`],
+/// [`crate::Combiner`], or [`crate::Extractor`].
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum PcztError {

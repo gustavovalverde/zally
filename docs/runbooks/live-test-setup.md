@@ -24,16 +24,22 @@ The repo defines two nextest profiles:
 
 ## Regtest (recommended for local iteration)
 
-1. Bring up a Zebra (`z3`) regtest node listening on `127.0.0.1:18232` with cookie auth enabled.
-2. Locate the cookie file the node wrote to disk and copy the cookie value.
-3. Run:
+1. Bring up or reuse a Zebra regtest node. The local `z3` sidecar stack exposes JSON-RPC on `127.0.0.1:39232`.
+2. Bring up or reuse a `zinder-ingest` + `zinder-query` pair for that node. See [Bringing up a zinder-backed chain source](#bringing-up-a-zinder-backed-chain-source).
+3. Verify readiness:
+
+   ```sh
+   curl -sS --fail http://127.0.0.1:9105/readyz
+   curl -sS --fail http://127.0.0.1:9106/readyz
+   ```
+
+4. Run:
 
    ```sh
    ZALLY_TEST_LIVE=1 \
      ZALLY_NETWORK=regtest \
-     ZALLY_NODE__JSON_RPC_ADDR=http://127.0.0.1:18232 \
-     ZALLY_NODE__COOKIE_VALUE=__cookie__:<value> \
-     cargo nextest run --profile=ci-live --run-ignored=all
+     ZINDER_ENDPOINT=http://127.0.0.1:9101 \
+     cargo nextest run --profile=ci-live --features zinder --run-ignored=all
    ```
 
 ## Public testnet
@@ -41,8 +47,8 @@ The repo defines two nextest profiles:
 ```sh
 ZALLY_TEST_LIVE=1 \
   ZALLY_NETWORK=testnet \
-  ZALLY_NODE__JSON_RPC_ADDR=https://testnet-zebra.example/ \
-  cargo nextest run --profile=ci-live --run-ignored=all
+  ZINDER_ENDPOINT=http://127.0.0.1:9203 \
+  cargo nextest run --profile=ci-live --features zinder --run-ignored=all
 ```
 
 ## Mainnet (gated behind explicit acknowledgement)
@@ -53,15 +59,15 @@ Mainnet runs require an extra acknowledgement environment variable on top of `ZA
 ZALLY_TEST_LIVE=1 \
   ZALLY_TEST_ALLOW_MAINNET=1 \
   ZALLY_NETWORK=mainnet \
-  ZALLY_NODE__JSON_RPC_ADDR=https://mainnet-zebra.example/ \
-  cargo nextest run --profile=ci-live --run-ignored=all
+  ZINDER_ENDPOINT=https://mainnet-zinder.example/ \
+  cargo nextest run --profile=ci-live --features zinder --run-ignored=all
 ```
 
 **Never** run live tests against an operator-owned mainnet wallet without explicit confirmation in the same operations session. The test runner does not validate which wallet it is talking to; if the sealed file points at a real account, real funds are at stake.
 
 ## Bringing up a zinder-backed chain source
 
-Tests that exercise `ZinderChainSource` need a running `zinder-ingest` + `zinder-query` pair against the node above. The `live_zinder_chain_source.rs` test target and the `live-zinder-probe` example both read `ZINDER_ENDPOINT` for the query process address.
+Tests that exercise `ZinderChainSource` need a running `zinder-ingest` + `zinder-query` pair against the node above. The `live_zinder_chain_source.rs` test target, the funded wallet proof, and the `live-zinder-probe` example all read `ZINDER_ENDPOINT` for the query process address.
 
 Pre-requisites:
 
@@ -119,7 +125,7 @@ Verify Zally connects:
 
 ```sh
 ZINDER_ENDPOINT=http://127.0.0.1:9101 ZALLY_NETWORK=regtest \
-  cargo run --example live-zinder-probe --features zinder
+  cargo run -p zally-wallet --example live-zinder-probe --features zinder
 ```
 
 Expected output: `live_zinder_tip_observed tip_height=<N>` then `live_zinder_sync_outcome scanned_to_height=<N>`.
@@ -158,8 +164,43 @@ Verify Zally connects:
 
 ```sh
 ZINDER_ENDPOINT=http://127.0.0.1:9203 ZALLY_NETWORK=testnet \
-  cargo run --example live-zinder-probe --features zinder
+  cargo run -p zally-wallet --example live-zinder-probe --features zinder
 ```
+
+## Funded Zinder wallet proof
+
+The funded T3 wallet test proves the full library path:
+
+1. Create a Zally wallet.
+2. Derive a Unified Address with a transparent receiver.
+3. Fund that receiver by spending a mature deterministic regtest coinbase.
+4. Mine enough regtest blocks for transparent and shielded spends.
+5. Let `SyncDriver` catch up through `ZinderChainSource`.
+6. Shield the transparent UTXO through `Wallet::shield_transparent_funds`.
+7. Send a payment through `Wallet::send_payment` and `ZinderSubmitter`.
+8. Propose, prove, sign, extract, and submit a PCZT.
+
+It is regtest-only because it spends a mature regtest coinbase controlled by the testkit key.
+It does not require Zallet or a separate funder wallet. The test derives regtest upgrade
+activations from the running node so Zally's transaction builder matches the node's active
+consensus branch.
+
+```sh
+ZALLY_TEST_LIVE=1 \
+  ZALLY_NETWORK=regtest \
+  ZINDER_ENDPOINT=http://127.0.0.1:9101 \
+  ZALLY_TEST_NODE_JSON_RPC_ADDR=http://127.0.0.1:39232/ \
+  cargo nextest run --profile=ci-live --features zinder --run-ignored=all \
+    -p zally-wallet funded_wallet_syncs_sends_and_submits_pczt_with_zinder
+```
+
+Set `ZALLY_TEST_NODE_RPC_USER` and `ZALLY_TEST_NODE_RPC_PASSWORD` together only when the
+node requires basic auth.
+
+Optional amount overrides:
+
+- `ZALLY_TEST_SHIELDING_THRESHOLD_ZAT`: minimum transparent value to shield (default `1000000`).
+- `ZALLY_TEST_SEND_ZAT`: integer zatoshis for each Zally-originated spend (default `10000`).
 
 ### Port allocation
 
@@ -182,3 +223,4 @@ ZINDER_ENDPOINT=http://127.0.0.1:9203 ZALLY_NETWORK=testnet \
 | `LiveTestError::MissingEnv` panic | Required env var not exported. |
 | Cookie auth rejected | Regenerate the cookie; the node rewrites it on restart. |
 | `LiveTestError::Refused` (mainnet) | `ZALLY_TEST_ALLOW_MAINNET=1` missing. |
+| `incorrect consensus branch id` | The wallet, storage, or test signer is not using the running node's advertised regtest activations. |

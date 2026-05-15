@@ -45,17 +45,6 @@ impl RetryPolicy {
         }
     }
 
-    /// Three attempts with exponential 100ms→200ms→400ms backoff. The Zally default.
-    #[must_use]
-    pub const fn default_v1() -> Self {
-        Self {
-            max_attempts: 3,
-            initial_backoff_ms: 100,
-            max_backoff_ms: 2_000,
-            backoff_multiplier_x10: 20,
-        }
-    }
-
     /// `max_attempts` attempts with a fixed `delay_ms` between every retry.
     #[must_use]
     pub const fn linear(max_attempts: u32, delay_ms: u32) -> Self {
@@ -70,7 +59,12 @@ impl RetryPolicy {
 
 impl Default for RetryPolicy {
     fn default() -> Self {
-        Self::default_v1()
+        Self {
+            max_attempts: 3,
+            initial_backoff_ms: 100,
+            max_backoff_ms: 2_000,
+            backoff_multiplier_x10: 20,
+        }
     }
 }
 
@@ -236,7 +230,7 @@ mod tests {
         let counter = Arc::new(AtomicU32::new(0));
         let c = Arc::clone(&counter);
         let outcome: Result<u32, FakeError> =
-            with_retry(RetryPolicy::default_v1(), "test", move || {
+            with_retry(RetryPolicy::default(), "test", move || {
                 let c = Arc::clone(&c);
                 async move {
                     c.fetch_add(1, Ordering::SeqCst);
@@ -283,7 +277,7 @@ mod tests {
         let counter = Arc::new(AtomicU32::new(0));
         let c = Arc::clone(&counter);
         let outcome: Result<u32, FakeError> =
-            with_retry(RetryPolicy::default_v1(), "test", move || {
+            with_retry(RetryPolicy::default(), "test", move || {
                 let c = Arc::clone(&c);
                 async move {
                     c.fetch_add(1, Ordering::SeqCst);

@@ -15,7 +15,7 @@ use zally_wallet::{Wallet, WalletError};
 #[tokio::test]
 async fn unsafe_plaintext_seed_warns() -> Result<(), TestError> {
     let temp = TempWalletPath::create()?;
-    let network = Network::regtest_all_at_genesis();
+    let network = Network::regtest();
 
     let events: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let subscriber = tracing_subscriber::registry().with(CaptureLayer {
@@ -24,14 +24,18 @@ async fn unsafe_plaintext_seed_warns() -> Result<(), TestError> {
     let _default_guard = tracing::subscriber::set_default(subscriber);
 
     let sealing = PlaintextSealing::new(temp.seed_path());
-    let storage =
-        SqliteWalletStorage::new(SqliteWalletStorageOptions::for_local_tests(temp.db_path()));
+    let storage = SqliteWalletStorage::new(SqliteWalletStorageOptions::for_network(
+        network,
+        temp.db_path(),
+    ));
     let chain = zally_testkit::MockChainSource::new(network);
     let _ = Wallet::create(&chain, network, sealing, storage, BlockHeight::from(1)).await?;
 
     let sealing = PlaintextSealing::new(temp.seed_path());
-    let storage =
-        SqliteWalletStorage::new(SqliteWalletStorageOptions::for_local_tests(temp.db_path()));
+    let storage = SqliteWalletStorage::new(SqliteWalletStorageOptions::for_network(
+        network,
+        temp.db_path(),
+    ));
     let _ = Wallet::open(network, sealing, storage).await?;
 
     let plaintext_count = {

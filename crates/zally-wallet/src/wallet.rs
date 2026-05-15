@@ -113,8 +113,8 @@ impl Wallet {
             storage: Box::new(storage),
             base_capabilities: capabilities,
             event_tx,
-            retry_policy: Mutex::new(RetryPolicy::default_v1()),
-            circuit_breaker: CircuitBreaker::new(CircuitBreakerConfig::default_v1()),
+            retry_policy: Mutex::new(RetryPolicy::default()),
+            circuit_breaker: CircuitBreaker::new(CircuitBreakerConfig::default()),
         });
         Ok((Self { inner }, account_id, mnemonic))
     }
@@ -171,19 +171,19 @@ impl Wallet {
             storage: Box::new(storage),
             base_capabilities: capabilities,
             event_tx,
-            retry_policy: Mutex::new(RetryPolicy::default_v1()),
-            circuit_breaker: CircuitBreaker::new(CircuitBreakerConfig::default_v1()),
+            retry_policy: Mutex::new(RetryPolicy::default()),
+            circuit_breaker: CircuitBreaker::new(CircuitBreakerConfig::default()),
         });
         Ok((Self { inner }, account_id))
     }
 
-    /// Opens an existing wallet, or restores its single account from the sealed seed.
+    /// Opens an existing wallet, or creates its single account from the sealed seed.
     ///
     /// Behaves like [`Wallet::open`] when storage already has an account that matches the
-    /// unsealed seed. On a fresh persistent volume (storage is initialized but the account
-    /// row is missing) the call creates the account at `birthday` from the unsealed seed,
-    /// then returns the same handle. Idempotent across boots: once the account exists,
-    /// `birthday` is ignored.
+    /// unsealed seed. On a fresh persistent volume (storage is initialized but the account row
+    /// is missing), the call creates the account at `birthday` from the unsealed seed, then
+    /// returns the same handle. Idempotent across boots: once the account exists, `birthday` is
+    /// ignored.
     ///
     /// The intended caller is a deployment whose sealed seed is provisioned through a
     /// secret store and whose persistent volume can be re-created from scratch. Operators
@@ -194,7 +194,7 @@ impl Wallet {
     /// [`WalletError::NetworkMismatch`] if `network != storage.network()`.
     ///
     /// `requires_operator` on `NoSealedSeed`. `retryable` on transient I/O.
-    pub async fn open_or_restore<S, St>(
+    pub async fn open_or_create_account<S, St>(
         chain: &dyn ChainSource,
         network: Network,
         sealing: S,
@@ -239,7 +239,7 @@ impl Wallet {
         };
 
         let capabilities = build_capabilities(network, sealing_capability, storage_capability);
-        emit_plaintext_warning_if_needed(&capabilities, "open_or_restore");
+        emit_plaintext_warning_if_needed(&capabilities, "open_or_create_account");
 
         let (event_tx, _rx_keepalive) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
         let inner = Arc::new(WalletInner {
@@ -248,8 +248,8 @@ impl Wallet {
             storage: Box::new(storage),
             base_capabilities: capabilities,
             event_tx,
-            retry_policy: Mutex::new(RetryPolicy::default_v1()),
-            circuit_breaker: CircuitBreaker::new(CircuitBreakerConfig::default_v1()),
+            retry_policy: Mutex::new(RetryPolicy::default()),
+            circuit_breaker: CircuitBreaker::new(CircuitBreakerConfig::default()),
         });
         Ok((Self { inner }, account_id))
     }
@@ -453,10 +453,12 @@ fn build_capabilities(
     features.insert(Capability::Zip320TexAddresses);
     features.insert(Capability::Zip317ConventionalFee);
     features.insert(Capability::SyncIncremental);
+    features.insert(Capability::SyncDriver);
     features.insert(Capability::EventStream);
     features.insert(Capability::IdempotentSend);
     features.insert(Capability::PcztV06);
     features.insert(Capability::MetricsSnapshot);
+    features.insert(Capability::StatusSnapshot);
     WalletCapabilities {
         network,
         sealing,

@@ -48,9 +48,11 @@ Mixed vocabulary (`fetch`/`retrieve`/`get` for the same operation) burns reader 
 | `open_*` / `close_*` | wallet lifecycle |
 | `create_*` | allocate or insert a new entity |
 | `propose_*` | build a `Proposal` without signing (librustzcash vocabulary) |
+| `prove_*` | create zero-knowledge proofs for a PCZT without applying signatures |
 | `sign_*` | apply signature material to a `Proposal` or `Pczt` |
 | `submit_*` | broadcast a signed transaction to the network |
 | `send_*` | high-level: propose + sign + submit in one call |
+| `shield_*` | move wallet-owned transparent funds into a shielded receiver |
 | `seal_*` / `unseal_*` | apply or remove at-rest encryption to seed material |
 | `observe_*` | subscribe to events (`WalletEvent` stream) |
 | `sync_*` | catch up wallet state with chain |
@@ -82,8 +84,13 @@ A name must survive a change of its implementation.
 | `IdempotencyKey` | `zally-core` | Caller-supplied identifier for send-idempotency. `AsRef<str>` newtype. |
 | `Memo` | `zally-core` | ZIP-302 memo wrapper. Refuses construction over 512 bytes. |
 | `Wallet` | `zally-wallet` | The operator-facing handle. Async API. |
+| `WalletStatus` | `zally-wallet` | Operator readiness snapshot derived from persisted wallet progress. |
+| `SyncDriver` | `zally-wallet` | Caller-owned continuous sync loop over a `Wallet` and `ChainSource`. |
+| `SyncSnapshot` | `zally-wallet` | Observable state emitted by a running `SyncDriver`. |
 | `WalletStorage` | `zally-storage` | Trait abstraction over librustzcash's `WalletRead` + `WalletWrite`. |
 | `ChainSource` | `zally-chain` | Trait for compact-block reads, tree state, transparent UTXO lookups. |
+| `ChainEventCursor` | `zally-chain` | Opaque cursor for resuming chain-event streams without exposing backend internals. |
+| `ChainEventEnvelope` | `zally-chain` | Cursor-bound chain event consumed by sync drivers. |
 | `Submitter` | `zally-chain` | Trait for transaction broadcast. |
 | `SeedSealing` | `zally-keys` | Trait for at-rest seed encryption. |
 | `WalletCapabilities` | `zally-wallet` | Runtime descriptor of supported features (ZIP coverage, PCZT version, sealing impl). |
@@ -94,10 +101,11 @@ For state-machine types, the discriminant field is `status:` (lifecycle) or `kin
 
 ```rust
 pub enum SyncStatus {
-    Starting,
-    Catching { current: BlockHeight, target: BlockHeight },
-    AtTip { since: SystemTime },
-    Reorg { rolled_back_to: BlockHeight },
+    NotStarted,
+    Starting { target_height: BlockHeight },
+    CatchingUp { scanned_height: BlockHeight, target_height: BlockHeight, lag_blocks: u32 },
+    AtTip { tip_height: BlockHeight },
+    TipRegressed { scanned_height: BlockHeight, chain_tip_height: BlockHeight },
 }
 
 pub enum ReceiverKind {
@@ -198,9 +206,10 @@ The contract surface Zally publishes, grouped by domain. Each item is a guarante
 
 ### Chain source and submission (CHAIN)
 
-- **CHAIN-1**: `ChainSource` trait with methods for compact-block range fetch, latest tree state, transaction lookup, address-UTXO read, mempool peek.
+- **CHAIN-1**: `ChainSource` trait with methods for compact-block range fetch, latest tree state, transaction lookup, address-UTXO read, and cursor-bound chain events.
 - **CHAIN-2**: `Submitter` trait with a single `submit(raw_tx) -> SubmitOutcome` method.
-- **CHAIN-3**: Reconnect, retry, and circuit-breaker logic at the trait boundary, not duplicated in each implementation.
+- **CHAIN-3**: Reconnect, retry, and circuit-breaker logic at the wallet boundary, not duplicated in each embedding application.
+- **CHAIN-4**: `ChainEventCursor` is opaque Zally vocabulary. Backend cursor types never cross the public Zally API.
 
 ### Sync and scanning (SYNC)
 
@@ -209,6 +218,10 @@ The contract surface Zally publishes, grouped by domain. Each item is a guarante
 - **SYNC-3**: Reorg handling: on continuity error, automatic rollback to the longest common prefix; emit `WalletEvent::ReorgDetected`.
 - **SYNC-4**: Configurable confirmation depth per receiver purpose (default 1 for non-coinbase, mandatory 100 for coinbase per ZIP-213).
 - **SYNC-5**: `WalletEvent` async stream for `ShieldedReceiveObserved`, `TransactionConfirmed`, `ReorgDetected`, `ScanProgress`.
+- **SYNC-6**: `SyncDriver` provides a caller-owned continuous sync loop over `Wallet::sync`, `ChainSource::chain_event_envelopes`, polling fallback, and bounded per-sync timeouts.
+- **SYNC-7**: `Wallet::status_snapshot() -> WalletStatus` reports `SyncStatus`, scan height, observed tip, lag, subscriber count, and circuit-breaker state.
+- **SYNC-8**: `Wallet::open_or_create_account(...) -> (Wallet, AccountId)` opens the sealed-seed account or creates it on a fresh storage volume.
+- **SYNC-9**: `Wallet::sync(...)` refreshes wallet-owned transparent UTXOs through `ChainSource::transparent_utxos` because compact blocks do not expose transparent receive details.
 
 ### Spending (SPEND)
 
@@ -218,20 +231,23 @@ The contract surface Zally publishes, grouped by domain. Each item is a guarante
 - **SPEND-4**: Conventional fee per ZIP-317 by default; `FeeStrategy::Custom(Zatoshis)` for advanced operators.
 - **SPEND-5**: `nExpiryHeight` set per ZIP-203.
 - **SPEND-6**: ZIP-321 payment URI parsing through `PaymentRequest::from_uri`.
+- **SPEND-7**: `Wallet::shield_transparent_funds(ShieldTransparentPlan) -> SendOutcome` explicitly shields wallet-owned transparent UTXOs before shielded spending.
 
 ### PCZT and external signing (PCZT)
 
 - **PCZT-1**: `Wallet::propose_pczt(plan) -> PcztBytes`: build an unsigned PCZT without holding spending keys.
 - **PCZT-2**: PCZT serialization to bytes for export to HSM, FROST coordinator, air-gapped signer.
-- **PCZT-3**: `Wallet::sign_pczt(pczt) -> PcztBytes`: sign in-process (uses USK).
-- **PCZT-4**: `Wallet::extract_and_submit_pczt(signed, submitter) -> SendOutcome`: extract the transaction from a fully-signed PCZT and submit.
-- **PCZT-5**: PCZT support covers transparent, Sapling, and Orchard bundles.
+- **PCZT-3**: `Wallet::prove_pczt(pczt) -> PcztBytes`: create required Sapling and Orchard proofs for the in-process path.
+- **PCZT-4**: `Wallet::sign_pczt(pczt) -> PcztBytes`: sign in-process (uses USK).
+- **PCZT-5**: `Wallet::extract_and_submit_pczt(final, submitter) -> SendOutcome`: extract the transaction from a fully-authorized PCZT and submit.
+- **PCZT-6**: PCZT support covers transparent, Sapling, and Orchard bundles.
 
 ### Observability (OBS)
 
 - **OBS-1**: `tracing` spans on every public async method with documented field schema.
-- **OBS-2**: `Wallet::metrics_snapshot() -> WalletMetrics` returns a typed snapshot.
+- **OBS-2**: `Wallet::metrics_snapshot() -> WalletMetrics` returns a typed metrics snapshot derived from the same persisted progress as `WalletStatus`.
 - **OBS-3**: `WalletEvent` async stream documented as the canonical push notification channel for state changes.
+- **OBS-4**: `SyncHandle::observe_status() -> SyncSnapshotStream` is the canonical push channel for sync-driver lifecycle state.
 
 ### Documentation and DX (DOC)
 
@@ -258,7 +274,7 @@ Which ZIPs Zally implements, which are designed-for-forward-compatibility, and w
 - **ZIP-225**: v5 transaction format. The default on every supported network.
 - **ZIP-244**: Non-malleable TxID. Tracked in wallet state; exposed via `WalletEvent` and `SendOutcome`.
 - **ZIP-302**: Memo encoding (current 512-byte format). Encoded and decoded per spec.
-- **ZIP-315**: Wallet best practices. Auto-shielding policy, trusted vs untrusted TXO accounting, confirmation-depth defaults aligned with the ZIP.
+- **ZIP-315**: Wallet best practices. Explicit transparent shielding, trusted vs untrusted TXO accounting, confirmation-depth defaults aligned with the ZIP.
 - **ZIP-316**: Unified Addresses, UFVKs, UIVKs. First-class address type; UFVK export.
 - **ZIP-317**: Conventional fee mechanism. Default fee strategy.
 - **ZIP-320**: TEX addresses. Recognised, refused-on-shielded-input enforced at spend.

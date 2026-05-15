@@ -13,8 +13,10 @@ use zally_storage::{SqliteWalletStorage, SqliteWalletStorageOptions, StorageErro
 async fn wallet_tx_ids_mined_in_range_round_trip() -> Result<(), TestError> {
     let temp = TempDir::new()?;
     let db_path = temp.path().join("wallet.db");
-    let storage =
-        SqliteWalletStorage::new(SqliteWalletStorageOptions::for_local_tests(db_path.clone()));
+    let storage = SqliteWalletStorage::new(SqliteWalletStorageOptions::for_network(
+        zally_core::Network::regtest(),
+        db_path.clone(),
+    ));
     storage.open_or_create().await?;
 
     let mined_at = [

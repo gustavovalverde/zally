@@ -11,8 +11,9 @@ use crate::block_height::BlockHeight;
 /// Zcash network variant.
 ///
 /// `Regtest` carries [`zcash_protocol::local_consensus::LocalNetwork`] directly, which records
-/// per-upgrade activation heights as `Option<BlockHeight>`. Use [`Network::regtest_all_at_genesis`]
-/// for the common "every upgrade active at height 1" regtest topology.
+/// per-upgrade activation heights as `Option<BlockHeight>`. Use [`Network::regtest`] for the
+/// local Zebra/Zinder topology; build [`Network::Regtest`] directly only when a custom node
+/// advertises a different activation table.
 ///
 /// Every public type that names an address, key, balance, or transaction carries a `Network`
 /// value. Constructors that touch chain state fail closed on network mismatch.
@@ -30,21 +31,24 @@ pub enum Network {
 }
 
 impl Network {
-    /// A regtest network with every upgrade activated at height 1.
+    /// Local Zebra/Zinder regtest topology.
     ///
-    /// Matches the common `nuparams=...:1` regtest configuration.
+    /// Overwinter through Canopy activate at height 1, NU5 and NU6 activate at height 2, and
+    /// later upgrades are unset. Callers that run a different regtest topology should construct
+    /// [`Network::Regtest`] with the node's advertised activation table.
     #[must_use]
-    pub const fn regtest_all_at_genesis() -> Self {
-        let height = zcash_protocol::consensus::BlockHeight::from_u32(1);
+    pub const fn regtest() -> Self {
+        let height_one = zcash_protocol::consensus::BlockHeight::from_u32(1);
+        let height_two = zcash_protocol::consensus::BlockHeight::from_u32(2);
         Self::Regtest(LocalNetwork {
-            overwinter: Some(height),
-            sapling: Some(height),
-            blossom: Some(height),
-            heartwood: Some(height),
-            canopy: Some(height),
-            nu5: Some(height),
-            nu6: Some(height),
-            nu6_1: Some(height),
+            overwinter: Some(height_one),
+            sapling: Some(height_one),
+            blossom: Some(height_one),
+            heartwood: Some(height_one),
+            canopy: Some(height_one),
+            nu5: Some(height_two),
+            nu6: Some(height_two),
+            nu6_1: None,
         })
     }
 
@@ -206,23 +210,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn regtest_all_at_genesis_activates_every_upgrade_at_height_one() {
-        let params = Network::regtest_all_at_genesis().to_parameters();
+    fn regtest_matches_local_live_topology() {
+        let params = Network::regtest().to_parameters();
         assert_eq!(
             params.activation_height(NetworkUpgrade::Sapling),
             Some(zcash_protocol::consensus::BlockHeight::from_u32(1))
         );
         assert_eq!(
             params.activation_height(NetworkUpgrade::Nu5),
-            Some(zcash_protocol::consensus::BlockHeight::from_u32(1))
+            Some(zcash_protocol::consensus::BlockHeight::from_u32(2))
         );
+        assert_eq!(
+            params.activation_height(NetworkUpgrade::Nu6),
+            Some(zcash_protocol::consensus::BlockHeight::from_u32(2))
+        );
+        assert_eq!(params.activation_height(NetworkUpgrade::Nu6_1), None);
     }
 
     #[test]
     fn coin_type_matches_slip_44() {
         assert_eq!(Network::Mainnet.coin_type(), 133);
         assert_eq!(Network::Testnet.coin_type(), 1);
-        assert_eq!(Network::regtest_all_at_genesis().coin_type(), 1);
+        assert_eq!(Network::regtest().coin_type(), 1);
     }
 
     #[test]
@@ -236,11 +245,7 @@ mod tests {
     #[cfg(feature = "serde")]
     #[test]
     fn network_serde_round_trip() -> Result<(), serde_json::Error> {
-        for net in [
-            Network::Mainnet,
-            Network::Testnet,
-            Network::regtest_all_at_genesis(),
-        ] {
+        for net in [Network::Mainnet, Network::Testnet, Network::regtest()] {
             let encoded = serde_json::to_string(&net)?;
             let decoded: Network = serde_json::from_str(&encoded)?;
             assert_eq!(decoded, net);

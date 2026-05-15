@@ -37,7 +37,7 @@ async fn main() -> Result<(), ExampleError> {
         )
         .try_init();
 
-    let network = Network::regtest_all_at_genesis();
+    let network = Network::regtest();
     let temp = TempDir::new()?;
     let seed_path = temp.path().join("wallet.age");
     let db_path = temp.path().join("wallet.db");

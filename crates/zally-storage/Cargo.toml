@@ -30,6 +30,8 @@ zcash_keys = { workspace = true, features = ["orchard", "sapling", "transparent-
 zcash_primitives.workspace = true
 zcash_proofs.workspace = true
 zcash_protocol.workspace = true
+zcash_script.workspace = true
+zcash_transparent.workspace = true
 zip32.workspace = true
 uuid.workspace = true
 

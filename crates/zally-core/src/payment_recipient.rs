@@ -92,7 +92,7 @@ mod tests {
     fn payment_recipient_classifications() {
         let ua = PaymentRecipient::UnifiedAddress {
             encoded: "uregtest1example".into(),
-            network: Network::regtest_all_at_genesis(),
+            network: Network::regtest(),
         };
         assert!(!ua.is_transparent());
         assert!(!ua.is_tex());

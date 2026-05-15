@@ -9,13 +9,15 @@ use zally_wallet::{Wallet, WalletError};
 #[tokio::test]
 async fn create_then_open_round_trip_in_memory() -> Result<(), TestError> {
     let temp = TempWalletPath::create()?;
-    let network = Network::regtest_all_at_genesis();
+    let network = Network::regtest();
 
     let sealing_primary = InMemorySealing::new();
     let sealing_shadow = sealing_primary.shared_with();
 
-    let storage =
-        SqliteWalletStorage::new(SqliteWalletStorageOptions::for_local_tests(temp.db_path()));
+    let storage = SqliteWalletStorage::new(SqliteWalletStorageOptions::for_network(
+        network,
+        temp.db_path(),
+    ));
     let chain = zally_testkit::MockChainSource::new(network);
     let (wallet, account_id, _mnemonic) = Wallet::create(
         &chain,
@@ -32,8 +34,10 @@ async fn create_then_open_round_trip_in_memory() -> Result<(), TestError> {
         .encode(&params);
     drop(wallet);
 
-    let storage =
-        SqliteWalletStorage::new(SqliteWalletStorageOptions::for_local_tests(temp.db_path()));
+    let storage = SqliteWalletStorage::new(SqliteWalletStorageOptions::for_network(
+        network,
+        temp.db_path(),
+    ));
     let (wallet, account_id_2) = Wallet::open(network, sealing_shadow, storage).await?;
     assert_eq!(account_id, account_id_2);
     let ua_second = wallet

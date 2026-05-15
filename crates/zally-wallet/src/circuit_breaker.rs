@@ -27,15 +27,6 @@ pub struct CircuitBreakerConfig {
 }
 
 impl CircuitBreakerConfig {
-    /// Five failures, sixty-second cooldown. The Zally default.
-    #[must_use]
-    pub const fn default_v1() -> Self {
-        Self {
-            failure_threshold: 5,
-            cooldown: Duration::from_secs(60),
-        }
-    }
-
     /// A configuration that never trips (`u32::MAX` threshold). Useful for tests that only
     /// exercise the retry path.
     #[must_use]
@@ -49,7 +40,10 @@ impl CircuitBreakerConfig {
 
 impl Default for CircuitBreakerConfig {
     fn default() -> Self {
-        Self::default_v1()
+        Self {
+            failure_threshold: 5,
+            cooldown: Duration::from_secs(60),
+        }
     }
 }
 
@@ -191,7 +185,7 @@ mod tests {
 
     #[test]
     fn success_resets_closed_counter() {
-        let breaker = CircuitBreaker::new(CircuitBreakerConfig::default_v1());
+        let breaker = CircuitBreaker::new(CircuitBreakerConfig::default());
         breaker.record_failure();
         breaker.record_failure();
         breaker.record_success();

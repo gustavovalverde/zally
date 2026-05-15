@@ -8,11 +8,13 @@ use zally_wallet::{Wallet, WalletError};
 #[tokio::test]
 async fn sync_network_mismatch_fails_closed() -> Result<(), TestError> {
     let temp = TempWalletPath::create()?;
-    let regtest = Network::regtest_all_at_genesis();
+    let regtest = Network::regtest();
 
     let sealing = InMemorySealing::new();
-    let storage =
-        SqliteWalletStorage::new(SqliteWalletStorageOptions::for_local_tests(temp.db_path()));
+    let storage = SqliteWalletStorage::new(SqliteWalletStorageOptions::for_network(
+        regtest,
+        temp.db_path(),
+    ));
     let chain = zally_testkit::MockChainSource::new(regtest);
     let (wallet, _, _) =
         Wallet::create(&chain, regtest, sealing, storage, BlockHeight::from(1)).await?;

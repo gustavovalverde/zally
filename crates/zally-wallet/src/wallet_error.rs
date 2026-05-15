@@ -117,7 +117,7 @@ pub enum WalletError {
         reason: String,
     },
 
-    /// A PCZT role (Creator, Signer, Combiner, Extractor) returned an error.
+    /// A PCZT role (Creator, Prover, Signer, Combiner, Extractor) returned an error.
     ///
     /// Posture follows the underlying [`PcztError`].
     #[error("pczt error: {0}")]
@@ -132,6 +132,18 @@ pub enum WalletError {
         /// Operation that observed the open circuit.
         operation: &'static str,
     },
+
+    /// The sync-driver task failed outside the wallet sync operation itself.
+    ///
+    /// `retryable` when the task was cancelled by the runtime; `requires_operator` when the
+    /// task panicked.
+    #[error("sync driver failed: {reason}")]
+    SyncDriverFailed {
+        /// Underlying task failure description.
+        reason: String,
+        /// Whether starting a new driver may succeed.
+        is_retryable: bool,
+    },
 }
 
 impl WalletError {
@@ -142,7 +154,8 @@ impl WalletError {
             Self::Sealing(e) => e.is_retryable(),
             Self::Storage(e) => e.is_retryable(),
             Self::KeyDerivation(e) => e.is_retryable(),
-            Self::ChainSource { is_retryable, .. } => *is_retryable,
+            Self::ChainSource { is_retryable, .. }
+            | Self::SyncDriverFailed { is_retryable, .. } => *is_retryable,
             Self::Submitter(e) => e.is_retryable(),
             Self::Pczt(e) => e.is_retryable(),
             Self::CircuitBroken { .. } => true,
@@ -193,6 +206,10 @@ mod tests {
             WalletError::SubmissionRejected { reason: "x".into() },
             WalletError::Pczt(PcztError::NoMatchingKeys),
             WalletError::CircuitBroken { operation: "test" },
+            WalletError::SyncDriverFailed {
+                reason: "x".into(),
+                is_retryable: true,
+            },
         ];
         for e in variants {
             let _ = e.is_retryable();

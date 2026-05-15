@@ -21,9 +21,9 @@ use tokio::sync::broadcast;
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::BroadcastStream;
 use zally_chain::{
-    BlockHeightRange, ChainEvent, ChainEventStream, ChainSource, ChainSourceError,
-    CompactBlockStream, ShieldedPool, SubtreeIndex, SubtreeRoot, TransactionStatus,
-    TransparentUtxo,
+    BlockHeightRange, ChainEvent, ChainEventCursor, ChainEventEnvelope, ChainEventEnvelopeStream,
+    ChainSource, ChainSourceError, CompactBlockStream, ShieldedPool, SubtreeIndex, SubtreeRoot,
+    TransactionStatus, TransparentUtxo,
 };
 use zally_core::{BlockHeight, Network, TxId};
 use zcash_client_backend::proto::compact_formats::CompactBlock;
@@ -214,18 +214,42 @@ impl ChainSource for MockChainSource {
 
     async fn transparent_utxos(
         &self,
-        _script_pub_key: &[u8],
+        _script_pub_key_bytes: &[u8],
     ) -> Result<Vec<TransparentUtxo>, ChainSourceError> {
         Ok(Vec::new())
     }
 
-    async fn chain_events(&self) -> Result<ChainEventStream, ChainSourceError> {
+    async fn chain_event_envelopes(
+        &self,
+        _from_cursor: Option<ChainEventCursor>,
+    ) -> Result<ChainEventEnvelopeStream, ChainSourceError> {
         let receiver = self.event_tx.subscribe();
         let stream = BroadcastStream::new(receiver).filter_map(|delivery| match delivery {
-            Ok(event) => Some(Ok(event)),
+            Ok(event) => {
+                let new_tip_height = event_tip_height(&event);
+                Some(Ok(ChainEventEnvelope::new(
+                    ChainEventCursor::from_bytes(new_tip_height.as_u32().to_be_bytes().to_vec()),
+                    u64::from(new_tip_height.as_u32()),
+                    new_tip_height,
+                    event,
+                )))
+            }
             Err(_lagged) => None,
         });
         Ok(Box::pin(stream))
+    }
+}
+
+fn event_tip_height(event: &ChainEvent) -> BlockHeight {
+    #[allow(
+        clippy::wildcard_enum_match_arm,
+        reason = "ChainEvent is #[non_exhaustive]; unknown future events use genesis in the \
+                  mock cursor because tests only assert current variants"
+    )]
+    match event {
+        ChainEvent::ChainTipAdvanced { new_tip_height, .. }
+        | ChainEvent::ChainReorged { new_tip_height, .. } => *new_tip_height,
+        _ => BlockHeight::GENESIS,
     }
 }
 
@@ -236,7 +260,7 @@ mod tests {
 
     #[tokio::test]
     async fn mock_chain_tip_advances_on_handle_call() -> Result<(), ChainSourceError> {
-        let mock = MockChainSource::new(Network::regtest_all_at_genesis());
+        let mock = MockChainSource::new(Network::regtest());
         let handle = mock.handle();
         assert_eq!(mock.chain_tip().await?, BlockHeight::GENESIS);
         handle.advance_tip(BlockHeight::from(10));
@@ -246,7 +270,7 @@ mod tests {
 
     #[tokio::test]
     async fn mock_emits_chain_tip_advanced_event() -> Result<(), ChainSourceError> {
-        let mock = MockChainSource::new(Network::regtest_all_at_genesis());
+        let mock = MockChainSource::new(Network::regtest());
         let mut events = mock.chain_events().await?;
         let handle = mock.handle();
         handle.advance_tip(BlockHeight::from(3));
@@ -260,7 +284,7 @@ mod tests {
 
     #[tokio::test]
     async fn mock_emits_chain_reorged_event() -> Result<(), ChainSourceError> {
-        let mock = MockChainSource::new(Network::regtest_all_at_genesis());
+        let mock = MockChainSource::new(Network::regtest());
         let handle = mock.handle();
         handle.advance_tip(BlockHeight::from(10));
         let mut events = mock.chain_events().await?;
@@ -275,7 +299,7 @@ mod tests {
 
     #[tokio::test]
     async fn mock_compact_blocks_returns_empty() -> Result<(), ChainSourceError> {
-        let mock = MockChainSource::new(Network::regtest_all_at_genesis());
+        let mock = MockChainSource::new(Network::regtest());
         mock.handle().advance_tip(BlockHeight::from(5));
         let range =
             BlockHeightRange::new(BlockHeight::from(1), BlockHeight::from(5)).ok_or_else(|| {
@@ -290,7 +314,7 @@ mod tests {
 
     #[tokio::test]
     async fn mock_compact_blocks_above_tip_rejected() -> Result<(), ChainSourceError> {
-        let mock = MockChainSource::new(Network::regtest_all_at_genesis());
+        let mock = MockChainSource::new(Network::regtest());
         let range = BlockHeightRange::new(BlockHeight::from(1), BlockHeight::from(100))
             .ok_or_else(|| ChainSourceError::Unavailable {
                 reason: "range".into(),

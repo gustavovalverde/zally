@@ -73,7 +73,7 @@ pub fn require_live() -> Result<(), LiveTestError> {
 /// `ZALLY_TEST_ALLOW_MAINNET=1` is also set.
 pub fn require_network() -> Result<Network, LiveTestError> {
     match env::var(NETWORK_ENV).ok().as_deref() {
-        None | Some("" | "regtest") => Ok(Network::regtest_all_at_genesis()),
+        None | Some("" | "regtest") => Ok(Network::regtest()),
         Some("testnet") => Ok(Network::Testnet),
         Some("mainnet") => {
             if env_flag_is_set(ALLOW_MAINNET_ENV) {

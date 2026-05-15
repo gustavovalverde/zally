@@ -1,13 +1,14 @@
 //! PCZT roles bound to a `Wallet`.
 //!
 //! `Wallet::propose_pczt` builds an unsigned PCZT against the wallet's live notes.
-//! `Wallet::sign_pczt` authorises a PCZT with the sealed seed.
-//! `Wallet::extract_and_submit_pczt` extracts a finalised PCZT, persists the
+//! `Wallet::prove_pczt` creates required zero-knowledge proofs.
+//! `Wallet::sign_pczt` authorizes a PCZT with the sealed seed.
+//! `Wallet::extract_and_submit_pczt` extracts a finalized PCZT, persists the
 //! transaction in the wallet DB, and broadcasts via the supplied `Submitter`.
 
 use zally_chain::Submitter;
 use zally_core::{BlockHeight, Network};
-use zally_pczt::{PcztBytes, Signer};
+use zally_pczt::{PcztBytes, Prover, Signer};
 
 use crate::spend::{FeeStrategy, ProposalPlan, SendOutcome};
 use crate::wallet::Wallet;
@@ -18,8 +19,8 @@ impl Wallet {
     ///
     /// Validates the same recipient/memo/fee guards as [`Wallet::propose`], then composes
     /// `propose_standard_transfer_to_address` and `create_pczt_from_proposal` inside the
-    /// storage layer. The returned bytes carry the wallet's network and must be authorised
-    /// via [`Wallet::sign_pczt`] before submission.
+    /// storage layer. The returned bytes carry the wallet's network and must be proven and
+    /// authorized via [`Wallet::prove_pczt`] and [`Wallet::sign_pczt`] before submission.
     ///
     /// `not_retryable` on validation failure or insufficient balance; `retryable` on
     /// transient I/O against the wallet database.
@@ -63,7 +64,30 @@ impl Wallet {
         Ok(authorized)
     }
 
-    /// Extracts a finalised PCZT, persists the transaction in the wallet DB, and broadcasts
+    /// Creates Sapling and Orchard proofs for `pczt` using the sealed seed when needed.
+    ///
+    /// The returned PCZT remains unsigned unless it was already signed. For the local
+    /// single-key path, call [`Wallet::prove_pczt`] and [`Wallet::sign_pczt`] before
+    /// [`Wallet::extract_and_submit_pczt`]. Separating these roles keeps the API aligned
+    /// with PCZT's distributed-proving model while still giving in-process embedders a
+    /// complete path.
+    ///
+    /// `requires_operator` on missing Sapling proving parameters; `not_retryable` on
+    /// malformed PCZT contents; `retryable` on transient sealing I/O.
+    pub async fn prove_pczt(&self, pczt: PcztBytes) -> Result<PcztBytes, WalletError> {
+        validate_pczt_network(pczt.network(), self.network())?;
+        let seed = self
+            .inner
+            .sealing
+            .unseal_seed()
+            .await
+            .map_err(WalletError::from)?;
+        let pczt_prover = Prover::new(self.network());
+        let proven = pczt_prover.prove_with_seed(pczt, &seed).await?;
+        Ok(proven)
+    }
+
+    /// Extracts a finalized PCZT, persists the transaction in the wallet DB, and broadcasts
     /// it through `submitter`.
     ///
     /// The storage layer wraps `extract_and_store_transaction_from_pczt` so the wallet DB

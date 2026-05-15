@@ -1,4 +1,4 @@
-//! `Extractor` role: pulls the final transaction out of a fully-signed PCZT.
+//! `Extractor` role: pulls the final transaction out of a fully-authorized PCZT.
 
 use pczt::roles::tx_extractor::TransactionExtractor;
 use zally_core::{Network, TxId};
@@ -18,7 +18,7 @@ pub struct ExtractedTransaction {
     pub network: Network,
 }
 
-/// Extracts a finalised PCZT into submittable transaction bytes.
+/// Extracts a finalized PCZT into submittable transaction bytes.
 ///
 /// Loads the Sapling verifying keys from the platform-default `ZcashParams` directory
 /// via [`LocalTxProver::with_default_location`]; an Orchard verifying key is generated
@@ -83,7 +83,7 @@ mod tests {
         let extractor = Extractor::new();
         let outcome = extractor.extract(PcztBytes::from_serialized(
             vec![0_u8; 4],
-            Network::regtest_all_at_genesis(),
+            Network::regtest(),
         ));
         assert!(
             matches!(

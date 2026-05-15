@@ -95,6 +95,28 @@ pub enum StorageError {
         /// Height at which the proposed-block parent hash diverged from the wallet's view.
         at_height: zally_core::BlockHeight,
     },
+
+    /// The transparent output script could not be mapped to a wallet-supported transparent
+    /// address kind.
+    ///
+    /// `not_retryable`: the chain source returned a malformed or unsupported transparent
+    /// output for this wallet.
+    #[error("transparent output {tx_id:?}:{output_index} has an unsupported script")]
+    TransparentOutputNotRecognized {
+        /// Transaction that produced the unsupported output.
+        tx_id: zally_core::TxId,
+        /// Output index within the producing transaction.
+        output_index: u32,
+    },
+
+    /// A transparent output reported a value that cannot be represented as Zcash zatoshis.
+    ///
+    /// `not_retryable`: the chain source returned an invalid transparent output value.
+    #[error("transparent output value {value_zat} exceeds the zatoshis range")]
+    TransparentOutputValueOutOfRange {
+        /// Invalid value in zatoshis.
+        value_zat: u64,
+    },
 }
 
 impl StorageError {
@@ -110,7 +132,9 @@ impl StorageError {
             | Self::AccountAlreadyExists
             | Self::KeyDerivationFailed { .. }
             | Self::ProverUnavailable
-            | Self::IdempotencyKeyConflict => false,
+            | Self::IdempotencyKeyConflict
+            | Self::TransparentOutputNotRecognized { .. }
+            | Self::TransparentOutputValueOutOfRange { .. } => false,
         }
     }
 }
@@ -121,7 +145,7 @@ mod tests {
 
     #[test]
     fn storage_error_retryable_match_complete() {
-        let variants: [StorageError; 10] = [
+        let variants: [StorageError; 12] = [
             StorageError::NotOpened,
             StorageError::MigrationFailed { reason: "x".into() },
             StorageError::SqliteFailed {
@@ -136,6 +160,13 @@ mod tests {
             StorageError::IdempotencyKeyConflict,
             StorageError::ChainReorgDetected {
                 at_height: zally_core::BlockHeight::from(1),
+            },
+            StorageError::TransparentOutputNotRecognized {
+                tx_id: zally_core::TxId::from_bytes([0_u8; 32]),
+                output_index: 0,
+            },
+            StorageError::TransparentOutputValueOutOfRange {
+                value_zat: u64::MAX,
             },
         ];
         for e in variants {

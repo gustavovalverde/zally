@@ -3,7 +3,7 @@
 use std::pin::Pin;
 
 use async_trait::async_trait;
-use futures_util::Stream;
+use futures_util::{Stream, StreamExt as _};
 use zally_core::{BlockHeight, Network, TxId};
 
 use crate::chain_error::ChainSourceError;
@@ -80,7 +80,7 @@ pub struct TransparentUtxo {
     /// Block height at which the output was mined.
     pub confirmed_at_height: BlockHeight,
     /// Output `scriptPubKey` bytes.
-    pub script_pub_key: Vec<u8>,
+    pub script_pub_key_bytes: Vec<u8>,
 }
 
 /// Status of a transaction at the source's current view.
@@ -127,6 +127,68 @@ pub enum ChainEvent {
     },
 }
 
+/// Opaque cursor for resuming a chain-event stream.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct ChainEventCursor {
+    cursor_bytes: Vec<u8>,
+}
+
+impl ChainEventCursor {
+    /// Creates a cursor from bytes returned by a chain source.
+    #[must_use]
+    pub fn from_bytes(cursor_bytes: impl Into<Vec<u8>>) -> Self {
+        Self {
+            cursor_bytes: cursor_bytes.into(),
+        }
+    }
+
+    /// Returns the opaque cursor bytes.
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.cursor_bytes
+    }
+
+    /// Consumes the cursor and returns the opaque bytes.
+    #[must_use]
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.cursor_bytes
+    }
+}
+
+/// Cursor-bound chain event returned to wallet consumers.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[non_exhaustive]
+pub struct ChainEventEnvelope {
+    /// Cursor for resuming strictly after this event.
+    pub cursor: ChainEventCursor,
+    /// Monotonic sequence in this event stream.
+    pub event_sequence: u64,
+    /// Finalized height reported with this event.
+    pub finalized_height: BlockHeight,
+    /// Source-neutral chain transition.
+    pub event: ChainEvent,
+}
+
+impl ChainEventEnvelope {
+    /// Constructs a cursor-bound chain event.
+    #[must_use]
+    pub const fn new(
+        cursor: ChainEventCursor,
+        event_sequence: u64,
+        finalized_height: BlockHeight,
+        event: ChainEvent,
+    ) -> Self {
+        Self {
+            cursor,
+            event_sequence,
+            finalized_height,
+            event,
+        }
+    }
+}
+
 /// Stream of compact blocks. Each item is exactly one block.
 pub type CompactBlockStream = Pin<
     Box<
@@ -142,6 +204,10 @@ pub type CompactBlockStream = Pin<
 /// Stream of chain events.
 pub type ChainEventStream =
     Pin<Box<dyn Stream<Item = Result<ChainEvent, ChainSourceError>> + Send>>;
+
+/// Stream of cursor-bound chain events.
+pub type ChainEventEnvelopeStream =
+    Pin<Box<dyn Stream<Item = Result<ChainEventEnvelope, ChainSourceError>> + Send>>;
 
 /// Chain-read plane.
 ///
@@ -188,9 +254,19 @@ pub trait ChainSource: Send + Sync + 'static {
     /// particular address-encoding crate.
     async fn transparent_utxos(
         &self,
-        script_pub_key: &[u8],
+        script_pub_key_bytes: &[u8],
     ) -> Result<Vec<TransparentUtxo>, ChainSourceError>;
 
-    /// Subscribes to chain events.
-    async fn chain_events(&self) -> Result<ChainEventStream, ChainSourceError>;
+    /// Subscribes to cursor-bound chain events.
+    async fn chain_event_envelopes(
+        &self,
+        from_cursor: Option<ChainEventCursor>,
+    ) -> Result<ChainEventEnvelopeStream, ChainSourceError>;
+
+    /// Subscribes to chain events without exposing cursors.
+    async fn chain_events(&self) -> Result<ChainEventStream, ChainSourceError> {
+        let stream = self.chain_event_envelopes(None).await?;
+        let mapped = stream.map(|envelope| envelope.map(|event_envelope| event_envelope.event));
+        Ok(Box::pin(mapped) as ChainEventStream)
+    }
 }

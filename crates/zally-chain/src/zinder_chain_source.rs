@@ -16,13 +16,13 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use futures_util::StreamExt as _;
 use prost::Message;
-use tokio::sync::Mutex;
 use zally_core::{BlockHeight, Network, TxId};
 use zcash_client_backend::proto::compact_formats::CompactBlock;
 use zcash_client_backend::proto::service::TreeState;
 use zinder_client::{
-    ChainEvent as ZinderChainEvent, ChainEventCursor, ChainEventEnvelope, ChainIndex, IndexerError,
-    RemoteChainIndex, RemoteOpenOptions, TransparentAddressUtxosQuery,
+    ChainEvent as ZinderChainEvent, ChainEventCursor as ZinderChainEventCursor,
+    ChainEventEnvelope as ZinderChainEventEnvelope, ChainIndex, IndexerError, RemoteChainIndex,
+    RemoteOpenOptions, TransparentAddressUtxosQuery,
 };
 use zinder_core::{
     BlockHeight as ZinderBlockHeight, BlockHeightRange as ZinderBlockHeightRange,
@@ -33,8 +33,9 @@ use zinder_core::{
 
 use crate::chain_error::ChainSourceError;
 use crate::chain_source::{
-    BlockHeightRange, ChainEvent, ChainEventStream, ChainSource, CompactBlockStream, ShieldedPool,
-    SubtreeIndex, SubtreeRoot, TransactionStatus, TransparentUtxo,
+    BlockHeightRange, ChainEvent, ChainEventCursor, ChainEventEnvelope, ChainEventEnvelopeStream,
+    ChainSource, CompactBlockStream, ShieldedPool, SubtreeIndex, SubtreeRoot, TransactionStatus,
+    TransparentUtxo,
 };
 
 const DEFAULT_SUBTREE_PAGE_SIZE: u32 = 256;
@@ -209,9 +210,10 @@ impl ChainSource for ZinderChainSource {
 
     async fn transparent_utxos(
         &self,
-        script_pub_key: &[u8],
+        script_pub_key_bytes: &[u8],
     ) -> Result<Vec<TransparentUtxo>, ChainSourceError> {
-        let address_script_hash = TransparentAddressScriptHash::of_script_pub_key(script_pub_key);
+        let address_script_hash =
+            TransparentAddressScriptHash::of_script_pub_key(script_pub_key_bytes);
         let query = TransparentAddressUtxosQuery {
             address_script_hash,
             start_height: ZinderBlockHeight::new(0),
@@ -231,29 +233,37 @@ impl ChainSource for ZinderChainSource {
                 output_index: artifact.outpoint.output_index,
                 value_zat: artifact.value_zat,
                 confirmed_at_height: BlockHeight::from(artifact.block_height.value()),
-                script_pub_key: artifact.script_pub_key,
+                script_pub_key_bytes: artifact.script_pub_key,
             })
             .collect())
     }
 
-    async fn chain_events(&self) -> Result<ChainEventStream, ChainSourceError> {
+    async fn chain_event_envelopes(
+        &self,
+        from_cursor: Option<ChainEventCursor>,
+    ) -> Result<ChainEventEnvelopeStream, ChainSourceError> {
         let inner = self.inner.clone();
+        let zinder_cursor =
+            from_cursor.map(|cursor| ZinderChainEventCursor::from_bytes(cursor.into_bytes()));
         let stream = inner
-            .chain_events(None)
+            .chain_events(zinder_cursor)
             .await
             .map_err(zinder_error_to_chain_source)?;
-        let cursor: Arc<Mutex<Option<ChainEventCursor>>> = Arc::new(Mutex::new(None));
-        let mapped = stream.then(move |envelope_result| {
-            let cursor = cursor.clone();
-            async move {
-                match envelope_result {
-                    Ok(envelope) => Ok(translate_chain_event(&envelope, &cursor).await),
-                    Err(err) => Err(zinder_error_to_chain_source(err)),
-                }
-            }
+        let mapped = stream.map(|envelope_result| match envelope_result {
+            Ok(envelope) => Ok(translate_chain_event_envelope(&envelope)),
+            Err(err) => Err(zinder_error_to_chain_source(err)),
         });
-        Ok(Box::pin(mapped) as ChainEventStream)
+        Ok(Box::pin(mapped) as ChainEventEnvelopeStream)
     }
+}
+
+fn translate_chain_event_envelope(envelope: &ZinderChainEventEnvelope) -> ChainEventEnvelope {
+    ChainEventEnvelope::new(
+        ChainEventCursor::from_bytes(envelope.cursor.as_bytes().to_vec()),
+        envelope.event_sequence,
+        BlockHeight::from(envelope.finalized_height.value()),
+        translate_chain_event(envelope),
+    )
 }
 
 #[allow(
@@ -262,11 +272,7 @@ impl ChainSource for ZinderChainSource {
               ChainTipAdvanced at the envelope's finalized height so streams keep flowing \
               and operators do not silently swallow new transitions."
 )]
-async fn translate_chain_event(
-    envelope: &ChainEventEnvelope,
-    cursor: &Mutex<Option<ChainEventCursor>>,
-) -> ChainEvent {
-    *cursor.lock().await = Some(envelope.cursor.clone());
+fn translate_chain_event(envelope: &ZinderChainEventEnvelope) -> ChainEvent {
     match &envelope.event {
         ZinderChainEvent::ChainCommitted { committed } => ChainEvent::ChainTipAdvanced {
             committed_range: zinder_range_to_zally(committed.block_range),

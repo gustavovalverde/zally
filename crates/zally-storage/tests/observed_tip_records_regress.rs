@@ -9,7 +9,8 @@ use zally_storage::{SqliteWalletStorage, SqliteWalletStorageOptions, StorageErro
 #[tokio::test]
 async fn observed_tip_records_regress() -> Result<(), TestError> {
     let temp = TempDir::new()?;
-    let storage = SqliteWalletStorage::new(SqliteWalletStorageOptions::for_local_tests(
+    let storage = SqliteWalletStorage::new(SqliteWalletStorageOptions::for_network(
+        zally_core::Network::regtest(),
         temp.path().join("wallet.db"),
     ));
     storage.open_or_create().await?;

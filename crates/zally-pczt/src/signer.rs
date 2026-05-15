@@ -6,7 +6,7 @@
 //! gap limit; matched inputs are signed by deriving the corresponding `secp256k1::SecretKey`
 //! and calling `Signer::sign_transparent`.
 
-use pczt::roles::signer::Signer as UpstreamSigner;
+use pczt::roles::signer::{Error as UpstreamSignerError, Signer as UpstreamSigner};
 use secp256k1::{PublicKey, Secp256k1, SecretKey, SignOnly};
 use zally_core::Network;
 use zally_keys::SeedMaterial;
@@ -112,6 +112,9 @@ fn sign_sapling_spends(
     for index in 0..spend_count {
         match signer.sign_sapling(index, &ask) {
             Ok(()) => authorized += 1,
+            Err(UpstreamSignerError::SaplingSign(
+                sapling::pczt::SignerError::WrongSpendAuthorizingKey,
+            )) => {}
             Err(err) => {
                 return Err(PcztError::UpstreamFailed {
                     reason: format!("sapling spend {index} sign failed: {err:?}"),
@@ -128,9 +131,6 @@ fn sign_orchard_spends(
     usk: &UnifiedSpendingKey,
     spend_count: usize,
 ) -> Result<usize, PcztError> {
-    // The zcash_keys 0.13 -> orchard 0.12 transitive dependency conflicts with pczt 0.6's
-    // direct orchard 0.13. Bridge the spending key via its canonical 32-byte form, which
-    // is stable across the minor version bump.
     let sk_bytes = *usk.orchard().to_bytes();
     let spending_key =
         Option::from(orchard::keys::SpendingKey::from_bytes(sk_bytes)).ok_or_else(|| {
@@ -144,6 +144,9 @@ fn sign_orchard_spends(
     for index in 0..spend_count {
         match signer.sign_orchard(index, &ask) {
             Ok(()) => authorized += 1,
+            Err(UpstreamSignerError::OrchardSign(
+                orchard::pczt::SignerError::WrongSpendAuthorizingKey,
+            )) => {}
             Err(err) => {
                 return Err(PcztError::UpstreamFailed {
                     reason: format!("orchard action {index} sign failed: {err:?}"),
@@ -261,16 +264,28 @@ mod tests {
     }
 
     #[test]
-    fn derive_candidate_transparent_keys_returns_internal_and_external_per_index() {
+    fn derive_candidate_transparent_keys_returns_internal_and_external_per_index()
+    -> Result<(), PcztError> {
         let mnemonic = Mnemonic::generate();
         let seed = SeedMaterial::from_mnemonic(&mnemonic, "");
         let params = Network::Testnet.to_parameters();
-        let usk = UnifiedSpendingKey::from_seed(&params, seed.expose_secret(), zip32::AccountId::ZERO)
-            .expect("derivation succeeds");
-        let keys = derive_candidate_transparent_keys(usk.transparent())
-            .expect("candidate derivation succeeds");
+        let usk =
+            UnifiedSpendingKey::from_seed(&params, seed.expose_secret(), zip32::AccountId::ZERO)
+                .map_err(|err| PcztError::UpstreamFailed {
+                    reason: format!("test seed derivation failed: {err:?}"),
+                    is_retryable: false,
+                })?;
+        let keys = derive_candidate_transparent_keys(usk.transparent())?;
         // External + internal at each non-hardened index within the gap limit, so the
         // search space is 2 keys per index.
-        assert_eq!(keys.len() as u32, TRANSPARENT_ADDRESS_GAP_LIMIT * 2);
+        let expected_key_count =
+            usize::try_from(TRANSPARENT_ADDRESS_GAP_LIMIT * 2).map_err(|err| {
+                PcztError::UpstreamFailed {
+                    reason: format!("test key count conversion failed: {err}"),
+                    is_retryable: false,
+                }
+            })?;
+        assert_eq!(keys.len(), expected_key_count);
+        Ok(())
     }
 }

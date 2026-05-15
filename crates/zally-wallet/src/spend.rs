@@ -292,22 +292,9 @@ impl Wallet {
             )
             .await
             .map_err(|err| lift_propose_error(&err))?;
-        let first = prepared
-            .into_iter()
-            .next()
-            .ok_or_else(|| WalletError::ProposalRejected {
-                reason: "create_proposed_transactions returned no transactions".into(),
-            })?;
-        let policy = self.retry_policy();
-        let outcome = crate::retry::with_breaker_and_retry(
-            &self.inner.circuit_breaker,
-            policy,
-            "send_payment.submit",
-            || plan.submitter.submit(&first.raw_bytes),
-            |err| map_submitter_error(&err),
-        )
-        .await?;
-        let result_tx_id = resolve_send_outcome(outcome, first.tx_id)?;
+        let result_tx_id = self
+            .submit_prepared_transactions("send_payment.submit", plan.submitter, prepared)
+            .await?;
 
         self.inner
             .storage
@@ -317,6 +304,104 @@ impl Wallet {
         Ok(SendOutcome {
             tx_id: result_tx_id,
             broadcast_at_height: BlockHeight::from(0),
+        })
+    }
+
+    /// Shields wallet-owned transparent UTXOs into the account's internal shielded receiver,
+    /// then broadcasts the shielding transaction through `plan.submitter`.
+    ///
+    /// This is the transparent-funds path exposed by librustzcash: normal payments do not use
+    /// transparent UTXOs directly unless the recipient shape requires transparent inputs. The
+    /// caller should run [`Wallet::sync`] first so transparent UTXOs have been refreshed from
+    /// the configured [`zally_chain::ChainSource`].
+    ///
+    /// `not_retryable` on insufficient transparent funds or missing prover params;
+    /// `retryable` on transient submitter failures.
+    pub async fn shield_transparent_funds(
+        &self,
+        plan: ShieldTransparentPlan<'_>,
+    ) -> Result<SendOutcome, WalletError> {
+        validate_non_zero(plan.shielding_threshold_zat)?;
+        if plan.submitter.network() != self.network() {
+            return Err(WalletError::NetworkMismatch {
+                storage: self.network(),
+                requested: plan.submitter.network(),
+            });
+        }
+
+        if let Some(prior_tx_id) = self
+            .inner
+            .storage
+            .lookup_idempotent_submission(&plan.idempotency)
+            .await?
+        {
+            return Ok(SendOutcome {
+                tx_id: prior_tx_id,
+                broadcast_at_height: BlockHeight::from(0),
+            });
+        }
+
+        let seed = self
+            .inner
+            .sealing
+            .unseal_seed()
+            .await
+            .map_err(WalletError::from)?;
+        let prepared = self
+            .inner
+            .storage
+            .shield_transparent_funds(
+                zally_storage::ShieldTransparentRequest::new(
+                    plan.account_id,
+                    plan.shielding_threshold_zat.as_u64(),
+                ),
+                &seed,
+            )
+            .await
+            .map_err(|err| lift_propose_error(&err))?;
+        let result_tx_id = self
+            .submit_prepared_transactions(
+                "shield_transparent_funds.submit",
+                plan.submitter,
+                prepared,
+            )
+            .await?;
+
+        self.inner
+            .storage
+            .record_idempotent_submission(plan.idempotency, result_tx_id)
+            .await?;
+
+        Ok(SendOutcome {
+            tx_id: result_tx_id,
+            broadcast_at_height: BlockHeight::from(0),
+        })
+    }
+
+    async fn submit_prepared_transactions(
+        &self,
+        operation: &'static str,
+        submitter: &dyn Submitter,
+        prepared: Vec<zally_storage::PreparedTransaction>,
+    ) -> Result<TxId, WalletError> {
+        let mut first_tx_id = None;
+        for transaction in prepared {
+            let policy = self.retry_policy();
+            let outcome = crate::retry::with_breaker_and_retry(
+                &self.inner.circuit_breaker,
+                policy,
+                operation,
+                || submitter.submit(&transaction.raw_bytes),
+                |err| map_submitter_error(&err),
+            )
+            .await?;
+            let tx_id = resolve_send_outcome(outcome, transaction.tx_id)?;
+            if first_tx_id.is_none() {
+                first_tx_id = Some(tx_id);
+            }
+        }
+        first_tx_id.ok_or_else(|| WalletError::ProposalRejected {
+            reason: "transaction construction returned no transactions".into(),
         })
     }
 }
@@ -433,6 +518,37 @@ pub struct SendPaymentPlan<'submitter> {
     pub submitter: &'submitter dyn Submitter,
 }
 
+/// Inputs to [`Wallet::shield_transparent_funds`].
+#[non_exhaustive]
+pub struct ShieldTransparentPlan<'submitter> {
+    /// Account whose transparent UTXOs are shielded.
+    pub account_id: AccountId,
+    /// Caller-supplied idempotency key.
+    pub idempotency: IdempotencyKey,
+    /// Minimum total transparent input value to shield, in zatoshis.
+    pub shielding_threshold_zat: Zatoshis,
+    /// Submitter that delivers the signed shielding transaction.
+    pub submitter: &'submitter dyn Submitter,
+}
+
+impl<'submitter> ShieldTransparentPlan<'submitter> {
+    /// Constructs a transparent shielding plan.
+    #[must_use]
+    pub const fn new(
+        account_id: AccountId,
+        idempotency: IdempotencyKey,
+        shielding_threshold_zat: Zatoshis,
+        submitter: &'submitter dyn Submitter,
+    ) -> Self {
+        Self {
+            account_id,
+            idempotency,
+            shielding_threshold_zat,
+            submitter,
+        }
+    }
+}
+
 impl<'submitter> SendPaymentPlan<'submitter> {
     /// Constructs a plan with the conventional ZIP-317 fee strategy and no memo.
     #[must_use]
@@ -508,7 +624,7 @@ mod tests {
     use super::*;
 
     fn regtest() -> Network {
-        Network::regtest_all_at_genesis()
+        Network::regtest()
     }
 
     #[test]

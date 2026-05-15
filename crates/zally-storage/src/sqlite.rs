@@ -26,13 +26,21 @@ use tokio::sync::{mpsc, oneshot};
 use zally_core::{AccountId, BlockHeight, IdempotencyKey, Network, NetworkParameters, TxId};
 use zally_keys::{KeyDerivationError, SeedMaterial, derive_ufvk};
 use zcash_client_backend::data_api::chain::ChainState;
+use zcash_client_backend::data_api::wallet::{
+    ConfirmationsPolicy, SpendingKeys, input_selection::GreedyInputSelector,
+};
 use zcash_client_backend::data_api::{Account, AccountBirthday, WalletRead, WalletWrite};
+use zcash_client_backend::fees::{DustOutputPolicy, StandardFeeRule, standard};
+use zcash_client_backend::wallet::WalletTransparentOutput;
 use zcash_client_sqlite::AccountUuid;
 use zcash_client_sqlite::WalletDb;
 use zcash_client_sqlite::util::SystemClock;
 use zcash_client_sqlite::wallet::init::WalletMigrator;
 use zcash_keys::address::UnifiedAddress;
 use zcash_keys::keys::UnifiedAddressRequest;
+use zcash_protocol::value::Zatoshis;
+use zcash_transparent::address::Script;
+use zcash_transparent::bundle::{OutPoint, TxOut};
 
 use crate::storage_error::StorageError;
 use crate::wallet_storage::WalletStorage;
@@ -49,22 +57,25 @@ const DEFAULT_ACCOUNT_NAME: &str = "primary";
 /// instead of letting an unbounded queue silently grow.
 const WALLET_DB_QUEUE_CAPACITY: usize = 256;
 
-/// Work item sent to the wallet-db actor. The closure owns its own reply
-/// channel and the typed result; the actor just calls it. This is the
-/// type-erasure that lets one `mpsc` channel carry every `with_db`,
-/// `with_db_mut`, `with_ledger`, and `open_or_create` request without a
-/// per-method message variant.
+/// Work item sent to the wallet-db actor.
+///
+/// The closure owns its own reply channel and typed result; the actor just
+/// calls it. This is the type-erasure that lets one `mpsc` channel carry every
+/// `with_db`, `with_db_mut`, `with_ledger`, and `open_or_create` request
+/// without a per-method message variant.
 type DbWork = Box<dyn FnOnce(&mut WalletDbState, &SqliteWalletStorageOptions) + Send>;
 
-/// State held on the actor thread. `NotOpened` is the initial state; the
-/// first successful [`WalletStorage::open_or_create`] transitions to
-/// `Opened`. Every other request errors with [`StorageError::NotOpened`]
-/// while the state is `NotOpened`, matching the prior lazy-open contract.
+/// State held on the actor thread.
+///
+/// `NotOpened` is the initial state; the first successful
+/// [`WalletStorage::open_or_create`] transitions to `Opened`. Every other
+/// request errors with [`StorageError::NotOpened`] while the state is
+/// `NotOpened`, matching the prior lazy-open contract.
 enum WalletDbState {
     NotOpened,
     Opened {
-        db: Db,
-        ledger: rusqlite::Connection,
+        db: Box<Db>,
+        ledger: Box<rusqlite::Connection>,
     },
 }
 
@@ -81,22 +92,12 @@ pub struct SqliteWalletStorageOptions {
 }
 
 impl SqliteWalletStorageOptions {
-    /// Production options. The account name defaults to `"primary"`.
+    /// Storage options for a network-bound wallet. The account name defaults to `"primary"`.
     #[must_use]
     pub fn for_network(network: Network, db_path: PathBuf) -> Self {
         Self {
             db_path,
             network,
-            account_name: DEFAULT_ACCOUNT_NAME.to_owned(),
-        }
-    }
-
-    /// Options for local tests. The account name defaults to `"primary"`.
-    #[must_use]
-    pub fn for_local_tests(db_path: PathBuf) -> Self {
-        Self {
-            db_path,
-            network: Network::regtest_all_at_genesis(),
             account_name: DEFAULT_ACCOUNT_NAME.to_owned(),
         }
     }
@@ -121,7 +122,7 @@ pub struct SqliteWalletStorage {
 impl SqliteWalletStorage {
     /// Constructs a new storage handle and spawns the wallet-db actor. The
     /// database is not opened until [`SqliteWalletStorage::open_or_create`] is
-    /// called (the actor starts in [`WalletDbState::NotOpened`]).
+    /// called (the actor starts unopened).
     ///
     /// Must be called from within a tokio runtime; the actor lives on the
     /// runtime's blocking pool until all handles are dropped.
@@ -182,7 +183,7 @@ impl SqliteWalletStorage {
     {
         self.dispatch(move |state, _options| match state {
             WalletDbState::NotOpened => Err(StorageError::NotOpened),
-            WalletDbState::Opened { ledger, .. } => work(ledger),
+            WalletDbState::Opened { ledger, .. } => work(ledger.as_ref()),
         })
         .await
     }
@@ -194,7 +195,7 @@ impl SqliteWalletStorage {
     {
         self.dispatch(move |state, _options| match state {
             WalletDbState::NotOpened => Err(StorageError::NotOpened),
-            WalletDbState::Opened { db, .. } => work(db),
+            WalletDbState::Opened { db, .. } => work(db.as_ref()),
         })
         .await
     }
@@ -206,7 +207,7 @@ impl SqliteWalletStorage {
     {
         self.dispatch(move |state, _options| match state {
             WalletDbState::NotOpened => Err(StorageError::NotOpened),
-            WalletDbState::Opened { db, .. } => work(db),
+            WalletDbState::Opened { db, .. } => work(db.as_mut()),
         })
         .await
     }
@@ -233,18 +234,17 @@ fn open_wallet_db(options: &SqliteWalletStorageOptions) -> Result<WalletDbState,
         })?;
     }
     let params = options.network.to_parameters();
-    let mut db =
-        WalletDb::for_path(&options.db_path, params, SystemClock, OsRng).map_err(|e| {
-            StorageError::SqliteFailed {
-                reason: e.to_string(),
-                is_retryable: false,
-            }
-        })?;
-    WalletMigrator::new().init_or_migrate(&mut db).map_err(|e| {
-        StorageError::MigrationFailed {
+    let mut db = WalletDb::for_path(&options.db_path, params, SystemClock, OsRng).map_err(|e| {
+        StorageError::SqliteFailed {
             reason: e.to_string(),
+            is_retryable: false,
         }
     })?;
+    WalletMigrator::new()
+        .init_or_migrate(&mut db)
+        .map_err(|e| StorageError::MigrationFailed {
+            reason: e.to_string(),
+        })?;
 
     let ledger =
         rusqlite::Connection::open(&options.db_path).map_err(|e| StorageError::SqliteFailed {
@@ -268,7 +268,10 @@ fn open_wallet_db(options: &SqliteWalletStorageOptions) -> Result<WalletDbState,
             is_retryable: false,
         })?;
 
-    Ok(WalletDbState::Opened { db, ledger })
+    Ok(WalletDbState::Opened {
+        db: Box::new(db),
+        ledger: Box::new(ledger),
+    })
 }
 
 #[allow(
@@ -375,6 +378,48 @@ impl WalletStorage for SqliteWalletStorage {
                 .map_err(|e| map_sqlite_error(&e))?;
             let (address, _diversifier) = outcome.ok_or(StorageError::AccountNotFound)?;
             Ok(address)
+        })
+        .await
+    }
+
+    async fn list_transparent_receivers(
+        &self,
+    ) -> Result<Vec<crate::wallet_storage::TransparentReceiverRow>, StorageError> {
+        self.with_db(move |db| {
+            let accounts = db
+                .get_unified_full_viewing_keys()
+                .map_err(|e| map_sqlite_error(&e))?;
+            let mut receivers = Vec::new();
+            for account_uuid in accounts.keys().copied() {
+                let transparent_addresses = db
+                    .get_transparent_receivers(account_uuid, true, true)
+                    .map_err(|e| map_sqlite_error(&e))?;
+                for address in transparent_addresses.into_keys() {
+                    let script = Script::from(address.script());
+                    receivers.push(crate::wallet_storage::TransparentReceiverRow::new(
+                        account_uuid_to_zally(account_uuid),
+                        script.0.0,
+                    ));
+                }
+            }
+            Ok(receivers)
+        })
+        .await
+    }
+
+    async fn record_transparent_utxos(
+        &self,
+        utxos: Vec<crate::wallet_storage::TransparentUtxoRow>,
+    ) -> Result<u64, StorageError> {
+        self.with_db_mut(move |db| {
+            let mut recorded_count = 0_u64;
+            for utxo in utxos {
+                let output = transparent_utxo_row_to_output(utxo)?;
+                db.put_received_transparent_utxo(&output)
+                    .map_err(|e| map_sqlite_error(&e))?;
+                recorded_count = recorded_count.saturating_add(1);
+            }
+            Ok(recorded_count)
         })
         .await
     }
@@ -581,10 +626,7 @@ impl WalletStorage for SqliteWalletStorage {
             .map_err(|err| StorageError::KeyDerivationFailed {
                 reason: format!("ZIP-32 derivation failed: {err}"),
             })?;
-            let spending_keys =
-                zcash_client_backend::data_api::wallet::SpendingKeys::from_unified_spending_key(
-                    usk,
-                );
+            let spending_keys = SpendingKeys::from_unified_spending_key(usk);
 
             let proposal =
                 zcash_client_backend::data_api::wallet::propose_standard_transfer_to_address::<
@@ -629,28 +671,69 @@ impl WalletStorage for SqliteWalletStorage {
                 is_retryable: false,
             })?;
 
-            let mut prepared = Vec::with_capacity(txids.len());
-            for tx_id in &txids {
-                let stored =
-                    zcash_client_backend::data_api::WalletRead::get_transaction(db, *tx_id)
-                        .map_err(|e| map_sqlite_error(&e))?
-                        .ok_or_else(|| StorageError::SqliteFailed {
-                            reason: format!("created tx {tx_id} not present in wallet store"),
-                            is_retryable: false,
-                        })?;
-                let mut raw_bytes = Vec::new();
-                stored
-                    .write(&mut raw_bytes)
-                    .map_err(|err| StorageError::SqliteFailed {
-                        reason: format!("transaction serialize failed: {err}"),
-                        is_retryable: false,
-                    })?;
-                prepared.push(crate::wallet_storage::PreparedTransaction::new(
-                    zally_core::TxId::from_bytes(*tx_id.as_ref()),
-                    raw_bytes,
-                ));
-            }
-            Ok(prepared)
+            prepared_transactions_for_txids(db, &txids, "created")
+        })
+        .await
+    }
+
+    async fn shield_transparent_funds(
+        &self,
+        request: crate::wallet_storage::ShieldTransparentRequest,
+        seed: &SeedMaterial,
+    ) -> Result<Vec<crate::wallet_storage::PreparedTransaction>, StorageError> {
+        let params = self.options.network.to_parameters();
+        let account_uuid = zally_to_account_uuid(request.account_id);
+        let shielding_threshold =
+            Zatoshis::from_u64(request.shielding_threshold_zat).map_err(|_| {
+                StorageError::TransparentOutputValueOutOfRange {
+                    value_zat: request.shielding_threshold_zat,
+                }
+            })?;
+        let prover = zcash_proofs::prover::LocalTxProver::with_default_location()
+            .ok_or(StorageError::ProverUnavailable)?;
+        let seed_bytes = SecretVec::new(seed.expose_secret().to_vec());
+
+        self.with_db_mut(move |db| {
+            let usk = zcash_keys::keys::UnifiedSpendingKey::from_seed(
+                &params,
+                seed_bytes.expose_secret(),
+                zip32::AccountId::ZERO,
+            )
+            .map_err(|err| StorageError::KeyDerivationFailed {
+                reason: format!("ZIP-32 derivation failed: {err}"),
+            })?;
+            let spending_keys = SpendingKeys::from_unified_spending_key(usk);
+            let from_addrs: Vec<_> = db
+                .get_transparent_receivers(account_uuid, true, true)
+                .map_err(|e| map_sqlite_error(&e))?
+                .into_keys()
+                .collect();
+            let input_selector = GreedyInputSelector::<Db>::new();
+            let change_strategy = standard::SingleOutputChangeStrategy::<Db>::new(
+                StandardFeeRule::Zip317,
+                None,
+                zcash_protocol::ShieldedProtocol::Orchard,
+                DustOutputPolicy::default(),
+            );
+            let txids = zcash_client_backend::data_api::wallet::shield_transparent_funds(
+                db,
+                &params,
+                &prover,
+                &prover,
+                &input_selector,
+                &change_strategy,
+                shielding_threshold,
+                &spending_keys,
+                &from_addrs,
+                account_uuid,
+                ConfirmationsPolicy::default(),
+            )
+            .map_err(|err| StorageError::SqliteFailed {
+                reason: format!("shield_transparent_funds failed: {err}"),
+                is_retryable: false,
+            })?;
+
+            prepared_transactions_for_txids(db, txids.iter(), "shielding")
         })
         .await
     }
@@ -1129,7 +1212,17 @@ const RECEIVED_SHIELDED_NOTES_FOR_ACCOUNT_SQL: &str = "\
     WHERE a.uuid = ?1 AND t.mined_height IS NOT NULL \
     ORDER BY mined_height ASC, txid ASC, output_index ASC, pool ASC";
 
-type ReceivedShieldedNoteRowRaw = (Vec<u8>, Vec<u8>, i64, i64, i64, String, Option<i64>, i64, i64);
+type ReceivedShieldedNoteRowRaw = (
+    Vec<u8>,
+    Vec<u8>,
+    i64,
+    i64,
+    i64,
+    String,
+    Option<i64>,
+    i64,
+    i64,
+);
 
 fn decode_received_shielded_note_row(
     row: &rusqlite::Row<'_>,
@@ -1148,7 +1241,10 @@ fn decode_received_shielded_note_row(
 }
 
 fn collect_received_shielded_note_rows(
-    mapped: rusqlite::MappedRows<'_, impl FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<ReceivedShieldedNoteRowRaw>>,
+    mapped: rusqlite::MappedRows<
+        '_,
+        impl FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<ReceivedShieldedNoteRowRaw>,
+    >,
 ) -> Result<Vec<crate::wallet_storage::ReceivedShieldedNoteRow>, StorageError> {
     let mut rows = Vec::new();
     for raw in mapped {
@@ -1173,18 +1269,18 @@ fn collect_received_shielded_note_rows(
                     reason: format!("transactions.txid had wrong byte length: {}", raw.len()),
                     is_retryable: false,
                 })?;
-        let account_uuid_array: [u8; 16] = account_uuid_bytes.try_into().map_err(|raw: Vec<u8>| {
-            StorageError::SqliteFailed {
-                reason: format!("accounts.uuid had wrong byte length: {}", raw.len()),
-                is_retryable: false,
-            }
-        })?;
+        let account_uuid_array: [u8; 16] =
+            account_uuid_bytes
+                .try_into()
+                .map_err(|raw: Vec<u8>| StorageError::SqliteFailed {
+                    reason: format!("accounts.uuid had wrong byte length: {}", raw.len()),
+                    is_retryable: false,
+                })?;
         let account_uuid = uuid::Uuid::from_bytes(account_uuid_array);
-        let output_index =
-            u32::try_from(output_index).map_err(|_| StorageError::SqliteFailed {
-                reason: format!("received note output_index out of u32 range: {output_index}"),
-                is_retryable: false,
-            })?;
+        let output_index = u32::try_from(output_index).map_err(|_| StorageError::SqliteFailed {
+            reason: format!("received note output_index out of u32 range: {output_index}"),
+            is_retryable: false,
+        })?;
         let value_zat = u64::try_from(value_zat).map_err(|_| StorageError::SqliteFailed {
             reason: format!("received note value out of u64 range: {value_zat}"),
             is_retryable: false,
@@ -1296,6 +1392,58 @@ fn account_uuid_to_zally(uuid: AccountUuid) -> AccountId {
 
 fn zally_to_account_uuid(id: AccountId) -> AccountUuid {
     AccountUuid::from_uuid(id.as_uuid())
+}
+
+fn prepared_transactions_for_txids<'a>(
+    db: &Db,
+    txids: impl IntoIterator<Item = &'a zcash_protocol::TxId>,
+    context: &'static str,
+) -> Result<Vec<crate::wallet_storage::PreparedTransaction>, StorageError> {
+    let txids_iter = txids.into_iter();
+    let (lower_bound, _) = txids_iter.size_hint();
+    let mut prepared = Vec::with_capacity(lower_bound);
+    for tx_id in txids_iter {
+        let stored = zcash_client_backend::data_api::WalletRead::get_transaction(db, *tx_id)
+            .map_err(|e| map_sqlite_error(&e))?
+            .ok_or_else(|| StorageError::SqliteFailed {
+                reason: format!("{context} tx {tx_id} not present in wallet store"),
+                is_retryable: false,
+            })?;
+        let mut raw_bytes = Vec::new();
+        stored
+            .write(&mut raw_bytes)
+            .map_err(|err| StorageError::SqliteFailed {
+                reason: format!("transaction serialize failed: {err}"),
+                is_retryable: false,
+            })?;
+        prepared.push(crate::wallet_storage::PreparedTransaction::new(
+            zally_core::TxId::from_bytes(*tx_id.as_ref()),
+            raw_bytes,
+        ));
+    }
+    Ok(prepared)
+}
+
+fn transparent_utxo_row_to_output(
+    row: crate::wallet_storage::TransparentUtxoRow,
+) -> Result<WalletTransparentOutput, StorageError> {
+    let output_zat = Zatoshis::from_u64(row.value_zat).map_err(|_| {
+        StorageError::TransparentOutputValueOutOfRange {
+            value_zat: row.value_zat,
+        }
+    })?;
+    let outpoint = OutPoint::new(*row.tx_id.as_bytes(), row.output_index);
+    let txout = TxOut::new(
+        output_zat,
+        Script(zcash_script::script::Code(row.script_pub_key_bytes)),
+    );
+    let mined_height = zcash_protocol::consensus::BlockHeight::from(row.mined_height.as_u32());
+    WalletTransparentOutput::from_parts(outpoint, txout, Some(mined_height)).ok_or(
+        StorageError::TransparentOutputNotRecognized {
+            tx_id: row.tx_id,
+            output_index: row.output_index,
+        },
+    )
 }
 
 fn map_sqlite_error<E: std::fmt::Display>(err: &E) -> StorageError {

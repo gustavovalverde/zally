@@ -8,5 +8,6 @@ pub use sqlite::{SqliteWalletStorage, SqliteWalletStorageOptions};
 pub use storage_error::StorageError;
 pub use wallet_storage::{
     PreparedTransaction, ProposalPaymentRequest, ProposalSummary, ReceivedShieldedNoteRow,
-    ScanRequest, ScanResult, UnspentShieldedNoteRow, WalletStorage,
+    ScanRequest, ScanResult, ShieldTransparentRequest, TransparentReceiverRow, TransparentUtxoRow,
+    UnspentShieldedNoteRow, WalletStorage,
 };

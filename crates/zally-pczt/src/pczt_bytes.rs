@@ -64,9 +64,9 @@ mod tests {
     #[test]
     fn pczt_bytes_round_trip_metadata() {
         let raw = vec![0_u8, 1, 2, 3];
-        let pczt = PcztBytes::from_serialized(raw.clone(), Network::regtest_all_at_genesis());
+        let pczt = PcztBytes::from_serialized(raw.clone(), Network::regtest());
         assert_eq!(pczt.as_bytes(), raw.as_slice());
-        assert_eq!(pczt.network(), Network::regtest_all_at_genesis());
+        assert_eq!(pczt.network(), Network::regtest());
         assert_eq!(pczt.into_bytes(), raw);
     }
 }

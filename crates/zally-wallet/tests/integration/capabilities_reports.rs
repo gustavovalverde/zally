@@ -10,11 +10,13 @@ use zally_wallet::{
 #[tokio::test]
 async fn capabilities_reports_standing_surface() -> Result<(), TestError> {
     let temp = TempWalletPath::create()?;
-    let network = Network::regtest_all_at_genesis();
+    let network = Network::regtest();
 
     let sealing = InMemorySealing::new();
-    let storage =
-        SqliteWalletStorage::new(SqliteWalletStorageOptions::for_local_tests(temp.db_path()));
+    let storage = SqliteWalletStorage::new(SqliteWalletStorageOptions::for_network(
+        network,
+        temp.db_path(),
+    ));
     let chain = zally_testkit::MockChainSource::new(network);
     let (wallet, _, _) =
         Wallet::create(&chain, network, sealing, storage, BlockHeight::from(1)).await?;
@@ -28,10 +30,12 @@ async fn capabilities_reports_standing_surface() -> Result<(), TestError> {
     assert!(caps.features.contains(&Capability::Zip320TexAddresses));
     assert!(caps.features.contains(&Capability::Zip317ConventionalFee));
     assert!(caps.features.contains(&Capability::SyncIncremental));
+    assert!(caps.features.contains(&Capability::SyncDriver));
     assert!(caps.features.contains(&Capability::EventStream));
     assert!(caps.features.contains(&Capability::IdempotentSend));
     assert!(caps.features.contains(&Capability::PcztV06));
     assert!(caps.features.contains(&Capability::MetricsSnapshot));
+    assert!(caps.features.contains(&Capability::StatusSnapshot));
     Ok(())
 }
 

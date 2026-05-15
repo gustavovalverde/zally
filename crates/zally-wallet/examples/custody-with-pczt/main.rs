@@ -35,7 +35,7 @@ async fn main() -> Result<(), ExampleError> {
         )
         .try_init();
 
-    let network = Network::regtest_all_at_genesis();
+    let network = Network::regtest();
     bootstrap_wallet(network).await?;
 
     let creator = Creator::new(network);

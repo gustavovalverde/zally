@@ -37,7 +37,7 @@ Zally fills the missing rung: typed, in-process, non-interactive, multi-receiver
                 │       ├──► zally-chain   (ChainSource + Submitter)       │
                 │       ├──► zally-storage (WalletStorage trait + SQLite)  │
                 │       ├──► zally-keys    (seed sealing, derivation)      │
-                │       ├──► zally-pczt    (PCZT roles for external sign)  │
+                │       ├──► zally-pczt    (PCZT roles)                    │
                 │       └──► zally-core    (Network, Zatoshis, errors)     │
                 │                                                          │
                 │  zally-testkit ──── fixtures + regtest helpers           │
@@ -62,7 +62,7 @@ Crate boundaries are recorded in [ADR-0001](docs/adrs/0001-workspace-crate-bound
 - `zally-keys`: seed lifecycle, encryption-at-rest (`SeedSealing` trait), USK/UFVK/UIVK derivation, zeroization discipline.
 - `zally-storage`: `WalletStorage` trait wrapping librustzcash's `WalletRead`/`WalletWrite`; default `SqliteWalletStorage` over `zcash_client_sqlite`.
 - `zally-chain`: `ChainSource` and `Submitter` traits. A `ZinderChainSource` plus `ZinderSubmitter` implementation ships behind the `zinder` cargo feature; operators with a different chain plane provide their own implementation of the traits.
-- `zally-pczt`: PCZT roles (`Creator`, `Signer`, `Combiner`, `Extractor`) for HSM and multi-party signing.
+- `zally-pczt`: PCZT roles (`Creator`, `Prover`, `Signer`, `Combiner`, `Extractor`) for HSM and multi-party signing.
 - `zally-wallet`: high-level operator API. Includes the scan-loop module (orchestrating `ChainSource` plus `WalletStorage`).
 - `zally-testkit`: fixtures, mock chain sources, in-memory storage, regtest helpers. Behind a feature flag so it never lands in operator binaries.
 

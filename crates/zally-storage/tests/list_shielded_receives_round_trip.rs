@@ -19,7 +19,8 @@ use zcash_primitives::block::BlockHash;
 #[tokio::test]
 async fn list_shielded_receives_round_trip_empty_account() -> Result<(), TestError> {
     let temp = TempDir::new()?;
-    let storage = SqliteWalletStorage::new(SqliteWalletStorageOptions::for_local_tests(
+    let storage = SqliteWalletStorage::new(SqliteWalletStorageOptions::for_network(
+        zally_core::Network::regtest(),
         temp.path().join("wallet.db"),
     ));
     storage.open_or_create().await?;
@@ -43,7 +44,8 @@ async fn list_shielded_receives_round_trip_empty_account() -> Result<(), TestErr
 #[tokio::test]
 async fn list_shielded_receives_returns_empty_for_unknown_account() -> Result<(), TestError> {
     let temp = TempDir::new()?;
-    let storage = SqliteWalletStorage::new(SqliteWalletStorageOptions::for_local_tests(
+    let storage = SqliteWalletStorage::new(SqliteWalletStorageOptions::for_network(
+        zally_core::Network::regtest(),
         temp.path().join("wallet.db"),
     ));
     storage.open_or_create().await?;

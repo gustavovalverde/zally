@@ -18,8 +18,9 @@ pub use buffered_block_source::{BufferedBlockSource, BufferedBlockSourceError};
 pub use chain_error::{ChainSourceError, SubmitterError};
 
 pub use chain_source::{
-    BlockHeightRange, ChainEvent, ChainEventStream, ChainSource, CompactBlockStream, ShieldedPool,
-    SubtreeIndex, SubtreeRoot, TransactionStatus, TransparentUtxo,
+    BlockHeightRange, ChainEvent, ChainEventCursor, ChainEventEnvelope, ChainEventEnvelopeStream,
+    ChainEventStream, ChainSource, CompactBlockStream, ShieldedPool, SubtreeIndex, SubtreeRoot,
+    TransactionStatus, TransparentUtxo,
 };
 pub use submitter::{SubmitOutcome, Submitter};
 /// Re-export of `zcash_client_backend::data_api::chain::ChainState` so callers of the Zally

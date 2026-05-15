@@ -85,6 +85,27 @@ impl ProposalPaymentRequest {
     }
 }
 
+/// Request body for [`WalletStorage::shield_transparent_funds`].
+///
+/// Shields wallet-owned transparent UTXOs into the account's internal shielded receiver.
+pub struct ShieldTransparentRequest {
+    /// Account that owns the transparent UTXOs and receives the shielded output.
+    pub account_id: AccountId,
+    /// Minimum total transparent input value to shield, in zatoshis.
+    pub shielding_threshold_zat: u64,
+}
+
+impl ShieldTransparentRequest {
+    /// Constructs a new transparent shielding request.
+    #[must_use]
+    pub fn new(account_id: AccountId, shielding_threshold_zat: u64) -> Self {
+        Self {
+            account_id,
+            shielding_threshold_zat,
+        }
+    }
+}
+
 /// One prepared transaction returned by [`WalletStorage::prepare_payment`].
 ///
 /// The transaction has been signed, persisted to the wallet DB, and is ready to broadcast.
@@ -169,6 +190,67 @@ pub struct ReceivedShieldedNoteRow {
     pub spent_our_inputs: bool,
 }
 
+/// One transparent receiver the wallet should refresh through a chain source.
+///
+/// Compact blocks do not carry enough transparent-output detail for wallet discovery.
+/// The wallet sync loop asks storage for the exposed transparent receivers and then asks
+/// `ChainSource` for matching UTXOs.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub struct TransparentReceiverRow {
+    /// Account that owns this receiver.
+    pub account_id: AccountId,
+    /// Receiver `scriptPubKey` bytes.
+    pub script_pub_key_bytes: Vec<u8>,
+}
+
+impl TransparentReceiverRow {
+    /// Constructs a transparent receiver row.
+    #[must_use]
+    pub fn new(account_id: AccountId, script_pub_key_bytes: Vec<u8>) -> Self {
+        Self {
+            account_id,
+            script_pub_key_bytes,
+        }
+    }
+}
+
+/// One transparent UTXO discovered by a chain source and ready to record in storage.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub struct TransparentUtxoRow {
+    /// Transaction that produced this output.
+    pub tx_id: TxId,
+    /// Output index within the producing transaction.
+    pub output_index: u32,
+    /// Value in zatoshis.
+    pub value_zat: u64,
+    /// Height at which this output was mined.
+    pub mined_height: BlockHeight,
+    /// Output `scriptPubKey` bytes.
+    pub script_pub_key_bytes: Vec<u8>,
+}
+
+impl TransparentUtxoRow {
+    /// Constructs a transparent UTXO row.
+    #[must_use]
+    pub fn new(
+        tx_id: TxId,
+        output_index: u32,
+        value_zat: u64,
+        mined_height: BlockHeight,
+        script_pub_key_bytes: Vec<u8>,
+    ) -> Self {
+        Self {
+            tx_id,
+            output_index,
+            value_zat,
+            mined_height,
+            script_pub_key_bytes,
+        }
+    }
+}
+
 /// Summary of a successful [`WalletStorage::propose_payment`] call.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
@@ -249,6 +331,30 @@ pub trait WalletStorage: Send + Sync + 'static {
         account_id: AccountId,
     ) -> Result<UnifiedAddress, StorageError>;
 
+    /// Returns every wallet-owned transparent receiver that should be refreshed from the
+    /// chain source.
+    ///
+    /// Wraps `WalletRead::get_transparent_receivers` for every wallet account. The caller
+    /// queries the chain source by `script_pub_key_bytes`, then records the resulting UTXOs
+    /// through [`Self::record_transparent_utxos`].
+    ///
+    /// `not_retryable` on unknown account or schema errors; `retryable` on transient I/O.
+    async fn list_transparent_receivers(&self)
+    -> Result<Vec<TransparentReceiverRow>, StorageError>;
+
+    /// Records transparent UTXOs discovered from a chain source.
+    ///
+    /// Wraps `WalletWrite::put_received_transparent_utxo`. The operation is idempotent at
+    /// the upstream wallet database boundary: recording a UTXO that already exists returns
+    /// success without duplicating spendable funds.
+    ///
+    /// `not_retryable` on malformed output scripts or schema errors; `retryable` on
+    /// transient I/O.
+    async fn record_transparent_utxos(
+        &self,
+        utxos: Vec<TransparentUtxoRow>,
+    ) -> Result<u64, StorageError>;
+
     /// Returns the network this storage instance was opened for.
     fn network(&self) -> Network;
 
@@ -288,6 +394,22 @@ pub trait WalletStorage: Send + Sync + 'static {
     async fn prepare_payment(
         &self,
         request: ProposalPaymentRequest,
+        seed: &SeedMaterial,
+    ) -> Result<Vec<PreparedTransaction>, StorageError>;
+
+    /// Shields wallet-owned transparent UTXOs into the account's internal shielded receiver.
+    ///
+    /// Wraps `zcash_client_backend::data_api::wallet::shield_transparent_funds` using ZIP-317
+    /// conventional fees and the default ZIP-315 confirmations policy. The storage layer
+    /// selects from the account's known transparent receivers; the wallet layer is responsible
+    /// for refreshing transparent UTXOs from a chain source before calling this method.
+    ///
+    /// `not_retryable` on insufficient transparent funds, unknown account, or missing
+    /// transparent receivers; `requires_operator` on missing Sapling params; `retryable` on
+    /// transient I/O.
+    async fn shield_transparent_funds(
+        &self,
+        request: ShieldTransparentRequest,
         seed: &SeedMaterial,
     ) -> Result<Vec<PreparedTransaction>, StorageError>;
 

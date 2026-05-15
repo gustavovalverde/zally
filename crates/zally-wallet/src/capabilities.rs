@@ -65,6 +65,8 @@ pub enum Capability {
     Zip317ConventionalFee,
     /// `Wallet::sync` is available.
     SyncIncremental,
+    /// `SyncDriver` is available for caller-owned continuous sync.
+    SyncDriver,
     /// `Wallet::observe` is available.
     EventStream,
     /// `Wallet::send_payment` honours the caller-supplied `zally_core::IdempotencyKey`.
@@ -73,6 +75,8 @@ pub enum Capability {
     PcztV06,
     /// `Wallet::metrics_snapshot` returns a typed [`crate::WalletMetrics`].
     MetricsSnapshot,
+    /// `Wallet::status_snapshot` returns a typed [`crate::WalletStatus`].
+    StatusSnapshot,
     /// The wallet's [`crate::CircuitBreaker`] has tripped open. Subsequent outbound IO
     /// short-circuits with [`crate::WalletError::CircuitBroken`] until the breaker cools
     /// down. Cleared automatically when the breaker re-closes.

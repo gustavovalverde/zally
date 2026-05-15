@@ -29,7 +29,7 @@ async fn main() -> Result<(), ExampleError> {
         )
         .try_init();
 
-    let network = Network::regtest_all_at_genesis();
+    let network = Network::regtest();
     let temp = TempDir::new()?;
     let sealing = AgeFileSealing::new(AgeFileSealingOptions::at_path(
         temp.path().join("wallet.age"),

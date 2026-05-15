@@ -20,13 +20,16 @@ Move every spendable note out of a Zally wallet to one operator-controlled recei
 2. **Online: create PCZT**
    - `Creator::wrap(pczt)` returns `PcztBytes` tagged with the wallet's network.
    - Transport the bytes to the cold signer (USB stick, QR, hardware wallet bridge: your choice).
-3. **Cold: sign**
+3. **Cold: prove**
+   - On the cold signer, instantiate `Prover::new(network)` and call `prove_with_seed(pczt, &seed)`.
+   - The prover validates the embedded network before touching the seed and creates required Sapling and Orchard proofs.
+4. **Cold: sign**
    - On the cold signer, instantiate `Signer::new(network)` and call `sign_with_seed(pczt, &seed)`.
    - The signer validates the embedded network *before* touching the seed. A mismatched PCZT routes to `PcztError::NetworkMismatch` with no key derivation.
-4. **Cold to online: combine (optional)**
+5. **Cold to online: combine (optional)**
    - For FROST or multi-sig quorums, gather every signer's `PcztBytes` and call `Combiner::new().combine(pczts)`.
    - The combiner rejects mixed networks and conflicting inputs and outputs before returning.
-5. **Online: extract and submit**
+6. **Online: extract and submit**
    - `Extractor::new().extract(pczt)` yields `ExtractedTransaction { raw_bytes, tx_id, network }`.
    - Hand `raw_bytes` to a `Submitter` implementation. The default `ZinderSubmitter` is available behind the `zinder` feature; operators with a different chain plane plug in their own implementation.
    - Persist `tx_id` in the operator's audit log and watch for `WalletEvent::TransactionConfirmed { tx_id, .. }` on the wallet's `observe()` stream.
@@ -49,7 +52,7 @@ The custody example [`crates/zally-wallet/examples/custody-with-pczt/main.rs`](.
 | `PcztError::NetworkMismatch` | PCZT and signer disagree on network. | Abort; never sign a misrouted PCZT. |
 | `PcztError::NoMatchingKeys` | The cold signer's seed cannot spend the inputs. | Wrong sealed seed; switch to the matching cold signer. |
 | `PcztError::CombineConflict` | Quorum members signed different proposals. | Rebuild from a single canonical proposal. |
-| `PcztError::NotFinalized` | Extractor called before all signers ran. | Check the combine step ran successfully. |
+| `PcztError::NotFinalized` | Extractor called before proving or signing completed. | Check the prove, sign, and combine steps ran successfully. |
 | `SubmitterError::NodeUnavailable { is_retryable: true }` | Node down. | Retry; idempotency is preserved by the persisted `tx_id`. |
 
 ## Operator checklist

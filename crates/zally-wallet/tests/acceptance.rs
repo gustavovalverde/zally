@@ -4,3 +4,4 @@
 //! `live/` module aggregates T3 live tests when they land.
 
 mod integration;
+mod live;

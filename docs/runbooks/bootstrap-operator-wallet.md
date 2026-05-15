@@ -27,9 +27,9 @@ Stand up a fresh Zally wallet on regtest, testnet, or mainnet, recording the BIP
 
 ## Verification
 
-Run [`cargo run --example open-wallet`](../../crates/zally-wallet/examples/open-wallet/main.rs). The example proves the create → seal → re-open → next-address round-trip for a regtest wallet. The address printed on first `derive_next_address` must differ from the address printed after re-opening; the example asserts this and fails loudly otherwise.
+Run [`cargo run -p zally-wallet --example open-wallet`](../../crates/zally-wallet/examples/open-wallet/main.rs). The example proves the create → seal → re-open → next-address round-trip for a regtest wallet. The address printed on first `derive_next_address` must differ from the address printed after re-opening; the example asserts this and fails loudly otherwise.
 
-For a mining-pool deployment, also run [`cargo run --example mining-payout`](../../crates/zally-wallet/examples/mining-payout/main.rs); it prints the ZIP-213 100-block confirmation depth alongside the hot-dispense single-block depth so the operator confirms which receiver-purpose policy is active.
+For a mining-pool deployment, also run [`cargo run -p zally-wallet --example mining-payout`](../../crates/zally-wallet/examples/mining-payout/main.rs); it prints the ZIP-213 100-block confirmation depth alongside the hot-dispense single-block depth so the operator confirms which receiver-purpose policy is active.
 
 ## Failure modes
 
