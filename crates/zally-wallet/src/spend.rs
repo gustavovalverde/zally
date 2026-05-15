@@ -374,8 +374,7 @@ impl Wallet {
 
 #[allow(
     clippy::wildcard_enum_match_arm,
-    reason = "SubmitOutcome is #[non_exhaustive]; unrecognised future variants surface as a \
-              non-retryable ProposalRejected so the operator gets a clear failure"
+    reason = "non_exhaustive submit outcomes map unknown variants to ProposalRejected"
 )]
 fn resolve_send_outcome(
     outcome: zally_chain::SubmitOutcome,

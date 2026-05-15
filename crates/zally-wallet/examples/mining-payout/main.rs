@@ -6,17 +6,14 @@
 //! 2. Derives a Unified Address for the operator's mining receiver.
 //! 3. Reads the ZIP-213 default depth from [`zally_core::ReceiverPurpose::Mining`] and prints it
 //!    alongside the non-coinbase default for contrast.
-//! 4. Drives a sync via `MockChainSource` so the example exercises the same `WalletEvent`
-//!    plane that a live `ChainSource` would.
+//! 4. Drives a sync via `MockChainSource` and observes the `WalletEvent` stream.
 //!
 //! ```sh
 //! cargo run --example mining-payout
 //! ```
 //!
-//! The mining-payout flow is operationally distinct from a hot-dispense (exchange withdrawals)
-//! flow because newly mined coinbase outputs cannot be spent for 100 blocks. Operators wire
-//! the `confirmation_depth_blocks` into their own bookkeeping; Zally exposes the constant from
-//! a single source of truth so it cannot drift.
+//! Mining payout receivers use a 100-block confirmation depth for newly mined coinbase outputs.
+//! `confirmation_depth_blocks` exposes that depth from the receiver-purpose vocabulary.
 
 use std::io;
 

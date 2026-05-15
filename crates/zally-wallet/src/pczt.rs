@@ -192,8 +192,7 @@ fn translate_submit_outcome(
 ) -> Result<SendOutcome, WalletError> {
     #[allow(
         clippy::wildcard_enum_match_arm,
-        reason = "SubmitOutcome is #[non_exhaustive]; unknown future variants surface as a \
-                  non-retryable ProposalRejected so the operator gets a clear failure"
+        reason = "non_exhaustive submit outcomes map unknown variants to ProposalRejected"
     )]
     match outcome {
         zally_chain::SubmitOutcome::Accepted { tx_id } => Ok(SendOutcome {

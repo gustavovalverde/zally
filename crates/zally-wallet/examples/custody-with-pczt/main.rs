@@ -1,7 +1,7 @@
 //! Custody-with-PCZT cookbook example.
 //!
-//! Walks an operator through the [`Creator`], [`Signer`], [`Combiner`], and [`Extractor`]
-//! role surface that backs Zally's cold-custody story. The example demonstrates:
+//! Demonstrates the [`Creator`], [`Signer`], [`Combiner`], and [`Extractor`] role surface for
+//! cold custody. The example covers:
 //!
 //! 1. The network-mismatch guard that every role enforces *before* touching key material.
 //! 2. The signer's `NoMatchingKeys` and the extractor's `NotFinalized` short-circuits when a

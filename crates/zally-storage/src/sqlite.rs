@@ -269,8 +269,7 @@ fn open_wallet_db(options: &SqliteWalletStorageOptions) -> Result<WalletDbState,
 
 #[allow(
     clippy::too_many_lines,
-    reason = "async-trait fans the WalletStorage methods into a single expanded impl; \
-              extracting helpers per method would obscure the trait-method boundary"
+    reason = "async-trait expands the WalletStorage impl; contiguous methods preserve the trait boundary"
 )]
 #[async_trait]
 impl WalletStorage for SqliteWalletStorage {
@@ -359,9 +358,9 @@ impl WalletStorage for SqliteWalletStorage {
     ) -> Result<UnifiedAddress, StorageError> {
         let sqlite_uuid = zally_to_account_uuid(account_id);
 
-        // `AllAvailableKeys` resolves the request against the actual UFVK: P2PKH becomes
-        // `Require` because Zally's UFVKs carry a transparent component, which routes the
-        // upstream into the gap-limit pre-generation path. The first call to this method
+        // `AllAvailableKeys` resolves the request against the actual UFVK. P2PKH becomes
+        // `Require` for Zally UFVKs with a transparent component, which routes upstream
+        // into the gap-limit pre-generation path. The first call to this method
         // on a fresh wallet returns a UA with a transparent receiver; subsequent calls
         // fail with the gap-limit error until an on-chain transaction credits one of the
         // reserved transparent addresses.

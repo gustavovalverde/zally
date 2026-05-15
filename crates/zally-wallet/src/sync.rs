@@ -924,8 +924,8 @@ impl Wallet {
     ///
     /// Rolling back a window rather than a single block is what guarantees forward progress:
     /// `scan_cached_blocks` reports the divergence at `fully_scanned_height + 1`, so an
-    /// `at_height - 1` rollback would leave the wallet exactly where it was and the next sync
-    /// would re-attack the identical poisoned range forever.
+    /// `at_height - 1` rollback leaves the wallet at the same scan point and retries the same
+    /// invalid range.
     async fn roll_back_after_reorg(
         &self,
         at_height: BlockHeight,
@@ -1055,9 +1055,9 @@ mod tests {
 
     #[test]
     fn rollback_target_lands_a_window_below_a_boundary_divergence() {
-        // The wedge: scan_cached_blocks reports the divergence at `fully_scanned_height + 1`.
+        // `scan_cached_blocks` reports the divergence at `fully_scanned_height + 1`.
         // The rollback must land strictly below `fully_scanned_height` so the next sync
-        // re-fetches a fresh range instead of re-attacking the identical poisoned block.
+        // re-fetches a fresh range instead of retrying the same invalid block.
         let fully_scanned_height = 4_009_770;
         let at_height = BlockHeight::from(fully_scanned_height + 1);
         let birthday = BlockHeight::from(4_009_000);

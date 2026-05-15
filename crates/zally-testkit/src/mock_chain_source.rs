@@ -243,8 +243,7 @@ impl ChainSource for MockChainSource {
 fn event_tip_height(event: &ChainEvent) -> BlockHeight {
     #[allow(
         clippy::wildcard_enum_match_arm,
-        reason = "ChainEvent is #[non_exhaustive]; unknown future events use genesis in the \
-                  mock cursor because tests only assert current variants"
+        reason = "non_exhaustive chain events map unknown variants to the genesis cursor"
     )]
     match event {
         ChainEvent::ChainTipAdvanced { new_tip_height, .. }

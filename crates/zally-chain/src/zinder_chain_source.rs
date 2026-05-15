@@ -190,9 +190,7 @@ impl ChainSource for ZinderChainSource {
             .map_err(zinder_error_to_chain_source)?;
         #[allow(
             clippy::wildcard_enum_match_arm,
-            reason = "zinder TxStatus is #[non_exhaustive]; future variants surface as \
-                      NotFound so callers retry against the same tx_id without coupling to \
-                      a transient zinder status that has no Zally equivalent yet"
+            reason = "non_exhaustive zinder tx statuses map unknown variants to NotFound"
         )]
         let translated = match status {
             ZinderTxStatus::Mined(mined) => TransactionStatus::Confirmed {
@@ -268,9 +266,7 @@ fn translate_chain_event_envelope(envelope: &ZinderChainEventEnvelope) -> ChainE
 
 #[allow(
     clippy::wildcard_enum_match_arm,
-    reason = "zinder_client::ChainEvent is #[non_exhaustive]; future variants are mapped to \
-              ChainTipAdvanced at the envelope's finalized height so streams keep flowing \
-              and operators do not silently swallow new transitions."
+    reason = "non_exhaustive zinder chain events map unknown variants to ChainTipAdvanced"
 )]
 fn translate_chain_event(envelope: &ZinderChainEventEnvelope) -> ChainEvent {
     match &envelope.event {
@@ -301,9 +297,7 @@ fn translate_chain_event(envelope: &ZinderChainEventEnvelope) -> ChainEvent {
 
 #[allow(
     clippy::wildcard_enum_match_arm,
-    reason = "zally_core::Network is #[non_exhaustive]; future variants surface as the same \
-              NetworkMismatch shape so operators get a clear configuration error rather than \
-              a silent fallthrough"
+    reason = "non_exhaustive Zally networks map unknown variants to NetworkMismatch"
 )]
 fn zally_network_to_zinder(network: Network) -> Result<ZinderNetwork, ChainSourceError> {
     match network {
@@ -405,8 +399,7 @@ fn decode_tree_state(
 
 #[allow(
     clippy::wildcard_enum_match_arm,
-    reason = "Network is #[non_exhaustive]; future variants default to the testnet label \
-              because lightwalletd's TreeState only distinguishes `main` vs `test`"
+    reason = "lightwalletd TreeState distinguishes only main and test network labels"
 )]
 const fn lightwalletd_network_label(network: Network) -> &'static str {
     match network {
@@ -422,9 +415,7 @@ const fn lightwalletd_network_label(network: Network) -> &'static str {
 fn zinder_error_to_chain_source(err: IndexerError) -> ChainSourceError {
     #[allow(
         clippy::wildcard_enum_match_arm,
-        reason = "IndexerError is #[non_exhaustive]; future variants fall back to a \
-                  not-retryable UpstreamFailed so the wallet surfaces an actionable error \
-                  rather than ignoring the failure"
+        reason = "non_exhaustive zinder errors map unknown variants to UpstreamFailed"
     )]
     match err {
         IndexerError::NoVisibleChainEpoch => ChainSourceError::Unavailable {

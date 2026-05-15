@@ -1,8 +1,6 @@
 # Public Interfaces
 
-The vocabulary spine. Every public type, function, error variant, trait method, config field, env var, file name, and directory in Zally defers to the conventions in this document. The conventions exist so that an operator integrating Zally, a contributor extending it, or an LLM agent navigating it can predict the right name and the right shape from context alone.
-
-This is the first document to read before writing any public Rust type. Drift here is expensive to revert; consistency here pays back at every read.
+This document defines Zally's public vocabulary: types, functions, error variants, trait methods, config fields, env vars, file names, and directories.
 
 ## Naming rules
 
@@ -18,7 +16,7 @@ As suffixes on type names: `*Service`, `*Server`, `*Api`, `*Manager`, `*Processo
 
 ### Required suffixes on numeric and lifecycle identifiers
 
-A bare number is a lie. Operators and agents must not have to read documentation to know whether `60` means seconds, milliseconds, blocks, or something else.
+Numeric identifiers carry their unit in the name.
 
 - Duration: `_ms`, `_seconds`, `_minutes`, `_hours`, `_blocks`, `_height`. Never bare `timeout`, `delay`, `interval`.
 - Money: `_zat` for integer zatoshis, `_zec` for decimal-string ZEC. Never bare `amount`.
@@ -31,12 +29,12 @@ A bare number is a lie. Operators and agents must not have to read documentation
 The most catastrophic class of wallet bug is signing a testnet transaction with mainnet keys (or vice versa). Make the bug unrepresentable.
 
 - Every public type that names an address, key, balance, or transaction carries a `Network` value or is generic over a `NetworkSpec` parameter.
-- A function that takes an address but not a network is a review-blocking smell.
+- A function that takes an address also takes or carries a network.
 - Constructors fail closed on mismatch. `Wallet::open(seed, Network::Testnet)` opens a testnet wallet; calling its methods with a mainnet address is a typed error at compile time where possible, at runtime otherwise.
 
 ### Verbs from a single vocabulary
 
-Mixed vocabulary (`fetch`/`retrieve`/`get` for the same operation) burns reader working memory. Zally pins one verb per operation.
+Zally pins one verb per operation.
 
 | Verb | Meaning |
 |---|---|
@@ -58,13 +56,13 @@ Mixed vocabulary (`fetch`/`retrieve`/`get` for the same operation) burns reader 
 | `sync_*` | catch up wallet state with chain |
 | `export_*` | serialise material for external consumption (UFVK, PCZT) |
 
-Forbidden verbs for domain operations: `handle_*`, `process_*`, `manage_*`, `do_*`, `perform_*`, `execute_*`. They name an action without naming *which* action. (`handle_*` is permitted only in UI event callbacks, which Zally has none of.)
+Forbidden verbs for domain operations: `handle_*`, `process_*`, `manage_*`, `do_*`, `perform_*`, `execute_*`.
 
 ### No temporal or implementation drift
 
 A name must survive a change of its implementation.
 
-- Banned patterns: `new_x`, `x2`, `legacy_x`, `x_old`, `x_final`, `x_real`, `x_actual`, `x_improved`. These names describe history instead of domain meaning.
+- Banned patterns: `new_x`, `x2`, `legacy_x`, `x_old`, `x_final`, `x_real`, `x_actual`, `x_improved`.
 - Banned implementation leaks: `sqlite_storage` (the implementation is `WalletStorage` with `SqliteWalletStorage` as one impl, not `SqliteStorage`), `zinder_chain` (`ChainSource` with `ZinderChainSource` as one impl).
 - Protocol names are domain, not implementation, and stay: `pczt`, `frost`, `zip32`, `zip316`, `zip321`, `zip317`, `zip320`, `tex`. These appear verbatim in identifiers.
 
@@ -141,13 +139,13 @@ Error names are `{Domain}Error`:
 
 - `WalletError`, `ChainSourceError`, `SubmitterError`, `StorageError`, `SealingError`, `PcztError`.
 
-Variants describe *what failed*, not *how*. `WalletError::MemoOnTransparentRecipient` is correct; `WalletError::InvalidArgument` is forbidden.
+Variants describe what failed. `WalletError::MemoOnTransparentRecipient` is valid; `WalletError::InvalidArgument` is forbidden.
 
 ## Config and env var conventions
 
 Zally is library-shaped and does not own a TOML config. Crates that surface configuration (e.g., `ZinderChainSource` connection settings) do so through typed Rust builders, not through a config file Zally owns.
 
-When operators integrating Zally do construct their own TOML or env-var layout, the recommended conventions match Zinder's:
+When operators integrating Zally construct their own TOML or env-var layout:
 
 - Env var prefix per consumer: for example, `WALLET_` or an application-specific product prefix. Zally itself does not prescribe one.
 - Test-only env vars (read by `zally-testkit`) use `ZALLY_TEST_*`. Production binaries strip these.
@@ -254,11 +252,11 @@ The contract surface Zally publishes, grouped by domain. Each item is a guarante
 - **DOC-1**: Every public item has rustdoc. CI enforces with `RUSTDOCFLAGS='-D warnings'`.
 - **DOC-2**: `examples/` directory contains cookbook entries: `open-wallet`, `exchange-deposit`, `payment-processor`, `custody-with-pczt`, `mining-payout`, `live-zinder-probe`. Each example compiles and runs.
 
-### Agent experience (AX)
+### Integration experience (IX)
 
-- **AX-1**: `WalletCapabilities` descriptor exposing typed feature flags; new capabilities are additive enum variants under `#[non_exhaustive]`.
-- **AX-2**: Every error variant has a documented retry posture (`retryable`, `not_retryable`, `requires_operator`).
-- **AX-3**: Examples are self-contained; each `examples/<name>/main.rs` runs end-to-end without external prerequisite shell scripts.
+- **IX-1**: `WalletCapabilities` descriptor exposing typed feature flags; new capabilities are additive enum variants under `#[non_exhaustive]`.
+- **IX-2**: Every error variant has a documented retry posture (`retryable`, `not_retryable`, `requires_operator`).
+- **IX-3**: Examples are self-contained; each `examples/<name>/main.rs` runs end-to-end without external prerequisite shell scripts.
 
 ## ZIP compliance surface
 
@@ -294,10 +292,6 @@ Which ZIPs Zally implements directly, which it inherits through librustzcash, an
 - **ZIP-308**: Sprout-to-Sapling migration (see ZIP-211).
 - **ZIP-311**: Payment disclosures.
 
-## When in doubt
+## Naming Priority
 
-The priority order: **honesty > specificity > vocabulary match > brevity**.
-
-Prefer a longer name that is honest (`unseal_seed_with_age_identity`) over a shorter one that lies (`load_seed`). Prefer a specific verb from the table (`derive`) over a shorter generic one (`get`). Prefer match-existing-convention even when a competing convention is technically defensible; consistency beats local optimality.
-
-If a name cannot be chosen without violating one of these rules, the abstraction is wrong, not the name. Reshape the abstraction.
+Priority order: specificity, vocabulary match, then brevity. Use the domain verb table and unit suffix rules before introducing a new naming pattern.

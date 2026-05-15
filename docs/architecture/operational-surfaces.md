@@ -1,6 +1,6 @@
 # Operational Surfaces
 
-Zally is library-shaped. It does not own a process, RPC listener, config file, signal handler, or package format. It does own wallet-local operational contracts that every embedding application would otherwise have to reinvent.
+Zally is library-shaped. It does not own a process, RPC listener, config file, signal handler, or package format. It owns wallet-local operational contracts for readiness, sync, storage pressure, event delivery, and live validation.
 
 ## Boundaries
 
@@ -11,7 +11,7 @@ Zally is library-shaped. It does not own a process, RPC listener, config file, s
 | `zally-wallet` | Wallet lifecycle, status, sync driver, proposal, signing, submission orchestration, and wallet events. |
 | `zally-testkit` | In-process mocks, live-test gates, and live-test environment conventions. |
 
-Zinder remains a `ChainSource` and `Submitter` implementation. Zally public wallet APIs must not expose Zinder cursor types, Zinder readiness states, or Zinder service names.
+Zinder is a `ChainSource` and `Submitter` implementation. Zally public wallet APIs expose Zally cursor, readiness, and error types.
 
 ## Status
 
@@ -23,13 +23,13 @@ Zinder remains a `ChainSource` and `Submitter` implementation. Zally public wall
 - `lag_blocks`: known scan lag when the tip has not regressed.
 - `circuit_breaker`: current outbound IO breaker state.
 
-`Wallet::metrics_snapshot()` is a metrics adapter source. It must be derivable from `WalletStatus` and must not invent a second truth for scan progress.
+`Wallet::metrics_snapshot()` is derived from the same persisted progress as `WalletStatus`.
 
 ## Storage Execution
 
 `SqliteWalletStorage` is a cheap clone handle over one wallet-db actor. The actor owns the `zcash_client_sqlite::WalletDb` and the Zally ledger connection on one blocking thread. Public storage methods send bounded work items to that actor and await a typed reply.
 
-The actor gives Zally one storage serialization point, one queue-depth signal, and one place where blocking librustzcash wallet operations run. Callers observe pressure through `SqliteWalletStorage::queue_depth()`. Queue depth near capacity means storage cannot keep up with wallet sync, proposal construction, or balance reads.
+The actor provides one storage serialization point and one queue-depth signal. Callers observe pressure through `SqliteWalletStorage::queue_depth()`. Queue depth near capacity means storage cannot keep up with wallet sync, proposal construction, or balance reads.
 
 ## Sync Driver
 
@@ -58,8 +58,7 @@ The driver does not:
 It opens the account for the sealed seed when storage is warm. If the persistent volume is fresh,
 it creates that account from the sealed seed at the configured birthday height.
 
-The caller does not need an `Opened` versus `Restored` branch: the useful postcondition is the
-same in both cases, one wallet handle and one account id bound to the sealed seed.
+The postcondition is one wallet handle and one account id bound to the sealed seed.
 
 ## Live Proof
 
@@ -76,9 +75,8 @@ Optional overrides:
 - `ZALLY_TEST_SHIELDING_THRESHOLD_ZAT` (defaults to `1000000`)
 - `ZALLY_TEST_SEND_ZAT` (defaults to `10000`)
 
-The funded proof does not require Zallet or a separate funder wallet. It derives the
-regtest activation table from the running node, funds a Zally transparent receiver with the
-testkit transparent signer, shields through `Wallet::shield_transparent_funds`, sends through
-`Wallet::send_payment`, and completes the PCZT path with
+The funded proof derives the regtest activation table from the running node, funds a Zally
+transparent receiver with the testkit transparent signer, shields through
+`Wallet::shield_transparent_funds`, sends through `Wallet::send_payment`, and completes the PCZT path with
 `Wallet::propose_pczt`, `Wallet::prove_pczt`, `Wallet::sign_pczt`, and
 `Wallet::extract_and_submit_pczt`.

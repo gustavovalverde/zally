@@ -22,8 +22,8 @@ async fn circuit_breaker_opens_after_threshold_failures() -> Result<(), TestErro
     let chain = zally_testkit::MockChainSource::new(network);
     let (wallet, _account_id, _mnemonic) =
         Wallet::create(&chain, network, sealing, storage, BlockHeight::from(1)).await?;
-    // No retries: each sync surfaces the first error immediately. The breaker then sees the
-    // same flat-out failure on each attempt and trips after the default threshold of 5.
+    // No retries: each sync surfaces the first error immediately. The breaker receives the
+    // same failure on each attempt and trips after the default threshold of 5.
     wallet.set_retry_policy(RetryPolicy::none());
 
     let chain = MockChainSource::new(network);

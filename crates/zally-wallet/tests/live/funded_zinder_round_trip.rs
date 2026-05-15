@@ -313,7 +313,7 @@ fn zally_transparent_to_funding_transparent(
 
 #[allow(
     clippy::wildcard_enum_match_arm,
-    reason = "SubmitOutcome is #[non_exhaustive]; future outcomes fail as rejected in the live proof"
+    reason = "non_exhaustive submit outcomes map unknown variants to rejected test errors"
 )]
 fn require_accepted(outcome: SubmitOutcome, context: &'static str) -> Result<TxId, TestError> {
     match outcome {

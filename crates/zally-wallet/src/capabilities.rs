@@ -6,8 +6,8 @@ use zally_core::Network;
 
 /// Runtime descriptor of supported wallet features.
 ///
-/// Agents read this at runtime to feature-detect supported sealing implementations, storage
-/// backends, and protocol coverage without pinning a Zally version. New capabilities land as
+/// Integrations read this at runtime to feature-detect supported sealing implementations, storage
+/// backends, and protocol coverage without pinning a Zally version. New capabilities are
 /// additive enum variants under `#[non_exhaustive]`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]

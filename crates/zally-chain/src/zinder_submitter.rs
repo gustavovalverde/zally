@@ -54,9 +54,7 @@ impl Submitter for ZinderSubmitter {
 
 #[allow(
     clippy::wildcard_enum_match_arm,
-    reason = "zinder TransactionBroadcastResult is #[non_exhaustive]; unrecognised variants \
-              surface as a non-retryable Rejected with the variant tag so operators can act \
-              on it without silently swallowing"
+    reason = "non_exhaustive zinder broadcast outcomes map unknown variants to Rejected"
 )]
 fn translate_broadcast_outcome(outcome: TransactionBroadcastResult) -> SubmitOutcome {
     match outcome {
@@ -64,9 +62,8 @@ fn translate_broadcast_outcome(outcome: TransactionBroadcastResult) -> SubmitOut
             tx_id: TxId::from_bytes(accepted.transaction_id.as_bytes()),
         },
         TransactionBroadcastResult::Duplicate(_duplicate) => SubmitOutcome::Duplicate {
-            // zinder's BroadcastDuplicate does not echo the transaction_id back; operators
-            // that need it can compute the ZIP-244 txid from the raw_tx bytes they
-            // submitted. The Duplicate variant signals idempotency-preserving acceptance.
+            // zinder's BroadcastDuplicate does not echo the transaction_id back. The
+            // Duplicate variant signals idempotency-preserving acceptance.
             tx_id: TxId::from_bytes([0_u8; 32]),
         },
         TransactionBroadcastResult::InvalidEncoding(invalid) => SubmitOutcome::Rejected {
@@ -97,8 +94,7 @@ fn translate_broadcast_outcome(outcome: TransactionBroadcastResult) -> SubmitOut
 fn zinder_error_to_submitter_error(err: zinder_client::IndexerError) -> SubmitterError {
     #[allow(
         clippy::wildcard_enum_match_arm,
-        reason = "IndexerError is #[non_exhaustive]; future variants fall through to a \
-                  not-retryable UpstreamFailed so the operator surface stays actionable"
+        reason = "non_exhaustive zinder errors map unknown variants to UpstreamFailed"
     )]
     match err {
         zinder_client::IndexerError::ServiceUnavailable { reason }
