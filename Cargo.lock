@@ -5846,7 +5846,7 @@ dependencies = [
 [[package]]
 name = "zinder-client"
 version = "0.1.0"
-source = "git+https://github.com/gustavovalverde/zinder?rev=ab2ce0d6c0a19556c3ba62ff58819501cb992ccb#ab2ce0d6c0a19556c3ba62ff58819501cb992ccb"
+source = "git+https://github.com/gustavovalverde/zinder?rev=d87a119095173e9ceaa5272329073676ac79ac9f#d87a119095173e9ceaa5272329073676ac79ac9f"
 dependencies = [
  "async-trait",
  "thiserror 2.0.18",
@@ -5864,7 +5864,7 @@ dependencies = [
 [[package]]
 name = "zinder-core"
 version = "0.1.0"
-source = "git+https://github.com/gustavovalverde/zinder?rev=ab2ce0d6c0a19556c3ba62ff58819501cb992ccb#ab2ce0d6c0a19556c3ba62ff58819501cb992ccb"
+source = "git+https://github.com/gustavovalverde/zinder?rev=d87a119095173e9ceaa5272329073676ac79ac9f#d87a119095173e9ceaa5272329073676ac79ac9f"
 dependencies = [
  "hex",
  "sha2 0.10.9",
@@ -5874,7 +5874,7 @@ dependencies = [
 [[package]]
 name = "zinder-proto"
 version = "0.1.0"
-source = "git+https://github.com/gustavovalverde/zinder?rev=ab2ce0d6c0a19556c3ba62ff58819501cb992ccb#ab2ce0d6c0a19556c3ba62ff58819501cb992ccb"
+source = "git+https://github.com/gustavovalverde/zinder?rev=d87a119095173e9ceaa5272329073676ac79ac9f#d87a119095173e9ceaa5272329073676ac79ac9f"
 dependencies = [
  "prost",
  "prost-build",
@@ -5886,7 +5886,7 @@ dependencies = [
 [[package]]
 name = "zinder-source"
 version = "0.1.0"
-source = "git+https://github.com/gustavovalverde/zinder?rev=ab2ce0d6c0a19556c3ba62ff58819501cb992ccb#ab2ce0d6c0a19556c3ba62ff58819501cb992ccb"
+source = "git+https://github.com/gustavovalverde/zinder?rev=d87a119095173e9ceaa5272329073676ac79ac9f#d87a119095173e9ceaa5272329073676ac79ac9f"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -5911,7 +5911,7 @@ dependencies = [
 [[package]]
 name = "zinder-store"
 version = "0.1.0"
-source = "git+https://github.com/gustavovalverde/zinder?rev=ab2ce0d6c0a19556c3ba62ff58819501cb992ccb#ab2ce0d6c0a19556c3ba62ff58819501cb992ccb"
+source = "git+https://github.com/gustavovalverde/zinder?rev=d87a119095173e9ceaa5272329073676ac79ac9f#d87a119095173e9ceaa5272329073676ac79ac9f"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -5933,7 +5933,7 @@ dependencies = [
 [[package]]
 name = "zinder-testkit"
 version = "0.1.0"
-source = "git+https://github.com/gustavovalverde/zinder?rev=ab2ce0d6c0a19556c3ba62ff58819501cb992ccb#ab2ce0d6c0a19556c3ba62ff58819501cb992ccb"
+source = "git+https://github.com/gustavovalverde/zinder?rev=d87a119095173e9ceaa5272329073676ac79ac9f#d87a119095173e9ceaa5272329073676ac79ac9f"
 dependencies = [
  "async-trait",
  "color-eyre",
