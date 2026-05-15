@@ -42,7 +42,7 @@ impl Default for CircuitBreakerConfig {
     fn default() -> Self {
         Self {
             failure_threshold: 5,
-            cooldown: Duration::from_secs(60),
+            cooldown: Duration::from_mins(1),
         }
     }
 }

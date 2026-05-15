@@ -12,7 +12,7 @@ members = [
 
 [workspace.package]
 edition = "2024"
-rust-version = "1.91"
+rust-version = "1.95"
 license = "MIT"
 repository = "https://github.com/gustavovalverde/zally"
 authors = []
@@ -76,9 +76,9 @@ zip32 = "0.2"
 # crates from a pinned git revision so the wallet integration tracks the zinder typed-
 # client surface directly. The [patch.crates-io] core2 pin below resolves the yanked
 # equihash-transitive dep.
-zinder-client = { git = "https://github.com/gustavovalverde/zinder", rev = "65316ecfc280ab4833b72d7a6ff5ddd7e524be89" }
-zinder-core = { git = "https://github.com/gustavovalverde/zinder", rev = "65316ecfc280ab4833b72d7a6ff5ddd7e524be89" }
-zinder-testkit = { git = "https://github.com/gustavovalverde/zinder", rev = "65316ecfc280ab4833b72d7a6ff5ddd7e524be89" }
+zinder-client = { git = "https://github.com/gustavovalverde/zinder", rev = "ab2ce0d6c0a19556c3ba62ff58819501cb992ccb" }
+zinder-core = { git = "https://github.com/gustavovalverde/zinder", rev = "ab2ce0d6c0a19556c3ba62ff58819501cb992ccb" }
+zinder-testkit = { git = "https://github.com/gustavovalverde/zinder", rev = "ab2ce0d6c0a19556c3ba62ff58819501cb992ccb" }
 
 # Async runtime and concurrency.
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "fs", "io-util"] }

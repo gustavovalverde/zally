@@ -454,7 +454,7 @@ fn zinder_error_to_chain_source(err: IndexerError) -> ChainSourceError {
             is_retryable: false,
         },
         IndexerError::NetworkMismatch { expected, actual } => ChainSourceError::UpstreamFailed {
-            reason: format!("zinder served network {actual} when {expected:?} was expected",),
+            reason: format!("zinder served network {actual} when {expected:?} was expected"),
             is_retryable: false,
         },
         IndexerError::BlockingTaskFailed { reason } => {
