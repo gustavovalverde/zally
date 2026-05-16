@@ -19,7 +19,7 @@ pub use circuit_breaker::{CircuitBreaker, CircuitBreakerConfig, CircuitBreakerSt
 pub use event::{WalletEvent, WalletEventStream};
 pub use metrics::WalletMetrics;
 pub use received_note::ShieldedReceiveRecord;
-pub use retry::{IsRetryable, RetryPolicy, with_retry};
+pub use retry::{HasFailurePosture, RetryPolicy, with_retry};
 pub use spend::{
     ParsedPayment, PaymentRequest, Proposal, ProposalPlan, SendOutcome, SendPaymentPlan,
     ShieldTransparentPlan,

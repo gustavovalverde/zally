@@ -1,9 +1,13 @@
 //! Retry policy and helper for wallet IO.
 //!
-//! `RetryPolicy` configures how the wallet retries transient, retryable failures from chain
-//! reads, submissions, sealed-seed reads, and storage operations. Each error type carries a
-//! per-variant `is_retryable()` posture; the helper [`with_retry`] consults that posture and
+//! [`RetryPolicy`] configures *how* the wallet retries (attempt count, backoff cadence).
+//! [`HasFailurePosture`] reports *whether* an error class earns a retry, an operator
+//! intervention, or no retry at all. The helper [`with_retry`] consults the posture and
 //! gives up on the first non-retryable error.
+//!
+//! The wallet's circuit breaker only trips on [`FailurePosture::Retryable`] failures:
+//! consecutive operator-action or caller-bug failures are not symptoms of a flaky backend
+//! and must not pollute the breaker counter.
 
 use std::future::Future;
 use std::time::Duration;
@@ -11,7 +15,7 @@ use std::time::Duration;
 use tokio::time::sleep;
 use tracing::warn;
 
-use zally_chain::{ChainSourceError, SubmitterError};
+use zally_chain::{ChainSourceError, FailurePosture, SubmitterError};
 use zally_keys::SealingError;
 use zally_pczt::PcztError;
 use zally_storage::StorageError;
@@ -68,54 +72,65 @@ impl Default for RetryPolicy {
     }
 }
 
-/// Posture introspection: did this error class earn a retry?
-pub trait IsRetryable {
-    /// `true` when the same call may succeed on retry.
-    fn is_retryable(&self) -> bool;
+/// Posture introspection: which class of failure is this?
+///
+/// Implementations return the canonical [`FailurePosture`] for the error, which drives
+/// retry, circuit-breaker, and alerting decisions at the wallet boundary.
+pub trait HasFailurePosture {
+    /// Returns the failure posture for this error.
+    fn failure_posture(&self) -> FailurePosture;
 }
 
-impl IsRetryable for ChainSourceError {
-    fn is_retryable(&self) -> bool {
-        Self::is_retryable(self)
+impl HasFailurePosture for ChainSourceError {
+    fn failure_posture(&self) -> FailurePosture {
+        Self::posture(self)
     }
 }
 
-impl IsRetryable for SubmitterError {
-    fn is_retryable(&self) -> bool {
-        Self::is_retryable(self)
+impl HasFailurePosture for SubmitterError {
+    fn failure_posture(&self) -> FailurePosture {
+        Self::posture(self)
     }
 }
 
-impl IsRetryable for StorageError {
-    fn is_retryable(&self) -> bool {
-        Self::is_retryable(self)
+impl HasFailurePosture for WalletError {
+    fn failure_posture(&self) -> FailurePosture {
+        Self::posture(self)
     }
 }
 
-impl IsRetryable for SealingError {
-    fn is_retryable(&self) -> bool {
-        Self::is_retryable(self)
+impl HasFailurePosture for StorageError {
+    fn failure_posture(&self) -> FailurePosture {
+        bool_to_posture(self.is_retryable())
     }
 }
 
-impl IsRetryable for PcztError {
-    fn is_retryable(&self) -> bool {
-        Self::is_retryable(self)
+impl HasFailurePosture for SealingError {
+    fn failure_posture(&self) -> FailurePosture {
+        bool_to_posture(self.is_retryable())
     }
 }
 
-impl IsRetryable for WalletError {
-    fn is_retryable(&self) -> bool {
-        Self::is_retryable(self)
+impl HasFailurePosture for PcztError {
+    fn failure_posture(&self) -> FailurePosture {
+        bool_to_posture(self.is_retryable())
+    }
+}
+
+const fn bool_to_posture(is_retryable: bool) -> FailurePosture {
+    if is_retryable {
+        FailurePosture::Retryable
+    } else {
+        FailurePosture::NotRetryable
     }
 }
 
 /// Retries `operation` up to `policy.max_attempts` times when `operation` returns a
-/// retryable error. Non-retryable errors surface immediately; the policy never sleeps after
-/// the final attempt.
+/// [`FailurePosture::Retryable`] error.
 ///
-/// `operation_label` is recorded in tracing breadcrumbs so operators can diagnose retry
-/// storms by call site.
+/// Non-retryable and operator-action errors surface immediately; the policy never sleeps
+/// after the final attempt. `operation_label` is recorded in tracing breadcrumbs so
+/// operators can diagnose retry storms by call site.
 ///
 /// # Errors
 ///
@@ -127,7 +142,7 @@ pub async fn with_retry<T, E, F, Fut>(
     mut operation: F,
 ) -> Result<T, E>
 where
-    E: IsRetryable + std::fmt::Display,
+    E: HasFailurePosture + std::fmt::Display,
     F: FnMut() -> Fut,
     Fut: Future<Output = Result<T, E>>,
 {
@@ -138,7 +153,7 @@ where
         match operation().await {
             Ok(outcome) => return Ok(outcome),
             Err(err) => {
-                if !err.is_retryable() || attempts >= policy.max_attempts {
+                if !err.failure_posture().allows_retry() || attempts >= policy.max_attempts {
                     return Err(err);
                 }
                 warn!(
@@ -165,7 +180,9 @@ where
 ///
 /// Returns [`WalletError::CircuitBroken`] immediately when the breaker is open. On call
 /// completion, records success or failure on the breaker so subsequent calls reflect the
-/// new state.
+/// new state. The breaker only counts [`FailurePosture::Retryable`] failures: operator-
+/// action and caller-bug failures must not trip the breaker since they are not symptoms of
+/// a flaky backend.
 ///
 /// # Errors
 ///
@@ -179,7 +196,7 @@ pub(crate) async fn with_breaker_and_retry<T, InnerError, F, Fut, LiftFn>(
     lift_err: LiftFn,
 ) -> Result<T, WalletError>
 where
-    InnerError: IsRetryable + std::fmt::Display,
+    InnerError: HasFailurePosture + std::fmt::Display,
     F: FnMut() -> Fut,
     Fut: Future<Output = Result<T, InnerError>>,
     LiftFn: FnOnce(InnerError) -> WalletError,
@@ -195,7 +212,7 @@ where
             Ok(outcome)
         }
         Err(err) => {
-            if err.is_retryable() {
+            if err.failure_posture().allows_retry() {
                 breaker.record_failure();
             } else {
                 breaker.record_success();
@@ -215,13 +232,19 @@ mod tests {
     enum FakeError {
         #[error("retryable: {0}")]
         Retryable(String),
-        #[error("permanent: {0}")]
-        Permanent(String),
+        #[error("requires operator: {0}")]
+        RequiresOperator(String),
+        #[error("not retryable: {0}")]
+        NotRetryable(String),
     }
 
-    impl IsRetryable for FakeError {
-        fn is_retryable(&self) -> bool {
-            matches!(self, Self::Retryable(_))
+    impl HasFailurePosture for FakeError {
+        fn failure_posture(&self) -> FailurePosture {
+            match self {
+                Self::Retryable(_) => FailurePosture::Retryable,
+                Self::RequiresOperator(_) => FailurePosture::RequiresOperator,
+                Self::NotRetryable(_) => FailurePosture::NotRetryable,
+            }
         }
     }
 
@@ -273,7 +296,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn with_retry_does_not_retry_permanent_errors() {
+    async fn with_retry_does_not_retry_not_retryable_errors() {
         let counter = Arc::new(AtomicU32::new(0));
         let c = Arc::clone(&counter);
         let outcome: Result<u32, FakeError> =
@@ -281,12 +304,33 @@ mod tests {
                 let c = Arc::clone(&c);
                 async move {
                     c.fetch_add(1, Ordering::SeqCst);
-                    Err::<u32, _>(FakeError::Permanent("config".into()))
+                    Err::<u32, _>(FakeError::NotRetryable("config".into()))
                 }
             })
             .await;
-        assert!(matches!(outcome, Err(FakeError::Permanent(_))));
+        assert!(matches!(outcome, Err(FakeError::NotRetryable(_))));
         assert_eq!(counter.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn with_retry_does_not_retry_operator_action_errors() {
+        let counter = Arc::new(AtomicU32::new(0));
+        let c = Arc::clone(&counter);
+        let outcome: Result<u32, FakeError> =
+            with_retry(RetryPolicy::default(), "test", move || {
+                let c = Arc::clone(&c);
+                async move {
+                    c.fetch_add(1, Ordering::SeqCst);
+                    Err::<u32, _>(FakeError::RequiresOperator("schema mismatch".into()))
+                }
+            })
+            .await;
+        assert!(matches!(outcome, Err(FakeError::RequiresOperator(_))));
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            1,
+            "operator-action errors must not be retried"
+        );
     }
 
     #[tokio::test]

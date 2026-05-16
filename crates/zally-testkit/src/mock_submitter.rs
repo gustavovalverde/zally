@@ -96,15 +96,13 @@ impl MockSubmitterHandle {
 
     /// Queues `count` consecutive failures for `submit` calls. Each subsequent call pops one
     /// failure off the queue; once empty, calls return the configured outcome.
-    #[allow(
-        clippy::needless_pass_by_value,
-        reason = "test API: taking the error template by value reads more naturally at the \
-                  call site than threading a borrow through the closure"
-    )]
-    pub fn fail_submit_next(&self, count: u32, error: SubmitterError) {
+    ///
+    /// `produce_error` is invoked once per queued failure; see
+    /// [`crate::MockChainSourceHandle::fail_chain_tip_next`] for the closure-factory rationale.
+    pub fn fail_submit_next(&self, count: u32, mut produce_error: impl FnMut() -> SubmitterError) {
         let mut guard = self.state.lock();
         for _ in 0..count {
-            guard.submit_failures.push(error.clone());
+            guard.submit_failures.push(produce_error());
         }
     }
 

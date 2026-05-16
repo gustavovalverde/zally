@@ -21,7 +21,7 @@ use tokio::time::{MissedTickBehavior, interval, timeout};
 use tokio_stream::wrappers::WatchStream;
 use zally_chain::{
     BlockHeightRange, ChainEventCursor, ChainEventEnvelope, ChainEventEnvelopeStream, ChainSource,
-    ChainSourceError, ChainState, ShieldedPool,
+    ChainSourceError, ChainState, FailurePosture, ShieldedPool,
 };
 use zally_core::{BlockHeight, Network};
 use zally_storage::{ScanRequest, StorageError, TransparentUtxoRow};
@@ -146,10 +146,10 @@ pub enum SyncDriverStatus {
     Closing,
     /// The driver closed cleanly.
     Closed,
-    /// The driver stopped after a non-retryable error.
+    /// The driver stopped after a terminal error.
     Failed {
-        /// Whether the failure may succeed if the caller starts a new driver.
-        is_retryable: bool,
+        /// Operator-facing posture for the terminal failure.
+        posture: FailurePosture,
     },
 }
 
@@ -160,8 +160,8 @@ pub enum SyncDriverStatus {
 pub struct SyncErrorSnapshot {
     /// Error description safe for logs and status pages.
     pub reason: String,
-    /// Whether retrying the same operation may succeed.
-    pub is_retryable: bool,
+    /// Operator-facing posture for this failure.
+    pub posture: FailurePosture,
 }
 
 /// Current observable state of a [`SyncDriver`].
@@ -319,10 +319,17 @@ impl SyncHandle {
         }
         match self.join.await {
             Ok(join_outcome) => join_outcome,
-            Err(join_error) => Err(WalletError::SyncDriverFailed {
-                reason: join_error.to_string(),
-                is_retryable: !join_error.is_panic(),
-            }),
+            Err(join_error) => {
+                let posture = if join_error.is_panic() {
+                    FailurePosture::RequiresOperator
+                } else {
+                    FailurePosture::Retryable
+                };
+                Err(WalletError::SyncDriverFailed {
+                    reason: join_error.to_string(),
+                    posture,
+                })
+            }
         }
     }
 }
@@ -410,7 +417,7 @@ async fn run_sync_driver(
                     Some(Err(err)) => {
                         run_state.last_error = Some(SyncErrorSnapshot {
                             reason: err.to_string(),
-                            is_retryable: err.is_retryable(),
+                            posture: err.posture(),
                         });
                         chain_events = None;
                         publish_fallback_snapshot(
@@ -523,12 +530,13 @@ async fn run_sync_wakeup(
                 return Ok(SyncWakeupExit::Waiting);
             }
             SyncRunAttempt::FatalError { error, snapshot } => {
+                let driver_posture = error.posture();
                 run_state.last_error = Some(snapshot);
                 publish_driver_snapshot(
                     scope.wallet,
                     scope.status_tx,
                     SyncDriverStatus::Failed {
-                        is_retryable: false,
+                        posture: driver_posture,
                     },
                     run_state.last_sync_outcome,
                     run_state.last_error.clone(),
@@ -553,22 +561,21 @@ async fn run_one_sync(
     .await
     {
         Ok(Ok(outcome)) => SyncRunAttempt::Completed(outcome),
-        Ok(Err(error)) if error.is_retryable() => {
-            SyncRunAttempt::RetryableError(SyncErrorSnapshot {
-                reason: error.to_string(),
-                is_retryable: true,
-            })
-        }
         Ok(Err(error)) => {
+            let posture = error.posture();
             let snapshot = SyncErrorSnapshot {
                 reason: error.to_string(),
-                is_retryable: false,
+                posture,
             };
-            SyncRunAttempt::FatalError { error, snapshot }
+            if posture.allows_retry() {
+                SyncRunAttempt::RetryableError(snapshot)
+            } else {
+                SyncRunAttempt::FatalError { error, snapshot }
+            }
         }
         Err(_elapsed) => SyncRunAttempt::RetryableError(SyncErrorSnapshot {
             reason: format!("sync exceeded {} seconds", options.sync_timeout_seconds),
-            is_retryable: true,
+            posture: FailurePosture::Retryable,
         }),
     }
 }
@@ -644,7 +651,7 @@ async fn open_chain_events(
                 None,
                 Some(SyncErrorSnapshot {
                     reason: err.to_string(),
-                    is_retryable: err.is_retryable(),
+                    posture: err.posture(),
                 }),
             );
             None
@@ -688,7 +695,7 @@ impl Wallet {
             policy,
             "sync.chain_tip",
             || chain.chain_tip(),
-            |e| map_chain_source_error(&e),
+            WalletError::from,
         )
         .await?;
         let prior_observed_tip = self.inner.storage.lookup_observed_tip().await?;
@@ -879,20 +886,22 @@ impl Wallet {
                 policy,
                 "sync.transparent_utxos",
                 || chain.transparent_utxos(&receiver.script_pub_key_bytes),
-                |e| map_chain_source_error(&e),
+                WalletError::from,
             )
             .await?;
 
             let mut transparent_utxo_rows = Vec::with_capacity(utxos.len());
             for utxo in utxos {
                 if utxo.script_pub_key_bytes != receiver.script_pub_key_bytes {
-                    return Err(WalletError::ChainSource {
-                        reason: format!(
-                            "transparent UTXO script did not match wallet receiver for account {:?}",
-                            receiver.account_id
-                        ),
-                        is_retryable: false,
-                    });
+                    return Err(WalletError::ChainSource(
+                        ChainSourceError::MalformedCompactBlock {
+                            block_height: utxo.confirmed_at_height,
+                            reason: format!(
+                                "transparent UTXO script did not match wallet receiver for account {:?}",
+                                receiver.account_id
+                            ),
+                        },
+                    ));
                 }
                 transparent_utxo_rows.push(TransparentUtxoRow::new(
                     utxo.tx_id,
@@ -1009,23 +1018,12 @@ async fn fetch_compact_blocks(
         start_height: scanned_from,
         end_height: BlockHeight::from(span_end),
     };
-    let mut stream = chain
-        .compact_blocks(range)
-        .await
-        .map_err(|e| map_chain_source_error(&e))?;
+    let mut stream = chain.compact_blocks(range).await?;
     let mut blocks = Vec::new();
     while let Some(stream_item) = stream.next().await {
-        let block = stream_item.map_err(|e| map_chain_source_error(&e))?;
-        blocks.push(block);
+        blocks.push(stream_item?);
     }
     Ok(blocks)
-}
-
-fn map_chain_source_error(err: &ChainSourceError) -> WalletError {
-    WalletError::ChainSource {
-        reason: err.to_string(),
-        is_retryable: err.is_retryable(),
-    }
 }
 
 async fn fetch_prior_chain_state(
@@ -1033,19 +1031,13 @@ async fn fetch_prior_chain_state(
     scanned_from: BlockHeight,
 ) -> Result<ChainState, WalletError> {
     let prior_height = BlockHeight::from(scanned_from.as_u32().saturating_sub(1));
-    let tree_state = chain
-        .tree_state_at(prior_height)
-        .await
-        .map_err(|e| map_chain_source_error(&e))?;
-    tree_state
-        .to_chain_state()
-        .map_err(|io| WalletError::ChainSource {
-            reason: format!(
-                "invalid tree state at height {}: {io}",
-                prior_height.as_u32()
-            ),
-            is_retryable: false,
+    let tree_state = chain.tree_state_at(prior_height).await?;
+    tree_state.to_chain_state().map_err(|io| {
+        WalletError::ChainSource(ChainSourceError::MalformedCompactBlock {
+            block_height: prior_height,
+            reason: format!("invalid tree state: {io}"),
         })
+    })
 }
 
 #[cfg(test)]

@@ -15,7 +15,7 @@ mod zinder_chain_source;
 mod zinder_submitter;
 
 pub use buffered_block_source::{BufferedBlockSource, BufferedBlockSourceError};
-pub use chain_error::{ChainSourceError, SubmitterError};
+pub use chain_error::{ChainSourceError, FailurePosture, SubmitterError};
 
 pub use chain_source::{
     BlockHeightRange, ChainEvent, ChainEventCursor, ChainEventEnvelope, ChainEventEnvelopeStream,

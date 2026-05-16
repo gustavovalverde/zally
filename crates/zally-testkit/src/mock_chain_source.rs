@@ -127,15 +127,19 @@ impl MockChainSourceHandle {
     /// Queues `count` consecutive failures for `chain_tip` calls. Each subsequent call pops
     /// one failure off the queue; once empty, calls succeed normally. Failures are returned
     /// in the order they were queued.
-    #[allow(
-        clippy::needless_pass_by_value,
-        reason = "test API: taking the error template by value reads more naturally at the \
-                  call site than threading a borrow through the closure"
-    )]
-    pub fn fail_chain_tip_next(&self, count: u32, error: ChainSourceError) {
+    ///
+    /// `produce_error` is invoked once per queued failure, so callers can either return the
+    /// same error each time (`|| ChainSourceError::Unavailable { ... }`) or vary the error
+    /// per attempt. The closure avoids requiring `Clone` on the error type, which would
+    /// otherwise force [`ChainSourceError::Indexer`] to carry an `Arc<IndexerError>`.
+    pub fn fail_chain_tip_next(
+        &self,
+        count: u32,
+        mut produce_error: impl FnMut() -> ChainSourceError,
+    ) {
         let mut guard = self.state.lock();
         for _ in 0..count {
-            guard.chain_tip_failures.push(error.clone());
+            guard.chain_tip_failures.push(produce_error());
         }
     }
 

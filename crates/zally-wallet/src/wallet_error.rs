@@ -1,5 +1,6 @@
 //! Operator-facing wallet error.
 
+use zally_chain::{ChainSourceError, FailurePosture, SubmitterError};
 use zally_core::Network;
 use zally_keys::{KeyDerivationError, SealingError};
 use zally_pczt::PcztError;
@@ -23,25 +24,26 @@ pub enum WalletError {
 
     /// `Wallet::open` was called but no sealed seed exists.
     ///
-    /// `not_retryable`: switch to `Wallet::create` for first-time bootstrap.
+    /// Posture: [`FailurePosture::NotRetryable`]: switch to `Wallet::create` for first-time
+    /// bootstrap.
     #[error("no sealed seed found for wallet")]
     NoSealedSeed,
 
     /// `Wallet::create` was called but an account already exists.
     ///
-    /// `not_retryable`: switch to `Wallet::open`.
+    /// Posture: [`FailurePosture::NotRetryable`]: switch to `Wallet::open`.
     #[error("an account already exists at this wallet location")]
     AccountAlreadyExists,
 
     /// The unsealed seed does not match any account in storage.
     ///
-    /// `not_retryable`.
+    /// Posture: [`FailurePosture::NotRetryable`].
     #[error("no account in storage matches the unsealed seed")]
     AccountNotFound,
 
     /// The storage's network does not match the wallet's requested network.
     ///
-    /// `requires_operator`: configuration mismatch.
+    /// Posture: [`FailurePosture::RequiresOperator`]: configuration mismatch.
     #[error("network mismatch: storage={storage:?}, requested={requested:?}")]
     NetworkMismatch {
         /// Network the storage was opened for.
@@ -50,36 +52,31 @@ pub enum WalletError {
         requested: Network,
     },
 
-    /// A chain-source operation failed. The posture follows the underlying chain-source
-    /// error.
-    #[error("chain source error: {reason}")]
-    ChainSource {
-        /// Underlying error description.
-        reason: String,
-        /// Whether retrying the same call may succeed.
-        is_retryable: bool,
-    },
+    /// A chain-source operation failed. Posture follows the inner [`ChainSourceError`].
+    #[error("chain source error: {0}")]
+    ChainSource(#[from] ChainSourceError),
 
-    /// A submitter operation failed.
+    /// A submitter operation failed. Posture follows the inner [`SubmitterError`].
     #[error("submitter error: {0}")]
-    Submitter(#[from] zally_chain::SubmitterError),
+    Submitter(#[from] SubmitterError),
 
     /// A memo was provided for a transparent recipient.
     ///
-    /// `not_retryable`: ZIP-302 prohibits memos on transparent outputs.
+    /// Posture: [`FailurePosture::NotRetryable`]: ZIP-302 prohibits memos on transparent
+    /// outputs.
     #[error("memos are not permitted on transparent recipients (ZIP-302)")]
     MemoOnTransparentRecipient,
 
     /// A TEX recipient was paid from a proposal containing shielded inputs.
     ///
-    /// `not_retryable`: ZIP-320 requires an all-transparent input set when paying a TEX
-    /// recipient.
+    /// Posture: [`FailurePosture::NotRetryable`]: ZIP-320 requires an all-transparent input set
+    /// when paying a TEX recipient.
     #[error("TEX recipients (ZIP-320) require an all-transparent input set")]
     ShieldedInputsOnTexRecipient,
 
     /// The wallet does not have enough spendable balance for the requested send.
     ///
-    /// `not_retryable` until balance is replenished.
+    /// Posture: [`FailurePosture::NotRetryable`] until balance is replenished.
     #[error("insufficient spendable balance: requested {requested_zat}, spendable {spendable_zat}")]
     InsufficientBalance {
         /// Amount the caller asked to send, in zatoshis.
@@ -90,7 +87,7 @@ pub enum WalletError {
 
     /// A ZIP-321 payment-request URI could not be parsed.
     ///
-    /// `not_retryable`: the caller must fix the URI.
+    /// Posture: [`FailurePosture::NotRetryable`]: the caller must fix the URI.
     #[error("payment request parse failed: {reason}")]
     PaymentRequestParseFailed {
         /// Underlying parser error.
@@ -100,7 +97,7 @@ pub enum WalletError {
     /// The proposal could not be built (e.g., unsupported recipient combination, missing
     /// anchor, fee constraint).
     ///
-    /// `not_retryable` for malformed input; `requires_operator` for missing chain state.
+    /// Posture: [`FailurePosture::NotRetryable`] for malformed input.
     #[error("proposal rejected: {reason}")]
     ProposalRejected {
         /// Underlying error description.
@@ -110,7 +107,8 @@ pub enum WalletError {
     /// The submission did not produce an `Accepted` or `Duplicate` outcome. The submitter
     /// returned `Rejected` with the carried reason.
     ///
-    /// `not_retryable`: retrying the same bytes will not change the outcome.
+    /// Posture: [`FailurePosture::NotRetryable`]: retrying the same bytes will not change
+    /// the outcome.
     #[error("submission rejected: {reason}")]
     SubmissionRejected {
         /// Reason carried by the submitter.
@@ -126,7 +124,7 @@ pub enum WalletError {
     /// The wallet's circuit breaker is open and short-circuited the call. The breaker
     /// re-closes after its cooldown expires or after a half-open probe succeeds.
     ///
-    /// `retryable`: callers may try again after the cooldown.
+    /// Posture: [`FailurePosture::Retryable`]: callers may try again after the cooldown.
     #[error("wallet circuit breaker is open; failures exceeded the configured threshold")]
     CircuitBroken {
         /// Operation that observed the open circuit.
@@ -135,41 +133,65 @@ pub enum WalletError {
 
     /// The sync-driver task failed outside the wallet sync operation itself.
     ///
-    /// `retryable` when the task was cancelled by the runtime; `requires_operator` when the
-    /// task panicked.
+    /// Posture carries the operator-facing classification. A runtime cancellation surfaces as
+    /// [`FailurePosture::Retryable`]; a panic in the driver task surfaces as
+    /// [`FailurePosture::RequiresOperator`] (the panic indicates a Zally bug or upstream
+    /// invariant violation that needs investigation before a new driver is started).
     #[error("sync driver failed: {reason}")]
     SyncDriverFailed {
         /// Underlying task failure description.
         reason: String,
-        /// Whether starting a new driver may succeed.
-        is_retryable: bool,
+        /// Operator-facing posture for this failure.
+        posture: FailurePosture,
     },
 }
 
 impl WalletError {
-    /// Whether the same call may succeed on retry.
+    /// Operator-facing posture describing what the consumer may do.
     #[must_use]
-    pub fn is_retryable(&self) -> bool {
+    pub fn posture(&self) -> FailurePosture {
         match self {
-            Self::Sealing(e) => e.is_retryable(),
-            Self::Storage(e) => e.is_retryable(),
-            Self::KeyDerivation(e) => e.is_retryable(),
-            Self::ChainSource { is_retryable, .. }
-            | Self::SyncDriverFailed { is_retryable, .. } => *is_retryable,
-            Self::Submitter(e) => e.is_retryable(),
-            Self::Pczt(e) => e.is_retryable(),
-            Self::CircuitBroken { .. } => true,
+            Self::Sealing(e) => bool_to_posture(e.is_retryable()),
+            Self::Storage(e) => bool_to_posture(e.is_retryable()),
+            Self::KeyDerivation(e) => bool_to_posture(e.is_retryable()),
+            Self::Pczt(e) => bool_to_posture(e.is_retryable()),
+            Self::ChainSource(e) => e.posture(),
+            Self::Submitter(e) => e.posture(),
+            Self::SyncDriverFailed { posture, .. } => *posture,
+            Self::CircuitBroken { .. } => FailurePosture::Retryable,
+            Self::NetworkMismatch { .. } => FailurePosture::RequiresOperator,
             Self::NoSealedSeed
             | Self::AccountAlreadyExists
             | Self::AccountNotFound
-            | Self::NetworkMismatch { .. }
             | Self::MemoOnTransparentRecipient
             | Self::ShieldedInputsOnTexRecipient
             | Self::InsufficientBalance { .. }
             | Self::PaymentRequestParseFailed { .. }
             | Self::ProposalRejected { .. }
-            | Self::SubmissionRejected { .. } => false,
+            | Self::SubmissionRejected { .. } => FailurePosture::NotRetryable,
         }
+    }
+
+    /// Convenience: `true` when the same call may succeed on retry.
+    ///
+    /// Equivalent to `self.posture().allows_retry()`.
+    #[must_use]
+    pub fn is_retryable(&self) -> bool {
+        self.posture().allows_retry()
+    }
+}
+
+/// Maps the two-state retry posture exposed by boundary errors into [`FailurePosture`].
+///
+/// `StorageError`, `SealingError`, `KeyDerivationError`, and `PcztError` keep a boolean
+/// signal because their retry semantics never need to distinguish "operator must act" from
+/// "caller fix needed"; the wallet-side mapping picks the conservative non-retryable
+/// variant for any `false`.
+const fn bool_to_posture(is_retryable: bool) -> FailurePosture {
+    if is_retryable {
+        FailurePosture::Retryable
+    } else {
+        FailurePosture::NotRetryable
     }
 }
 
@@ -178,7 +200,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn wallet_error_retryable_match_complete() {
+    fn wallet_error_posture_match_complete() {
         let variants = [
             WalletError::Sealing(SealingError::NoSealedSeed),
             WalletError::Storage(StorageError::NotOpened),
@@ -190,11 +212,8 @@ mod tests {
                 storage: Network::Mainnet,
                 requested: Network::Testnet,
             },
-            WalletError::ChainSource {
-                reason: "x".into(),
-                is_retryable: true,
-            },
-            WalletError::Submitter(zally_chain::SubmitterError::Unavailable { reason: "x".into() }),
+            WalletError::ChainSource(ChainSourceError::Unavailable { reason: "x".into() }),
+            WalletError::Submitter(SubmitterError::Unavailable { reason: "x".into() }),
             WalletError::MemoOnTransparentRecipient,
             WalletError::ShieldedInputsOnTexRecipient,
             WalletError::InsufficientBalance {
@@ -208,11 +227,41 @@ mod tests {
             WalletError::CircuitBroken { operation: "test" },
             WalletError::SyncDriverFailed {
                 reason: "x".into(),
-                is_retryable: true,
+                posture: FailurePosture::Retryable,
             },
         ];
         for e in variants {
+            let _ = e.posture();
             let _ = e.is_retryable();
         }
+    }
+
+    #[test]
+    fn network_mismatch_requires_operator() {
+        let err = WalletError::NetworkMismatch {
+            storage: Network::Mainnet,
+            requested: Network::Testnet,
+        };
+        assert_eq!(err.posture(), FailurePosture::RequiresOperator);
+        assert!(!err.is_retryable());
+    }
+
+    #[test]
+    fn chain_source_posture_delegates_to_inner() {
+        let err = WalletError::ChainSource(ChainSourceError::MalformedCompactBlock {
+            block_height: zally_core::BlockHeight::from(1),
+            reason: "x".into(),
+        });
+        assert_eq!(err.posture(), FailurePosture::RequiresOperator);
+    }
+
+    #[test]
+    fn sync_driver_failed_posture_is_carried_through() {
+        let err = WalletError::SyncDriverFailed {
+            reason: "panicked".into(),
+            posture: FailurePosture::RequiresOperator,
+        };
+        assert_eq!(err.posture(), FailurePosture::RequiresOperator);
+        assert!(!err.is_retryable());
     }
 }

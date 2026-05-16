@@ -43,11 +43,7 @@ impl Submitter for ZinderSubmitter {
 
     async fn submit(&self, raw_tx: &[u8]) -> Result<SubmitOutcome, SubmitterError> {
         let bytes = RawTransactionBytes::new(raw_tx.to_vec());
-        let outcome = self
-            .inner
-            .broadcast_transaction(bytes)
-            .await
-            .map_err(zinder_error_to_submitter_error)?;
+        let outcome = self.inner.broadcast_transaction(bytes).await?;
         Ok(translate_broadcast_outcome(outcome))
     }
 }
@@ -83,34 +79,6 @@ fn translate_broadcast_outcome(outcome: TransactionBroadcastResult) -> SubmitOut
         },
         _ => SubmitOutcome::Rejected {
             reason: "zinder returned an unrecognised broadcast outcome variant".into(),
-        },
-    }
-}
-
-#[allow(
-    clippy::needless_pass_by_value,
-    reason = "zinder client errors are consumed once at the broadcast boundary"
-)]
-fn zinder_error_to_submitter_error(err: zinder_client::IndexerError) -> SubmitterError {
-    #[allow(
-        clippy::wildcard_enum_match_arm,
-        reason = "non_exhaustive zinder errors map unknown variants to UpstreamFailed"
-    )]
-    match err {
-        zinder_client::IndexerError::ServiceUnavailable { reason }
-        | zinder_client::IndexerError::StorageUnavailable { reason } => {
-            SubmitterError::Unavailable { reason }
-        }
-        zinder_client::IndexerError::InvalidRequest { reason }
-        | zinder_client::IndexerError::FailedPrecondition { reason } => {
-            SubmitterError::UpstreamFailed {
-                reason,
-                is_retryable: false,
-            }
-        }
-        other => SubmitterError::UpstreamFailed {
-            reason: other.to_string(),
-            is_retryable: false,
         },
     }
 }

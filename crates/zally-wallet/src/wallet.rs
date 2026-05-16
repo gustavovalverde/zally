@@ -408,26 +408,16 @@ async fn fetch_prior_chain_state(
     birthday: BlockHeight,
 ) -> Result<ChainState, WalletError> {
     let prior_height = BlockHeight::from(birthday.as_u32().saturating_sub(1));
-    let tree_state = chain
-        .tree_state_at(prior_height)
-        .await
-        .map_err(|err| map_chain_source_to_wallet_error(&err))?;
-    tree_state
-        .to_chain_state()
-        .map_err(|io| WalletError::ChainSource {
+    let tree_state = chain.tree_state_at(prior_height).await?;
+    tree_state.to_chain_state().map_err(|io| {
+        WalletError::ChainSource(ChainSourceError::MalformedCompactBlock {
+            block_height: prior_height,
             reason: format!(
                 "invalid tree state for birthday {}: {io}",
                 birthday.as_u32()
             ),
-            is_retryable: false,
         })
-}
-
-fn map_chain_source_to_wallet_error(err: &ChainSourceError) -> WalletError {
-    WalletError::ChainSource {
-        reason: err.to_string(),
-        is_retryable: err.is_retryable(),
-    }
+    })
 }
 
 fn lift_storage_to_wallet_error(err: StorageError) -> WalletError {

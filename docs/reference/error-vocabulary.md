@@ -1,14 +1,16 @@
 # Error Vocabulary
 
-Zally public errors are typed, retry-classified, and part of the public API. New variants must be added here in the same change that introduces them.
+Zally public errors are typed, posture-classified, and part of the public API. New variants must be added here in the same change that introduces them.
 
-## Retry Posture
+## Failure Posture
 
-| Posture | Meaning |
-|---------|---------|
-| `retryable` | The same call with the same arguments may succeed later. |
-| `not_retryable` | The caller must change input or state before retrying. |
-| `requires_operator` | An operator must repair configuration, storage, or runtime state. |
+Every chain-source and wallet error exposes a `posture()` method returning a [`FailurePosture`](../../crates/zally-chain/src/chain_error.rs) value drawn from this three-class taxonomy. See [ADR-0002](../adrs/0002-source-failure-posture.md) for the architectural contract.
+
+| Posture | Meaning | Wallet behaviour |
+|---------|---------|------------------|
+| `retryable` | The same call with the same arguments may succeed later. | `with_retry` retries with backoff; `CircuitBreaker` counts consecutive failures and trips at threshold. |
+| `requires_operator` | An operator must repair configuration, storage, or runtime state. | Surface immediately; do not retry; do not trip the breaker. |
+| `not_retryable` | The caller must change input or state before retrying. | Surface immediately; do not retry; do not trip the breaker. |
 
 ## WalletError
 
@@ -17,21 +19,42 @@ Zally public errors are typed, retry-classified, and part of the public API. New
 | `Sealing` | Mirrors `SealingError` | Seed sealing or unsealing failed. |
 | `Storage` | Mirrors `StorageError` | Wallet storage failed. |
 | `KeyDerivation` | Mirrors `KeyDerivationError` | Key derivation failed. |
-| `NoSealedSeed` | `requires_operator` | `Wallet::open` or `Wallet::open_or_create_account` had no sealed seed. |
-| `AccountAlreadyExists` | `requires_operator` | `Wallet::create` found an existing account. |
-| `AccountNotFound` | `requires_operator` | The sealed seed does not match any storage account. |
+| `NoSealedSeed` | `not_retryable` | `Wallet::open` or `Wallet::open_or_create_account` had no sealed seed. |
+| `AccountAlreadyExists` | `not_retryable` | `Wallet::create` found an existing account. |
+| `AccountNotFound` | `not_retryable` | The sealed seed does not match any storage account. |
 | `NetworkMismatch` | `requires_operator` | Two configured boundaries disagree on network. |
-| `ChainSource` | Carries `is_retryable` | A chain-read operation failed. |
-| `Submitter` | Mirrors `SubmitterError` | Transaction broadcast failed. |
+| `ChainSource(ChainSourceError)` | Mirrors `ChainSourceError` | A chain-read operation failed. |
+| `Submitter(SubmitterError)` | Mirrors `SubmitterError` | Transaction broadcast failed. |
 | `MemoOnTransparentRecipient` | `not_retryable` | ZIP-302 forbids memos on transparent recipients. |
 | `ShieldedInputsOnTexRecipient` | `not_retryable` | ZIP-320 requires transparent-only inputs for TEX. |
 | `InsufficientBalance` | `not_retryable` | The wallet lacks spendable funds. |
 | `PaymentRequestParseFailed` | `not_retryable` | ZIP-321 URI parsing failed. |
-| `ProposalRejected` | `not_retryable` or `requires_operator` | Proposal construction failed. |
+| `ProposalRejected` | `not_retryable` | Proposal construction failed. |
 | `SubmissionRejected` | `not_retryable` | The node rejected the submitted transaction. |
 | `Pczt` | Mirrors `PcztError` | A PCZT role failed. |
 | `CircuitBroken` | `retryable` | The wallet IO circuit breaker is open. |
-| `SyncDriverFailed` | Carries `is_retryable` | The sync driver failed outside a wallet operation. |
+| `SyncDriverFailed` | Carries `FailurePosture` | The sync driver failed outside a wallet operation. Cancellation surfaces `Retryable`; panic surfaces `RequiresOperator`. |
+
+## ChainSourceError
+
+| Variant | Posture | Meaning |
+|---------|---------|---------|
+| `Unavailable` | `retryable` | Generic source-agnostic transient backend stall (used by mocks and future non-zinder sources). |
+| `BlockHeightBelowFloor` | `not_retryable` | Requested height is below the source's earliest available block. |
+| `BlockHeightAboveTip` | `not_retryable` | Requested height is above the source's tip; re-query `chain_tip()`. |
+| `NetworkMismatch` | `requires_operator` | The source serves a different network than the caller asked for. |
+| `MalformedCompactBlock` | `requires_operator` | The source returned bytes that did not decode; investigate the upstream version. |
+| `BlockingTaskFailed` | `retryable` | A `spawn_blocking` task panicked or was cancelled. |
+| `Indexer(IndexerError)` | Mirrors `IndexerError::retry_policy` | Lossless pass-through of a `zinder-client` error. |
+
+## SubmitterError
+
+| Variant | Posture | Meaning |
+|---------|---------|---------|
+| `Unavailable` | `retryable` | Generic source-agnostic transient broadcast unavailability. |
+| `NetworkMismatch` | `requires_operator` | Submitter network disagrees with the transaction network. |
+| `BlockingTaskFailed` | `retryable` | A `spawn_blocking` task panicked or was cancelled. |
+| `Indexer(IndexerError)` | Mirrors `IndexerError::retry_policy` | Lossless pass-through of a `zinder-client` broadcast error. |
 
 ## StorageError
 

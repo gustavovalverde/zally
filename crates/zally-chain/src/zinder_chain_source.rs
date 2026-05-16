@@ -21,7 +21,7 @@ use zcash_client_backend::proto::compact_formats::CompactBlock;
 use zcash_client_backend::proto::service::TreeState;
 use zinder_client::{
     ChainEvent as ZinderChainEvent, ChainEventCursor as ZinderChainEventCursor,
-    ChainEventEnvelope as ZinderChainEventEnvelope, ChainIndex, IndexerError, RemoteChainIndex,
+    ChainEventEnvelope as ZinderChainEventEnvelope, ChainIndex, RemoteChainIndex,
     RemoteOpenOptions, TransparentAddressUtxosQuery,
 };
 use zinder_core::{
@@ -78,8 +78,7 @@ impl ZinderChainSource {
         let remote = RemoteChainIndex::connect(RemoteOpenOptions {
             endpoint: options.endpoint,
             network: zinder_network,
-        })
-        .map_err(zinder_error_to_chain_source)?;
+        })?;
 
         Ok(Self {
             inner: Arc::new(remote),
@@ -113,11 +112,7 @@ impl ChainSource for ZinderChainSource {
     }
 
     async fn chain_tip(&self) -> Result<BlockHeight, ChainSourceError> {
-        let block_id = self
-            .inner
-            .latest_block(None)
-            .await
-            .map_err(zinder_error_to_chain_source)?;
+        let block_id = self.inner.latest_block(None).await?;
         Ok(BlockHeight::from(block_id.height.value()))
     }
 
@@ -132,12 +127,11 @@ impl ChainSource for ZinderChainSource {
         let stream = self
             .inner
             .compact_blocks_in_range(zinder_range, None)
-            .await
-            .map_err(zinder_error_to_chain_source)?;
+            .await?;
 
         let mapped = stream.map(|stream_item| match stream_item {
             Ok(artifact) => decode_compact_block(&artifact.payload_bytes, artifact.height),
-            Err(err) => Err(zinder_error_to_chain_source(err)),
+            Err(err) => Err(ChainSourceError::from(err)),
         });
         Ok(Box::pin(mapped) as CompactBlockStream)
     }
@@ -149,8 +143,7 @@ impl ChainSource for ZinderChainSource {
         let artifact = self
             .inner
             .tree_state_at(ZinderBlockHeight::new(block_height.as_u32()), None)
-            .await
-            .map_err(zinder_error_to_chain_source)?;
+            .await?;
         decode_tree_state(&artifact.payload_bytes, block_height, self.network)
     }
 
@@ -167,11 +160,7 @@ impl ChainSource for ZinderChainSource {
             ZinderSubtreeRootIndex::new(start_index.0),
             max_entries,
         );
-        let artifacts = self
-            .inner
-            .subtree_roots_in_range(range, None)
-            .await
-            .map_err(zinder_error_to_chain_source)?;
+        let artifacts = self.inner.subtree_roots_in_range(range, None).await?;
         Ok(artifacts
             .into_iter()
             .map(|artifact| SubtreeRoot {
@@ -183,11 +172,7 @@ impl ChainSource for ZinderChainSource {
 
     async fn transaction_status(&self, tx_id: TxId) -> Result<TransactionStatus, ChainSourceError> {
         let zinder_id = ZinderTransactionId::from_bytes(*tx_id.as_bytes());
-        let status = self
-            .inner
-            .transaction_by_id(zinder_id, None)
-            .await
-            .map_err(zinder_error_to_chain_source)?;
+        let status = self.inner.transaction_by_id(zinder_id, None).await?;
         #[allow(
             clippy::wildcard_enum_match_arm,
             reason = "non_exhaustive zinder tx statuses map unknown variants to NotFound"
@@ -218,11 +203,7 @@ impl ChainSource for ZinderChainSource {
             max_entries: None,
             from_cursor: None,
         };
-        let view = self
-            .inner
-            .transparent_address_utxos(query, None)
-            .await
-            .map_err(zinder_error_to_chain_source)?;
+        let view = self.inner.transparent_address_utxos(query, None).await?;
         Ok(view
             .utxos
             .into_iter()
@@ -243,13 +224,10 @@ impl ChainSource for ZinderChainSource {
         let inner = self.inner.clone();
         let zinder_cursor =
             from_cursor.map(|cursor| ZinderChainEventCursor::from_bytes(cursor.into_bytes()));
-        let stream = inner
-            .chain_events(zinder_cursor)
-            .await
-            .map_err(zinder_error_to_chain_source)?;
+        let stream = inner.chain_events(zinder_cursor).await?;
         let mapped = stream.map(|envelope_result| match envelope_result {
             Ok(envelope) => Ok(translate_chain_event_envelope(&envelope)),
-            Err(err) => Err(zinder_error_to_chain_source(err)),
+            Err(err) => Err(ChainSourceError::from(err)),
         });
         Ok(Box::pin(mapped) as ChainEventEnvelopeStream)
     }
@@ -405,64 +383,5 @@ const fn lightwalletd_network_label(network: Network) -> &'static str {
     match network {
         Network::Mainnet => "main",
         _ => "test",
-    }
-}
-
-#[allow(
-    clippy::needless_pass_by_value,
-    reason = "IndexerError is consumed once at each call site through map_err"
-)]
-fn zinder_error_to_chain_source(err: IndexerError) -> ChainSourceError {
-    #[allow(
-        clippy::wildcard_enum_match_arm,
-        reason = "non_exhaustive zinder errors map unknown variants to UpstreamFailed"
-    )]
-    match err {
-        IndexerError::NoVisibleChainEpoch => ChainSourceError::Unavailable {
-            reason: "zinder reports no visible chain epoch yet".into(),
-        },
-        IndexerError::NotFound { resource } => ChainSourceError::UpstreamFailed {
-            reason: format!("zinder reports {resource} not found"),
-            is_retryable: false,
-        },
-        IndexerError::ArtifactUnavailable { family, key } => ChainSourceError::UpstreamFailed {
-            reason: format!("zinder artifact {family} unavailable for key {key}"),
-            is_retryable: false,
-        },
-        IndexerError::InvalidRequest { reason } => ChainSourceError::UpstreamFailed {
-            reason: format!("zinder rejected the request: {reason}"),
-            is_retryable: false,
-        },
-        IndexerError::FailedPrecondition { reason } => ChainSourceError::UpstreamFailed {
-            reason: format!("zinder failed precondition: {reason}"),
-            is_retryable: false,
-        },
-        IndexerError::DataLoss { reason } => ChainSourceError::MalformedCompactBlock {
-            block_height: BlockHeight::from(0),
-            reason: format!("zinder reports data loss: {reason}"),
-        },
-        IndexerError::StorageUnavailable { reason }
-        | IndexerError::ServiceUnavailable { reason } => ChainSourceError::Unavailable { reason },
-        IndexerError::RemoteEndpointUnconfigured { operation } => {
-            ChainSourceError::UpstreamFailed {
-                reason: format!("zinder local chain index missing remote endpoint for {operation}"),
-                is_retryable: false,
-            }
-        }
-        IndexerError::MalformedResponse { field, reason } => ChainSourceError::UpstreamFailed {
-            reason: format!("zinder malformed response on field {field}: {reason}"),
-            is_retryable: false,
-        },
-        IndexerError::NetworkMismatch { expected, actual } => ChainSourceError::UpstreamFailed {
-            reason: format!("zinder served network {actual} when {expected:?} was expected"),
-            is_retryable: false,
-        },
-        IndexerError::BlockingTaskFailed { reason } => {
-            ChainSourceError::BlockingTaskFailed { reason }
-        }
-        _ => ChainSourceError::UpstreamFailed {
-            reason: "unrecognised zinder IndexerError variant".into(),
-            is_retryable: false,
-        },
     }
 }

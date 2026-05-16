@@ -358,7 +358,7 @@ impl Wallet {
                 policy,
                 operation,
                 || submitter.submit(&transaction.raw_bytes),
-                |err| map_submitter_error(&err),
+                WalletError::from,
             )
             .await?;
             let tx_id = resolve_send_outcome(outcome, transaction.tx_id)?;
@@ -389,13 +389,6 @@ fn resolve_send_outcome(
         _ => Err(WalletError::ProposalRejected {
             reason: "submitter returned an unrecognised outcome variant".into(),
         }),
-    }
-}
-
-fn map_submitter_error(err: &zally_chain::SubmitterError) -> WalletError {
-    WalletError::ChainSource {
-        reason: err.to_string(),
-        is_retryable: err.is_retryable(),
     }
 }
 

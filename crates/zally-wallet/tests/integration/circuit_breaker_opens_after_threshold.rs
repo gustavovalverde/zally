@@ -1,6 +1,8 @@
-//! Regression: the wallet's [`CircuitBreaker`] trips open after the configured number of
-//! consecutive retryable failures, and `Wallet::capabilities()` reflects `CircuitBroken`
-//! while the breaker is open.
+//! Regression: the wallet's circuit breaker only trips on retryable failures.
+//!
+//! Consecutive [`FailurePosture::Retryable`] failures advance the breaker counter until it
+//! opens; `Wallet::capabilities()` reflects `CircuitBroken` while open. Operator-action
+//! failures do not advance the counter since they are not symptoms of a flaky backend.
 
 use zally_chain::ChainSourceError;
 use zally_core::{BlockHeight, Network};
@@ -10,7 +12,7 @@ use zally_testkit::{MockChainSource, TempWalletPath};
 use zally_wallet::{Capability, CircuitBreakerState, RetryPolicy, Wallet, WalletError};
 
 #[tokio::test]
-async fn circuit_breaker_opens_after_threshold_failures() -> Result<(), TestError> {
+async fn circuit_breaker_opens_after_threshold_retryable_failures() -> Result<(), TestError> {
     let temp = TempWalletPath::create()?;
     let network = Network::regtest();
 
@@ -22,19 +24,15 @@ async fn circuit_breaker_opens_after_threshold_failures() -> Result<(), TestErro
     let chain = zally_testkit::MockChainSource::new(network);
     let (wallet, _account_id, _mnemonic) =
         Wallet::create(&chain, network, sealing, storage, BlockHeight::from(1)).await?;
-    // No retries: each sync surfaces the first error immediately. The breaker receives the
-    // same failure on each attempt and trips after the default threshold of 5.
     wallet.set_retry_policy(RetryPolicy::none());
 
     let chain = MockChainSource::new(network);
     chain.handle().advance_tip(BlockHeight::from(50));
-    // Inject more than enough failures to trip the default-threshold breaker.
-    chain.handle().fail_chain_tip_next(
-        20,
-        ChainSourceError::Unavailable {
+    chain
+        .handle()
+        .fail_chain_tip_next(20, || ChainSourceError::Unavailable {
             reason: "simulated outage".into(),
-        },
-    );
+        });
 
     assert!(
         matches!(
@@ -65,6 +63,52 @@ async fn circuit_breaker_opens_after_threshold_failures() -> Result<(), TestErro
     assert!(
         matches!(outcome, Err(WalletError::CircuitBroken { .. })),
         "open breaker must short-circuit subsequent calls, got {outcome:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn circuit_breaker_does_not_trip_on_requires_operator_failures() -> Result<(), TestError> {
+    let temp = TempWalletPath::create()?;
+    let network = Network::regtest();
+
+    let sealing = AgeFileSealing::new(AgeFileSealingOptions::at_path(temp.seed_path()));
+    let storage = SqliteWalletStorage::new(SqliteWalletStorageOptions::for_network(
+        network,
+        temp.db_path(),
+    ));
+    let chain = zally_testkit::MockChainSource::new(network);
+    let (wallet, _account_id, _mnemonic) =
+        Wallet::create(&chain, network, sealing, storage, BlockHeight::from(1)).await?;
+    wallet.set_retry_policy(RetryPolicy::none());
+
+    let chain = MockChainSource::new(network);
+    chain.handle().advance_tip(BlockHeight::from(50));
+    chain
+        .handle()
+        .fail_chain_tip_next(20, || ChainSourceError::MalformedCompactBlock {
+            block_height: BlockHeight::from(10),
+            reason: "synthetic upstream malformed".into(),
+        });
+
+    for _ in 0..10 {
+        let _ = wallet.sync(&chain).await;
+    }
+
+    assert!(
+        matches!(
+            wallet.circuit_breaker_state(),
+            CircuitBreakerState::Closed { .. }
+        ),
+        "operator-action failures must not trip the breaker, got {:?}",
+        wallet.circuit_breaker_state()
+    );
+    assert!(
+        !wallet
+            .capabilities()
+            .features
+            .contains(&Capability::CircuitBroken),
+        "Capability::CircuitBroken must not appear while the breaker is closed"
     );
     Ok(())
 }

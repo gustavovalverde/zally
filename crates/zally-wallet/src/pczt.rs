@@ -120,7 +120,7 @@ impl Wallet {
             policy,
             "extract_and_submit_pczt.submit",
             || submitter.submit(&prepared.raw_bytes),
-            |err| map_submitter_error(&err),
+            WalletError::from,
         )
         .await?;
         translate_submit_outcome(outcome, prepared.tx_id)
@@ -172,13 +172,6 @@ fn lift_storage_error(err: &zally_storage::StorageError) -> WalletError {
     }
     WalletError::ProposalRejected {
         reason: err.to_string(),
-    }
-}
-
-fn map_submitter_error(err: &zally_chain::SubmitterError) -> WalletError {
-    WalletError::ChainSource {
-        reason: err.to_string(),
-        is_retryable: err.is_retryable(),
     }
 }
 
