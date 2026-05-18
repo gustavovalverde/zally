@@ -1,12 +1,15 @@
 //! `WalletStorage` trait.
 
 use async_trait::async_trait;
-use zally_core::{AccountId, BlockHeight, IdempotencyKey, Network, TxId};
+use zally_core::{AccountId, BlockHeight, IdempotencyKey, Network, OutPoint, TxId};
 use zally_keys::SeedMaterial;
 use zcash_client_backend::data_api::chain::ChainState;
 use zcash_client_backend::proto::compact_formats::CompactBlock;
 use zcash_keys::address::UnifiedAddress;
 
+use crate::account_balance_row::AccountBalanceRow;
+use crate::exposed_address_row::ExposedAddressRow;
+use crate::pending_broadcast_input_row::PendingBroadcastInputRow;
 use crate::storage_error::StorageError;
 
 /// Request body for [`WalletStorage::scan_blocks`].
@@ -65,10 +68,13 @@ pub struct ProposalPaymentRequest {
     pub amount_zat: u64,
     /// Optional memo (the wallet layer enforces the no-memo-on-transparent rule before this).
     pub memo: Option<Vec<u8>>,
+    /// Transparent outpoints that must not be selected as inputs (e.g. outpoints locked by a
+    /// still-unconfirmed wallet-owned broadcast).
+    pub excluded_outpoints: std::collections::HashSet<OutPoint>,
 }
 
 impl ProposalPaymentRequest {
-    /// Constructs a new request.
+    /// Constructs a new request with no excluded outpoints.
     #[must_use]
     pub fn new(
         account_id: AccountId,
@@ -81,7 +87,18 @@ impl ProposalPaymentRequest {
             recipient_encoded,
             amount_zat,
             memo,
+            excluded_outpoints: std::collections::HashSet::new(),
         }
+    }
+
+    /// Returns the request with `excluded_outpoints` replaced.
+    #[must_use]
+    pub fn with_excluded_outpoints(
+        mut self,
+        excluded_outpoints: std::collections::HashSet<OutPoint>,
+    ) -> Self {
+        self.excluded_outpoints = excluded_outpoints;
+        self
     }
 }
 
@@ -93,16 +110,30 @@ pub struct ShieldTransparentRequest {
     pub account_id: AccountId,
     /// Minimum total transparent input value to shield, in zatoshis.
     pub shielding_threshold_zat: u64,
+    /// Transparent outpoints that must not be selected as shielding inputs (e.g. outpoints
+    /// locked by a still-unconfirmed wallet-owned broadcast).
+    pub excluded_outpoints: std::collections::HashSet<OutPoint>,
 }
 
 impl ShieldTransparentRequest {
-    /// Constructs a new transparent shielding request.
+    /// Constructs a new transparent shielding request with no excluded outpoints.
     #[must_use]
     pub fn new(account_id: AccountId, shielding_threshold_zat: u64) -> Self {
         Self {
             account_id,
             shielding_threshold_zat,
+            excluded_outpoints: std::collections::HashSet::new(),
         }
+    }
+
+    /// Returns the request with `excluded_outpoints` replaced.
+    #[must_use]
+    pub fn with_excluded_outpoints(
+        mut self,
+        excluded_outpoints: std::collections::HashSet<OutPoint>,
+    ) -> Self {
+        self.excluded_outpoints = excluded_outpoints;
+        self
     }
 }
 
@@ -263,6 +294,26 @@ pub struct ProposalSummary {
     pub min_target_height: BlockHeight,
     /// Number of payment outputs in the proposal.
     pub output_count: usize,
+}
+
+/// Request body for [`WalletStorage::record_pending_broadcast_inputs`].
+///
+/// Carries the metadata a wallet-owned broadcast needs to register itself with the
+/// pending-broadcast filter: the broadcast txid, the account it belongs to, when the
+/// broadcast happened (wall-clock and chain tip), and the transparent outpoints the
+/// transaction consumes (each paired with its value).
+#[derive(Clone, Debug)]
+pub struct PendingBroadcastRecord {
+    /// Identifier of the wallet-owned transaction that consumed the outpoints.
+    pub broadcast_tx_id: TxId,
+    /// Account that owns the broadcast.
+    pub account_id: AccountId,
+    /// Unix milliseconds when the wallet recorded the broadcast.
+    pub broadcast_at_ms: u64,
+    /// Chain tip the wallet had observed at broadcast time. `None` when no tip was recorded.
+    pub broadcast_at_height: Option<BlockHeight>,
+    /// Each transparent input the broadcast consumes, paired with its value.
+    pub inputs: Vec<(OutPoint, zally_core::Zatoshis)>,
 }
 
 /// Trait abstracting the wallet database.
@@ -456,12 +507,12 @@ pub trait WalletStorage: Send + Sync + 'static {
     /// wallet database.
     ///
     /// `not_retryable` on schema errors; `retryable` on transient I/O.
-    async fn lookup_idempotent_submission(
+    async fn find_idempotent_submission(
         &self,
         key: &IdempotencyKey,
     ) -> Result<Option<TxId>, StorageError>;
 
-    /// Records `(key, tx_id)` so subsequent [`WalletStorage::lookup_idempotent_submission`]
+    /// Records `(key, tx_id)` so subsequent [`WalletStorage::find_idempotent_submission`]
     /// calls with the same `key` return the same `tx_id`.
     ///
     /// Returns [`StorageError::IdempotencyKeyConflict`] when `key` is already bound to a
@@ -498,13 +549,13 @@ pub trait WalletStorage: Send + Sync + 'static {
     /// comparing the current chain tip against the recorded observed tip.
     ///
     /// `not_retryable` on schema errors; `retryable` on transient I/O.
-    async fn lookup_observed_tip(&self) -> Result<Option<BlockHeight>, StorageError>;
+    async fn find_observed_tip(&self) -> Result<Option<BlockHeight>, StorageError>;
 
     /// Records `new_tip` as the most recently observed chain tip, unconditionally: the
     /// stored value always reflects the last observation, even when `new_tip` is lower than
     /// a previously recorded tip. Reorg detection depends on this: a monotonic high-water
     /// mark would hide a tip regress. Callers detect reorgs by reading
-    /// [`Self::lookup_observed_tip`] and comparing against the chain source's current tip
+    /// [`Self::find_observed_tip`] and comparing against the chain source's current tip
     /// before this call.
     ///
     /// `not_retryable` on schema errors; `retryable` on transient I/O.
@@ -536,6 +587,103 @@ pub trait WalletStorage: Send + Sync + 'static {
         account_id: AccountId,
         target_height: BlockHeight,
     ) -> Result<Vec<UnspentShieldedNoteRow>, StorageError>;
+
+    /// Returns every Unified Address previously exposed for `account_id`, in derivation
+    /// order (ascending by exposure height, then by diversifier index).
+    ///
+    /// Read-only counterpart to [`Self::derive_next_address`] and
+    /// [`Self::derive_next_address_with_transparent`]. Calling this method never advances
+    /// a diversifier index and never burns a transparent gap-limit slot.
+    ///
+    /// `not_retryable` on unknown account or schema errors; `retryable` on transient I/O.
+    async fn list_exposed_addresses(
+        &self,
+        account_id: AccountId,
+    ) -> Result<Vec<ExposedAddressRow>, StorageError>;
+
+    /// Records the transparent inputs of a wallet-owned transaction that was just broadcast.
+    ///
+    /// Used by the spend path immediately after `zally_chain::Submitter::submit` returns
+    /// success. The recorded rows are what
+    /// [`Self::list_pending_broadcast_inputs`] returns and what the input-selection filter
+    /// excludes from new spends, so callers must record every transparent input the
+    /// broadcast consumed.
+    ///
+    /// Inserts are idempotent on `(broadcast_tx_id, outpoint_tx_id, outpoint_index)`: a
+    /// second call with the same triple replaces the prior `broadcast_at_*` fields.
+    ///
+    /// `not_retryable` on schema errors; `retryable` on transient I/O.
+    async fn record_pending_broadcast_inputs(
+        &self,
+        record: PendingBroadcastRecord,
+    ) -> Result<(), StorageError>;
+
+    /// Returns every pending broadcast input owned by `account_id` whose `broadcast_at_ms`
+    /// is at or after `after_at_ms`. Older rows are filtered out so the caller does not
+    /// need to apply the inflight-window cutoff itself.
+    ///
+    /// `not_retryable` on schema errors; `retryable` on transient I/O.
+    async fn list_pending_broadcast_inputs(
+        &self,
+        account_id: AccountId,
+        after_at_ms: u64,
+    ) -> Result<Vec<PendingBroadcastInputRow>, StorageError>;
+
+    /// Drops every pending-broadcast row whose `broadcast_tx_id` appears in `tx_ids`.
+    ///
+    /// Called by `Wallet::sync` after each scan to retire pending entries whose spending
+    /// transaction is now observed mined.
+    ///
+    /// Returns the number of rows removed.
+    ///
+    /// `not_retryable` on schema errors; `retryable` on transient I/O.
+    async fn clear_pending_broadcast_inputs_for_mined(
+        &self,
+        tx_ids: &[TxId],
+    ) -> Result<u64, StorageError>;
+
+    /// Drops every pending-broadcast row whose `broadcast_at_ms` is strictly before
+    /// `before_at_ms`.
+    ///
+    /// Called by `Wallet::sync` once per cycle so a permanently-dropped broadcast
+    /// eventually frees its locked outpoints.
+    ///
+    /// Returns the number of rows removed.
+    ///
+    /// `not_retryable` on schema errors; `retryable` on transient I/O.
+    async fn clear_expired_pending_broadcast_inputs(
+        &self,
+        before_at_ms: u64,
+    ) -> Result<u64, StorageError>;
+
+    /// Returns the recorded value of the supplied transparent outpoints, as stored on
+    /// `transparent_received_outputs`.
+    ///
+    /// Used by the spend path to resolve the value of each `vin` outpoint when recording a
+    /// broadcast's pending inputs. Outpoints unknown to the wallet are omitted from the
+    /// returned map (they are not wallet-owned and would not have been selected as inputs).
+    ///
+    /// `not_retryable` on schema errors; `retryable` on transient I/O.
+    async fn find_outpoint_values(
+        &self,
+        outpoints: &[OutPoint],
+    ) -> Result<std::collections::HashMap<OutPoint, zally_core::Zatoshis>, StorageError>;
+
+    /// Returns the per-pool balance snapshot for `account_id`, anchored to the wallet's last
+    /// observed chain tip.
+    ///
+    /// Sapling and Orchard values come from `WalletRead::get_wallet_summary`; the
+    /// transparent mature/immature split applies ZIP-213 coinbase maturity directly against
+    /// the `transparent_received_outputs` rows so the figure stays consistent with what
+    /// `shield_transparent_funds` will accept as input. Unconfirmed wallet-owned spends are
+    /// excluded from the totals so callers do not double-count outpoints already consumed
+    /// by a still-pending broadcast.
+    ///
+    /// `not_retryable` on unknown account or schema errors; `retryable` on transient I/O.
+    async fn get_account_balance(
+        &self,
+        account_id: AccountId,
+    ) -> Result<AccountBalanceRow, StorageError>;
 
     /// Rolls the wallet back so that no scanned block above `max_height` is retained.
     ///

@@ -683,6 +683,22 @@ impl Wallet {
     ///
     /// `not_retryable` on network mismatch. `retryable` on transient chain-source failures.
     pub async fn sync(&self, chain: &dyn ChainSource) -> Result<SyncOutcome, WalletError> {
+        let outcome = self.sync_inner(chain).await?;
+        self.retire_expired_pending_broadcasts().await?;
+        Ok(outcome)
+    }
+
+    async fn retire_expired_pending_broadcasts(&self) -> Result<(), WalletError> {
+        let before_at_ms = crate::wallet::current_unix_ms()
+            .saturating_sub(self.inner.options.pending_broadcast_window_ms);
+        self.inner
+            .storage
+            .clear_expired_pending_broadcast_inputs(before_at_ms)
+            .await?;
+        Ok(())
+    }
+
+    async fn sync_inner(&self, chain: &dyn ChainSource) -> Result<SyncOutcome, WalletError> {
         if chain.network() != self.network() {
             return Err(WalletError::NetworkMismatch {
                 storage: self.network(),
@@ -698,7 +714,7 @@ impl Wallet {
             WalletError::from,
         )
         .await?;
-        let prior_observed_tip = self.inner.storage.lookup_observed_tip().await?;
+        let prior_observed_tip = self.inner.storage.find_observed_tip().await?;
         let reorg = self.detect_tip_regress(prior_observed_tip, chain_tip);
         self.inner.storage.record_observed_tip(chain_tip).await?;
         // Pin the WalletDb chain tip to the height this run scans to, so transaction
@@ -827,6 +843,8 @@ impl Wallet {
             .storage
             .wallet_tx_ids_mined_in_range(scanned_from, outcome.scanned_to_height)
             .await?;
+        self.retire_pending_broadcasts_for_mined(&newly_confirmed)
+            .await?;
         for (tx_id, confirmed_at_height) in newly_confirmed {
             self.publish_event(WalletEvent::TransactionConfirmed {
                 tx_id,
@@ -874,6 +892,21 @@ impl Wallet {
             transparent_utxo_count,
             reorgs_observed,
         })
+    }
+
+    async fn retire_pending_broadcasts_for_mined(
+        &self,
+        newly_confirmed: &[(zally_core::TxId, BlockHeight)],
+    ) -> Result<(), WalletError> {
+        if newly_confirmed.is_empty() {
+            return Ok(());
+        }
+        let confirmed_tx_ids: Vec<_> = newly_confirmed.iter().map(|(tx_id, _)| *tx_id).collect();
+        self.inner
+            .storage
+            .clear_pending_broadcast_inputs_for_mined(&confirmed_tx_ids)
+            .await?;
+        Ok(())
     }
 
     async fn sync_transparent_utxos(&self, chain: &dyn ChainSource) -> Result<u64, WalletError> {

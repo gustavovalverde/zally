@@ -16,14 +16,14 @@ async fn observed_tip_records_regress() -> Result<(), TestError> {
     storage.open_or_create().await?;
 
     assert_eq!(
-        storage.lookup_observed_tip().await?,
+        storage.find_observed_tip().await?,
         None,
         "a fresh wallet has no observed tip",
     );
 
     storage.record_observed_tip(BlockHeight::from(50)).await?;
     assert_eq!(
-        storage.lookup_observed_tip().await?,
+        storage.find_observed_tip().await?,
         Some(BlockHeight::from(50)),
     );
 
@@ -31,14 +31,14 @@ async fn observed_tip_records_regress() -> Result<(), TestError> {
     // higher prior value, not be swallowed.
     storage.record_observed_tip(BlockHeight::from(20)).await?;
     assert_eq!(
-        storage.lookup_observed_tip().await?,
+        storage.find_observed_tip().await?,
         Some(BlockHeight::from(20)),
         "record_observed_tip must store the regressed tip, not keep the high-water mark",
     );
 
     storage.record_observed_tip(BlockHeight::from(30)).await?;
     assert_eq!(
-        storage.lookup_observed_tip().await?,
+        storage.find_observed_tip().await?,
         Some(BlockHeight::from(30)),
     );
     Ok(())

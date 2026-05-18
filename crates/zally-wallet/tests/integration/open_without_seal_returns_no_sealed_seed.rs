@@ -4,7 +4,7 @@ use zally_core::Network;
 use zally_keys::{AgeFileSealing, AgeFileSealingOptions};
 use zally_storage::{SqliteWalletStorage, SqliteWalletStorageOptions};
 use zally_testkit::TempWalletPath;
-use zally_wallet::{Wallet, WalletError};
+use zally_wallet::{Wallet, WalletError, WalletOptions};
 
 #[tokio::test]
 async fn open_without_seal_returns_no_sealed_seed() -> Result<(), std::io::Error> {
@@ -16,7 +16,7 @@ async fn open_without_seal_returns_no_sealed_seed() -> Result<(), std::io::Error
         network,
         temp.db_path(),
     ));
-    let outcome = Wallet::open(network, sealing, storage).await;
+    let outcome = Wallet::open(network, sealing, storage, WalletOptions::default()).await;
     assert!(matches!(outcome, Err(WalletError::NoSealedSeed)));
     Ok(())
 }

@@ -1,4 +1,4 @@
-//! `WalletStorage::record_idempotent_submission` + `lookup_idempotent_submission` integration.
+//! `WalletStorage::record_idempotent_submission` + `find_idempotent_submission` integration.
 
 use tempfile::TempDir;
 use zally_core::{IdempotencyKey, TxId};
@@ -18,17 +18,17 @@ async fn idempotency_ledger_round_trip() -> Result<(), TestError> {
     let tx_a = TxId::from_bytes([0x11_u8; 32]);
     let tx_b = TxId::from_bytes([0x22_u8; 32]);
 
-    assert_eq!(storage.lookup_idempotent_submission(&key_a).await?, None);
+    assert_eq!(storage.find_idempotent_submission(&key_a).await?, None);
     storage
         .record_idempotent_submission(key_a.clone(), tx_a)
         .await?;
     assert_eq!(
-        storage.lookup_idempotent_submission(&key_a).await?,
+        storage.find_idempotent_submission(&key_a).await?,
         Some(tx_a),
         "record then lookup must return the recorded tx_id",
     );
     assert_eq!(
-        storage.lookup_idempotent_submission(&key_b).await?,
+        storage.find_idempotent_submission(&key_b).await?,
         None,
         "an unrelated key must miss",
     );

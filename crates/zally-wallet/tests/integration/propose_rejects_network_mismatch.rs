@@ -3,7 +3,7 @@
 use zally_core::{BlockHeight, Network, PaymentRecipient, Zatoshis};
 use zally_storage::{SqliteWalletStorage, SqliteWalletStorageOptions};
 use zally_testkit::{InMemorySealing, TempWalletPath};
-use zally_wallet::{Wallet, WalletError};
+use zally_wallet::{Wallet, WalletError, WalletOptions};
 
 #[tokio::test]
 async fn propose_rejects_network_mismatch() -> Result<(), TestError> {
@@ -15,8 +15,15 @@ async fn propose_rejects_network_mismatch() -> Result<(), TestError> {
         temp.db_path(),
     ));
     let chain = zally_testkit::MockChainSource::new(network);
-    let (wallet, account, _) =
-        Wallet::create(&chain, network, sealing, storage, BlockHeight::from(1)).await?;
+    let (wallet, account, _) = Wallet::create(
+        &chain,
+        network,
+        sealing,
+        storage,
+        BlockHeight::from(1),
+        WalletOptions::default(),
+    )
+    .await?;
 
     let recipient = PaymentRecipient::UnifiedAddress {
         encoded: "u1mainnet-example".into(),

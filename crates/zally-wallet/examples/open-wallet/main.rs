@@ -26,7 +26,7 @@ use tracing_subscriber::EnvFilter;
 use zally_core::{BlockHeight, Network};
 use zally_keys::{AgeFileSealing, AgeFileSealingOptions};
 use zally_storage::{SqliteWalletStorage, SqliteWalletStorageOptions};
-use zally_wallet::{Wallet, WalletError};
+use zally_wallet::{Wallet, WalletError, WalletOptions};
 use zcash_keys::address::UnifiedAddress;
 
 #[tokio::main]
@@ -77,8 +77,15 @@ async fn bootstrap_wallet(
     ));
 
     let chain = zally_testkit::MockChainSource::new(network);
-    let (wallet, account_id, mnemonic) =
-        Wallet::create(&chain, network, sealing, storage, BlockHeight::from(1)).await?;
+    let (wallet, account_id, mnemonic) = Wallet::create(
+        &chain,
+        network,
+        sealing,
+        storage,
+        BlockHeight::from(1),
+        WalletOptions::default(),
+    )
+    .await?;
 
     // The operator must record the mnemonic out-of-band. Zally does not back it up.
     warn!(
@@ -109,7 +116,8 @@ async fn reopen_wallet(
         network,
         db_path.to_path_buf(),
     ));
-    let (wallet, account_id) = Wallet::open(network, sealing, storage).await?;
+    let (wallet, account_id) =
+        Wallet::open(network, sealing, storage, WalletOptions::default()).await?;
     wallet.derive_next_address(account_id).await
 }
 
@@ -123,8 +131,15 @@ async fn plaintext_demo(network: Network, dir: &std::path::Path) -> Result<(), W
     let storage =
         SqliteWalletStorage::new(SqliteWalletStorageOptions::for_network(network, db_path));
     let chain = zally_testkit::MockChainSource::new(network);
-    let (wallet, account_id, _mnemonic) =
-        Wallet::create(&chain, network, sealing, storage, BlockHeight::from(1)).await?;
+    let (wallet, account_id, _mnemonic) = Wallet::create(
+        &chain,
+        network,
+        sealing,
+        storage,
+        BlockHeight::from(1),
+        WalletOptions::default(),
+    )
+    .await?;
     let _ua = wallet.derive_next_address(account_id).await?;
     warn!(
         target: "zally::example",

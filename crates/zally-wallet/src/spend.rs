@@ -5,13 +5,15 @@
 //! `Wallet::send_payment` adds signing and submission through the caller-supplied
 //! `Submitter`.
 
+use std::collections::HashSet;
+
 use zally_chain::Submitter;
 use zally_core::{
-    AccountId, BlockHeight, IdempotencyKey, Memo, MemoBytes, Network, PaymentRecipient, TxId,
-    Zatoshis,
+    AccountId, BlockHeight, IdempotencyKey, Memo, MemoBytes, Network, OutPoint, PaymentRecipient,
+    TxId, Zatoshis,
 };
 
-use crate::wallet::Wallet;
+use crate::wallet::{Wallet, current_unix_ms};
 use crate::wallet_error::WalletError;
 
 /// Parsed ZIP-321 payment request.
@@ -227,12 +229,12 @@ impl Wallet {
         if let Some(prior_tx_id) = self
             .inner
             .storage
-            .lookup_idempotent_submission(&plan.idempotency)
+            .find_idempotent_submission(&plan.idempotency)
             .await?
         {
             return Ok(SendOutcome {
                 tx_id: prior_tx_id,
-                broadcast_at_height: BlockHeight::from(0),
+                broadcast_at_height: self.observed_tip_or_zero().await?,
             });
         }
 
@@ -244,6 +246,9 @@ impl Wallet {
             .map_err(WalletError::from)?;
         let recipient_encoded = plan.recipient.encoded().to_owned();
         let memo_bytes = plan.memo.as_ref().map(memo_to_wire_bytes);
+        let excluded_outpoints = self
+            .collect_pending_broadcast_outpoints(plan.account_id)
+            .await?;
         let prepared = self
             .inner
             .storage
@@ -253,13 +258,26 @@ impl Wallet {
                     recipient_encoded,
                     plan.amount_zat.as_u64(),
                     memo_bytes,
-                ),
+                )
+                .with_excluded_outpoints(excluded_outpoints),
                 &seed,
             )
             .await
             .map_err(|err| lift_propose_error(&err))?;
+        let observed_tip = self
+            .inner
+            .storage
+            .find_observed_tip()
+            .await
+            .map_err(|err| lift_propose_error(&err))?;
         let result_tx_id = self
-            .submit_prepared_transactions("send_payment.submit", plan.submitter, prepared)
+            .submit_and_record_pending(
+                "send_payment.submit",
+                plan.submitter,
+                plan.account_id,
+                prepared,
+                observed_tip,
+            )
             .await?;
 
         self.inner
@@ -269,7 +287,7 @@ impl Wallet {
 
         Ok(SendOutcome {
             tx_id: result_tx_id,
-            broadcast_at_height: BlockHeight::from(0),
+            broadcast_at_height: observed_tip.unwrap_or_else(|| BlockHeight::from(0)),
         })
     }
 
@@ -298,12 +316,12 @@ impl Wallet {
         if let Some(prior_tx_id) = self
             .inner
             .storage
-            .lookup_idempotent_submission(&plan.idempotency)
+            .find_idempotent_submission(&plan.idempotency)
             .await?
         {
             return Ok(SendOutcome {
                 tx_id: prior_tx_id,
-                broadcast_at_height: BlockHeight::from(0),
+                broadcast_at_height: self.observed_tip_or_zero().await?,
             });
         }
 
@@ -313,6 +331,9 @@ impl Wallet {
             .unseal_seed()
             .await
             .map_err(WalletError::from)?;
+        let excluded_outpoints = self
+            .collect_pending_broadcast_outpoints(plan.account_id)
+            .await?;
         let prepared = self
             .inner
             .storage
@@ -320,16 +341,25 @@ impl Wallet {
                 zally_storage::ShieldTransparentRequest::new(
                     plan.account_id,
                     plan.shielding_threshold_zat.as_u64(),
-                ),
+                )
+                .with_excluded_outpoints(excluded_outpoints),
                 &seed,
             )
             .await
             .map_err(|err| lift_propose_error(&err))?;
+        let observed_tip = self
+            .inner
+            .storage
+            .find_observed_tip()
+            .await
+            .map_err(|err| lift_propose_error(&err))?;
         let result_tx_id = self
-            .submit_prepared_transactions(
+            .submit_and_record_pending(
                 "shield_transparent_funds.submit",
                 plan.submitter,
+                plan.account_id,
                 prepared,
+                observed_tip,
             )
             .await?;
 
@@ -340,17 +370,24 @@ impl Wallet {
 
         Ok(SendOutcome {
             tx_id: result_tx_id,
-            broadcast_at_height: BlockHeight::from(0),
+            broadcast_at_height: observed_tip.unwrap_or_else(|| BlockHeight::from(0)),
         })
     }
 
-    async fn submit_prepared_transactions(
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "each parameter is a distinct piece of broadcast context (operation label, submitter, account, prepared txs, observed tip) used inside the loop"
+    )]
+    async fn submit_and_record_pending(
         &self,
         operation: &'static str,
         submitter: &dyn Submitter,
+        account_id: AccountId,
         prepared: Vec<zally_storage::PreparedTransaction>,
+        observed_tip: Option<BlockHeight>,
     ) -> Result<TxId, WalletError> {
         let mut first_tx_id = None;
+        let broadcast_at_ms = current_unix_ms();
         for transaction in prepared {
             let policy = self.retry_policy();
             let outcome = crate::retry::with_breaker_and_retry(
@@ -361,7 +398,16 @@ impl Wallet {
                 WalletError::from,
             )
             .await?;
+            let outpoints = extract_transparent_vin_outpoints(&transaction.raw_bytes)?;
             let tx_id = resolve_send_outcome(outcome, transaction.tx_id)?;
+            self.record_broadcast_inputs(
+                account_id,
+                tx_id,
+                broadcast_at_ms,
+                observed_tip,
+                outpoints,
+            )
+            .await?;
             if first_tx_id.is_none() {
                 first_tx_id = Some(tx_id);
             }
@@ -369,6 +415,72 @@ impl Wallet {
         first_tx_id.ok_or_else(|| WalletError::ProposalRejected {
             reason: "transaction construction returned no transactions".into(),
         })
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "broadcast metadata + outpoints flow through one helper that resolves values and forwards a PendingBroadcastRecord"
+    )]
+    async fn record_broadcast_inputs(
+        &self,
+        account_id: AccountId,
+        broadcast_tx_id: TxId,
+        broadcast_at_ms: u64,
+        observed_tip: Option<BlockHeight>,
+        outpoints: Vec<OutPoint>,
+    ) -> Result<(), WalletError> {
+        if outpoints.is_empty() {
+            return Ok(());
+        }
+        let values = self
+            .inner
+            .storage
+            .find_outpoint_values(&outpoints)
+            .await
+            .map_err(|err| lift_propose_error(&err))?;
+        let inputs: Vec<(OutPoint, Zatoshis)> = outpoints
+            .into_iter()
+            .filter_map(|op| values.get(&op).copied().map(|value_zat| (op, value_zat)))
+            .collect();
+        if inputs.is_empty() {
+            return Ok(());
+        }
+        self.inner
+            .storage
+            .record_pending_broadcast_inputs(zally_storage::PendingBroadcastRecord {
+                broadcast_tx_id,
+                account_id,
+                broadcast_at_ms,
+                broadcast_at_height: observed_tip,
+                inputs,
+            })
+            .await
+            .map_err(|err| lift_propose_error(&err))
+    }
+
+    async fn collect_pending_broadcast_outpoints(
+        &self,
+        account_id: AccountId,
+    ) -> Result<HashSet<OutPoint>, WalletError> {
+        let after_at_ms =
+            current_unix_ms().saturating_sub(self.inner.options.pending_broadcast_window_ms);
+        let rows = self
+            .inner
+            .storage
+            .list_pending_broadcast_inputs(account_id, after_at_ms)
+            .await
+            .map_err(|err| lift_propose_error(&err))?;
+        Ok(rows.into_iter().map(|row| row.outpoint).collect())
+    }
+
+    async fn observed_tip_or_zero(&self) -> Result<BlockHeight, WalletError> {
+        Ok(self
+            .inner
+            .storage
+            .find_observed_tip()
+            .await
+            .map_err(|err| lift_propose_error(&err))?
+            .unwrap_or_else(|| BlockHeight::from(0)))
     }
 }
 
@@ -394,6 +506,32 @@ fn resolve_send_outcome(
 
 fn memo_to_wire_bytes(memo: &Memo) -> Vec<u8> {
     MemoBytes::from(memo).as_slice().to_vec()
+}
+
+fn extract_transparent_vin_outpoints(raw_tx: &[u8]) -> Result<Vec<OutPoint>, WalletError> {
+    // The branch_id argument is required by the v4 read path but ignored on v5; Zally only
+    // produces v5 transactions per ZIP-225, so any branch tag works here.
+    let tx = zcash_primitives::transaction::Transaction::read(
+        raw_tx,
+        zcash_protocol::consensus::BranchId::Nu5,
+    )
+    .map_err(|err| WalletError::ProposalRejected {
+        reason: format!("could not parse broadcast tx for input recording: {err}"),
+    })?;
+    let outpoints = tx
+        .transparent_bundle()
+        .map(|bundle| {
+            bundle
+                .vin
+                .iter()
+                .map(|txin| {
+                    let prevout = txin.prevout();
+                    OutPoint::new(TxId::from_bytes(*prevout.hash()), prevout.n())
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok(outpoints)
 }
 
 fn lift_propose_error(err: &zally_storage::StorageError) -> WalletError {

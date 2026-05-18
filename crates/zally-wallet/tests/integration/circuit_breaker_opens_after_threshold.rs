@@ -9,7 +9,9 @@ use zally_core::{BlockHeight, Network};
 use zally_keys::{AgeFileSealing, AgeFileSealingOptions};
 use zally_storage::{SqliteWalletStorage, SqliteWalletStorageOptions};
 use zally_testkit::{MockChainSource, TempWalletPath};
-use zally_wallet::{Capability, CircuitBreakerState, RetryPolicy, Wallet, WalletError};
+use zally_wallet::{
+    Capability, CircuitBreakerState, RetryPolicy, Wallet, WalletError, WalletOptions,
+};
 
 #[tokio::test]
 async fn circuit_breaker_opens_after_threshold_retryable_failures() -> Result<(), TestError> {
@@ -22,8 +24,15 @@ async fn circuit_breaker_opens_after_threshold_retryable_failures() -> Result<()
         temp.db_path(),
     ));
     let chain = zally_testkit::MockChainSource::new(network);
-    let (wallet, _account_id, _mnemonic) =
-        Wallet::create(&chain, network, sealing, storage, BlockHeight::from(1)).await?;
+    let (wallet, _account_id, _mnemonic) = Wallet::create(
+        &chain,
+        network,
+        sealing,
+        storage,
+        BlockHeight::from(1),
+        WalletOptions::default(),
+    )
+    .await?;
     wallet.set_retry_policy(RetryPolicy::none());
 
     let chain = MockChainSource::new(network);
@@ -78,8 +87,15 @@ async fn circuit_breaker_does_not_trip_on_requires_operator_failures() -> Result
         temp.db_path(),
     ));
     let chain = zally_testkit::MockChainSource::new(network);
-    let (wallet, _account_id, _mnemonic) =
-        Wallet::create(&chain, network, sealing, storage, BlockHeight::from(1)).await?;
+    let (wallet, _account_id, _mnemonic) = Wallet::create(
+        &chain,
+        network,
+        sealing,
+        storage,
+        BlockHeight::from(1),
+        WalletOptions::default(),
+    )
+    .await?;
     wallet.set_retry_policy(RetryPolicy::none());
 
     let chain = MockChainSource::new(network);

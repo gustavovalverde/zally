@@ -6,7 +6,7 @@ use zally_core::{BlockHeight, Network};
 use zally_keys::{AgeFileSealing, AgeFileSealingOptions};
 use zally_storage::{SqliteWalletStorage, SqliteWalletStorageOptions};
 use zally_testkit::{MockChainSource, TempWalletPath};
-use zally_wallet::{Wallet, WalletError, WalletEvent};
+use zally_wallet::{Wallet, WalletError, WalletEvent, WalletOptions};
 
 #[tokio::test]
 async fn sync_emits_reorg_when_tip_regresses() -> Result<(), TestError> {
@@ -19,8 +19,15 @@ async fn sync_emits_reorg_when_tip_regresses() -> Result<(), TestError> {
         temp.db_path(),
     ));
     let chain = zally_testkit::MockChainSource::new(network);
-    let (wallet, _account_id, _mnemonic) =
-        Wallet::create(&chain, network, sealing, storage, BlockHeight::from(1)).await?;
+    let (wallet, _account_id, _mnemonic) = Wallet::create(
+        &chain,
+        network,
+        sealing,
+        storage,
+        BlockHeight::from(1),
+        WalletOptions::default(),
+    )
+    .await?;
     let mut events = wallet.observe();
 
     let chain = MockChainSource::new(network);

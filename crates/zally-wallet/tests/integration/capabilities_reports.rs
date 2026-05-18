@@ -5,6 +5,7 @@ use zally_storage::{SqliteWalletStorage, SqliteWalletStorageOptions};
 use zally_testkit::{InMemorySealing, TempWalletPath};
 use zally_wallet::{
     Capability, SealingCapability, StorageCapability, Wallet, WalletCapabilities, WalletError,
+    WalletOptions,
 };
 
 #[tokio::test]
@@ -18,8 +19,15 @@ async fn capabilities_reports_standing_surface() -> Result<(), TestError> {
         temp.db_path(),
     ));
     let chain = zally_testkit::MockChainSource::new(network);
-    let (wallet, _, _) =
-        Wallet::create(&chain, network, sealing, storage, BlockHeight::from(1)).await?;
+    let (wallet, _, _) = Wallet::create(
+        &chain,
+        network,
+        sealing,
+        storage,
+        BlockHeight::from(1),
+        WalletOptions::default(),
+    )
+    .await?;
 
     let caps: WalletCapabilities = wallet.capabilities();
     assert_eq!(caps.sealing, SealingCapability::InMemory);

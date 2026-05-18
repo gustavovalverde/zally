@@ -19,7 +19,7 @@ use zally_testkit::{
 };
 use zally_wallet::{
     ProposalPlan, SendPaymentPlan, ShieldTransparentPlan, SyncDriver, SyncDriverOptions,
-    SyncHandle, SyncSnapshotStream, SyncStatus, Wallet, WalletError,
+    SyncHandle, SyncSnapshotStream, SyncStatus, Wallet, WalletError, WalletOptions,
 };
 use zcash_protocol::{
     consensus::BlockHeight as ConsensusBlockHeight,
@@ -55,6 +55,54 @@ async fn funded_wallet_syncs_sends_and_submits_pczt_with_zinder() -> Result<(), 
     let send_tx_id = round_trip.submit_shielded_payment().await?;
     let pczt_tx_id = round_trip.submit_pczt_payment().await?;
     assert_ne!(send_tx_id, pczt_tx_id);
+    round_trip.close().await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "live test; see CLAUDE.md §Live Node Tests"]
+async fn shielding_excludes_pending_broadcast_inputs() -> Result<(), TestError> {
+    let _guard = init();
+    require_live()?;
+
+    let mut round_trip = FundedZinderRoundTrip::open().await?;
+    let _funding_tx_id = round_trip.submit_transparent_funding().await?;
+
+    let first_shield = round_trip.shield_transparent_funds_no_mine().await?;
+
+    let pending = round_trip
+        .wallet
+        .get_pending_transparent_inputs(round_trip.account_id)
+        .await?;
+    assert!(
+        !pending.inputs.is_empty(),
+        "after a successful broadcast the pending-broadcast snapshot must report at least one locked outpoint"
+    );
+
+    let second_outcome = round_trip
+        .attempt_shield_with_idempotency("t3-duplicate-protect")
+        .await;
+    match second_outcome {
+        Err(WalletError::InsufficientBalance { .. } | WalletError::ProposalRejected { .. }) => {}
+        Err(other) => {
+            return Err(TestError::Unexpected {
+                reason: format!(
+                    "expected InsufficientBalance or ProposalRejected on second immediate shield, got {other:?}"
+                ),
+            });
+        }
+        Ok(second_outcome) => {
+            return Err(TestError::Unexpected {
+                reason: format!(
+                    "expected the second immediate shield to be refused; it produced a duplicate \
+                     broadcast (first shield tx_id bytes {:?}, second {:?})",
+                    first_shield.tx_id.as_bytes(),
+                    second_outcome.tx_id.as_bytes(),
+                ),
+            });
+        }
+    }
+
     round_trip.close().await?;
     Ok(())
 }
@@ -202,6 +250,55 @@ impl FundedZinderRoundTrip {
         Ok(pczt_outcome.tx_id)
     }
 
+    // &mut self stays even though no field is mutated; the live test holds a
+    // SyncSnapshotStream which is !Sync, so &self would make this future not-Send.
+    #[allow(
+        clippy::needless_pass_by_ref_mut,
+        reason = "Sync auto-trait coercion requires exclusive borrow on this !Sync struct"
+    )]
+    async fn shield_transparent_funds_no_mine(
+        &mut self,
+    ) -> Result<zally_wallet::SendOutcome, TestError> {
+        let shielding_threshold_zat = shielding_threshold_zat_from_env()?;
+        let shield_idempotency = IdempotencyKey::try_from("t3-duplicate-protect-first")?;
+        let outcome = self
+            .wallet
+            .shield_transparent_funds(ShieldTransparentPlan::new(
+                self.account_id,
+                shield_idempotency,
+                shielding_threshold_zat,
+                &self.submitter,
+            ))
+            .await?;
+        Ok(outcome)
+    }
+
+    #[allow(
+        clippy::needless_pass_by_ref_mut,
+        reason = "Sync auto-trait coercion requires exclusive borrow on this !Sync struct"
+    )]
+    async fn attempt_shield_with_idempotency(
+        &mut self,
+        idempotency_label: &str,
+    ) -> Result<zally_wallet::SendOutcome, WalletError> {
+        let shielding_threshold_zat = shielding_threshold_zat_from_env().unwrap_or_else(|_| {
+            Zatoshis::try_from(1_000_000_u64).unwrap_or_else(|_| Zatoshis::zero())
+        });
+        let idempotency = IdempotencyKey::try_from(idempotency_label).map_err(|err| {
+            WalletError::PaymentRequestParseFailed {
+                reason: err.to_string(),
+            }
+        })?;
+        self.wallet
+            .shield_transparent_funds(ShieldTransparentPlan::new(
+                self.account_id,
+                idempotency,
+                shielding_threshold_zat,
+                &self.submitter,
+            ))
+            .await
+    }
+
     async fn close(self) -> Result<(), TestError> {
         self.sync_handle.close().await?;
         Ok(())
@@ -220,8 +317,15 @@ async fn create_wallet_at_tip(
         temp.db_path(),
     ));
     let birthday = BlockHeight::from(tip_height.as_u32().saturating_sub(10).max(1));
-    let (wallet, account_id, _mnemonic) =
-        Wallet::create(chain, network, sealing, storage, birthday).await?;
+    let (wallet, account_id, _mnemonic) = Wallet::create(
+        chain,
+        network,
+        sealing,
+        storage,
+        birthday,
+        WalletOptions::default(),
+    )
+    .await?;
     Ok((temp, wallet, account_id))
 }
 
@@ -752,4 +856,6 @@ enum TestError {
     SyncStreamClosed,
     #[error("timed out waiting for sync to reach tip")]
     SyncTimeout,
+    #[error("unexpected test outcome: {reason}")]
+    Unexpected { reason: String },
 }

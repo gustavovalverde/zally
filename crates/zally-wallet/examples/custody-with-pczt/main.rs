@@ -25,7 +25,7 @@ use zally_core::{BlockHeight, Network};
 use zally_keys::{AgeFileSealing, AgeFileSealingOptions, Mnemonic, SeedMaterial};
 use zally_pczt::{Combiner, Creator, Extractor, PcztBytes, PcztError, Signer};
 use zally_storage::{SqliteWalletStorage, SqliteWalletStorageOptions};
-use zally_wallet::{Wallet, WalletError};
+use zally_wallet::{Wallet, WalletError, WalletOptions};
 
 #[tokio::main]
 async fn main() -> Result<(), ExampleError> {
@@ -68,8 +68,15 @@ async fn bootstrap_wallet(network: Network) -> Result<TempDir, ExampleError> {
         temp.path().join("wallet.db"),
     ));
     let chain = zally_testkit::MockChainSource::new(network);
-    let (_wallet, _account_id, _mnemonic) =
-        Wallet::create(&chain, network, sealing, storage, BlockHeight::from(1)).await?;
+    let (_wallet, _account_id, _mnemonic) = Wallet::create(
+        &chain,
+        network,
+        sealing,
+        storage,
+        BlockHeight::from(1),
+        WalletOptions::default(),
+    )
+    .await?;
     Ok(temp)
 }
 

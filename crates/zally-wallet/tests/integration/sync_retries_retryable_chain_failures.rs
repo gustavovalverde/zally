@@ -8,7 +8,7 @@ use zally_core::{BlockHeight, Network};
 use zally_keys::{AgeFileSealing, AgeFileSealingOptions};
 use zally_storage::{SqliteWalletStorage, SqliteWalletStorageOptions};
 use zally_testkit::{MockChainSource, TempWalletPath};
-use zally_wallet::{RetryPolicy, Wallet, WalletError};
+use zally_wallet::{RetryPolicy, Wallet, WalletError, WalletOptions};
 
 #[tokio::test]
 async fn sync_retries_until_chain_tip_recovers() -> Result<(), TestError> {
@@ -21,8 +21,15 @@ async fn sync_retries_until_chain_tip_recovers() -> Result<(), TestError> {
         temp.db_path(),
     ));
     let chain = zally_testkit::MockChainSource::new(network);
-    let (wallet, _account_id, _mnemonic) =
-        Wallet::create(&chain, network, sealing, storage, BlockHeight::from(1)).await?;
+    let (wallet, _account_id, _mnemonic) = Wallet::create(
+        &chain,
+        network,
+        sealing,
+        storage,
+        BlockHeight::from(1),
+        WalletOptions::default(),
+    )
+    .await?;
     wallet.set_retry_policy(RetryPolicy::linear(4, 1));
 
     let chain = MockChainSource::new(network);
@@ -54,8 +61,15 @@ async fn sync_does_not_retry_operator_action_chain_failures() -> Result<(), Test
         temp.db_path(),
     ));
     let chain = zally_testkit::MockChainSource::new(network);
-    let (wallet, _account_id, _mnemonic) =
-        Wallet::create(&chain, network, sealing, storage, BlockHeight::from(1)).await?;
+    let (wallet, _account_id, _mnemonic) = Wallet::create(
+        &chain,
+        network,
+        sealing,
+        storage,
+        BlockHeight::from(1),
+        WalletOptions::default(),
+    )
+    .await?;
     wallet.set_retry_policy(RetryPolicy::linear(4, 1));
 
     let chain = MockChainSource::new(network);

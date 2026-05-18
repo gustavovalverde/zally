@@ -38,25 +38,33 @@ Zally pins one verb per operation.
 
 | Verb | Meaning |
 |---|---|
-| `get_*` | synchronous or cached read with no I/O |
-| `find_*` | lookup that may return `None` |
-| `compute_*` | pure deterministic calculation, no I/O |
-| `derive_*` | protocol-level derivation (cryptographic, ZIP-32 keys, ZIP-244 digests) |
-| `resolve_*` | polymorphic dispatch returning one authoritative value |
-| `open_*` / `close_*` | wallet lifecycle |
-| `create_*` | allocate or insert a new entity |
-| `propose_*` | build a `Proposal` without signing (librustzcash vocabulary) |
-| `prove_*` | create zero-knowledge proofs for a PCZT without applying signatures |
-| `sign_*` | apply signature material to a `Proposal` or `Pczt` |
-| `submit_*` | broadcast a signed transaction to the network |
-| `send_*` | high-level: propose + sign + submit in one call |
-| `shield_*` | move wallet-owned transparent funds into a shielded receiver |
-| `seal_*` / `unseal_*` | apply or remove at-rest encryption to seed material |
-| `observe_*` | subscribe to events (`WalletEvent` stream) |
-| `sync_*` | catch up wallet state with chain |
-| `export_*` | serialise material for external consumption (UFVK, PCZT) |
+| `get_*` | reads a single authoritative record by key; returns the record or a typed error. Storage I/O is allowed; chain calls are not. |
+| `list_*` | returns an ordered collection of existing records without advancing any state or performing a new chain call. |
+| `find_*` | lookup that may return `None`. Both single-key and batch lookups (sparse maps) are `find_*`. |
+| `compute_*` | pure deterministic calculation, no I/O. |
+| `derive_*` | protocol-level derivation (cryptographic, ZIP-32 keys, ZIP-244 digests). |
+| `resolve_*` | polymorphic dispatch returning one authoritative value. |
+| `open_*` / `close_*` | wallet or driver lifecycle. |
+| `create_*` | allocate or insert a new entity. |
+| `record_*` | persist a fact derived from an external event (broadcast emitted, tip observed, receive seen). Idempotent on the natural key. |
+| `clear_*` | remove rows from a write-through filter or cache table (does not delete user data). |
+| `truncate_*` | roll persisted state back to a height, discarding rows above. |
+| `update_*` | replace a tracked value in place (chain tip, retry policy). |
+| `propose_*` | build a `Proposal` without signing (librustzcash vocabulary). |
+| `prepare_*` | build, sign, and persist a transaction without broadcasting (intermediate step in the spend pipeline). |
+| `prove_*` | create zero-knowledge proofs for a PCZT without applying signatures. |
+| `sign_*` | apply signature material to a `Proposal` or `Pczt`. |
+| `submit_*` | broadcast a signed transaction to the network. |
+| `send_*` | high-level: propose + sign + submit in one call. |
+| `shield_*` | move wallet-owned transparent funds into a shielded receiver. |
+| `seal_*` / `unseal_*` | apply or remove at-rest encryption to seed material. |
+| `observe_*` | subscribe to events (`WalletEvent` stream). |
+| `sync_*` | catch up wallet state with chain. |
+| `scan_*` | run the block scanner against a batch of compact blocks. |
+| `export_*` | serialise material for external consumption (UFVK, PCZT). |
+| `extract_*` | parse a serialised artifact (PCZT) back into a typed value. |
 
-Forbidden verbs for domain operations: `handle_*`, `process_*`, `manage_*`, `do_*`, `perform_*`, `execute_*`.
+Forbidden verbs for domain operations: `handle_*`, `process_*`, `manage_*`, `do_*`, `perform_*`, `execute_*`, `lookup_*` (use `find_*`), `fetch_*` (use `get_*` or `find_*`).
 
 ### No temporal or implementation drift
 
@@ -82,6 +90,12 @@ A name must survive a change of its implementation.
 | `IdempotencyKey` | `zally-core` | Caller-supplied identifier for send-idempotency. `AsRef<str>` newtype. |
 | `Memo` | `zally-core` | ZIP-302 memo wrapper. Refuses construction over 512 bytes. |
 | `Wallet` | `zally-wallet` | The operator-facing handle. Async API. |
+| `AccountBalance` | `zally-wallet` | Per-pool balance snapshot anchored to the last observed chain tip; network-tagged with mature/immature transparent split. |
+| `ExposedAddress` | `zally-wallet` | Previously-derived Unified Address in derivation order, with diversifier index and transparent-receiver flag. |
+| `PendingTransparentInputs` | `zally-wallet` | Snapshot of transparent outpoints locked by wallet-owned broadcasts not yet observed mined. |
+| `PendingTransparentInput` | `zally-wallet` | Single locked outpoint, with `broadcast_tx_id`, `broadcast_at_ms`, and `broadcast_at_height`. The same field names appear on the storage-side row; no rename across layers. |
+| `WalletOptions` | `zally-wallet` | Open-time wallet configuration; currently carries the pending-broadcast inflight window. |
+| `OutPoint` | `zally-core` | Transparent transaction outpoint (`tx_id` + `output_index`). Zally-owned so the public surface composes only Zally domain types; inside `zally-storage` the upstream `zcash_transparent::bundle::OutPoint` is imported as `UpstreamOutPoint` to avoid the same-name collision. |
 | `WalletStatus` | `zally-wallet` | Operator readiness snapshot derived from persisted wallet progress. |
 | `SyncDriver` | `zally-wallet` | Caller-owned continuous sync loop over a `Wallet` and `ChainSource`. |
 | `SyncSnapshot` | `zally-wallet` | Observable state emitted by a running `SyncDriver`. |
@@ -191,7 +205,7 @@ The contract surface Zally publishes, grouped by domain. Each item is a guarante
 - **CORE-1**: Generate a fresh wallet (mnemonic plus ZIP-32 derivation) for any network. Single async call.
 - **CORE-2**: Open an existing wallet from a sealed seed; fail closed on integrity error.
 - **CORE-3**: One operator identity per process; the wallet has one account per `Wallet::create`.
-- **CORE-4**: UA derivation per ZIP-316; UFVK and UIVK export.
+- **CORE-4**: UA derivation per ZIP-316; UFVK and UIVK export. Previously exposed Unified Addresses are queryable in derivation order via `Wallet::list_exposed_addresses` without advancing the diversifier index or consuming BIP-44 transparent gap-limit slots.
 - **CORE-5**: Idempotent send by `IdempotencyKey`.
 - **CORE-6**: Network-tagged types throughout; compile error if a network is missing.
 
@@ -229,7 +243,10 @@ The contract surface Zally publishes, grouped by domain. Each item is a guarante
 - **SPEND-4**: Conventional fee per ZIP-317.
 - **SPEND-5**: `nExpiryHeight` set per ZIP-203.
 - **SPEND-6**: ZIP-321 payment URI parsing through `PaymentRequest::from_uri`.
-- **SPEND-7**: `Wallet::shield_transparent_funds(ShieldTransparentPlan) -> SendOutcome` explicitly shields wallet-owned transparent UTXOs before shielded spending.
+- **SPEND-7**: `Wallet::shield_transparent_funds(ShieldTransparentPlan) -> SendOutcome` explicitly shields wallet-owned transparent UTXOs before shielded spending. Transparent outpoints locked by a still-unconfirmed wallet-owned broadcast are excluded from input selection at the `InputSource::get_spendable_transparent_outputs` seam (see `WalletOptions::pending_broadcast_window_ms`). When the filter removes every eligible input the spend fails closed with `WalletError::InsufficientBalance`, not a generic proposal-rejected error.
+- **SPEND-8**: `Wallet::get_account_balance(account_id) -> AccountBalance` returns a per-pool balance snapshot (Sapling, Orchard, transparent-mature, transparent-immature) anchored to the wallet's last observed chain tip. Read-only; composes the persisted wallet rows that drive `Wallet::sync` and `Wallet::list_unspent_shielded_notes`. Transparent values split by ZIP-213 coinbase maturity (100 confirmations) computed against `as_of_height + 1`, matching `zcash_client_backend`'s `chain_tip + 1` convention.
+- **SPEND-9**: `Wallet::get_pending_transparent_inputs(account_id) -> PendingTransparentInputs` returns the transparent outpoints currently locked by wallet-owned broadcasts not yet observed mined. The snapshot honours `WalletOptions::pending_broadcast_window_ms`: rows whose broadcast timestamp falls outside the window are excluded so a permanently-dropped broadcast eventually frees its outpoints.
+- **SPEND-10**: `Wallet::send_payment` excludes the same pending-broadcast outpoints as SPEND-7 from transparent input selection via the same `InputSource` override; no path-specific filter exists. Records its broadcast inputs to storage *before* calling `Submitter::submit`, so a crash window between submit and persistence does not leave an in-flight broadcast unrecorded.
 
 ### PCZT and external signing (PCZT)
 
@@ -246,6 +263,7 @@ The contract surface Zally publishes, grouped by domain. Each item is a guarante
 - **OBS-2**: `Wallet::metrics_snapshot() -> WalletMetrics` returns a typed metrics snapshot derived from the same persisted progress as `WalletStatus`.
 - **OBS-3**: `WalletEvent` async stream documented as the canonical push notification channel for state changes.
 - **OBS-4**: `SyncHandle::observe_status() -> SyncSnapshotStream` is the canonical push channel for sync-driver lifecycle state.
+- **OBS-5**: `event = "transparent_inputs_filtered_pending_broadcast"` is emitted at `info` (target `zally::storage`) when the wallet-owned `InputSource` excludes at least one transparent outpoint that is locked by a still-unconfirmed wallet-owned broadcast. Fields: `network = %network`, `account_id = %account_id`, `excluded_count: u32`, `pending_broadcast_count: u32`. The event fires from inside the pre-selection filter, not after a rejected proposal.
 
 ### Documentation and DX (DOC)
 

@@ -8,7 +8,7 @@ use zally_core::{
 use zally_keys::{AgeFileSealing, AgeFileSealingOptions};
 use zally_storage::{SqliteWalletStorage, SqliteWalletStorageOptions, StorageError, WalletStorage};
 use zally_testkit::{MockSubmitter, TempWalletPath};
-use zally_wallet::{SendPaymentPlan, Wallet, WalletError};
+use zally_wallet::{SendPaymentPlan, Wallet, WalletError, WalletOptions};
 
 #[tokio::test]
 async fn send_payment_short_circuits_on_known_idempotency_key() -> Result<(), TestError> {
@@ -29,8 +29,15 @@ async fn send_payment_short_circuits_on_known_idempotency_key() -> Result<(), Te
         .await?;
 
     let chain = zally_testkit::MockChainSource::new(network);
-    let (wallet, account_id, _mnemonic) =
-        Wallet::create(&chain, network, sealing, storage, BlockHeight::from(1)).await?;
+    let (wallet, account_id, _mnemonic) = Wallet::create(
+        &chain,
+        network,
+        sealing,
+        storage,
+        BlockHeight::from(1),
+        WalletOptions::default(),
+    )
+    .await?;
 
     let recipient_ua = wallet.derive_next_address(account_id).await?;
     let encoded = recipient_ua.encode(&network.to_parameters());

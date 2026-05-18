@@ -10,75 +10,29 @@
 //! contract that anchors this vocabulary, including the upstream zinder
 //! `ADR-0013` it inherits.
 
-use zally_core::{BlockHeight, Network};
+use zally_core::{BlockHeight, FailurePosture, Network};
 
 #[cfg(feature = "zinder")]
 use zinder_client::{IndexerError, RetryPolicy as IndexerRetryPolicy};
 
-/// Operator-facing classification of a chain-source or submitter failure.
-///
-/// Three classes are sufficient for wallet-side lifecycle decisions:
-/// transient backend trouble that benefits from retry, conditions that
-/// require operator action before the request can succeed, and caller bugs
-/// that retrying will not help. The three labels are the canonical
-/// operator-facing names used in zally's error vocabulary and metrics.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-#[non_exhaustive]
-pub enum FailurePosture {
-    /// Transient backend trouble. Retry with backoff is the appropriate
-    /// response; the circuit breaker trips on consecutive failures.
-    Retryable,
-    /// An operator must intervene before the request can succeed
-    /// (capability missing, configuration mismatch, upstream returning
-    /// malformed bytes). Callers must surface this and stop retrying.
-    RequiresOperator,
-    /// The request itself is wrong or out of bounds. Callers fix the
-    /// request and re-issue; retrying the same input fails again.
-    NotRetryable,
-}
-
-impl FailurePosture {
-    /// Stable kebab-case label for metrics, logs, and readiness payloads.
-    ///
-    /// Do not rename without coordinating dashboards: the label is the
-    /// operator-facing identifier.
-    #[must_use]
-    pub const fn label(self) -> &'static str {
-        match self {
-            Self::Retryable => "retryable",
-            Self::RequiresOperator => "requires_operator",
-            Self::NotRetryable => "not_retryable",
-        }
-    }
-
-    /// `true` when the caller may issue the same request again.
-    ///
-    /// Equivalent to `matches!(self, Self::Retryable)`. Provided for
-    /// callers that just need a boolean retry decision.
-    #[must_use]
-    pub const fn allows_retry(self) -> bool {
-        matches!(self, Self::Retryable)
-    }
-}
-
 #[cfg(feature = "zinder")]
-impl From<IndexerRetryPolicy> for FailurePosture {
+/// Maps a zinder `IndexerRetryPolicy` onto a [`FailurePosture`].
+///
+/// Defined here rather than on `FailurePosture` so `zally-core` does not learn about the
+/// zinder client. The mapping picks `RequiresOperator` for any future unknown variant so a
+/// new retry class never silently masquerades as `Retryable`.
+pub(crate) fn posture_for_indexer(policy: IndexerRetryPolicy) -> FailurePosture {
     #[allow(
         clippy::wildcard_enum_match_arm,
         clippy::match_same_arms,
-        reason = "IndexerRetryPolicy is #[non_exhaustive]; the OperatorActionRequired arm \
-                  documents the canonical mapping for the today-known variant, and the \
-                  wildcard arm picks the same conservative posture for any future unknown \
-                  variant so a new retry class never silently masquerades as Retryable."
+        reason = "IndexerRetryPolicy is #[non_exhaustive]; the wildcard arm picks the same \
+                  conservative posture as OperatorActionRequired for any future variant"
     )]
-    fn from(policy: IndexerRetryPolicy) -> Self {
-        match policy {
-            IndexerRetryPolicy::RetryWithBackoff => Self::Retryable,
-            IndexerRetryPolicy::OperatorActionRequired => Self::RequiresOperator,
-            IndexerRetryPolicy::ClientError => Self::NotRetryable,
-            _ => Self::RequiresOperator,
-        }
+    match policy {
+        IndexerRetryPolicy::RetryWithBackoff => FailurePosture::Retryable,
+        IndexerRetryPolicy::OperatorActionRequired => FailurePosture::RequiresOperator,
+        IndexerRetryPolicy::ClientError => FailurePosture::NotRetryable,
+        _ => FailurePosture::RequiresOperator,
     }
 }
 
@@ -160,10 +114,9 @@ pub enum ChainSourceError {
 
     /// A zinder client call failed.
     ///
-    /// Posture: derived from [`IndexerError::retry_policy`] via
-    /// [`FailurePosture::from`]; preserves the typed `IndexerError`
-    /// variant so operators see the canonical zinder cause without the
-    /// adapter collapsing it into a generic string.
+    /// Posture: derived from `IndexerError::retry_policy` via the crate-private
+    /// `posture_for_indexer` adapter; preserves the typed `IndexerError` variant so operators
+    /// see the canonical zinder cause without the adapter collapsing it into a generic string.
     #[cfg(feature = "zinder")]
     #[error("zinder indexer error: {0}")]
     Indexer(#[from] IndexerError),
@@ -182,7 +135,7 @@ impl ChainSourceError {
                 FailurePosture::RequiresOperator
             }
             #[cfg(feature = "zinder")]
-            Self::Indexer(err) => FailurePosture::from(err.retry_policy()),
+            Self::Indexer(err) => posture_for_indexer(err.retry_policy()),
         }
     }
 }
@@ -237,7 +190,7 @@ impl SubmitterError {
             Self::Unavailable { .. } | Self::BlockingTaskFailed { .. } => FailurePosture::Retryable,
             Self::NetworkMismatch { .. } => FailurePosture::RequiresOperator,
             #[cfg(feature = "zinder")]
-            Self::Indexer(err) => FailurePosture::from(err.retry_policy()),
+            Self::Indexer(err) => posture_for_indexer(err.retry_policy()),
         }
     }
 }
@@ -336,15 +289,15 @@ mod tests {
     #[test]
     fn indexer_retry_policy_maps_to_posture() {
         assert_eq!(
-            FailurePosture::from(IndexerRetryPolicy::RetryWithBackoff),
+            posture_for_indexer(IndexerRetryPolicy::RetryWithBackoff),
             FailurePosture::Retryable,
         );
         assert_eq!(
-            FailurePosture::from(IndexerRetryPolicy::OperatorActionRequired),
+            posture_for_indexer(IndexerRetryPolicy::OperatorActionRequired),
             FailurePosture::RequiresOperator,
         );
         assert_eq!(
-            FailurePosture::from(IndexerRetryPolicy::ClientError),
+            posture_for_indexer(IndexerRetryPolicy::ClientError),
             FailurePosture::NotRetryable,
         );
     }

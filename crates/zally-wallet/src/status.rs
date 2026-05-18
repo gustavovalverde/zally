@@ -80,7 +80,7 @@ impl Wallet {
     /// failures surfaced by the storage implementation.
     pub async fn status_snapshot(&self) -> Result<WalletStatus, WalletError> {
         let scanned_height = self.inner.storage.fully_scanned_height().await?;
-        let chain_tip_height = self.inner.storage.lookup_observed_tip().await?;
+        let chain_tip_height = self.inner.storage.find_observed_tip().await?;
         let sync_status = sync_status_from_heights(scanned_height, chain_tip_height);
         Ok(WalletStatus {
             network: self.network(),

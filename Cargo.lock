@@ -5221,6 +5221,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "tracing",
  "uuid",
  "zally-core",
  "zally-keys",
@@ -5268,6 +5269,7 @@ dependencies = [
  "tokio-stream",
  "tracing",
  "tracing-subscriber",
+ "uuid",
  "zally-chain",
  "zally-core",
  "zally-keys",
@@ -5276,10 +5278,12 @@ dependencies = [
  "zally-testkit",
  "zcash_client_backend",
  "zcash_keys",
+ "zcash_primitives 0.27.0",
  "zcash_protocol 0.8.0",
  "zcash_transparent 0.7.0",
  "zinder-core",
  "zinder-testkit",
+ "zip32",
  "zip321",
 ]
 

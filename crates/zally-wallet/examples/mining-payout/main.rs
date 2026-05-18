@@ -24,7 +24,7 @@ use zally_core::{BlockHeight, Network, ReceiverPurpose};
 use zally_keys::{AgeFileSealing, AgeFileSealingOptions};
 use zally_storage::{SqliteWalletStorage, SqliteWalletStorageOptions};
 use zally_testkit::MockChainSource;
-use zally_wallet::{Wallet, WalletError};
+use zally_wallet::{Wallet, WalletError, WalletOptions};
 
 #[tokio::main]
 async fn main() -> Result<(), ExampleError> {
@@ -44,8 +44,15 @@ async fn main() -> Result<(), ExampleError> {
         temp.path().join("wallet.db"),
     ));
     let chain = zally_testkit::MockChainSource::new(network);
-    let (wallet, account_id, _mnemonic) =
-        Wallet::create(&chain, network, sealing, storage, BlockHeight::from(1)).await?;
+    let (wallet, account_id, _mnemonic) = Wallet::create(
+        &chain,
+        network,
+        sealing,
+        storage,
+        BlockHeight::from(1),
+        WalletOptions::default(),
+    )
+    .await?;
 
     let mining = ReceiverPurpose::Mining;
     let hot_dispense = ReceiverPurpose::HotDispense;

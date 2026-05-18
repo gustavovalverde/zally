@@ -17,7 +17,10 @@ use rand::rngs::OsRng;
 use rusqlite::OptionalExtension as _;
 use secrecy::{ExposeSecret as _, SecretVec};
 use tokio::sync::{mpsc, oneshot};
-use zally_core::{AccountId, BlockHeight, IdempotencyKey, Network, NetworkParameters, TxId};
+use zally_core::{
+    AccountId, BlockHeight, FailurePosture, IdempotencyKey, Network, NetworkParameters, TxId,
+    Zatoshis,
+};
 use zally_keys::{KeyDerivationError, SeedMaterial, derive_ufvk};
 use zcash_client_backend::data_api::chain::ChainState;
 use zcash_client_backend::data_api::wallet::{
@@ -32,9 +35,9 @@ use zcash_client_sqlite::util::SystemClock;
 use zcash_client_sqlite::wallet::init::WalletMigrator;
 use zcash_keys::address::UnifiedAddress;
 use zcash_keys::keys::UnifiedAddressRequest;
-use zcash_protocol::value::Zatoshis;
+use zcash_protocol::value::Zatoshis as UpstreamZatoshis;
 use zcash_transparent::address::Script;
-use zcash_transparent::bundle::{OutPoint, TxOut};
+use zcash_transparent::bundle::{OutPoint as UpstreamOutPoint, TxOut};
 
 use crate::storage_error::StorageError;
 use crate::wallet_storage::WalletStorage;
@@ -204,6 +207,18 @@ impl SqliteWalletStorage {
         })
         .await
     }
+
+    async fn with_db_and_ledger<F, T>(&self, work: F) -> Result<T, StorageError>
+    where
+        F: FnOnce(&Db, &rusqlite::Connection) -> Result<T, StorageError> + Send + 'static,
+        T: Send + 'static,
+    {
+        self.dispatch(move |state, _options| match state {
+            WalletDbState::NotOpened => Err(StorageError::NotOpened),
+            WalletDbState::Opened { db, ledger } => work(db.as_ref(), ledger.as_ref()),
+        })
+        .await
+    }
 }
 
 fn run_wallet_db_actor(
@@ -223,14 +238,14 @@ fn open_wallet_db(options: &SqliteWalletStorageOptions) -> Result<WalletDbState,
     if let Some(parent) = options.db_path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| StorageError::SqliteFailed {
             reason: format!("could not create database directory: {e}"),
-            is_retryable: false,
+            posture: FailurePosture::NotRetryable,
         })?;
     }
     let params = options.network.to_parameters();
     let mut db = WalletDb::for_path(&options.db_path, params, SystemClock, OsRng).map_err(|e| {
         StorageError::SqliteFailed {
             reason: e.to_string(),
-            is_retryable: false,
+            posture: FailurePosture::NotRetryable,
         }
     })?;
     WalletMigrator::new()
@@ -242,7 +257,7 @@ fn open_wallet_db(options: &SqliteWalletStorageOptions) -> Result<WalletDbState,
     let ledger =
         rusqlite::Connection::open(&options.db_path).map_err(|e| StorageError::SqliteFailed {
             reason: format!("ledger connection open failed: {e}"),
-            is_retryable: false,
+            posture: FailurePosture::NotRetryable,
         })?;
     ledger
         .execute_batch(
@@ -254,11 +269,25 @@ fn open_wallet_db(options: &SqliteWalletStorageOptions) -> Result<WalletDbState,
              CREATE TABLE IF NOT EXISTS ext_zally_observed_tip (\
                  id INTEGER PRIMARY KEY CHECK (id = 0),\
                  tip_height INTEGER NOT NULL\
-             );",
+             ); \
+             CREATE TABLE IF NOT EXISTS ext_zally_pending_broadcast_inputs (\
+                 broadcast_tx_id BLOB NOT NULL,\
+                 outpoint_tx_id BLOB NOT NULL,\
+                 outpoint_index INTEGER NOT NULL,\
+                 value_zat INTEGER NOT NULL,\
+                 account_id BLOB NOT NULL,\
+                 broadcast_at_ms INTEGER NOT NULL,\
+                 broadcast_at_height INTEGER,\
+                 PRIMARY KEY (broadcast_tx_id, outpoint_tx_id, outpoint_index)\
+             ); \
+             CREATE INDEX IF NOT EXISTS ix_ezpbi_by_account \
+                 ON ext_zally_pending_broadcast_inputs(account_id); \
+             CREATE INDEX IF NOT EXISTS ix_ezpbi_by_broadcast_at \
+                 ON ext_zally_pending_broadcast_inputs(broadcast_at_ms);",
         )
         .map_err(|e| StorageError::SqliteFailed {
             reason: format!("ext_zally schema init failed: {e}"),
-            is_retryable: false,
+            posture: FailurePosture::NotRetryable,
         })?;
 
     Ok(WalletDbState::Opened {
@@ -464,7 +493,7 @@ impl WalletStorage for SqliteWalletStorage {
                 .map(|new_height| BlockHeight::from(u32::from(new_height)))
                 .map_err(|err| StorageError::SqliteFailed {
                     reason: format!("truncate_to_height failed: {err}"),
-                    is_retryable: false,
+                    posture: FailurePosture::NotRetryable,
                 })
         })
         .await
@@ -476,7 +505,7 @@ impl WalletStorage for SqliteWalletStorage {
             zcash_client_backend::data_api::WalletWrite::update_chain_tip(db, target).map_err(
                 |err| StorageError::SqliteFailed {
                     reason: format!("update_chain_tip failed: {err}"),
-                    is_retryable: false,
+                    posture: FailurePosture::NotRetryable,
                 },
             )
         })
@@ -510,20 +539,19 @@ impl WalletStorage for SqliteWalletStorage {
     ) -> Result<crate::wallet_storage::ProposalSummary, StorageError> {
         let params = self.options.network.to_parameters();
         let account_uuid = zally_to_account_uuid(request.account_id);
-        let amount =
-            zcash_protocol::value::Zatoshis::from_u64(request.amount_zat).map_err(|err| {
-                StorageError::SqliteFailed {
-                    reason: format!(
-                        "amount {} exceeds Zatoshis maximum: {err}",
-                        request.amount_zat
-                    ),
-                    is_retryable: false,
-                }
-            })?;
+        let amount = UpstreamZatoshis::from_u64(request.amount_zat).map_err(|err| {
+            StorageError::SqliteFailed {
+                reason: format!(
+                    "amount {} exceeds Zatoshis maximum: {err}",
+                    request.amount_zat
+                ),
+                posture: FailurePosture::NotRetryable,
+            }
+        })?;
         let recipient = zcash_keys::address::Address::decode(&params, &request.recipient_encoded)
             .ok_or_else(|| StorageError::SqliteFailed {
             reason: format!("could not decode recipient '{}'", request.recipient_encoded),
-            is_retryable: false,
+            posture: FailurePosture::NotRetryable,
         })?;
         let memo_bytes = request
             .memo
@@ -532,7 +560,7 @@ impl WalletStorage for SqliteWalletStorage {
             .transpose()
             .map_err(|err| StorageError::SqliteFailed {
                 reason: format!("memo too long: {err}"),
-                is_retryable: false,
+                posture: FailurePosture::NotRetryable,
             })?;
 
         self.with_db_mut(move |db| {
@@ -555,7 +583,7 @@ impl WalletStorage for SqliteWalletStorage {
                 )
                 .map_err(|err| StorageError::SqliteFailed {
                     reason: format!("propose_transfer failed: {err}"),
-                    is_retryable: false,
+                    posture: FailurePosture::NotRetryable,
                 })?;
 
             let first_step = proposal.steps().first();
@@ -581,20 +609,19 @@ impl WalletStorage for SqliteWalletStorage {
     ) -> Result<Vec<crate::wallet_storage::PreparedTransaction>, StorageError> {
         let params = self.options.network.to_parameters();
         let account_uuid = zally_to_account_uuid(request.account_id);
-        let amount =
-            zcash_protocol::value::Zatoshis::from_u64(request.amount_zat).map_err(|err| {
-                StorageError::SqliteFailed {
-                    reason: format!(
-                        "amount {} exceeds Zatoshis maximum: {err}",
-                        request.amount_zat
-                    ),
-                    is_retryable: false,
-                }
-            })?;
+        let amount = UpstreamZatoshis::from_u64(request.amount_zat).map_err(|err| {
+            StorageError::SqliteFailed {
+                reason: format!(
+                    "amount {} exceeds Zatoshis maximum: {err}",
+                    request.amount_zat
+                ),
+                posture: FailurePosture::NotRetryable,
+            }
+        })?;
         let recipient = zcash_keys::address::Address::decode(&params, &request.recipient_encoded)
             .ok_or_else(|| StorageError::SqliteFailed {
             reason: format!("could not decode recipient '{}'", request.recipient_encoded),
-            is_retryable: false,
+            posture: FailurePosture::NotRetryable,
         })?;
         let memo_bytes = request
             .memo
@@ -603,11 +630,14 @@ impl WalletStorage for SqliteWalletStorage {
             .transpose()
             .map_err(|err| StorageError::SqliteFailed {
                 reason: format!("memo too long: {err}"),
-                is_retryable: false,
+                posture: FailurePosture::NotRetryable,
             })?;
         let prover = zcash_proofs::prover::LocalTxProver::with_default_location()
             .ok_or(StorageError::ProverUnavailable)?;
         let seed_bytes = SecretVec::new(seed.expose_secret().to_vec());
+        let network = self.options.network;
+        let account_id = request.account_id;
+        let excluded_outpoints = request.excluded_outpoints;
 
         self.with_db_mut(move |db| {
             let usk = zcash_keys::keys::UnifiedSpendingKey::from_seed(
@@ -639,8 +669,15 @@ impl WalletStorage for SqliteWalletStorage {
                 )
                 .map_err(|err| StorageError::SqliteFailed {
                     reason: format!("propose_transfer failed: {err}"),
-                    is_retryable: false,
+                    posture: FailurePosture::NotRetryable,
                 })?;
+
+            check_proposal_against_excluded_outpoints(
+                &proposal,
+                &excluded_outpoints,
+                network,
+                account_id,
+            )?;
 
             let txids = zcash_client_backend::data_api::wallet::create_proposed_transactions::<
                 Db,
@@ -660,7 +697,7 @@ impl WalletStorage for SqliteWalletStorage {
             )
             .map_err(|err| StorageError::SqliteFailed {
                 reason: format!("create_proposed_transactions failed: {err}"),
-                is_retryable: false,
+                posture: FailurePosture::NotRetryable,
             })?;
 
             prepared_transactions_for_txids(db, &txids, "created")
@@ -675,15 +712,16 @@ impl WalletStorage for SqliteWalletStorage {
     ) -> Result<Vec<crate::wallet_storage::PreparedTransaction>, StorageError> {
         let params = self.options.network.to_parameters();
         let account_uuid = zally_to_account_uuid(request.account_id);
-        let shielding_threshold =
-            Zatoshis::from_u64(request.shielding_threshold_zat).map_err(|_| {
-                StorageError::TransparentOutputValueOutOfRange {
-                    value_zat: request.shielding_threshold_zat,
-                }
+        let shielding_threshold = UpstreamZatoshis::from_u64(request.shielding_threshold_zat)
+            .map_err(|_| StorageError::TransparentOutputValueOutOfRange {
+                value_zat: request.shielding_threshold_zat,
             })?;
         let prover = zcash_proofs::prover::LocalTxProver::with_default_location()
             .ok_or(StorageError::ProverUnavailable)?;
         let seed_bytes = SecretVec::new(seed.expose_secret().to_vec());
+        let network = self.options.network;
+        let account_id = request.account_id;
+        let excluded_outpoints = request.excluded_outpoints;
 
         self.with_db_mut(move |db| {
             let usk = zcash_keys::keys::UnifiedSpendingKey::from_seed(
@@ -707,22 +745,55 @@ impl WalletStorage for SqliteWalletStorage {
                 zcash_protocol::ShieldedProtocol::Orchard,
                 DustOutputPolicy::default(),
             );
-            let txids = zcash_client_backend::data_api::wallet::shield_transparent_funds(
+
+            let proposal = zcash_client_backend::data_api::wallet::propose_shielding::<
+                Db,
+                NetworkParameters,
+                _,
+                _,
+                std::convert::Infallible,
+            >(
+                db,
+                &params,
+                &input_selector,
+                &change_strategy,
+                shielding_threshold,
+                &from_addrs,
+                account_uuid,
+                ConfirmationsPolicy::default(),
+                zcash_client_backend::data_api::TransparentOutputFilter::All,
+            )
+            .map_err(|err| StorageError::SqliteFailed {
+                reason: format!("propose_shielding failed: {err}"),
+                posture: FailurePosture::NotRetryable,
+            })?;
+
+            check_proposal_against_excluded_outpoints(
+                &proposal,
+                &excluded_outpoints,
+                network,
+                account_id,
+            )?;
+
+            let txids = zcash_client_backend::data_api::wallet::create_proposed_transactions::<
+                Db,
+                NetworkParameters,
+                zcash_client_sqlite::error::SqliteClientError,
+                StandardFeeRule,
+                std::convert::Infallible,
+                std::convert::Infallible,
+            >(
                 db,
                 &params,
                 &prover,
                 &prover,
-                &input_selector,
-                &change_strategy,
-                shielding_threshold,
                 &spending_keys,
-                &from_addrs,
-                account_uuid,
-                ConfirmationsPolicy::default(),
+                zcash_client_backend::wallet::OvkPolicy::Sender,
+                &proposal,
             )
             .map_err(|err| StorageError::SqliteFailed {
-                reason: format!("shield_transparent_funds failed: {err}"),
-                is_retryable: false,
+                reason: format!("shield_transparent_funds create failed: {err}"),
+                posture: FailurePosture::NotRetryable,
             })?;
 
             prepared_transactions_for_txids(db, txids.iter(), "shielding")
@@ -736,20 +807,19 @@ impl WalletStorage for SqliteWalletStorage {
     ) -> Result<Vec<u8>, StorageError> {
         let params = self.options.network.to_parameters();
         let account_uuid = zally_to_account_uuid(request.account_id);
-        let amount =
-            zcash_protocol::value::Zatoshis::from_u64(request.amount_zat).map_err(|err| {
-                StorageError::SqliteFailed {
-                    reason: format!(
-                        "amount {} exceeds Zatoshis maximum: {err}",
-                        request.amount_zat
-                    ),
-                    is_retryable: false,
-                }
-            })?;
+        let amount = UpstreamZatoshis::from_u64(request.amount_zat).map_err(|err| {
+            StorageError::SqliteFailed {
+                reason: format!(
+                    "amount {} exceeds Zatoshis maximum: {err}",
+                    request.amount_zat
+                ),
+                posture: FailurePosture::NotRetryable,
+            }
+        })?;
         let recipient = zcash_keys::address::Address::decode(&params, &request.recipient_encoded)
             .ok_or_else(|| StorageError::SqliteFailed {
             reason: format!("could not decode recipient '{}'", request.recipient_encoded),
-            is_retryable: false,
+            posture: FailurePosture::NotRetryable,
         })?;
         let memo_bytes = request
             .memo
@@ -758,7 +828,7 @@ impl WalletStorage for SqliteWalletStorage {
             .transpose()
             .map_err(|err| StorageError::SqliteFailed {
                 reason: format!("memo too long: {err}"),
-                is_retryable: false,
+                posture: FailurePosture::NotRetryable,
             })?;
 
         self.with_db_mut(move |db| {
@@ -781,7 +851,7 @@ impl WalletStorage for SqliteWalletStorage {
                 )
                 .map_err(|err| StorageError::SqliteFailed {
                     reason: format!("propose_transfer failed: {err}"),
-                    is_retryable: false,
+                    posture: FailurePosture::NotRetryable,
                 })?;
 
             let pczt = zcash_client_backend::data_api::wallet::create_pczt_from_proposal::<
@@ -800,7 +870,7 @@ impl WalletStorage for SqliteWalletStorage {
             )
             .map_err(|err| StorageError::SqliteFailed {
                 reason: format!("create_pczt_from_proposal failed: {err}"),
-                is_retryable: false,
+                posture: FailurePosture::NotRetryable,
             })?;
 
             Ok(pczt.serialize())
@@ -814,7 +884,7 @@ impl WalletStorage for SqliteWalletStorage {
     ) -> Result<crate::wallet_storage::PreparedTransaction, StorageError> {
         let parsed = pczt::Pczt::parse(&pczt_bytes).map_err(|err| StorageError::SqliteFailed {
             reason: format!("pczt parse failed: {err:?}"),
-            is_retryable: false,
+            posture: FailurePosture::NotRetryable,
         })?;
         let prover = zcash_proofs::prover::LocalTxProver::with_default_location()
             .ok_or(StorageError::ProverUnavailable)?;
@@ -828,21 +898,21 @@ impl WalletStorage for SqliteWalletStorage {
                 >(db, parsed, Some((&spend_vk, &output_vk)), None)
                 .map_err(|err| StorageError::SqliteFailed {
                     reason: format!("extract_and_store_transaction_from_pczt failed: {err}"),
-                    is_retryable: false,
+                    posture: FailurePosture::NotRetryable,
                 })?;
 
             let stored = zcash_client_backend::data_api::WalletRead::get_transaction(db, tx_id)
                 .map_err(|e| map_sqlite_error(&e))?
                 .ok_or_else(|| StorageError::SqliteFailed {
                     reason: format!("extracted tx {tx_id} not present in wallet store"),
-                    is_retryable: false,
+                    posture: FailurePosture::NotRetryable,
                 })?;
             let mut raw_bytes = Vec::new();
             stored
                 .write(&mut raw_bytes)
                 .map_err(|err| StorageError::SqliteFailed {
                     reason: format!("transaction serialize failed: {err}"),
-                    is_retryable: false,
+                    posture: FailurePosture::NotRetryable,
                 })?;
             Ok(crate::wallet_storage::PreparedTransaction::new(
                 zally_core::TxId::from_bytes(*tx_id.as_ref()),
@@ -852,7 +922,7 @@ impl WalletStorage for SqliteWalletStorage {
         .await
     }
 
-    async fn lookup_idempotent_submission(
+    async fn find_idempotent_submission(
         &self,
         key: &IdempotencyKey,
     ) -> Result<Option<TxId>, StorageError> {
@@ -867,7 +937,7 @@ impl WalletStorage for SqliteWalletStorage {
                 .optional()
                 .map_err(|err| StorageError::SqliteFailed {
                     reason: format!("ext_zally_idempotency lookup failed: {err}"),
-                    is_retryable: false,
+                    posture: FailurePosture::NotRetryable,
                 })?;
             outcome
                 .map(|raw| -> Result<TxId, StorageError> {
@@ -878,7 +948,7 @@ impl WalletStorage for SqliteWalletStorage {
                                     "ext_zally_idempotency tx_id_bytes had wrong length: {}",
                                     raw.len()
                                 ),
-                                is_retryable: false,
+                                posture: FailurePosture::NotRetryable,
                             })?;
                     Ok(TxId::from_bytes(array))
                 })
@@ -907,7 +977,7 @@ impl WalletStorage for SqliteWalletStorage {
                 .optional()
                 .map_err(|err| StorageError::SqliteFailed {
                     reason: format!("ext_zally_idempotency lookup failed: {err}"),
-                    is_retryable: false,
+                    posture: FailurePosture::NotRetryable,
                 })?;
             if let Some(prior_bytes) = prior {
                 return if prior_bytes == tx_bytes {
@@ -924,7 +994,7 @@ impl WalletStorage for SqliteWalletStorage {
             )
             .map_err(|err| StorageError::SqliteFailed {
                 reason: format!("ext_zally_idempotency insert failed: {err}"),
-                is_retryable: false,
+                posture: FailurePosture::NotRetryable,
             })?;
             Ok(())
         })
@@ -947,7 +1017,7 @@ impl WalletStorage for SqliteWalletStorage {
                 )
                 .map_err(|err| StorageError::SqliteFailed {
                     reason: format!("transactions range query prepare failed: {err}"),
-                    is_retryable: false,
+                    posture: FailurePosture::NotRetryable,
                 })?;
             let rows = stmt
                 .query_map([start_h, end_h], |row| {
@@ -957,13 +1027,13 @@ impl WalletStorage for SqliteWalletStorage {
                 })
                 .map_err(|err| StorageError::SqliteFailed {
                     reason: format!("transactions range query failed: {err}"),
-                    is_retryable: false,
+                    posture: FailurePosture::NotRetryable,
                 })?;
             let mut entries = Vec::new();
             for row in rows {
                 let (txid_bytes, mined_height) = row.map_err(|err| StorageError::SqliteFailed {
                     reason: format!("transactions row decode failed: {err}"),
-                    is_retryable: false,
+                    posture: FailurePosture::NotRetryable,
                 })?;
                 let array: [u8; 32] =
                     txid_bytes
@@ -973,14 +1043,14 @@ impl WalletStorage for SqliteWalletStorage {
                                 "transactions.txid had wrong byte length: {}",
                                 raw.len()
                             ),
-                            is_retryable: false,
+                            posture: FailurePosture::NotRetryable,
                         })?;
                 let height =
                     u32::try_from(mined_height).map_err(|_| StorageError::SqliteFailed {
                         reason: format!(
                             "transactions.mined_height out of u32 range: {mined_height}"
                         ),
-                        is_retryable: false,
+                        posture: FailurePosture::NotRetryable,
                     })?;
                 entries.push((TxId::from_bytes(array), BlockHeight::from(height)));
             }
@@ -989,7 +1059,7 @@ impl WalletStorage for SqliteWalletStorage {
         .await
     }
 
-    async fn lookup_observed_tip(&self) -> Result<Option<BlockHeight>, StorageError> {
+    async fn find_observed_tip(&self) -> Result<Option<BlockHeight>, StorageError> {
         self.with_ledger(move |conn| {
             let outcome = conn
                 .query_row(
@@ -1000,14 +1070,14 @@ impl WalletStorage for SqliteWalletStorage {
                 .optional()
                 .map_err(|err| StorageError::SqliteFailed {
                     reason: format!("ext_zally_observed_tip lookup failed: {err}"),
-                    is_retryable: false,
+                    posture: FailurePosture::NotRetryable,
                 })?;
             outcome
                 .map(|raw| {
                     u32::try_from(raw).map(BlockHeight::from).map_err(|_| {
                         StorageError::SqliteFailed {
                             reason: format!("ext_zally_observed_tip.tip_height out of u32: {raw}"),
-                            is_retryable: false,
+                            posture: FailurePosture::NotRetryable,
                         }
                     })
                 })
@@ -1026,9 +1096,414 @@ impl WalletStorage for SqliteWalletStorage {
             )
             .map_err(|err| StorageError::SqliteFailed {
                 reason: format!("ext_zally_observed_tip upsert failed: {err}"),
-                is_retryable: false,
+                posture: FailurePosture::NotRetryable,
             })?;
             Ok(())
+        })
+        .await
+    }
+
+    async fn record_pending_broadcast_inputs(
+        &self,
+        record: crate::wallet_storage::PendingBroadcastRecord,
+    ) -> Result<(), StorageError> {
+        let account_uuid_bytes = record.account_id.as_uuid().as_bytes().to_vec();
+        let broadcast_tx_bytes = record.broadcast_tx_id.as_bytes().to_vec();
+        let broadcast_at_ms_i64 = clamp_unsigned_to_i64(record.broadcast_at_ms);
+        let broadcast_at_height_i64 = record.broadcast_at_height.map(|h| i64::from(h.as_u32()));
+        let inputs = record.inputs;
+
+        self.with_ledger(move |conn| {
+            for (outpoint, value_zat) in inputs {
+                let outpoint_tx_bytes = outpoint.tx_id.as_bytes().to_vec();
+                let value_zat_i64 = clamp_unsigned_to_i64(value_zat.as_u64());
+                conn.execute(
+                    "INSERT INTO ext_zally_pending_broadcast_inputs \
+                         (broadcast_tx_id, outpoint_tx_id, outpoint_index, value_zat, \
+                          account_id, broadcast_at_ms, broadcast_at_height) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
+                     ON CONFLICT(broadcast_tx_id, outpoint_tx_id, outpoint_index) DO UPDATE \
+                     SET value_zat = excluded.value_zat, \
+                         account_id = excluded.account_id, \
+                         broadcast_at_ms = excluded.broadcast_at_ms, \
+                         broadcast_at_height = excluded.broadcast_at_height",
+                    rusqlite::params![
+                        &broadcast_tx_bytes,
+                        &outpoint_tx_bytes,
+                        i64::from(outpoint.output_index),
+                        value_zat_i64,
+                        &account_uuid_bytes,
+                        broadcast_at_ms_i64,
+                        broadcast_at_height_i64,
+                    ],
+                )
+                .map_err(|err| StorageError::SqliteFailed {
+                    reason: format!("ext_zally_pending_broadcast_inputs insert failed: {err}"),
+                    posture: FailurePosture::NotRetryable,
+                })?;
+            }
+            Ok(())
+        })
+        .await
+    }
+
+    async fn list_pending_broadcast_inputs(
+        &self,
+        account_id: AccountId,
+        after_at_ms: u64,
+    ) -> Result<Vec<crate::PendingBroadcastInputRow>, StorageError> {
+        let account_uuid_bytes = account_id.as_uuid().as_bytes().to_vec();
+        let after_at_ms_i64 = clamp_unsigned_to_i64(after_at_ms);
+
+        self.with_ledger(move |conn| {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT broadcast_tx_id, outpoint_tx_id, outpoint_index, value_zat, \
+                            broadcast_at_ms, broadcast_at_height \
+                     FROM ext_zally_pending_broadcast_inputs \
+                     WHERE account_id = ?1 AND broadcast_at_ms >= ?2 \
+                     ORDER BY broadcast_at_ms ASC, broadcast_tx_id ASC, outpoint_index ASC",
+                )
+                .map_err(|err| StorageError::SqliteFailed {
+                    reason: format!("pending-broadcast-inputs prepare failed: {err}"),
+                    posture: FailurePosture::NotRetryable,
+                })?;
+            let mapped = stmt
+                .query_map(
+                    rusqlite::params![&account_uuid_bytes, after_at_ms_i64],
+                    |row| {
+                        let broadcast_tx_bytes: Vec<u8> = row.get(0)?;
+                        let outpoint_tx_bytes: Vec<u8> = row.get(1)?;
+                        let outpoint_index: i64 = row.get(2)?;
+                        let value_zat: i64 = row.get(3)?;
+                        let broadcast_at_ms: i64 = row.get(4)?;
+                        let broadcast_at_height: Option<i64> = row.get(5)?;
+                        Ok((
+                            broadcast_tx_bytes,
+                            outpoint_tx_bytes,
+                            outpoint_index,
+                            value_zat,
+                            broadcast_at_ms,
+                            broadcast_at_height,
+                        ))
+                    },
+                )
+                .map_err(|err| StorageError::SqliteFailed {
+                    reason: format!("pending-broadcast-inputs query failed: {err}"),
+                    posture: FailurePosture::NotRetryable,
+                })?;
+            let mut rows = Vec::new();
+            for raw in mapped {
+                let (
+                    broadcast_tx_bytes,
+                    outpoint_tx_bytes,
+                    outpoint_index_raw,
+                    value_zat_raw,
+                    broadcast_at_ms_raw,
+                    broadcast_at_height_raw,
+                ) = raw.map_err(|err| StorageError::SqliteFailed {
+                    reason: format!("pending-broadcast-inputs row decode failed: {err}"),
+                    posture: FailurePosture::NotRetryable,
+                })?;
+                let broadcast_tx_id = decode_txid_bytes(broadcast_tx_bytes, "broadcast_tx_id")?;
+                let outpoint_tx_id = decode_txid_bytes(outpoint_tx_bytes, "outpoint_tx_id")?;
+                let outpoint_index =
+                    u32::try_from(outpoint_index_raw).map_err(|_| StorageError::SqliteFailed {
+                        reason: format!(
+                            "ext_zally_pending_broadcast_inputs.outpoint_index out of u32: \
+                             {outpoint_index_raw}"
+                        ),
+                        posture: FailurePosture::NotRetryable,
+                    })?;
+                let value_zat_u64 =
+                    u64::try_from(value_zat_raw).map_err(|_| StorageError::SqliteFailed {
+                        reason: format!(
+                            "ext_zally_pending_broadcast_inputs.value_zat out of u64: \
+                             {value_zat_raw}"
+                        ),
+                        posture: FailurePosture::NotRetryable,
+                    })?;
+                let value_zat = Zatoshis::try_from(value_zat_u64).map_err(|_| {
+                    StorageError::RowValueOutOfRange {
+                        column: "ext_zally_pending_broadcast_inputs.value_zat",
+                        raw: value_zat_u64.to_string(),
+                    }
+                })?;
+                let broadcast_at_ms =
+                    u64::try_from(broadcast_at_ms_raw).map_err(|_| StorageError::SqliteFailed {
+                        reason: format!(
+                            "ext_zally_pending_broadcast_inputs.broadcast_at_ms out of u64: \
+                             {broadcast_at_ms_raw}"
+                        ),
+                        posture: FailurePosture::NotRetryable,
+                    })?;
+                let broadcast_at_height = broadcast_at_height_raw
+                    .map(|raw_height| {
+                        u32::try_from(raw_height)
+                            .map(BlockHeight::from)
+                            .map_err(|_| StorageError::SqliteFailed {
+                                reason: format!(
+                                    "ext_zally_pending_broadcast_inputs.broadcast_at_height \
+                                     out of u32: {raw_height}"
+                                ),
+                                posture: FailurePosture::NotRetryable,
+                            })
+                    })
+                    .transpose()?;
+                rows.push(crate::PendingBroadcastInputRow {
+                    broadcast_tx_id,
+                    outpoint: zally_core::OutPoint::new(outpoint_tx_id, outpoint_index),
+                    value_zat,
+                    broadcast_at_ms,
+                    broadcast_at_height,
+                });
+            }
+            Ok(rows)
+        })
+        .await
+    }
+
+    async fn clear_pending_broadcast_inputs_for_mined(
+        &self,
+        tx_ids: &[TxId],
+    ) -> Result<u64, StorageError> {
+        if tx_ids.is_empty() {
+            return Ok(0);
+        }
+        let tx_id_blobs: Vec<Vec<u8>> = tx_ids.iter().map(|t| t.as_bytes().to_vec()).collect();
+        self.with_ledger(move |conn| {
+            let mut removed = 0_u64;
+            for blob in tx_id_blobs {
+                let count = conn
+                    .execute(
+                        "DELETE FROM ext_zally_pending_broadcast_inputs WHERE broadcast_tx_id = ?1",
+                        [&blob],
+                    )
+                    .map_err(|err| StorageError::SqliteFailed {
+                        reason: format!(
+                            "ext_zally_pending_broadcast_inputs cleanup-for-mined failed: {err}"
+                        ),
+                        posture: FailurePosture::NotRetryable,
+                    })?;
+                removed = removed.saturating_add(u64::try_from(count).unwrap_or(0));
+            }
+            Ok(removed)
+        })
+        .await
+    }
+
+    async fn clear_expired_pending_broadcast_inputs(
+        &self,
+        before_at_ms: u64,
+    ) -> Result<u64, StorageError> {
+        let before_at_ms_i64 = clamp_unsigned_to_i64(before_at_ms);
+        self.with_ledger(move |conn| {
+            let count = conn
+                .execute(
+                    "DELETE FROM ext_zally_pending_broadcast_inputs WHERE broadcast_at_ms < ?1",
+                    [before_at_ms_i64],
+                )
+                .map_err(|err| StorageError::SqliteFailed {
+                    reason: format!(
+                        "ext_zally_pending_broadcast_inputs cleanup-expired failed: {err}"
+                    ),
+                    posture: FailurePosture::NotRetryable,
+                })?;
+            Ok(u64::try_from(count).unwrap_or(0))
+        })
+        .await
+    }
+
+    async fn find_outpoint_values(
+        &self,
+        outpoints: &[zally_core::OutPoint],
+    ) -> Result<std::collections::HashMap<zally_core::OutPoint, Zatoshis>, StorageError> {
+        if outpoints.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let queries: Vec<(Vec<u8>, i64, zally_core::OutPoint)> = outpoints
+            .iter()
+            .map(|op| {
+                (
+                    op.tx_id.as_bytes().to_vec(),
+                    i64::from(op.output_index),
+                    *op,
+                )
+            })
+            .collect();
+
+        self.with_ledger(move |conn| {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT tro.value_zat \
+                     FROM transparent_received_outputs tro \
+                     JOIN transactions t ON t.id_tx = tro.transaction_id \
+                     WHERE t.txid = ?1 AND tro.output_index = ?2",
+                )
+                .map_err(|err| StorageError::SqliteFailed {
+                    reason: format!("find_outpoint_values prepare failed: {err}"),
+                    posture: FailurePosture::NotRetryable,
+                })?;
+            let mut resolved = std::collections::HashMap::new();
+            for (txid_bytes, output_index_i64, outpoint) in queries {
+                let value_zat: Option<i64> = stmt
+                    .query_row(rusqlite::params![&txid_bytes, output_index_i64], |row| {
+                        row.get(0)
+                    })
+                    .optional()
+                    .map_err(|err| StorageError::SqliteFailed {
+                        reason: format!("find_outpoint_values query failed: {err}"),
+                        posture: FailurePosture::NotRetryable,
+                    })?;
+                if let Some(raw) = value_zat {
+                    let zat = decode_row_zatoshis(raw, "transparent_received_outputs.value_zat")?;
+                    resolved.insert(outpoint, zat);
+                }
+            }
+            Ok(resolved)
+        })
+        .await
+    }
+
+    async fn list_exposed_addresses(
+        &self,
+        account_id: AccountId,
+    ) -> Result<Vec<crate::ExposedAddressRow>, StorageError> {
+        let account_uuid = zally_to_account_uuid(account_id);
+        let account_uuid_bytes = account_id.as_uuid().as_bytes().to_vec();
+        let params = self.options.network.to_parameters();
+
+        self.with_db_and_ledger(move |db, ledger| {
+            if WalletRead::get_account(db, account_uuid)
+                .map_err(|e| map_sqlite_error(&e))?
+                .is_none()
+            {
+                return Err(StorageError::AccountNotFound);
+            }
+
+            let mut stmt = ledger.prepare(EXPOSED_ADDRESSES_SQL).map_err(|err| {
+                StorageError::SqliteFailed {
+                    reason: format!("list_exposed_addresses prepare failed: {err}"),
+                    posture: FailurePosture::NotRetryable,
+                }
+            })?;
+            let mapped = stmt
+                .query_map([&account_uuid_bytes], |row| {
+                    let address: String = row.get(0)?;
+                    let diversifier_index_be: Vec<u8> = row.get(1)?;
+                    let exposed_at_height: Option<i64> = row.get(2)?;
+                    Ok((address, diversifier_index_be, exposed_at_height))
+                })
+                .map_err(|err| StorageError::SqliteFailed {
+                    reason: format!("list_exposed_addresses query failed: {err}"),
+                    posture: FailurePosture::NotRetryable,
+                })?;
+
+            let mut rows = Vec::new();
+            for raw in mapped {
+                let (address_str, di_be_bytes, exposed_at_height_raw) =
+                    raw.map_err(|err| StorageError::SqliteFailed {
+                        reason: format!("list_exposed_addresses row decode failed: {err}"),
+                        posture: FailurePosture::NotRetryable,
+                    })?;
+                let address = zcash_keys::address::Address::decode(&params, &address_str)
+                    .ok_or_else(|| StorageError::SqliteFailed {
+                        reason: format!("undecodable address in store: {address_str}"),
+                        posture: FailurePosture::NotRetryable,
+                    })?;
+                let zcash_keys::address::Address::Unified(unified_address) = address else {
+                    continue;
+                };
+                let diversifier_index = decode_diversifier_index_be(di_be_bytes)?;
+                let exposed_at_height = exposed_at_height_raw
+                    .map(|raw_height| {
+                        u32::try_from(raw_height)
+                            .map(BlockHeight::from)
+                            .map_err(|_| StorageError::SqliteFailed {
+                                reason: format!(
+                                    "addresses.exposed_at_height out of u32: {raw_height}"
+                                ),
+                                posture: FailurePosture::NotRetryable,
+                            })
+                    })
+                    .transpose()?;
+                let has_transparent_receiver = unified_address.transparent().is_some();
+                rows.push(crate::ExposedAddressRow {
+                    unified_address,
+                    diversifier_index,
+                    has_transparent_receiver,
+                    exposed_at_height,
+                });
+            }
+            Ok(rows)
+        })
+        .await
+    }
+
+    async fn get_account_balance(
+        &self,
+        account_id: AccountId,
+    ) -> Result<crate::AccountBalanceRow, StorageError> {
+        let account_uuid = zally_to_account_uuid(account_id);
+        let account_uuid_bytes = account_id.as_uuid().as_bytes().to_vec();
+
+        self.with_db_and_ledger(move |db, ledger| {
+            if WalletRead::get_account(db, account_uuid)
+                .map_err(|e| map_sqlite_error(&e))?
+                .is_none()
+            {
+                return Err(StorageError::AccountNotFound);
+            }
+
+            let summary = db
+                .get_wallet_summary(ConfirmationsPolicy::default())
+                .map_err(|e| map_sqlite_error(&e))?;
+            let (sapling_zat, orchard_zat, transparent_mature_zat) = summary
+                .as_ref()
+                .and_then(|s| s.account_balances().get(&account_uuid))
+                .map_or(
+                    (Zatoshis::zero(), Zatoshis::zero(), Zatoshis::zero()),
+                    |balance| {
+                        (
+                            upstream_to_zally_zatoshis(balance.sapling_balance().spendable_value()),
+                            upstream_to_zally_zatoshis(balance.orchard_balance().spendable_value()),
+                            upstream_to_zally_zatoshis(
+                                balance.unshielded_balance().spendable_value(),
+                            ),
+                        )
+                    },
+                );
+
+            let observed_tip = find_observed_tip_on(ledger)?;
+            // ZIP-213 maturity uses `chain_tip + 1` per `zcash_client_backend`'s convention so
+            // an output mined at H is considered mature once the chain tip reaches H+99
+            // (confirmations = 100). On a fresh wallet with no observed tip the maturity
+            // check is moot because no coinbase has been recorded yet.
+            let target_height_i64 =
+                i64::from(observed_tip.map_or(0_u32, |h| h.as_u32().saturating_add(1)));
+
+            let immature_raw = ledger
+                .query_row(
+                    IMMATURE_COINBASE_AGGREGATE_SQL,
+                    rusqlite::params![&account_uuid_bytes, target_height_i64],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map_err(|err| StorageError::SqliteFailed {
+                    reason: format!("immature coinbase aggregate failed: {err}"),
+                    posture: FailurePosture::NotRetryable,
+                })?;
+            let transparent_immature_zat = decode_row_zatoshis(
+                immature_raw,
+                "transparent_received_outputs.value_zat (immature coinbase)",
+            )?;
+
+            Ok(crate::AccountBalanceRow {
+                sapling_zat,
+                orchard_zat,
+                transparent_mature_zat,
+                transparent_immature_zat,
+                as_of_height: observed_tip,
+            })
         })
         .await
     }
@@ -1055,7 +1530,7 @@ impl WalletStorage for SqliteWalletStorage {
             )
             .map_err(|err| StorageError::SqliteFailed {
                 reason: format!("select_unspent_notes failed: {err}"),
-                is_retryable: false,
+                posture: FailurePosture::NotRetryable,
             })?;
 
             let mut rows = Vec::new();
@@ -1100,13 +1575,13 @@ impl WalletStorage for SqliteWalletStorage {
                 .prepare(RECEIVED_SHIELDED_NOTES_IN_RANGE_SQL)
                 .map_err(|err| StorageError::SqliteFailed {
                     reason: format!("received_shielded_notes prepare failed: {err}"),
-                    is_retryable: false,
+                    posture: FailurePosture::NotRetryable,
                 })?;
             let mapped = stmt
                 .query_map([from_h, to_h], decode_received_shielded_note_row)
                 .map_err(|err| StorageError::SqliteFailed {
                     reason: format!("received_shielded_notes query failed: {err}"),
-                    is_retryable: false,
+                    posture: FailurePosture::NotRetryable,
                 })?;
             collect_received_shielded_note_rows(mapped)
         })
@@ -1123,19 +1598,59 @@ impl WalletStorage for SqliteWalletStorage {
                 .prepare(RECEIVED_SHIELDED_NOTES_FOR_ACCOUNT_SQL)
                 .map_err(|err| StorageError::SqliteFailed {
                     reason: format!("list_shielded_receives prepare failed: {err}"),
-                    is_retryable: false,
+                    posture: FailurePosture::NotRetryable,
                 })?;
             let mapped = stmt
                 .query_map([&account_uuid_bytes], decode_received_shielded_note_row)
                 .map_err(|err| StorageError::SqliteFailed {
                     reason: format!("list_shielded_receives query failed: {err}"),
-                    is_retryable: false,
+                    posture: FailurePosture::NotRetryable,
                 })?;
             collect_received_shielded_note_rows(mapped)
         })
         .await
     }
 }
+
+/// Previously-exposed Unified Addresses for one account, in derivation order.
+///
+/// Bound to one account by uuid (`?1`); returns the encoded address string, the
+/// diversifier-index blob (big-endian), and the optional exposure height. Filtering to UA
+/// shape, decoding the diversifier index, and projecting to [`ExposedAddressRow`] happens
+/// in Rust so the SQL stays portable across `zcash_client_sqlite` migrations.
+///
+/// [`ExposedAddressRow`]: crate::ExposedAddressRow
+const EXPOSED_ADDRESSES_SQL: &str = "\
+    SELECT a.address, a.diversifier_index_be, a.exposed_at_height \
+    FROM addresses a \
+    JOIN accounts ac ON ac.id = a.account_id \
+    WHERE ac.uuid = ?1 \
+      AND a.exposed_at_height IS NOT NULL \
+    ORDER BY a.exposed_at_height ASC, a.diversifier_index_be ASC";
+
+/// Aggregate of unmatured wallet-owned coinbase transparent value at one target height.
+///
+/// Bound to one account by uuid (`?1`) and one target height (`?2`, conventionally
+/// `observed_tip + 1` to match `zcash_client_backend`'s `chain_tip + 1` convention).
+/// Returns the sum of `value_zat` across `transparent_received_outputs` whose producing
+/// transaction is coinbase and whose ZIP-213 100-block maturity window has not yet closed
+/// at `?2`. Outputs already consumed by a wallet-owned spending transaction are excluded
+/// regardless of whether that spend has confirmed, so a still-unconfirmed shielding tx that
+/// already spent the immature coinbase does not double-count its value: the `mature`
+/// half (from `unshielded_balance().spendable_value()`) excludes the same outputs.
+const IMMATURE_COINBASE_AGGREGATE_SQL: &str = "\
+    SELECT COALESCE(SUM(tro.value_zat), 0) \
+    FROM transparent_received_outputs tro \
+    JOIN transactions t ON t.id_tx = tro.transaction_id \
+    JOIN accounts a ON a.id = tro.account_id \
+    WHERE a.uuid = ?1 \
+      AND t.mined_height IS NOT NULL \
+      AND IFNULL(t.tx_index, 1) = 0 \
+      AND (CAST(?2 AS INTEGER) - t.mined_height) < 100 \
+      AND tro.id NOT IN ( \
+        SELECT s.transparent_received_output_id \
+        FROM transparent_received_output_spends s \
+      )";
 
 /// Per-pool receive query bounded by a mined-height window.
 ///
@@ -1252,35 +1767,35 @@ fn collect_received_shielded_note_rows(
             spent_our_inputs,
         ) = raw.map_err(|err| StorageError::SqliteFailed {
             reason: format!("received_shielded_notes row decode failed: {err}"),
-            is_retryable: false,
+            posture: FailurePosture::NotRetryable,
         })?;
         let txid_array: [u8; 32] =
             txid_bytes
                 .try_into()
                 .map_err(|raw: Vec<u8>| StorageError::SqliteFailed {
                     reason: format!("transactions.txid had wrong byte length: {}", raw.len()),
-                    is_retryable: false,
+                    posture: FailurePosture::NotRetryable,
                 })?;
         let account_uuid_array: [u8; 16] =
             account_uuid_bytes
                 .try_into()
                 .map_err(|raw: Vec<u8>| StorageError::SqliteFailed {
                     reason: format!("accounts.uuid had wrong byte length: {}", raw.len()),
-                    is_retryable: false,
+                    posture: FailurePosture::NotRetryable,
                 })?;
         let account_uuid = uuid::Uuid::from_bytes(account_uuid_array);
         let output_index = u32::try_from(output_index).map_err(|_| StorageError::SqliteFailed {
             reason: format!("received note output_index out of u32 range: {output_index}"),
-            is_retryable: false,
+            posture: FailurePosture::NotRetryable,
         })?;
         let value_zat = u64::try_from(value_zat).map_err(|_| StorageError::SqliteFailed {
             reason: format!("received note value out of u64 range: {value_zat}"),
-            is_retryable: false,
+            posture: FailurePosture::NotRetryable,
         })?;
         let mined_height_u32 =
             u32::try_from(mined_height).map_err(|_| StorageError::SqliteFailed {
                 reason: format!("transactions.mined_height out of u32 range: {mined_height}"),
-                is_retryable: false,
+                posture: FailurePosture::NotRetryable,
             })?;
         let protocol = match pool.as_str() {
             "sapling" => zcash_protocol::ShieldedProtocol::Sapling,
@@ -1288,7 +1803,7 @@ fn collect_received_shielded_note_rows(
             other => {
                 return Err(StorageError::SqliteFailed {
                     reason: format!("unknown pool tag: {other}"),
-                    is_retryable: false,
+                    posture: FailurePosture::NotRetryable,
                 });
             }
         };
@@ -1374,12 +1889,140 @@ where
     }
     StorageError::SqliteFailed {
         reason: format!("scan_cached_blocks failed: {err}"),
-        is_retryable: false,
+        posture: FailurePosture::NotRetryable,
     }
 }
 
 fn account_uuid_to_zally(uuid: AccountUuid) -> AccountId {
     AccountId::from_uuid(uuid.expose_uuid())
+}
+
+fn check_proposal_against_excluded_outpoints<FeeRuleT, N>(
+    proposal: &zcash_client_backend::proposal::Proposal<FeeRuleT, N>,
+    excluded: &std::collections::HashSet<zally_core::OutPoint>,
+    network: Network,
+    account_id: AccountId,
+) -> Result<(), StorageError> {
+    if excluded.is_empty() {
+        return Ok(());
+    }
+    let excluded_count = proposal
+        .steps()
+        .iter()
+        .flat_map(zcash_client_backend::proposal::Step::transparent_inputs)
+        .filter(|utxo| {
+            let prevout = utxo.outpoint();
+            let zally_outpoint = zally_core::OutPoint::new(
+                zally_core::TxId::from_bytes(*prevout.hash()),
+                prevout.n(),
+            );
+            excluded.contains(&zally_outpoint)
+        })
+        .count();
+    if excluded_count > 0 {
+        tracing::info!(
+            target: "zally::storage",
+            event = "transparent_inputs_filtered_pending_broadcast",
+            network = ?network,
+            account_id = %account_id.as_uuid(),
+            excluded_count = excluded_count,
+            pending_broadcast_count = excluded.len(),
+            "transparent inputs locked by pending broadcast were selected by upstream; refusing"
+        );
+        return Err(StorageError::SqliteFailed {
+            reason: format!(
+                "insufficient unlocked transparent inputs: {excluded_count} input(s) selected by upstream \
+                 are locked by a still-unconfirmed wallet-owned broadcast"
+            ),
+            posture: FailurePosture::Retryable,
+        });
+    }
+    Ok(())
+}
+
+fn clamp_unsigned_to_i64(unsigned: u64) -> i64 {
+    i64::try_from(unsigned).unwrap_or(i64::MAX)
+}
+
+/// Translates an upstream `zcash_protocol::value::Zatoshis` into Zally's `Zatoshis` newtype.
+///
+/// Both types carry a `MAX_MONEY`-bounded non-negative zatoshi count, so the conversion is
+/// total: `try_from` cannot fail because the upstream value's invariant already enforces
+/// the same cap Zally requires.
+fn upstream_to_zally_zatoshis(upstream: UpstreamZatoshis) -> Zatoshis {
+    Zatoshis::try_from(u64::from(upstream)).unwrap_or_else(|_| Zatoshis::zero())
+}
+
+/// Decodes a sqlite signed-integer zatoshi column into a typed `Zatoshis`, failing closed
+/// on a negative or above-`MAX_MONEY` value.
+fn decode_row_zatoshis(stored: i64, column: &'static str) -> Result<Zatoshis, StorageError> {
+    let positive = u64::try_from(stored).map_err(|_| StorageError::RowValueOutOfRange {
+        column,
+        raw: stored.to_string(),
+    })?;
+    Zatoshis::try_from(positive).map_err(|_| StorageError::RowValueOutOfRange {
+        column,
+        raw: positive.to_string(),
+    })
+}
+
+/// Reads the `ext_zally_observed_tip` row through `ledger` and decodes it into a typed
+/// `BlockHeight`. Returns `Ok(None)` when the wallet has never recorded an observed tip.
+fn find_observed_tip_on(
+    ledger: &rusqlite::Connection,
+) -> Result<Option<BlockHeight>, StorageError> {
+    let raw = ledger
+        .query_row(
+            "SELECT tip_height FROM ext_zally_observed_tip WHERE id = 0",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()
+        .map_err(|err| StorageError::SqliteFailed {
+            reason: format!("ext_zally_observed_tip lookup failed: {err}"),
+            posture: FailurePosture::NotRetryable,
+        })?;
+    raw.map(|tip_i64| {
+        u32::try_from(tip_i64).map(BlockHeight::from).map_err(|_| {
+            StorageError::RowValueOutOfRange {
+                column: "ext_zally_observed_tip.tip_height",
+                raw: tip_i64.to_string(),
+            }
+        })
+    })
+    .transpose()
+}
+
+fn decode_txid_bytes(bytes: Vec<u8>, label: &'static str) -> Result<TxId, StorageError> {
+    let array: [u8; 32] = bytes
+        .try_into()
+        .map_err(|raw: Vec<u8>| StorageError::SqliteFailed {
+            reason: format!("{label} had wrong byte length: {}", raw.len()),
+            posture: FailurePosture::NotRetryable,
+        })?;
+    Ok(TxId::from_bytes(array))
+}
+
+/// Decodes the big-endian diversifier-index blob stored on the addresses table.
+///
+/// Mirrors `zcash_client_sqlite::wallet::encoding::decode_diversifier_index_be`, which is
+/// crate-private upstream. The blob is 11 bytes, stored big-endian for index ordering;
+/// `DiversifierIndex` itself is little-endian internally.
+fn decode_diversifier_index_be(
+    di_be_bytes: Vec<u8>,
+) -> Result<zip32::DiversifierIndex, StorageError> {
+    let mut di_be: [u8; 11] =
+        di_be_bytes
+            .try_into()
+            .map_err(|raw: Vec<u8>| StorageError::SqliteFailed {
+                reason: format!(
+                    "addresses.diversifier_index_be had wrong byte length: {}",
+                    raw.len()
+                ),
+                posture: FailurePosture::NotRetryable,
+            })?;
+    di_be.reverse();
+    Ok(zip32::DiversifierIndex::from(di_be))
 }
 
 fn zally_to_account_uuid(id: AccountId) -> AccountUuid {
@@ -1399,14 +2042,14 @@ fn prepared_transactions_for_txids<'a>(
             .map_err(|e| map_sqlite_error(&e))?
             .ok_or_else(|| StorageError::SqliteFailed {
                 reason: format!("{context} tx {tx_id} not present in wallet store"),
-                is_retryable: false,
+                posture: FailurePosture::NotRetryable,
             })?;
         let mut raw_bytes = Vec::new();
         stored
             .write(&mut raw_bytes)
             .map_err(|err| StorageError::SqliteFailed {
                 reason: format!("transaction serialize failed: {err}"),
-                is_retryable: false,
+                posture: FailurePosture::NotRetryable,
             })?;
         prepared.push(crate::wallet_storage::PreparedTransaction::new(
             zally_core::TxId::from_bytes(*tx_id.as_ref()),
@@ -1419,12 +2062,12 @@ fn prepared_transactions_for_txids<'a>(
 fn transparent_utxo_row_to_output(
     row: crate::wallet_storage::TransparentUtxoRow,
 ) -> Result<WalletTransparentOutput, StorageError> {
-    let output_zat = Zatoshis::from_u64(row.value_zat).map_err(|_| {
+    let output_zat = UpstreamZatoshis::from_u64(row.value_zat).map_err(|_| {
         StorageError::TransparentOutputValueOutOfRange {
             value_zat: row.value_zat,
         }
     })?;
-    let outpoint = OutPoint::new(*row.tx_id.as_bytes(), row.output_index);
+    let outpoint = UpstreamOutPoint::new(*row.tx_id.as_bytes(), row.output_index);
     let txout = TxOut::new(
         output_zat,
         Script(zcash_script::script::Code(row.script_pub_key_bytes)),
@@ -1444,11 +2087,12 @@ fn map_sqlite_error<E: std::fmt::Display>(err: &E) -> StorageError {
     if lc.contains("already") || lc.contains("collide") || lc.contains("conflict") {
         return StorageError::AccountAlreadyExists;
     }
-    let is_retryable = lc.contains("locked") || lc.contains("busy");
-    StorageError::SqliteFailed {
-        reason,
-        is_retryable,
-    }
+    let posture = if lc.contains("locked") || lc.contains("busy") {
+        FailurePosture::Retryable
+    } else {
+        FailurePosture::NotRetryable
+    };
+    StorageError::SqliteFailed { reason, posture }
 }
 
 fn map_derivation_error(err: &KeyDerivationError) -> StorageError {

@@ -4,7 +4,7 @@ use zally_core::{BlockHeight, Network};
 use zally_keys::{AgeFileSealing, AgeFileSealingOptions};
 use zally_storage::{SqliteWalletStorage, SqliteWalletStorageOptions};
 use zally_testkit::TempWalletPath;
-use zally_wallet::{Wallet, WalletError};
+use zally_wallet::{Wallet, WalletError, WalletOptions};
 
 #[tokio::test]
 async fn create_then_create_returns_already_exists() -> Result<(), TestError> {
@@ -17,7 +17,15 @@ async fn create_then_create_returns_already_exists() -> Result<(), TestError> {
         temp.db_path(),
     ));
     let chain = zally_testkit::MockChainSource::new(network);
-    let _ = Wallet::create(&chain, network, sealing, storage, BlockHeight::from(1)).await?;
+    let _ = Wallet::create(
+        &chain,
+        network,
+        sealing,
+        storage,
+        BlockHeight::from(1),
+        WalletOptions::default(),
+    )
+    .await?;
 
     let sealing = AgeFileSealing::new(AgeFileSealingOptions::at_path(temp.seed_path()));
     let storage = SqliteWalletStorage::new(SqliteWalletStorageOptions::for_network(
@@ -25,7 +33,15 @@ async fn create_then_create_returns_already_exists() -> Result<(), TestError> {
         temp.db_path(),
     ));
     let chain = zally_testkit::MockChainSource::new(network);
-    let outcome = Wallet::create(&chain, network, sealing, storage, BlockHeight::from(1)).await;
+    let outcome = Wallet::create(
+        &chain,
+        network,
+        sealing,
+        storage,
+        BlockHeight::from(1),
+        WalletOptions::default(),
+    )
+    .await;
     assert!(matches!(outcome, Err(WalletError::AccountAlreadyExists)));
     Ok(())
 }

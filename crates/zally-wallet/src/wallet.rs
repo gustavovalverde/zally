@@ -17,6 +17,7 @@ use crate::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig, CircuitBreake
 use crate::event::{WalletEvent, WalletEventStream};
 use crate::retry::RetryPolicy;
 use crate::wallet_error::WalletError;
+use crate::wallet_options::WalletOptions;
 
 const EVENT_CHANNEL_CAPACITY: usize = 1024;
 
@@ -38,6 +39,7 @@ pub(crate) struct WalletInner {
     pub(crate) event_tx: broadcast::Sender<WalletEvent>,
     pub(crate) retry_policy: Mutex<RetryPolicy>,
     pub(crate) circuit_breaker: CircuitBreaker,
+    pub(crate) options: WalletOptions,
 }
 
 impl Wallet {
@@ -54,12 +56,17 @@ impl Wallet {
     /// Returns [`WalletError::NetworkMismatch`] if `network != storage.network()`.
     ///
     /// `requires_operator` on `AccountAlreadyExists`. `retryable` on transient I/O.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "every parameter is mandatory wallet-construction context; grouping them into a single struct would obscure the call site"
+    )]
     pub async fn create<S, St>(
         chain: &dyn ChainSource,
         network: Network,
         sealing: S,
         storage: St,
         birthday: BlockHeight,
+        options: WalletOptions,
     ) -> Result<(Self, AccountId, Mnemonic), WalletError>
     where
         S: SeedSealing,
@@ -115,6 +122,7 @@ impl Wallet {
             event_tx,
             retry_policy: Mutex::new(RetryPolicy::default()),
             circuit_breaker: CircuitBreaker::new(CircuitBreakerConfig::default()),
+            options,
         });
         Ok((Self { inner }, account_id, mnemonic))
     }
@@ -134,6 +142,7 @@ impl Wallet {
         network: Network,
         sealing: S,
         storage: St,
+        options: WalletOptions,
     ) -> Result<(Self, AccountId), WalletError>
     where
         S: SeedSealing,
@@ -173,6 +182,7 @@ impl Wallet {
             event_tx,
             retry_policy: Mutex::new(RetryPolicy::default()),
             circuit_breaker: CircuitBreaker::new(CircuitBreakerConfig::default()),
+            options,
         });
         Ok((Self { inner }, account_id))
     }
@@ -194,12 +204,17 @@ impl Wallet {
     /// [`WalletError::NetworkMismatch`] if `network != storage.network()`.
     ///
     /// `requires_operator` on `NoSealedSeed`. `retryable` on transient I/O.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "every parameter is mandatory wallet-construction context; grouping them into a single struct would obscure the call site"
+    )]
     pub async fn open_or_create_account<S, St>(
         chain: &dyn ChainSource,
         network: Network,
         sealing: S,
         storage: St,
         birthday: BlockHeight,
+        options: WalletOptions,
     ) -> Result<(Self, AccountId), WalletError>
     where
         S: SeedSealing,
@@ -250,6 +265,7 @@ impl Wallet {
             event_tx,
             retry_policy: Mutex::new(RetryPolicy::default()),
             circuit_breaker: CircuitBreaker::new(CircuitBreakerConfig::default()),
+            options,
         });
         Ok((Self { inner }, account_id))
     }
@@ -258,6 +274,12 @@ impl Wallet {
     #[must_use]
     pub fn network(&self) -> Network {
         self.inner.network
+    }
+
+    /// Returns the open-time options this wallet was constructed with.
+    #[must_use]
+    pub fn options(&self) -> WalletOptions {
+        self.inner.options
     }
 
     /// Returns the runtime capability descriptor. When the wallet's [`CircuitBreaker`] is
@@ -346,7 +368,7 @@ impl Wallet {
         let observed_tip = self
             .inner
             .storage
-            .lookup_observed_tip()
+            .find_observed_tip()
             .await
             .map_err(lift_storage_to_wallet_error)?;
         let target = observed_tip.unwrap_or_else(|| BlockHeight::from(0));
@@ -360,6 +382,99 @@ impl Wallet {
             .into_iter()
             .map(|row| translate_unspent_note(row, observed_tip))
             .collect())
+    }
+
+    /// Returns the snapshot of transparent outpoints currently locked by wallet-owned
+    /// broadcasts that have not yet been observed mined.
+    ///
+    /// The snapshot honours [`WalletOptions::pending_broadcast_window_ms`]: entries whose
+    /// `broadcast_at_ms` falls outside the window are excluded so a permanently-dropped
+    /// broadcast eventually frees its locked outpoints from the read view as well as the
+    /// spend filter.
+    ///
+    /// `not_retryable` on unknown account; `retryable` on transient storage I/O.
+    pub async fn get_pending_transparent_inputs(
+        &self,
+        account_id: AccountId,
+    ) -> Result<crate::pending_transparent_inputs::PendingTransparentInputs, WalletError> {
+        let after_at_ms =
+            current_unix_ms().saturating_sub(self.inner.options.pending_broadcast_window_ms);
+        let rows = self
+            .inner
+            .storage
+            .list_pending_broadcast_inputs(account_id, after_at_ms)
+            .await
+            .map_err(lift_storage_to_wallet_error)?;
+        let as_of_height = self
+            .inner
+            .storage
+            .find_observed_tip()
+            .await
+            .map_err(lift_storage_to_wallet_error)?;
+        let inputs = rows
+            .into_iter()
+            .map(translate_pending_broadcast_input)
+            .collect();
+        Ok(
+            crate::pending_transparent_inputs::PendingTransparentInputs {
+                network: self.inner.network,
+                account_id,
+                inputs,
+                as_of_height,
+            },
+        )
+    }
+
+    /// Returns every Unified Address previously exposed for `account_id`, in derivation
+    /// order (ascending by exposure height, then by diversifier index).
+    ///
+    /// Read-only counterpart to [`Wallet::derive_next_address`] and
+    /// [`Wallet::derive_next_address_with_transparent`]. Calling this method never advances
+    /// a diversifier index and never burns a BIP-44 transparent gap-limit slot, so it is
+    /// safe to call on every diagnostics poll.
+    ///
+    /// `not_retryable` on unknown account; `retryable` on transient storage I/O.
+    pub async fn list_exposed_addresses(
+        &self,
+        account_id: AccountId,
+    ) -> Result<Vec<crate::exposed_address::ExposedAddress>, WalletError> {
+        let rows = self
+            .inner
+            .storage
+            .list_exposed_addresses(account_id)
+            .await
+            .map_err(lift_storage_to_wallet_error)?;
+        let network = self.inner.network;
+        Ok(rows
+            .into_iter()
+            .map(|row| translate_exposed_address(row, network))
+            .collect())
+    }
+
+    /// Returns the per-pool balance snapshot for `account_id`, anchored to the wallet's
+    /// last observed chain tip.
+    ///
+    /// Composes the same persisted wallet rows that drive
+    /// [`Wallet::list_unspent_shielded_notes`] and the transparent UTXO refresh in
+    /// [`Wallet::sync`]; no chain call is made. Operators that need a fresher snapshot
+    /// should call [`Wallet::sync`] before this method.
+    ///
+    /// Transparent values split by ZIP-213 coinbase maturity computed against the
+    /// snapshot's `as_of_height` (the wallet's last observed tip). The mature half is what
+    /// [`Wallet::shield_transparent_funds`] is allowed to consume right now.
+    ///
+    /// `not_retryable` on unknown account; `retryable` on transient storage I/O.
+    pub async fn get_account_balance(
+        &self,
+        account_id: AccountId,
+    ) -> Result<crate::account_balance::AccountBalance, WalletError> {
+        let row = self
+            .inner
+            .storage
+            .get_account_balance(account_id)
+            .await
+            .map_err(lift_storage_to_wallet_error)?;
+        Ok(translate_account_balance(row, self.inner.network))
     }
 
     /// Returns every Sapling and Orchard note ever received by `account_id`, spent or
@@ -495,6 +610,51 @@ fn capability_for_storage<St: WalletStorage>() -> StorageCapability {
         StorageCapability::Sqlite
     } else {
         StorageCapability::Custom
+    }
+}
+
+pub(crate) fn current_unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0_u64, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+}
+
+fn translate_pending_broadcast_input(
+    row: zally_storage::PendingBroadcastInputRow,
+) -> crate::pending_transparent_inputs::PendingTransparentInput {
+    crate::pending_transparent_inputs::PendingTransparentInput {
+        outpoint: row.outpoint,
+        value_zat: row.value_zat,
+        broadcast_tx_id: row.broadcast_tx_id,
+        broadcast_at_ms: row.broadcast_at_ms,
+        broadcast_at_height: row.broadcast_at_height,
+    }
+}
+
+fn translate_exposed_address(
+    row: zally_storage::ExposedAddressRow,
+    network: Network,
+) -> crate::exposed_address::ExposedAddress {
+    crate::exposed_address::ExposedAddress {
+        network,
+        unified_address: row.unified_address,
+        diversifier_index: row.diversifier_index,
+        has_transparent_receiver: row.has_transparent_receiver,
+        exposed_at_height: row.exposed_at_height,
+    }
+}
+
+fn translate_account_balance(
+    row: zally_storage::AccountBalanceRow,
+    network: Network,
+) -> crate::account_balance::AccountBalance {
+    crate::account_balance::AccountBalance {
+        network,
+        sapling_zat: row.sapling_zat,
+        orchard_zat: row.orchard_zat,
+        transparent_mature_zat: row.transparent_mature_zat,
+        transparent_immature_zat: row.transparent_immature_zat,
+        as_of_height: row.as_of_height,
     }
 }
 

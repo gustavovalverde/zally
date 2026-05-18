@@ -23,7 +23,7 @@ use zally_chain::{ChainSource, ZinderChainSource, ZinderRemoteOptions};
 use zally_core::{BlockHeight, Network, PaymentRecipient, Zatoshis};
 use zally_keys::{AgeFileSealing, AgeFileSealingOptions};
 use zally_storage::{SqliteWalletStorage, SqliteWalletStorageOptions};
-use zally_wallet::{ProposalPlan, Wallet, WalletError};
+use zally_wallet::{ProposalPlan, Wallet, WalletError, WalletOptions};
 
 #[tokio::main]
 async fn main() -> Result<(), ExampleError> {
@@ -73,6 +73,7 @@ async fn main() -> Result<(), ExampleError> {
         sealing,
         storage,
         BlockHeight::from(tip.as_u32().saturating_sub(1).max(1)),
+        WalletOptions::default(),
     )
     .await?;
 

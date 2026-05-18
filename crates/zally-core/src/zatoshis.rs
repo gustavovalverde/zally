@@ -26,6 +26,21 @@ impl Zatoshis {
     pub const fn as_u64(self) -> u64 {
         self.0
     }
+
+    /// Returns the sum of `self` and `rhs`, saturating at [`Zatoshis::MAX`].
+    ///
+    /// Sums within a single wallet account stay below `MAX_MONEY` by Zcash protocol
+    /// invariant; the saturating behaviour exists so cross-account aggregates never
+    /// produce a value above `MAX_MONEY` even when callers compose totals loosely.
+    #[must_use]
+    pub const fn saturating_add(self, rhs: Self) -> Self {
+        let sum = self.0.saturating_add(rhs.0);
+        if sum > Self::MAX.0 {
+            Self::MAX
+        } else {
+            Self(sum)
+        }
+    }
 }
 
 impl TryFrom<u64> for Zatoshis {

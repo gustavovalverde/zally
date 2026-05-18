@@ -14,7 +14,7 @@ use zally_core::{BlockHeight, Network, TxId};
 use zally_storage::{SqliteWalletStorage, SqliteWalletStorageOptions};
 use zally_testkit::{InMemorySealing, MockChainSource, TempWalletPath};
 use zally_wallet::{
-    SyncDriver, SyncDriverOptions, SyncDriverStatus, SyncStatus, Wallet, WalletError,
+    SyncDriver, SyncDriverOptions, SyncDriverStatus, SyncStatus, Wallet, WalletError, WalletOptions,
 };
 use zcash_client_backend::proto::service::TreeState;
 
@@ -35,6 +35,7 @@ async fn sync_driver_wakes_from_chain_event() -> Result<(), TestError> {
         sealing,
         storage,
         BlockHeight::from(1),
+        WalletOptions::default(),
     )
     .await?;
 
@@ -78,8 +79,15 @@ async fn close_returns_while_sync_attempt_is_blocked() -> Result<(), TestError> 
         temp.db_path(),
     ));
     let chain = MockChainSource::new(network);
-    let (wallet, _, _) =
-        Wallet::create(&chain, network, sealing, storage, BlockHeight::from(1)).await?;
+    let (wallet, _, _) = Wallet::create(
+        &chain,
+        network,
+        sealing,
+        storage,
+        BlockHeight::from(1),
+        WalletOptions::default(),
+    )
+    .await?;
 
     let chain_source: Arc<dyn ChainSource> = Arc::new(StalledChainSource::new(network));
     let driver = SyncDriver::new(
