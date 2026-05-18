@@ -11,34 +11,22 @@ use zally_chain::{
     TransactionStatus, TransparentUtxo,
 };
 use zally_core::{BlockHeight, Network, TxId};
-use zally_storage::{SqliteWalletStorage, SqliteWalletStorageOptions};
-use zally_testkit::{InMemorySealing, MockChainSource, TempWalletPath};
-use zally_wallet::{
-    SyncDriver, SyncDriverOptions, SyncDriverStatus, SyncStatus, Wallet, WalletError, WalletOptions,
-};
+use zally_testkit::MockChainSource;
+use zally_wallet::{SyncDriver, SyncDriverOptions, SyncDriverStatus, SyncStatus, WalletError};
 use zcash_client_backend::proto::service::TreeState;
+
+use super::fixtures::{TestWalletFixture, create_test_wallet};
 
 #[tokio::test]
 async fn sync_driver_wakes_from_chain_event() -> Result<(), TestError> {
-    let temp = TempWalletPath::create()?;
-    let network = Network::regtest();
+    let TestWalletFixture {
+        temp: _temp,
+        wallet,
+        account_id: _account_id,
+    } = create_test_wallet().await?;
+    let network = wallet.network();
 
-    let sealing = InMemorySealing::new();
-    let storage = SqliteWalletStorage::new(SqliteWalletStorageOptions::for_network(
-        network,
-        temp.db_path(),
-    ));
     let chain = Arc::new(MockChainSource::new(network));
-    let (wallet, _, _) = Wallet::create(
-        chain.as_ref(),
-        network,
-        sealing,
-        storage,
-        BlockHeight::from(1),
-        WalletOptions::default(),
-    )
-    .await?;
-
     let chain_handle = chain.handle();
     let chain_source: Arc<dyn ChainSource> = chain;
     let driver = SyncDriver::new(
@@ -70,24 +58,12 @@ async fn sync_driver_wakes_from_chain_event() -> Result<(), TestError> {
 
 #[tokio::test]
 async fn close_returns_while_sync_attempt_is_blocked() -> Result<(), TestError> {
-    let temp = TempWalletPath::create()?;
-    let network = Network::regtest();
-
-    let sealing = InMemorySealing::new();
-    let storage = SqliteWalletStorage::new(SqliteWalletStorageOptions::for_network(
-        network,
-        temp.db_path(),
-    ));
-    let chain = MockChainSource::new(network);
-    let (wallet, _, _) = Wallet::create(
-        &chain,
-        network,
-        sealing,
-        storage,
-        BlockHeight::from(1),
-        WalletOptions::default(),
-    )
-    .await?;
+    let TestWalletFixture {
+        temp: _temp,
+        wallet,
+        account_id: _account_id,
+    } = create_test_wallet().await?;
+    let network = wallet.network();
 
     let chain_source: Arc<dyn ChainSource> = Arc::new(StalledChainSource::new(network));
     let driver = SyncDriver::new(
@@ -217,8 +193,8 @@ impl ChainSource for StalledChainSource {
 
 #[derive(Debug, thiserror::Error)]
 enum TestError {
-    #[error("io error: {0}")]
-    Io(#[from] std::io::Error),
+    #[error("test wallet error: {0}")]
+    Fixture(#[from] super::fixtures::TestWalletError),
     #[error("wallet error: {0}")]
     Wallet(#[from] WalletError),
     #[error("sync snapshot stream closed")]

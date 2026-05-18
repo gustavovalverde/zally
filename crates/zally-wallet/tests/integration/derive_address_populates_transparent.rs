@@ -1,32 +1,15 @@
 //! Regression: `Wallet::derive_next_address_with_transparent` returns a Unified Address
 //! whose transparent receiver is populated.
 
-use zally_core::{BlockHeight, Network};
-use zally_keys::{AgeFileSealing, AgeFileSealingOptions};
-use zally_storage::{SqliteWalletStorage, SqliteWalletStorageOptions};
-use zally_testkit::TempWalletPath;
-use zally_wallet::{Wallet, WalletError, WalletOptions};
+use super::fixtures::{TestWalletError, TestWalletFixture, create_test_wallet};
 
 #[tokio::test]
-async fn derive_address_populates_transparent() -> Result<(), TestError> {
-    let temp = TempWalletPath::create()?;
-    let network = Network::regtest();
-
-    let sealing = AgeFileSealing::new(AgeFileSealingOptions::at_path(temp.seed_path()));
-    let storage = SqliteWalletStorage::new(SqliteWalletStorageOptions::for_network(
-        network,
-        temp.db_path(),
-    ));
-    let chain = zally_testkit::MockChainSource::new(network);
-    let (wallet, account_id, _mnemonic) = Wallet::create(
-        &chain,
-        network,
-        sealing,
-        storage,
-        BlockHeight::from(1),
-        WalletOptions::default(),
-    )
-    .await?;
+async fn derive_address_populates_transparent() -> Result<(), TestWalletError> {
+    let TestWalletFixture {
+        temp: _temp,
+        wallet,
+        account_id,
+    } = create_test_wallet().await?;
 
     // The upstream BIP-44 transparent gap limit defaults to 10 and pre-generates the gap
     // ahead of the reserved address, so a single
@@ -42,12 +25,4 @@ async fn derive_address_populates_transparent() -> Result<(), TestError> {
         "derive_next_address_with_transparent returned a UA without a transparent receiver"
     );
     Ok(())
-}
-
-#[derive(Debug, thiserror::Error)]
-enum TestError {
-    #[error("io error: {0}")]
-    Io(#[from] std::io::Error),
-    #[error("wallet error: {0}")]
-    Wallet(#[from] WalletError),
 }

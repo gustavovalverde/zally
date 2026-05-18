@@ -12,6 +12,6 @@ pub use age_file_sealing::{AgeFileSealing, AgeFileSealingOptions};
 pub use mnemonic::{Mnemonic, MnemonicError};
 #[cfg(feature = "unsafe_plaintext_seed")]
 pub use plaintext_sealing::PlaintextSealing;
-pub use sealing::{SealingError, SeedSealing};
+pub use sealing::{SealingError, SealingKind, SeedSealing};
 pub use seed_material::{SeedMaterial, SeedMaterialError};
 pub use ufvk::{KeyDerivationError, derive_ufvk};

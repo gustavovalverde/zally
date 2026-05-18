@@ -27,6 +27,10 @@ impl PlaintextSealing {
 
 #[async_trait]
 impl SeedSealing for PlaintextSealing {
+    fn kind(&self) -> crate::SealingKind {
+        crate::SealingKind::Plaintext
+    }
+
     async fn seal_seed(&self, seed: &SeedMaterial) -> Result<(), SealingError> {
         let path = self.seed_path.clone();
         let bytes = seed.expose_secret().to_vec();

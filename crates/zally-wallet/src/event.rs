@@ -60,8 +60,8 @@ pub enum WalletEvent {
         tx_id: TxId,
         /// Output index of the note within its transaction's bundle.
         output_index: u32,
-        /// Note value in zatoshis.
-        value_zat: u64,
+        /// Note value.
+        value_zat: zally_core::Zatoshis,
         /// Block height the note was mined at.
         mined_height: BlockHeight,
         /// Block header timestamp in milliseconds (Unix epoch).

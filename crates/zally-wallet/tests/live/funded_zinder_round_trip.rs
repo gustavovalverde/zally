@@ -19,7 +19,7 @@ use zally_testkit::{
 };
 use zally_wallet::{
     ProposalPlan, SendPaymentPlan, ShieldTransparentPlan, SyncDriver, SyncDriverOptions,
-    SyncHandle, SyncSnapshotStream, SyncStatus, Wallet, WalletError, WalletOptions,
+    SyncHandle, SyncSnapshotStream, SyncStatus, Wallet, WalletError,
 };
 use zcash_protocol::{
     consensus::BlockHeight as ConsensusBlockHeight,
@@ -317,15 +317,9 @@ async fn create_wallet_at_tip(
         temp.db_path(),
     ));
     let birthday = BlockHeight::from(tip_height.as_u32().saturating_sub(10).max(1));
-    let (wallet, account_id, _mnemonic) = Wallet::create(
-        chain,
-        network,
-        sealing,
-        storage,
-        birthday,
-        WalletOptions::default(),
-    )
-    .await?;
+    let (wallet, account_id, _mnemonic) = Wallet::builder(network, sealing, storage)
+        .create(chain, birthday)
+        .await?;
     Ok((temp, wallet, account_id))
 }
 

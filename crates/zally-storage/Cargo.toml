@@ -12,19 +12,22 @@ categories.workspace = true
 
 [features]
 default = []
-serde = ["zally-core/serde"]
+serde = ["dep:serde", "zally-core/serde", "zally-keys/serde"]
 
 [dependencies]
 async-trait.workspace = true
 rand.workspace = true
 rusqlite.workspace = true
 secrecy.workspace = true
+serde = { workspace = true, optional = true }
 thiserror.workspace = true
 tokio = { workspace = true, features = ["sync", "rt"] }
 tracing.workspace = true
 zally-core = { path = "../zally-core", version = "0.1" }
 zally-keys = { path = "../zally-keys", version = "0.1" }
 pczt = { workspace = true }
+orchard.workspace = true
+sapling.workspace = true
 zcash_client_backend = { workspace = true, features = ["orchard", "transparent-inputs", "pczt"] }
 zcash_client_sqlite = { workspace = true, features = ["orchard", "transparent-inputs", "serde"] }
 zcash_keys = { workspace = true, features = ["orchard", "sapling", "transparent-inputs"] }

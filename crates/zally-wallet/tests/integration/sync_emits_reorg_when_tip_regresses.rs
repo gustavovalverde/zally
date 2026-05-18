@@ -2,32 +2,20 @@
 //! observed below the wallet's prior fully-scanned height across syncs.
 
 use zally_chain::ChainSource as _;
-use zally_core::{BlockHeight, Network};
-use zally_keys::{AgeFileSealing, AgeFileSealingOptions};
-use zally_storage::{SqliteWalletStorage, SqliteWalletStorageOptions};
-use zally_testkit::{MockChainSource, TempWalletPath};
-use zally_wallet::{Wallet, WalletError, WalletEvent, WalletOptions};
+use zally_core::BlockHeight;
+use zally_testkit::MockChainSource;
+use zally_wallet::{WalletError, WalletEvent};
+
+use super::fixtures::{TestWalletFixture, create_test_wallet};
 
 #[tokio::test]
 async fn sync_emits_reorg_when_tip_regresses() -> Result<(), TestError> {
-    let temp = TempWalletPath::create()?;
-    let network = Network::regtest();
-
-    let sealing = AgeFileSealing::new(AgeFileSealingOptions::at_path(temp.seed_path()));
-    let storage = SqliteWalletStorage::new(SqliteWalletStorageOptions::for_network(
-        network,
-        temp.db_path(),
-    ));
-    let chain = zally_testkit::MockChainSource::new(network);
-    let (wallet, _account_id, _mnemonic) = Wallet::create(
-        &chain,
-        network,
-        sealing,
-        storage,
-        BlockHeight::from(1),
-        WalletOptions::default(),
-    )
-    .await?;
+    let TestWalletFixture {
+        temp: _temp,
+        wallet,
+        account_id: _account_id,
+    } = create_test_wallet().await?;
+    let network = wallet.network();
     let mut events = wallet.observe();
 
     let chain = MockChainSource::new(network);
@@ -64,8 +52,8 @@ async fn sync_emits_reorg_when_tip_regresses() -> Result<(), TestError> {
 
 #[derive(Debug, thiserror::Error)]
 enum TestError {
-    #[error("io error: {0}")]
-    Io(#[from] std::io::Error),
+    #[error("test wallet error: {0}")]
+    Fixture(#[from] super::fixtures::TestWalletError),
     #[error("wallet error: {0}")]
     Wallet(#[from] WalletError),
     #[error("chain source error: {reason}")]

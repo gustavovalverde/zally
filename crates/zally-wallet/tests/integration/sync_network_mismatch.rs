@@ -3,7 +3,7 @@
 use zally_core::{BlockHeight, Network};
 use zally_storage::{SqliteWalletStorage, SqliteWalletStorageOptions};
 use zally_testkit::{InMemorySealing, MockChainSource, TempWalletPath};
-use zally_wallet::{Wallet, WalletError, WalletOptions};
+use zally_wallet::{Wallet, WalletError};
 
 #[tokio::test]
 async fn sync_network_mismatch_fails_closed() -> Result<(), TestError> {
@@ -16,15 +16,9 @@ async fn sync_network_mismatch_fails_closed() -> Result<(), TestError> {
         temp.db_path(),
     ));
     let chain = zally_testkit::MockChainSource::new(regtest);
-    let (wallet, _, _) = Wallet::create(
-        &chain,
-        regtest,
-        sealing,
-        storage,
-        BlockHeight::from(1),
-        WalletOptions::default(),
-    )
-    .await?;
+    let (wallet, _, _) = Wallet::builder(regtest, sealing, storage)
+        .create(&chain, BlockHeight::from(1))
+        .await?;
 
     let chain = MockChainSource::new(Network::Mainnet);
     let outcome = wallet.sync(&chain).await;

@@ -13,7 +13,7 @@ use tracing_subscriber::EnvFilter;
 use zally_core::{BlockHeight, IdempotencyKey, Network};
 use zally_keys::{AgeFileSealing, AgeFileSealingOptions};
 use zally_storage::{SqliteWalletStorage, SqliteWalletStorageOptions};
-use zally_wallet::{ProposalPlan, Wallet, WalletError, WalletOptions};
+use zally_wallet::{ProposalPlan, Wallet, WalletError};
 
 #[tokio::main]
 async fn main() -> Result<(), ExampleError> {
@@ -33,15 +33,9 @@ async fn main() -> Result<(), ExampleError> {
         temp.path().join("wallet.db"),
     ));
     let chain = zally_testkit::MockChainSource::new(network);
-    let (wallet, account_id, _mnemonic) = Wallet::create(
-        &chain,
-        network,
-        sealing,
-        storage,
-        BlockHeight::from(1),
-        WalletOptions::default(),
-    )
-    .await?;
+    let (wallet, account_id, _mnemonic) = Wallet::builder(network, sealing, storage)
+        .create(&chain, BlockHeight::from(1))
+        .await?;
 
     let idempotency = IdempotencyKey::try_from("invoice-2026-05-13-abc-123")
         .map_err(|err| ExampleError::Idempotency(err.to_string()))?;
@@ -84,8 +78,8 @@ async fn main() -> Result<(), ExampleError> {
             warn!(
                 target: "zally::example",
                 event = "proposal_short_circuited_insufficient_balance",
-                requested_zat,
-                spendable_zat,
+                requested_zat = requested_zat.as_u64(),
+                spendable_zat = spendable_zat.as_u64(),
                 "proposal rejected: wallet has no spendable balance against the empty test storage"
             );
         }

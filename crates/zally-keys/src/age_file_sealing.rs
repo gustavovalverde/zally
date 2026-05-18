@@ -57,6 +57,10 @@ impl AgeFileSealing {
 
 #[async_trait]
 impl SeedSealing for AgeFileSealing {
+    fn kind(&self) -> crate::SealingKind {
+        crate::SealingKind::AgeFile
+    }
+
     async fn seal_seed(&self, seed: &SeedMaterial) -> Result<(), SealingError> {
         let seed_path = self.options.seed_path.clone();
         let identity_path = self.identity_path();

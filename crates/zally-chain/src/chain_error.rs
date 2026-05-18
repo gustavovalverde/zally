@@ -15,12 +15,12 @@ use zally_core::{BlockHeight, FailurePosture, Network};
 #[cfg(feature = "zinder")]
 use zinder_client::{IndexerError, RetryPolicy as IndexerRetryPolicy};
 
-#[cfg(feature = "zinder")]
 /// Maps a zinder `IndexerRetryPolicy` onto a [`FailurePosture`].
 ///
 /// Defined here rather than on `FailurePosture` so `zally-core` does not learn about the
 /// zinder client. The mapping picks `RequiresOperator` for any future unknown variant so a
 /// new retry class never silently masquerades as `Retryable`.
+#[cfg(feature = "zinder")]
 pub(crate) fn posture_for_indexer(policy: IndexerRetryPolicy) -> FailurePosture {
     #[allow(
         clippy::wildcard_enum_match_arm,

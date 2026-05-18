@@ -3,12 +3,18 @@
 use std::collections::BTreeSet;
 
 use zally_core::Network;
+/// Re-export of [`zally_keys::SealingKind`] so [`WalletCapabilities`] consumers don't have
+/// to pull `zally-keys` directly.
+pub use zally_keys::SealingKind as SealingCapability;
+/// Re-export of [`zally_storage::StorageKind`] so [`WalletCapabilities`] consumers don't
+/// have to pull `zally-storage` directly.
+pub use zally_storage::StorageKind as StorageCapability;
 
 /// Runtime descriptor of supported wallet features.
 ///
-/// Integrations read this at runtime to feature-detect supported sealing implementations, storage
-/// backends, and protocol coverage without pinning a Zally version. New capabilities are
-/// additive enum variants under `#[non_exhaustive]`.
+/// Integrations read this at runtime to feature-detect supported sealing implementations,
+/// storage backends, and protocol coverage without pinning a Zally version. New
+/// capabilities are additive enum variants under `#[non_exhaustive]`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[non_exhaustive]
@@ -21,33 +27,6 @@ pub struct WalletCapabilities {
     pub storage: StorageCapability,
     /// Protocol features advertised by this wallet build.
     pub features: BTreeSet<Capability>,
-}
-
-/// The sealing implementation behind a [`crate::Wallet`].
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-#[non_exhaustive]
-pub enum SealingCapability {
-    /// Age-encrypted file sealing (`zally_keys::AgeFileSealing`).
-    AgeFile,
-    /// In-memory sealing (`zally_testkit::InMemorySealing`). Tests only.
-    InMemory,
-    /// Plaintext seed storage. Available only behind the `unsafe_plaintext_seed` feature.
-    #[cfg(feature = "unsafe_plaintext_seed")]
-    Plaintext,
-    /// A custom sealing implementation provided by the operator.
-    Custom,
-}
-
-/// The storage backend behind a [`crate::Wallet`].
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-#[non_exhaustive]
-pub enum StorageCapability {
-    /// `zally_storage::SqliteWalletStorage`.
-    Sqlite,
-    /// A custom storage implementation provided by the operator.
-    Custom,
 }
 
 /// A protocol capability advertised by Zally.

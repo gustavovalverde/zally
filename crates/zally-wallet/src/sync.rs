@@ -936,10 +936,19 @@ impl Wallet {
                         },
                     ));
                 }
+                let value_zat = zally_core::Zatoshis::try_from(utxo.value_zat).map_err(|_| {
+                    WalletError::ChainSource(ChainSourceError::MalformedCompactBlock {
+                        block_height: utxo.confirmed_at_height,
+                        reason: format!(
+                            "transparent UTXO value {} exceeds MAX_MONEY for account {:?}",
+                            utxo.value_zat, receiver.account_id
+                        ),
+                    })
+                })?;
                 transparent_utxo_rows.push(TransparentUtxoRow::new(
                     utxo.tx_id,
                     utxo.output_index,
-                    utxo.value_zat,
+                    value_zat,
                     utxo.confirmed_at_height,
                     utxo.script_pub_key_bytes,
                 ));

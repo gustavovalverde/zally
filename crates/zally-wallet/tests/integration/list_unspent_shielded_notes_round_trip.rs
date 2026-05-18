@@ -5,32 +5,19 @@
 //! method returns an empty list and does not error.
 
 use zally_chain::ChainSource as _;
-use zally_core::{BlockHeight, Network};
-use zally_keys::{AgeFileSealing, AgeFileSealingOptions};
-use zally_storage::{SqliteWalletStorage, SqliteWalletStorageOptions};
-use zally_testkit::{MockChainSource, TempWalletPath};
-use zally_wallet::{Wallet, WalletError, WalletOptions};
+use zally_core::BlockHeight;
+use zally_testkit::MockChainSource;
+use zally_wallet::WalletError;
+
+use super::fixtures::{TestWalletFixture, create_test_wallet};
 
 #[tokio::test]
 async fn list_unspent_shielded_notes_returns_empty_on_fresh_wallet() -> Result<(), TestError> {
-    let temp = TempWalletPath::create()?;
-    let network = Network::regtest();
-
-    let sealing = AgeFileSealing::new(AgeFileSealingOptions::at_path(temp.seed_path()));
-    let storage = SqliteWalletStorage::new(SqliteWalletStorageOptions::for_network(
-        network,
-        temp.db_path(),
-    ));
-    let chain = zally_testkit::MockChainSource::new(network);
-    let (wallet, account_id, _mnemonic) = Wallet::create(
-        &chain,
-        network,
-        sealing,
-        storage,
-        BlockHeight::from(1),
-        WalletOptions::default(),
-    )
-    .await?;
+    let TestWalletFixture {
+        temp: _temp,
+        wallet,
+        account_id,
+    } = create_test_wallet().await?;
 
     let notes = wallet.list_unspent_shielded_notes(account_id).await?;
     assert!(notes.is_empty(), "fresh wallet must have no unspent notes");
@@ -39,24 +26,12 @@ async fn list_unspent_shielded_notes_returns_empty_on_fresh_wallet() -> Result<(
 
 #[tokio::test]
 async fn list_unspent_shielded_notes_uses_observed_tip_after_sync() -> Result<(), TestError> {
-    let temp = TempWalletPath::create()?;
-    let network = Network::regtest();
-
-    let sealing = AgeFileSealing::new(AgeFileSealingOptions::at_path(temp.seed_path()));
-    let storage = SqliteWalletStorage::new(SqliteWalletStorageOptions::for_network(
-        network,
-        temp.db_path(),
-    ));
-    let chain = zally_testkit::MockChainSource::new(network);
-    let (wallet, account_id, _mnemonic) = Wallet::create(
-        &chain,
-        network,
-        sealing,
-        storage,
-        BlockHeight::from(1),
-        WalletOptions::default(),
-    )
-    .await?;
+    let TestWalletFixture {
+        temp: _temp,
+        wallet,
+        account_id,
+    } = create_test_wallet().await?;
+    let network = wallet.network();
 
     // Advance the wallet's observed tip via sync; the MockChainSource returns an empty
     // block stream so no notes get persisted, but observed_tip lands.
@@ -76,8 +51,8 @@ async fn list_unspent_shielded_notes_uses_observed_tip_after_sync() -> Result<()
 
 #[derive(Debug, thiserror::Error)]
 enum TestError {
-    #[error("io error: {0}")]
-    Io(#[from] std::io::Error),
+    #[error("test wallet error: {0}")]
+    Fixture(#[from] super::fixtures::TestWalletError),
     #[error("wallet error: {0}")]
     Wallet(#[from] WalletError),
     #[error("chain source error: {reason}")]

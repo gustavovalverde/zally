@@ -1,5 +1,11 @@
 //! Integration tests.
 
+#[allow(
+    dead_code,
+    reason = "fixture helpers are consumed test-by-test; not every test uses every helper"
+)]
+mod fixtures;
+
 mod capabilities_reports;
 mod circuit_breaker_opens_after_threshold;
 mod create_then_create_returns_already_exists;

@@ -2,42 +2,33 @@
 //! when the supplied `IdempotencyKey` is already recorded in the ledger.
 
 use zally_core::{
-    BlockHeight, IdempotencyKey, IdempotencyKeyError, Network, PaymentRecipient, TxId, Zatoshis,
-    ZatoshisError,
+    IdempotencyKey, IdempotencyKeyError, PaymentRecipient, TxId, Zatoshis, ZatoshisError,
 };
-use zally_keys::{AgeFileSealing, AgeFileSealingOptions};
 use zally_storage::{SqliteWalletStorage, SqliteWalletStorageOptions, StorageError, WalletStorage};
-use zally_testkit::{MockSubmitter, TempWalletPath};
-use zally_wallet::{SendPaymentPlan, Wallet, WalletError, WalletOptions};
+use zally_testkit::MockSubmitter;
+use zally_wallet::{SendPaymentPlan, WalletError};
+
+use super::fixtures::{TestWalletFixture, create_test_wallet};
 
 #[tokio::test]
 async fn send_payment_short_circuits_on_known_idempotency_key() -> Result<(), TestError> {
-    let temp = TempWalletPath::create()?;
-    let network = Network::regtest();
+    let TestWalletFixture {
+        temp,
+        wallet,
+        account_id,
+    } = create_test_wallet().await?;
+    let network = wallet.network();
 
-    let sealing = AgeFileSealing::new(AgeFileSealingOptions::at_path(temp.seed_path()));
+    let known_key = IdempotencyKey::try_from("invoice-deadbeef-1")?;
+    let prior_tx_id = TxId::from_bytes([0xCC_u8; 32]);
     let storage = SqliteWalletStorage::new(SqliteWalletStorageOptions::for_network(
         network,
         temp.db_path(),
     ));
     storage.open_or_create().await?;
-
-    let known_key = IdempotencyKey::try_from("invoice-deadbeef-1")?;
-    let prior_tx_id = TxId::from_bytes([0xCC_u8; 32]);
     storage
         .record_idempotent_submission(known_key.clone(), prior_tx_id)
         .await?;
-
-    let chain = zally_testkit::MockChainSource::new(network);
-    let (wallet, account_id, _mnemonic) = Wallet::create(
-        &chain,
-        network,
-        sealing,
-        storage,
-        BlockHeight::from(1),
-        WalletOptions::default(),
-    )
-    .await?;
 
     let recipient_ua = wallet.derive_next_address(account_id).await?;
     let encoded = recipient_ua.encode(&network.to_parameters());
@@ -67,8 +58,8 @@ async fn send_payment_short_circuits_on_known_idempotency_key() -> Result<(), Te
 
 #[derive(Debug, thiserror::Error)]
 enum TestError {
-    #[error("io error: {0}")]
-    Io(#[from] std::io::Error),
+    #[error("test wallet error: {0}")]
+    Fixture(#[from] super::fixtures::TestWalletError),
     #[error("wallet error: {0}")]
     Wallet(#[from] WalletError),
     #[error("storage error: {0}")]

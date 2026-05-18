@@ -2,13 +2,14 @@
 //! storage, honours the configured inflight window, and clears on confirmation.
 
 use zally_chain::ChainSource as _;
-use zally_core::{BlockHeight, Network, OutPoint, TxId, Zatoshis};
-use zally_keys::{AgeFileSealing, AgeFileSealingOptions};
+use zally_core::{BlockHeight, OutPoint, TxId, Zatoshis};
 use zally_storage::{
     PendingBroadcastRecord, SqliteWalletStorage, SqliteWalletStorageOptions, WalletStorage,
 };
-use zally_testkit::{MockChainSource, TempWalletPath};
-use zally_wallet::{Wallet, WalletError, WalletOptions};
+use zally_testkit::MockChainSource;
+use zally_wallet::{WalletError, WalletOptions};
+
+use super::fixtures::{TestWalletFixture, create_test_wallet, create_test_wallet_with_options};
 
 fn unix_ms_now() -> u64 {
     std::time::SystemTime::now()
@@ -18,24 +19,12 @@ fn unix_ms_now() -> u64 {
 
 #[tokio::test]
 async fn get_pending_transparent_inputs_returns_empty_on_fresh_wallet() -> Result<(), TestError> {
-    let temp = TempWalletPath::create()?;
-    let network = Network::regtest();
-
-    let sealing = AgeFileSealing::new(AgeFileSealingOptions::at_path(temp.seed_path()));
-    let storage = SqliteWalletStorage::new(SqliteWalletStorageOptions::for_network(
-        network,
-        temp.db_path(),
-    ));
-    let chain = MockChainSource::new(network);
-    let (wallet, account_id, _mnemonic) = Wallet::create(
-        &chain,
-        network,
-        sealing,
-        storage,
-        BlockHeight::from(1),
-        WalletOptions::default(),
-    )
-    .await?;
+    let TestWalletFixture {
+        temp: _temp,
+        wallet,
+        account_id,
+    } = create_test_wallet().await?;
+    let network = wallet.network();
 
     let snapshot = wallet.get_pending_transparent_inputs(account_id).await?;
     assert!(
@@ -50,24 +39,17 @@ async fn get_pending_transparent_inputs_returns_empty_on_fresh_wallet() -> Resul
 
 #[tokio::test]
 async fn get_pending_transparent_inputs_reports_recorded_rows() -> Result<(), TestError> {
-    let temp = TempWalletPath::create()?;
-    let network = Network::regtest();
-
+    let TestWalletFixture {
+        temp,
+        wallet,
+        account_id,
+    } = create_test_wallet().await?;
+    let network = wallet.network();
     let storage = SqliteWalletStorage::new(SqliteWalletStorageOptions::for_network(
         network,
         temp.db_path(),
     ));
-    let sealing = AgeFileSealing::new(AgeFileSealingOptions::at_path(temp.seed_path()));
-    let chain = MockChainSource::new(network);
-    let (wallet, account_id, _mnemonic) = Wallet::create(
-        &chain,
-        network,
-        sealing,
-        storage.clone(),
-        BlockHeight::from(1),
-        WalletOptions::default(),
-    )
-    .await?;
+    storage.open_or_create().await?;
 
     let now_ms = unix_ms_now();
     let broadcast_tx_id = TxId::from_bytes([1_u8; 32]);
@@ -98,25 +80,18 @@ async fn get_pending_transparent_inputs_reports_recorded_rows() -> Result<(), Te
 
 #[tokio::test]
 async fn get_pending_transparent_inputs_drops_rows_outside_window() -> Result<(), TestError> {
-    let temp = TempWalletPath::create()?;
-    let network = Network::regtest();
-
+    let options = WalletOptions::default().with_pending_broadcast_window_ms(60_000);
+    let TestWalletFixture {
+        temp,
+        wallet,
+        account_id,
+    } = create_test_wallet_with_options(options).await?;
+    let network = wallet.network();
     let storage = SqliteWalletStorage::new(SqliteWalletStorageOptions::for_network(
         network,
         temp.db_path(),
     ));
-    let sealing = AgeFileSealing::new(AgeFileSealingOptions::at_path(temp.seed_path()));
-    let chain = MockChainSource::new(network);
-    let options = WalletOptions::default().with_pending_broadcast_window_ms(60_000);
-    let (wallet, account_id, _mnemonic) = Wallet::create(
-        &chain,
-        network,
-        sealing,
-        storage.clone(),
-        BlockHeight::from(1),
-        options,
-    )
-    .await?;
+    storage.open_or_create().await?;
 
     let stale_at_ms = unix_ms_now().saturating_sub(10 * 60_000);
     storage
@@ -142,25 +117,18 @@ async fn get_pending_transparent_inputs_drops_rows_outside_window() -> Result<()
 
 #[tokio::test]
 async fn sync_clears_expired_pending_broadcast_rows() -> Result<(), TestError> {
-    let temp = TempWalletPath::create()?;
-    let network = Network::regtest();
-
+    let options = WalletOptions::default().with_pending_broadcast_window_ms(60_000);
+    let TestWalletFixture {
+        temp,
+        wallet,
+        account_id,
+    } = create_test_wallet_with_options(options).await?;
+    let network = wallet.network();
     let storage = SqliteWalletStorage::new(SqliteWalletStorageOptions::for_network(
         network,
         temp.db_path(),
     ));
-    let sealing = AgeFileSealing::new(AgeFileSealingOptions::at_path(temp.seed_path()));
-    let chain = MockChainSource::new(network);
-    let options = WalletOptions::default().with_pending_broadcast_window_ms(60_000);
-    let (wallet, account_id, _mnemonic) = Wallet::create(
-        &chain,
-        network,
-        sealing,
-        storage.clone(),
-        BlockHeight::from(1),
-        options,
-    )
-    .await?;
+    storage.open_or_create().await?;
 
     let stale_at_ms = unix_ms_now().saturating_sub(10 * 60_000);
     let tx_id = TxId::from_bytes([5_u8; 32]);
@@ -195,8 +163,8 @@ async fn sync_clears_expired_pending_broadcast_rows() -> Result<(), TestError> {
 
 #[derive(Debug, thiserror::Error)]
 enum TestError {
-    #[error("io error: {0}")]
-    Io(#[from] std::io::Error),
+    #[error("test wallet error: {0}")]
+    Fixture(#[from] super::fixtures::TestWalletError),
     #[error("wallet error: {0}")]
     Wallet(#[from] WalletError),
     #[error("storage error: {0}")]

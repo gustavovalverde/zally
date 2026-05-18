@@ -4,6 +4,24 @@ use async_trait::async_trait;
 
 use crate::seed_material::{SeedMaterial, SeedMaterialError};
 
+/// The sealing implementation behind a wallet handle.
+///
+/// Returned by [`SeedSealing::kind`] so the wallet capability descriptor can advertise the
+/// in-use sealing flavour without `std::any::type_name::<S>()` introspection.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[non_exhaustive]
+pub enum SealingKind {
+    /// Age-encrypted file sealing (`zally_keys::AgeFileSealing`).
+    AgeFile,
+    /// In-memory sealing (`zally_testkit::InMemorySealing`). Tests only.
+    InMemory,
+    /// Plaintext seed storage. Available only behind the `unsafe_plaintext_seed` feature.
+    Plaintext,
+    /// A custom sealing implementation provided by the operator.
+    Custom,
+}
+
 /// Trait for at-rest seed encryption.
 ///
 /// Implementations hold the sealed seed and expose [`SeedSealing::seal_seed`] /
@@ -15,6 +33,12 @@ use crate::seed_material::{SeedMaterial, SeedMaterialError};
 /// wallet, with no external mutex layer required.
 #[async_trait]
 pub trait SeedSealing: Send + Sync + 'static {
+    /// Returns the sealing flavour for the wallet capability descriptor. Default is
+    /// [`SealingKind::Custom`]; first-party implementations override.
+    fn kind(&self) -> SealingKind {
+        SealingKind::Custom
+    }
+
     /// Encrypts and persists `seed`. Idempotent: calling twice with the same seed replaces the
     /// prior sealed copy.
     ///

@@ -34,11 +34,11 @@ impl Wallet {
             .create_pczt(zally_storage::ProposalPaymentRequest::new(
                 plan.account_id,
                 recipient_encoded,
-                plan.amount_zat.as_u64(),
+                plan.amount_zat,
                 memo_bytes,
             ))
             .await
-            .map_err(|err| lift_storage_error(&err))?;
+            .map_err(WalletError::from)?;
         Ok(PcztBytes::from_serialized(raw, self.network()))
     }
 
@@ -113,7 +113,7 @@ impl Wallet {
             .storage
             .extract_and_store_pczt(pczt.into_bytes())
             .await
-            .map_err(|err| lift_storage_error(&err))?;
+            .map_err(WalletError::from)?;
         let policy = self.retry_policy();
         let outcome = crate::retry::with_breaker_and_retry(
             &self.inner.circuit_breaker,
@@ -159,19 +159,6 @@ fn validate_pczt_network(
             storage: wallet_network,
             requested: pczt_network,
         })
-    }
-}
-
-fn lift_storage_error(err: &zally_storage::StorageError) -> WalletError {
-    let display = err.to_string().to_lowercase();
-    if display.contains("insufficient") || display.contains("balanceerror") {
-        return WalletError::InsufficientBalance {
-            requested_zat: 0,
-            spendable_zat: 0,
-        };
-    }
-    WalletError::ProposalRejected {
-        reason: err.to_string(),
     }
 }
 

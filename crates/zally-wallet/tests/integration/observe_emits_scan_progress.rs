@@ -1,30 +1,19 @@
 //! `Wallet::observe()` receives `ScanProgress` events emitted during sync.
 
-use zally_core::{BlockHeight, Network};
-use zally_storage::{SqliteWalletStorage, SqliteWalletStorageOptions};
-use zally_testkit::{InMemorySealing, MockChainSource, TempWalletPath};
-use zally_wallet::{Wallet, WalletError, WalletEvent, WalletOptions};
+use zally_core::BlockHeight;
+use zally_testkit::MockChainSource;
+use zally_wallet::WalletEvent;
+
+use super::fixtures::{TestWalletError, TestWalletFixture, create_test_wallet};
 
 #[tokio::test]
-async fn observe_emits_scan_progress() -> Result<(), TestError> {
-    let temp = TempWalletPath::create()?;
-    let network = Network::regtest();
-
-    let sealing = InMemorySealing::new();
-    let storage = SqliteWalletStorage::new(SqliteWalletStorageOptions::for_network(
-        network,
-        temp.db_path(),
-    ));
-    let chain = zally_testkit::MockChainSource::new(network);
-    let (wallet, _, _) = Wallet::create(
-        &chain,
-        network,
-        sealing,
-        storage,
-        BlockHeight::from(1),
-        WalletOptions::default(),
-    )
-    .await?;
+async fn observe_emits_scan_progress() -> Result<(), TestWalletError> {
+    let TestWalletFixture {
+        temp: _temp,
+        wallet,
+        account_id: _account_id,
+    } = create_test_wallet().await?;
+    let network = wallet.network();
 
     let mut events = wallet.observe();
     let chain = MockChainSource::new(network);
@@ -42,12 +31,4 @@ async fn observe_emits_scan_progress() -> Result<(), TestError> {
         }) if scanned_height == BlockHeight::from(7) && target_height == BlockHeight::from(7)
     ));
     Ok(())
-}
-
-#[derive(Debug, thiserror::Error)]
-enum TestError {
-    #[error("io error: {0}")]
-    Io(#[from] std::io::Error),
-    #[error("wallet error: {0}")]
-    Wallet(#[from] WalletError),
 }

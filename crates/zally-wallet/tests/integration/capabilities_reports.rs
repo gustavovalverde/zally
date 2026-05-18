@@ -1,36 +1,20 @@
 //! `Wallet::capabilities()` reports the wallet's standing feature surface.
 
-use zally_core::{BlockHeight, Network};
-use zally_storage::{SqliteWalletStorage, SqliteWalletStorageOptions};
-use zally_testkit::{InMemorySealing, TempWalletPath};
-use zally_wallet::{
-    Capability, SealingCapability, StorageCapability, Wallet, WalletCapabilities, WalletError,
-    WalletOptions,
-};
+use zally_wallet::{Capability, SealingCapability, StorageCapability, WalletCapabilities};
+
+use super::fixtures::{TestWalletError, TestWalletFixture, create_test_wallet};
 
 #[tokio::test]
-async fn capabilities_reports_standing_surface() -> Result<(), TestError> {
-    let temp = TempWalletPath::create()?;
-    let network = Network::regtest();
-
-    let sealing = InMemorySealing::new();
-    let storage = SqliteWalletStorage::new(SqliteWalletStorageOptions::for_network(
-        network,
-        temp.db_path(),
-    ));
-    let chain = zally_testkit::MockChainSource::new(network);
-    let (wallet, _, _) = Wallet::create(
-        &chain,
-        network,
-        sealing,
-        storage,
-        BlockHeight::from(1),
-        WalletOptions::default(),
-    )
-    .await?;
+async fn capabilities_reports_standing_surface() -> Result<(), TestWalletError> {
+    let TestWalletFixture {
+        temp: _temp,
+        wallet,
+        account_id: _account_id,
+    } = create_test_wallet().await?;
+    let network = wallet.network();
 
     let caps: WalletCapabilities = wallet.capabilities();
-    assert_eq!(caps.sealing, SealingCapability::InMemory);
+    assert_eq!(caps.sealing, SealingCapability::AgeFile);
     assert_eq!(caps.storage, StorageCapability::Sqlite);
     assert_eq!(caps.network, network);
     assert!(caps.features.contains(&Capability::Zip316UnifiedAddresses));
@@ -45,12 +29,4 @@ async fn capabilities_reports_standing_surface() -> Result<(), TestError> {
     assert!(caps.features.contains(&Capability::MetricsSnapshot));
     assert!(caps.features.contains(&Capability::StatusSnapshot));
     Ok(())
-}
-
-#[derive(Debug, thiserror::Error)]
-enum TestError {
-    #[error("io error: {0}")]
-    Io(#[from] std::io::Error),
-    #[error("wallet error: {0}")]
-    Wallet(#[from] WalletError),
 }

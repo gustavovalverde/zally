@@ -1,29 +1,19 @@
 //! `Wallet::metrics_snapshot` returns a typed snapshot of wallet state (OBS-2).
 
-use zally_core::{BlockHeight, Network};
-use zally_storage::{SqliteWalletStorage, SqliteWalletStorageOptions};
-use zally_testkit::{InMemorySealing, TempWalletPath};
-use zally_wallet::{SyncStatus, Wallet, WalletError, WalletOptions};
+use zally_core::BlockHeight;
+use zally_testkit::MockChainSource;
+use zally_wallet::SyncStatus;
+
+use super::fixtures::{TestWalletError, TestWalletFixture, create_test_wallet};
 
 #[tokio::test]
-async fn metrics_snapshot_reports_network_and_account_count() -> Result<(), TestError> {
-    let temp = TempWalletPath::create()?;
-    let network = Network::regtest();
-    let sealing = InMemorySealing::new();
-    let storage = SqliteWalletStorage::new(SqliteWalletStorageOptions::for_network(
-        network,
-        temp.db_path(),
-    ));
-    let chain = zally_testkit::MockChainSource::new(network);
-    let (wallet, _, _) = Wallet::create(
-        &chain,
-        network,
-        sealing,
-        storage,
-        BlockHeight::from(1),
-        WalletOptions::default(),
-    )
-    .await?;
+async fn metrics_snapshot_reports_network_and_account_count() -> Result<(), TestWalletError> {
+    let TestWalletFixture {
+        temp: _temp,
+        wallet,
+        account_id: _account_id,
+    } = create_test_wallet().await?;
+    let network = wallet.network();
 
     let snapshot = wallet.metrics_snapshot().await?;
     assert_eq!(snapshot.network, network);
@@ -40,25 +30,15 @@ async fn metrics_snapshot_reports_network_and_account_count() -> Result<(), Test
 }
 
 #[tokio::test]
-async fn status_snapshot_reports_observed_tip_after_sync() -> Result<(), TestError> {
-    let temp = TempWalletPath::create()?;
-    let network = Network::regtest();
-    let sealing = InMemorySealing::new();
-    let storage = SqliteWalletStorage::new(SqliteWalletStorageOptions::for_network(
-        network,
-        temp.db_path(),
-    ));
-    let chain = zally_testkit::MockChainSource::new(network);
-    let (wallet, _, _) = Wallet::create(
-        &chain,
-        network,
-        sealing,
-        storage,
-        BlockHeight::from(1),
-        WalletOptions::default(),
-    )
-    .await?;
+async fn status_snapshot_reports_observed_tip_after_sync() -> Result<(), TestWalletError> {
+    let TestWalletFixture {
+        temp: _temp,
+        wallet,
+        account_id: _account_id,
+    } = create_test_wallet().await?;
+    let network = wallet.network();
 
+    let chain = MockChainSource::new(network);
     chain.handle().advance_tip(BlockHeight::from(42));
     wallet.sync(&chain).await?;
 
@@ -76,12 +56,4 @@ async fn status_snapshot_reports_observed_tip_after_sync() -> Result<(), TestErr
     let metrics = wallet.metrics_snapshot().await?;
     assert_eq!(metrics.chain_tip_height, Some(BlockHeight::from(42)));
     Ok(())
-}
-
-#[derive(Debug, thiserror::Error)]
-enum TestError {
-    #[error("io error: {0}")]
-    Io(#[from] std::io::Error),
-    #[error("wallet error: {0}")]
-    Wallet(#[from] WalletError),
 }

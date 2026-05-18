@@ -4,7 +4,7 @@
 use zally_core::{BlockHeight, Network};
 use zally_storage::{SqliteWalletStorage, SqliteWalletStorageOptions};
 use zally_testkit::{InMemorySealing, TempWalletPath};
-use zally_wallet::{Wallet, WalletError, WalletOptions};
+use zally_wallet::{Wallet, WalletError};
 
 #[tokio::test]
 async fn create_then_open_round_trip_in_memory() -> Result<(), TestError> {
@@ -19,15 +19,9 @@ async fn create_then_open_round_trip_in_memory() -> Result<(), TestError> {
         temp.db_path(),
     ));
     let chain = zally_testkit::MockChainSource::new(network);
-    let (wallet, account_id, _mnemonic) = Wallet::create(
-        &chain,
-        network,
-        sealing_primary,
-        storage,
-        BlockHeight::from(1),
-        WalletOptions::default(),
-    )
-    .await?;
+    let (wallet, account_id, _mnemonic) = Wallet::builder(network, sealing_primary, storage)
+        .create(&chain, BlockHeight::from(1))
+        .await?;
     let params = network.to_parameters();
     let ua_first = wallet
         .derive_next_address(account_id)
@@ -39,8 +33,9 @@ async fn create_then_open_round_trip_in_memory() -> Result<(), TestError> {
         network,
         temp.db_path(),
     ));
-    let (wallet, account_id_2) =
-        Wallet::open(network, sealing_shadow, storage, WalletOptions::default()).await?;
+    let (wallet, account_id_2) = Wallet::builder(network, sealing_shadow, storage)
+        .open()
+        .await?;
     assert_eq!(account_id, account_id_2);
     let ua_second = wallet
         .derive_next_address(account_id_2)

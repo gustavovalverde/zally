@@ -10,7 +10,7 @@ use zally_core::{BlockHeight, Network};
 use zally_keys::PlaintextSealing;
 use zally_storage::{SqliteWalletStorage, SqliteWalletStorageOptions};
 use zally_testkit::TempWalletPath;
-use zally_wallet::{Wallet, WalletError, WalletOptions};
+use zally_wallet::{Wallet, WalletError};
 
 #[tokio::test]
 async fn unsafe_plaintext_seed_warns() -> Result<(), TestError> {
@@ -29,22 +29,16 @@ async fn unsafe_plaintext_seed_warns() -> Result<(), TestError> {
         temp.db_path(),
     ));
     let chain = zally_testkit::MockChainSource::new(network);
-    let _ = Wallet::create(
-        &chain,
-        network,
-        sealing,
-        storage,
-        BlockHeight::from(1),
-        WalletOptions::default(),
-    )
-    .await?;
+    let _ = Wallet::builder(network, sealing, storage)
+        .create(&chain, BlockHeight::from(1))
+        .await?;
 
     let sealing = PlaintextSealing::new(temp.seed_path());
     let storage = SqliteWalletStorage::new(SqliteWalletStorageOptions::for_network(
         network,
         temp.db_path(),
     ));
-    let _ = Wallet::open(network, sealing, storage, WalletOptions::default()).await?;
+    let _ = Wallet::builder(network, sealing, storage).open().await?;
 
     let plaintext_count = {
         let captured = events.lock().map_err(|_| TestError::Mutex)?;

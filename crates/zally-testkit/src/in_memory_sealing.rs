@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use parking_lot::Mutex;
-use zally_keys::{SealingError, SeedMaterial, SeedSealing};
+use zally_keys::{SealingError, SealingKind, SeedMaterial, SeedSealing};
 
 type Slot = Arc<Mutex<Option<Vec<u8>>>>;
 
@@ -47,6 +47,10 @@ impl Default for InMemorySealing {
 
 #[async_trait]
 impl SeedSealing for InMemorySealing {
+    fn kind(&self) -> SealingKind {
+        SealingKind::InMemory
+    }
+
     async fn seal_seed(&self, seed: &SeedMaterial) -> Result<(), SealingError> {
         let mut guard = self.slot.lock();
         *guard = Some(seed.expose_secret().to_vec());

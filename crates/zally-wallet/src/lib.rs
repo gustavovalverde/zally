@@ -37,6 +37,6 @@ pub use sync::{
     SyncSnapshot, SyncSnapshotStream,
 };
 pub use unspent_note::UnspentShieldedNote;
-pub use wallet::Wallet;
+pub use wallet::{Wallet, WalletBuilder};
 pub use wallet_error::WalletError;
 pub use wallet_options::WalletOptions;

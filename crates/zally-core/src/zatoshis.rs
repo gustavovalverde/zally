@@ -1,5 +1,7 @@
 //! Non-negative integer zatoshi amount.
 
+use core::fmt;
+
 /// Non-negative integer zatoshi amount.
 ///
 /// Construction above [`Zatoshis::MAX`] is rejected. The unit suffix on field and parameter
@@ -10,6 +12,20 @@
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Zatoshis(u64);
+
+impl fmt::Display for Zatoshis {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} zat", self.0)
+    }
+}
+
+impl From<zcash_protocol::value::Zatoshis> for Zatoshis {
+    fn from(upstream: zcash_protocol::value::Zatoshis) -> Self {
+        // Upstream `Zatoshis::from_u64` enforces the same `MAX_MONEY` cap Zally uses, so the
+        // value is always within Zally's range.
+        Self(u64::from(upstream))
+    }
+}
 
 impl Zatoshis {
     /// The maximum representable amount: 21,000,000 ZEC expressed in zatoshis.

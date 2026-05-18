@@ -3,17 +3,19 @@
 //! BIP-44 transparent gap-limit slot.
 
 use uuid::Uuid;
-use zally_core::{AccountId, BlockHeight, Network};
-use zally_keys::{AgeFileSealing, AgeFileSealingOptions};
-use zally_storage::{SqliteWalletStorage, SqliteWalletStorageOptions};
-use zally_testkit::{MockChainSource, TempWalletPath};
-use zally_wallet::{Wallet, WalletError, WalletOptions};
+use zally_core::AccountId;
+use zally_wallet::WalletError;
+
+use super::fixtures::{TestWalletFixture, create_test_wallet};
 
 #[tokio::test]
 async fn list_exposed_addresses_returns_baseline_after_create() -> Result<(), TestError> {
-    let temp = TempWalletPath::create()?;
-    let network = Network::regtest();
-    let (wallet, account_id) = create_wallet(&temp, network).await?;
+    let TestWalletFixture {
+        temp: _temp,
+        wallet,
+        account_id,
+    } = create_test_wallet().await?;
+    let network = wallet.network();
 
     let exposed = wallet.list_exposed_addresses(account_id).await?;
     for entry in &exposed {
@@ -24,9 +26,12 @@ async fn list_exposed_addresses_returns_baseline_after_create() -> Result<(), Te
 
 #[tokio::test]
 async fn list_exposed_addresses_extends_when_address_derived() -> Result<(), TestError> {
-    let temp = TempWalletPath::create()?;
-    let network = Network::regtest();
-    let (wallet, account_id) = create_wallet(&temp, network).await?;
+    let TestWalletFixture {
+        temp: _temp,
+        wallet,
+        account_id,
+    } = create_test_wallet().await?;
+    let network = wallet.network();
 
     let baseline = wallet.list_exposed_addresses(account_id).await?.len();
 
@@ -56,9 +61,11 @@ async fn list_exposed_addresses_extends_when_address_derived() -> Result<(), Tes
 
 #[tokio::test]
 async fn list_exposed_addresses_flags_transparent_receiver() -> Result<(), TestError> {
-    let temp = TempWalletPath::create()?;
-    let network = Network::regtest();
-    let (wallet, account_id) = create_wallet(&temp, network).await?;
+    let TestWalletFixture {
+        temp: _temp,
+        wallet,
+        account_id,
+    } = create_test_wallet().await?;
 
     let with_transparent = wallet
         .derive_next_address_with_transparent(account_id)
@@ -80,9 +87,11 @@ async fn list_exposed_addresses_flags_transparent_receiver() -> Result<(), TestE
 
 #[tokio::test]
 async fn list_exposed_addresses_is_idempotent_and_gap_limit_invariant() -> Result<(), TestError> {
-    let temp = TempWalletPath::create()?;
-    let network = Network::regtest();
-    let (wallet, account_id) = create_wallet(&temp, network).await?;
+    let TestWalletFixture {
+        temp: _temp,
+        wallet,
+        account_id,
+    } = create_test_wallet().await?;
 
     let before = wallet.derive_next_address(account_id).await?;
     let count_after_first_derive = wallet.list_exposed_addresses(account_id).await?.len();
@@ -112,9 +121,11 @@ async fn list_exposed_addresses_is_idempotent_and_gap_limit_invariant() -> Resul
 #[tokio::test]
 async fn list_exposed_addresses_unknown_account_returns_account_not_found() -> Result<(), TestError>
 {
-    let temp = TempWalletPath::create()?;
-    let network = Network::regtest();
-    let (wallet, _account_id) = create_wallet(&temp, network).await?;
+    let TestWalletFixture {
+        temp: _temp,
+        wallet,
+        account_id: _account_id,
+    } = create_test_wallet().await?;
 
     let unknown = AccountId::from_uuid(Uuid::nil());
     match wallet.list_exposed_addresses(unknown).await {
@@ -128,32 +139,10 @@ async fn list_exposed_addresses_unknown_account_returns_account_not_found() -> R
     }
 }
 
-async fn create_wallet(
-    temp: &TempWalletPath,
-    network: Network,
-) -> Result<(Wallet, AccountId), TestError> {
-    let sealing = AgeFileSealing::new(AgeFileSealingOptions::at_path(temp.seed_path()));
-    let storage = SqliteWalletStorage::new(SqliteWalletStorageOptions::for_network(
-        network,
-        temp.db_path(),
-    ));
-    let chain = MockChainSource::new(network);
-    let (wallet, account_id, _mnemonic) = Wallet::create(
-        &chain,
-        network,
-        sealing,
-        storage,
-        BlockHeight::from(1),
-        WalletOptions::default(),
-    )
-    .await?;
-    Ok((wallet, account_id))
-}
-
 #[derive(Debug, thiserror::Error)]
 enum TestError {
-    #[error("io error: {0}")]
-    Io(#[from] std::io::Error),
+    #[error("test wallet error: {0}")]
+    Fixture(#[from] super::fixtures::TestWalletError),
     #[error("wallet error: {0}")]
     Wallet(#[from] WalletError),
     #[error("unexpected test outcome: {reason}")]

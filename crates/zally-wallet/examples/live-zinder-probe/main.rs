@@ -23,7 +23,7 @@ use zally_chain::{ChainSource, ZinderChainSource, ZinderRemoteOptions};
 use zally_core::{BlockHeight, Network, PaymentRecipient, Zatoshis};
 use zally_keys::{AgeFileSealing, AgeFileSealingOptions};
 use zally_storage::{SqliteWalletStorage, SqliteWalletStorageOptions};
-use zally_wallet::{ProposalPlan, Wallet, WalletError, WalletOptions};
+use zally_wallet::{ProposalPlan, Wallet, WalletError};
 
 #[tokio::main]
 async fn main() -> Result<(), ExampleError> {
@@ -67,15 +67,12 @@ async fn main() -> Result<(), ExampleError> {
         network,
         temp.path().join("wallet.db"),
     ));
-    let (wallet, account_id, _mnemonic) = Wallet::create(
-        &chain,
-        network,
-        sealing,
-        storage,
-        BlockHeight::from(tip.as_u32().saturating_sub(1).max(1)),
-        WalletOptions::default(),
-    )
-    .await?;
+    let (wallet, account_id, _mnemonic) = Wallet::builder(network, sealing, storage)
+        .create(
+            &chain,
+            BlockHeight::from(tip.as_u32().saturating_sub(1).max(1)),
+        )
+        .await?;
 
     let outcome = wallet.sync(&chain).await?;
     info!(
@@ -142,8 +139,8 @@ async fn probe_live_propose(
         }) => info!(
             target: "zally::example",
             event = "live_zinder_propose_insufficient_balance",
-            requested_zat,
-            spendable_zat,
+            requested_zat = requested_zat.as_u64(),
+            spendable_zat = spendable_zat.as_u64(),
             "Wallet::propose hit InsufficientBalance against the live empty wallet (expected)"
         ),
         Err(other) => info!(
@@ -192,8 +189,8 @@ async fn probe_live_pczt_cycle(
         }) => info!(
             target: "zally::example",
             event = "live_zinder_propose_pczt_insufficient_balance",
-            requested_zat,
-            spendable_zat,
+            requested_zat = requested_zat.as_u64(),
+            spendable_zat = spendable_zat.as_u64(),
             "Wallet::propose_pczt hit InsufficientBalance against the live empty wallet (expected)"
         ),
         Err(other) => info!(

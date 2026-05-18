@@ -2,6 +2,7 @@
 
 mod account_balance_row;
 mod exposed_address_row;
+mod filtered_wallet_db;
 mod pending_broadcast_input_row;
 mod sqlite;
 mod storage_error;
@@ -14,6 +15,6 @@ pub use sqlite::{SqliteWalletStorage, SqliteWalletStorageOptions};
 pub use storage_error::StorageError;
 pub use wallet_storage::{
     PendingBroadcastRecord, PreparedTransaction, ProposalPaymentRequest, ProposalSummary,
-    ReceivedShieldedNoteRow, ScanRequest, ScanResult, ShieldTransparentRequest,
+    ReceivedShieldedNoteRow, ScanRequest, ScanResult, ShieldTransparentRequest, StorageKind,
     TransparentReceiverRow, TransparentUtxoRow, UnspentShieldedNoteRow, WalletStorage,
 };

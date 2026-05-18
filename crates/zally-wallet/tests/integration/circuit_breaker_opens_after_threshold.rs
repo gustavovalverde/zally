@@ -5,34 +5,20 @@
 //! failures do not advance the counter since they are not symptoms of a flaky backend.
 
 use zally_chain::ChainSourceError;
-use zally_core::{BlockHeight, Network};
-use zally_keys::{AgeFileSealing, AgeFileSealingOptions};
-use zally_storage::{SqliteWalletStorage, SqliteWalletStorageOptions};
-use zally_testkit::{MockChainSource, TempWalletPath};
-use zally_wallet::{
-    Capability, CircuitBreakerState, RetryPolicy, Wallet, WalletError, WalletOptions,
-};
+use zally_core::BlockHeight;
+use zally_testkit::MockChainSource;
+use zally_wallet::{Capability, CircuitBreakerState, RetryPolicy, WalletError};
+
+use super::fixtures::{TestWalletError, TestWalletFixture, create_test_wallet};
 
 #[tokio::test]
-async fn circuit_breaker_opens_after_threshold_retryable_failures() -> Result<(), TestError> {
-    let temp = TempWalletPath::create()?;
-    let network = Network::regtest();
-
-    let sealing = AgeFileSealing::new(AgeFileSealingOptions::at_path(temp.seed_path()));
-    let storage = SqliteWalletStorage::new(SqliteWalletStorageOptions::for_network(
-        network,
-        temp.db_path(),
-    ));
-    let chain = zally_testkit::MockChainSource::new(network);
-    let (wallet, _account_id, _mnemonic) = Wallet::create(
-        &chain,
-        network,
-        sealing,
-        storage,
-        BlockHeight::from(1),
-        WalletOptions::default(),
-    )
-    .await?;
+async fn circuit_breaker_opens_after_threshold_retryable_failures() -> Result<(), TestWalletError> {
+    let TestWalletFixture {
+        temp: _temp,
+        wallet,
+        account_id: _account_id,
+    } = create_test_wallet().await?;
+    let network = wallet.network();
     wallet.set_retry_policy(RetryPolicy::none());
 
     let chain = MockChainSource::new(network);
@@ -77,25 +63,14 @@ async fn circuit_breaker_opens_after_threshold_retryable_failures() -> Result<()
 }
 
 #[tokio::test]
-async fn circuit_breaker_does_not_trip_on_requires_operator_failures() -> Result<(), TestError> {
-    let temp = TempWalletPath::create()?;
-    let network = Network::regtest();
-
-    let sealing = AgeFileSealing::new(AgeFileSealingOptions::at_path(temp.seed_path()));
-    let storage = SqliteWalletStorage::new(SqliteWalletStorageOptions::for_network(
-        network,
-        temp.db_path(),
-    ));
-    let chain = zally_testkit::MockChainSource::new(network);
-    let (wallet, _account_id, _mnemonic) = Wallet::create(
-        &chain,
-        network,
-        sealing,
-        storage,
-        BlockHeight::from(1),
-        WalletOptions::default(),
-    )
-    .await?;
+async fn circuit_breaker_does_not_trip_on_requires_operator_failures() -> Result<(), TestWalletError>
+{
+    let TestWalletFixture {
+        temp: _temp,
+        wallet,
+        account_id: _account_id,
+    } = create_test_wallet().await?;
+    let network = wallet.network();
     wallet.set_retry_policy(RetryPolicy::none());
 
     let chain = MockChainSource::new(network);
@@ -127,12 +102,4 @@ async fn circuit_breaker_does_not_trip_on_requires_operator_failures() -> Result
         "Capability::CircuitBroken must not appear while the breaker is closed"
     );
     Ok(())
-}
-
-#[derive(Debug, thiserror::Error)]
-enum TestError {
-    #[error("io error: {0}")]
-    Io(#[from] std::io::Error),
-    #[error("wallet error: {0}")]
-    Wallet(#[from] WalletError),
 }

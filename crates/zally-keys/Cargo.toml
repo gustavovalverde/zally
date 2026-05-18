@@ -14,13 +14,14 @@ categories.workspace = true
 default = []
 # Exposes PlaintextSealing. Never enable in production binaries.
 unsafe_plaintext_seed = []
-serde = ["zally-core/serde"]
+serde = ["dep:serde", "zally-core/serde"]
 
 [dependencies]
 age.workspace = true
 async-trait.workspace = true
 bip0039.workspace = true
 secrecy.workspace = true
+serde = { workspace = true, optional = true }
 thiserror.workspace = true
 tokio = { workspace = true, features = ["fs", "io-util", "sync"] }
 zally-core = { path = "../zally-core", version = "0.1" }

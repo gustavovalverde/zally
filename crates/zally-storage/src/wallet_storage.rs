@@ -1,7 +1,21 @@
 //! `WalletStorage` trait.
 
 use async_trait::async_trait;
-use zally_core::{AccountId, BlockHeight, IdempotencyKey, Network, OutPoint, TxId};
+use zally_core::{AccountId, BlockHeight, IdempotencyKey, Network, OutPoint, TxId, Zatoshis};
+
+/// The storage backend behind a wallet handle.
+///
+/// Returned by [`WalletStorage::kind`] so the wallet capability descriptor can advertise the
+/// in-use backend without `std::any::type_name::<St>()` introspection.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[non_exhaustive]
+pub enum StorageKind {
+    /// `zally_storage::SqliteWalletStorage`.
+    Sqlite,
+    /// A custom storage backend provided by the operator.
+    Custom,
+}
 use zally_keys::SeedMaterial;
 use zcash_client_backend::data_api::chain::ChainState;
 use zcash_client_backend::proto::compact_formats::CompactBlock;
@@ -59,27 +73,28 @@ pub struct ScanResult {
 /// the wallet layer can build a Zally proposal without depending on the upstream proposal
 /// generics. Carries the single-output ZIP-317 conventional fee path; richer multi-output
 /// and custom-fee plans land alongside their own request constructors.
+///
+/// The storage backend transparently excludes wallet-owned outpoints that are locked by a
+/// still-unconfirmed broadcast at its `InputSource::get_spendable_transparent_outputs`
+/// override; callers do not pass an exclusion set.
 pub struct ProposalPaymentRequest {
     /// Spending account.
     pub account_id: AccountId,
     /// Recipient address, already validated by the wallet layer (encoded string form).
     pub recipient_encoded: String,
-    /// Amount to send, in zatoshis.
-    pub amount_zat: u64,
+    /// Amount to send.
+    pub amount_zat: Zatoshis,
     /// Optional memo (the wallet layer enforces the no-memo-on-transparent rule before this).
     pub memo: Option<Vec<u8>>,
-    /// Transparent outpoints that must not be selected as inputs (e.g. outpoints locked by a
-    /// still-unconfirmed wallet-owned broadcast).
-    pub excluded_outpoints: std::collections::HashSet<OutPoint>,
 }
 
 impl ProposalPaymentRequest {
-    /// Constructs a new request with no excluded outpoints.
+    /// Constructs a payment request.
     #[must_use]
-    pub fn new(
+    pub const fn new(
         account_id: AccountId,
         recipient_encoded: String,
-        amount_zat: u64,
+        amount_zat: Zatoshis,
         memo: Option<Vec<u8>>,
     ) -> Self {
         Self {
@@ -87,59 +102,39 @@ impl ProposalPaymentRequest {
             recipient_encoded,
             amount_zat,
             memo,
-            excluded_outpoints: std::collections::HashSet::new(),
         }
-    }
-
-    /// Returns the request with `excluded_outpoints` replaced.
-    #[must_use]
-    pub fn with_excluded_outpoints(
-        mut self,
-        excluded_outpoints: std::collections::HashSet<OutPoint>,
-    ) -> Self {
-        self.excluded_outpoints = excluded_outpoints;
-        self
     }
 }
 
 /// Request body for [`WalletStorage::shield_transparent_funds`].
 ///
 /// Shields wallet-owned transparent UTXOs into the account's internal shielded receiver.
+/// The storage backend transparently excludes outpoints locked by a still-unconfirmed
+/// wallet-owned broadcast at the `InputSource::get_spendable_transparent_outputs` override.
 pub struct ShieldTransparentRequest {
     /// Account that owns the transparent UTXOs and receives the shielded output.
     pub account_id: AccountId,
-    /// Minimum total transparent input value to shield, in zatoshis.
-    pub shielding_threshold_zat: u64,
-    /// Transparent outpoints that must not be selected as shielding inputs (e.g. outpoints
-    /// locked by a still-unconfirmed wallet-owned broadcast).
-    pub excluded_outpoints: std::collections::HashSet<OutPoint>,
+    /// Minimum total transparent input value to shield.
+    pub shielding_threshold_zat: Zatoshis,
 }
 
 impl ShieldTransparentRequest {
-    /// Constructs a new transparent shielding request with no excluded outpoints.
+    /// Constructs a transparent shielding request.
     #[must_use]
-    pub fn new(account_id: AccountId, shielding_threshold_zat: u64) -> Self {
+    pub const fn new(account_id: AccountId, shielding_threshold_zat: Zatoshis) -> Self {
         Self {
             account_id,
             shielding_threshold_zat,
-            excluded_outpoints: std::collections::HashSet::new(),
         }
-    }
-
-    /// Returns the request with `excluded_outpoints` replaced.
-    #[must_use]
-    pub fn with_excluded_outpoints(
-        mut self,
-        excluded_outpoints: std::collections::HashSet<OutPoint>,
-    ) -> Self {
-        self.excluded_outpoints = excluded_outpoints;
-        self
     }
 }
 
-/// One prepared transaction returned by [`WalletStorage::prepare_payment`].
+/// One prepared transaction returned by [`WalletStorage::prepare_payment`] or
+/// [`WalletStorage::shield_transparent_funds`].
 ///
 /// The transaction has been signed, persisted to the wallet DB, and is ready to broadcast.
+/// `transparent_inputs` carries the outpoints the proposal selected so callers can record a
+/// pending-broadcast row without re-parsing the raw transaction.
 #[derive(Clone, Debug)]
 #[non_exhaustive]
 pub struct PreparedTransaction {
@@ -147,13 +142,23 @@ pub struct PreparedTransaction {
     pub tx_id: TxId,
     /// Raw wire bytes ready for `Submitter::submit`.
     pub raw_bytes: Vec<u8>,
+    /// Transparent outpoints consumed by this transaction, with their values.
+    pub transparent_inputs: Vec<(OutPoint, Zatoshis)>,
 }
 
 impl PreparedTransaction {
-    /// Constructs a new prepared transaction record.
+    /// Constructs a prepared transaction record.
     #[must_use]
-    pub fn new(tx_id: TxId, raw_bytes: Vec<u8>) -> Self {
-        Self { tx_id, raw_bytes }
+    pub const fn new(
+        tx_id: TxId,
+        raw_bytes: Vec<u8>,
+        transparent_inputs: Vec<(OutPoint, Zatoshis)>,
+    ) -> Self {
+        Self {
+            tx_id,
+            raw_bytes,
+            transparent_inputs,
+        }
     }
 }
 
@@ -167,8 +172,8 @@ impl PreparedTransaction {
 pub struct UnspentShieldedNoteRow {
     /// Pool this note lives on.
     pub protocol: zcash_protocol::ShieldedProtocol,
-    /// Value in zatoshis.
-    pub value_zat: u64,
+    /// Spendable value in this note.
+    pub value_zat: Zatoshis,
     /// Transaction that created the note.
     pub tx_id: TxId,
     /// Output index within the producing transaction (Sapling output index or Orchard
@@ -199,8 +204,8 @@ pub struct ReceivedShieldedNoteRow {
     pub account_id: AccountId,
     /// Pool this note lives on.
     pub protocol: zcash_protocol::ShieldedProtocol,
-    /// Value in zatoshis.
-    pub value_zat: u64,
+    /// Note value at the time of receipt.
+    pub value_zat: Zatoshis,
     /// Transaction that created the note.
     pub tx_id: TxId,
     /// Output index within the producing transaction.
@@ -254,8 +259,8 @@ pub struct TransparentUtxoRow {
     pub tx_id: TxId,
     /// Output index within the producing transaction.
     pub output_index: u32,
-    /// Value in zatoshis.
-    pub value_zat: u64,
+    /// UTXO value.
+    pub value_zat: Zatoshis,
     /// Height at which this output was mined.
     pub mined_height: BlockHeight,
     /// Output `scriptPubKey` bytes.
@@ -268,7 +273,7 @@ impl TransparentUtxoRow {
     pub fn new(
         tx_id: TxId,
         output_index: u32,
-        value_zat: u64,
+        value_zat: Zatoshis,
         mined_height: BlockHeight,
         script_pub_key_bytes: Vec<u8>,
     ) -> Self {
@@ -287,9 +292,9 @@ impl TransparentUtxoRow {
 #[non_exhaustive]
 pub struct ProposalSummary {
     /// Sum of payment outputs.
-    pub total_zat: u64,
+    pub total_zat: Zatoshis,
     /// Fee paid by the proposal.
-    pub fee_zat: u64,
+    pub fee_zat: Zatoshis,
     /// Min chain height required to execute the proposal.
     pub min_target_height: BlockHeight,
     /// Number of payment outputs in the proposal.
@@ -409,6 +414,12 @@ pub trait WalletStorage: Send + Sync + 'static {
     /// Returns the network this storage instance was opened for.
     fn network(&self) -> Network;
 
+    /// Returns the storage backend kind for the wallet capability descriptor. Default is
+    /// [`StorageKind::Custom`]; first-party implementations override.
+    fn kind(&self) -> StorageKind {
+        StorageKind::Custom
+    }
+
     /// Scans `request.blocks` into the wallet, persisting decrypted notes and updating the
     /// chain tip.
     ///
@@ -436,6 +447,11 @@ pub trait WalletStorage: Send + Sync + 'static {
     /// and returns the raw transaction bytes (one per step) for the caller to submit via
     /// a `Submitter` (see `zally_chain::Submitter`).
     ///
+    /// `excluded_outpoints` is the set of transparent outpoints locked by a still-unconfirmed
+    /// wallet-owned broadcast; the storage layer filters these out at the
+    /// `InputSource::get_spendable_transparent_outputs` seam so the proposal selector never
+    /// picks them. An empty set disables the filter.
+    ///
     /// The storage layer constructs a `LocalTxProver` using the default params location
     /// (`~/.local/share/ZcashParams/` on macOS, `~/.zcash-params/` on Linux). Returns
     /// `StorageError::ProverUnavailable` if the params are not present.
@@ -445,10 +461,14 @@ pub trait WalletStorage: Send + Sync + 'static {
     async fn prepare_payment(
         &self,
         request: ProposalPaymentRequest,
+        excluded_outpoints: std::collections::HashSet<OutPoint>,
         seed: &SeedMaterial,
     ) -> Result<Vec<PreparedTransaction>, StorageError>;
 
     /// Shields wallet-owned transparent UTXOs into the account's internal shielded receiver.
+    ///
+    /// `excluded_outpoints` follows the same contract as on `prepare_payment`. Empty set
+    /// disables the filter.
     ///
     /// Wraps `zcash_client_backend::data_api::wallet::shield_transparent_funds` using ZIP-317
     /// conventional fees and the default ZIP-315 confirmations policy. The storage layer
@@ -461,6 +481,7 @@ pub trait WalletStorage: Send + Sync + 'static {
     async fn shield_transparent_funds(
         &self,
         request: ShieldTransparentRequest,
+        excluded_outpoints: std::collections::HashSet<OutPoint>,
         seed: &SeedMaterial,
     ) -> Result<Vec<PreparedTransaction>, StorageError>;
 
@@ -655,19 +676,6 @@ pub trait WalletStorage: Send + Sync + 'static {
         &self,
         before_at_ms: u64,
     ) -> Result<u64, StorageError>;
-
-    /// Returns the recorded value of the supplied transparent outpoints, as stored on
-    /// `transparent_received_outputs`.
-    ///
-    /// Used by the spend path to resolve the value of each `vin` outpoint when recording a
-    /// broadcast's pending inputs. Outpoints unknown to the wallet are omitted from the
-    /// returned map (they are not wallet-owned and would not have been selected as inputs).
-    ///
-    /// `not_retryable` on schema errors; `retryable` on transient I/O.
-    async fn find_outpoint_values(
-        &self,
-        outpoints: &[OutPoint],
-    ) -> Result<std::collections::HashMap<OutPoint, zally_core::Zatoshis>, StorageError>;
 
     /// Returns the per-pool balance snapshot for `account_id`, anchored to the wallet's last
     /// observed chain tip.

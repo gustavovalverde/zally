@@ -1,7 +1,7 @@
 //! Storage-level transparent receiver and UTXO round trip.
 
 use tempfile::TempDir;
-use zally_core::{BlockHeight, TxId};
+use zally_core::{BlockHeight, TxId, Zatoshis};
 use zally_keys::{Mnemonic, SeedMaterial};
 use zally_storage::{
     SqliteWalletStorage, SqliteWalletStorageOptions, StorageError, TransparentUtxoRow,
@@ -48,7 +48,7 @@ async fn transparent_utxo_round_trip_records_exposed_receiver() -> Result<(), Te
         .record_transparent_utxos(vec![TransparentUtxoRow::new(
             TxId::from_bytes([0x11_u8; 32]),
             0,
-            50_000,
+            Zatoshis::try_from(50_000_u64).unwrap_or(Zatoshis::zero()),
             BlockHeight::from(2),
             expected_script,
         )])

@@ -1,7 +1,7 @@
 //! Operator-facing wallet error.
 
 use zally_chain::{ChainSourceError, FailurePosture, SubmitterError};
-use zally_core::Network;
+use zally_core::{Network, Zatoshis};
 use zally_keys::{KeyDerivationError, SealingError};
 use zally_pczt::PcztError;
 use zally_storage::StorageError;
@@ -16,7 +16,7 @@ pub enum WalletError {
 
     /// A `WalletStorage` operation failed.
     #[error("storage error: {0}")]
-    Storage(#[from] StorageError),
+    Storage(StorageError),
 
     /// Key derivation failed.
     #[error("key derivation error: {0}")]
@@ -79,10 +79,10 @@ pub enum WalletError {
     /// Posture: [`FailurePosture::NotRetryable`] until balance is replenished.
     #[error("insufficient spendable balance: requested {requested_zat}, spendable {spendable_zat}")]
     InsufficientBalance {
-        /// Amount the caller asked to send, in zatoshis.
-        requested_zat: u64,
-        /// Spendable balance reported by storage, in zatoshis.
-        spendable_zat: u64,
+        /// Amount the caller asked to send.
+        requested_zat: Zatoshis,
+        /// Spendable balance reported by storage at proposal time.
+        spendable_zat: Zatoshis,
     },
 
     /// A ZIP-321 payment-request URI could not be parsed.
@@ -181,17 +181,37 @@ impl WalletError {
     }
 }
 
-/// Maps the two-state retry posture exposed by boundary errors into [`FailurePosture`].
-///
-/// `StorageError`, `SealingError`, `KeyDerivationError`, and `PcztError` keep a boolean
-/// signal because their retry semantics never need to distinguish "operator must act" from
-/// "caller fix needed"; the wallet-side mapping picks the conservative non-retryable
-/// variant for any `false`.
+/// Maps the two-state retry posture exposed by boundary errors that still expose
+/// `is_retryable: bool` (`SealingError`, `KeyDerivationError`, `PcztError`) into
+/// [`FailurePosture`].
 const fn bool_to_posture(is_retryable: bool) -> FailurePosture {
     if is_retryable {
         FailurePosture::Retryable
     } else {
         FailurePosture::NotRetryable
+    }
+}
+
+impl From<StorageError> for WalletError {
+    fn from(err: StorageError) -> Self {
+        #[allow(
+            clippy::wildcard_enum_match_arm,
+            reason = "the named arms cover every variant whose translation is non-trivial; \
+                      the wildcard preserves the storage error verbatim"
+        )]
+        match err {
+            StorageError::AccountNotFound => Self::AccountNotFound,
+            StorageError::AccountAlreadyExists => Self::AccountAlreadyExists,
+            StorageError::InsufficientFunds {
+                required_zat,
+                available_zat,
+            } => Self::InsufficientBalance {
+                requested_zat: required_zat,
+                spendable_zat: available_zat,
+            },
+            StorageError::ProposalBuildFailed { reason, .. } => Self::ProposalRejected { reason },
+            other => Self::Storage(other),
+        }
     }
 }
 
@@ -217,8 +237,8 @@ mod tests {
             WalletError::MemoOnTransparentRecipient,
             WalletError::ShieldedInputsOnTexRecipient,
             WalletError::InsufficientBalance {
-                requested_zat: 10,
-                spendable_zat: 0,
+                requested_zat: Zatoshis::try_from(10_u64).unwrap_or(Zatoshis::zero()),
+                spendable_zat: Zatoshis::zero(),
             },
             WalletError::PaymentRequestParseFailed { reason: "x".into() },
             WalletError::ProposalRejected { reason: "x".into() },

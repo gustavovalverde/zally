@@ -21,6 +21,7 @@ serde = [
     "zally-chain/serde",
     "zally-core/serde",
     "zally-keys/serde",
+    "zally-storage/serde",
 ]
 zinder = ["zally-chain/zinder"]
 

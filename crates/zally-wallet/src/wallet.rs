@@ -8,7 +8,7 @@ use tokio::sync::broadcast;
 use zally_chain::{ChainSource, ChainSourceError};
 use zally_core::{AccountId, BlockHeight, Network};
 use zally_keys::{Mnemonic, SealingError, SeedMaterial, SeedSealing};
-use zally_storage::{StorageError, WalletStorage};
+use zally_storage::WalletStorage;
 use zcash_client_backend::data_api::chain::ChainState;
 use zcash_keys::address::UnifiedAddress;
 
@@ -25,7 +25,8 @@ const EVENT_CHANNEL_CAPACITY: usize = 1024;
 ///
 /// Cheap to clone; cloning shares the inner sealing and storage handles via `Arc`. All async
 /// methods are cancellation-safe. Zally holds one account per wallet; the `AccountId`
-/// returned by [`Wallet::create`] and [`Wallet::open`] names that single account.
+/// returned by [`WalletBuilder::create`] and [`WalletBuilder::open`] names that single
+/// account.
 #[derive(Clone)]
 pub struct Wallet {
     pub(crate) inner: Arc<WalletInner>,
@@ -43,231 +44,19 @@ pub(crate) struct WalletInner {
 }
 
 impl Wallet {
-    /// Creates a new wallet.
+    /// Starts a builder for a new [`Wallet`].
     ///
-    /// Generates a 24-word BIP-39 mnemonic, derives the seed, seals it via the provided
-    /// sealing implementation, opens (or creates) the storage, and creates the wallet's first
-    /// account at `birthday`.
-    ///
-    /// Returns the wallet handle, the new account's `AccountId`, and the generated `Mnemonic`.
-    /// The operator must record the mnemonic out-of-band; Zally does not back it up.
-    ///
-    /// Returns [`WalletError::AccountAlreadyExists`] if the storage already has an account.
-    /// Returns [`WalletError::NetworkMismatch`] if `network != storage.network()`.
-    ///
-    /// `requires_operator` on `AccountAlreadyExists`. `retryable` on transient I/O.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "every parameter is mandatory wallet-construction context; grouping them into a single struct would obscure the call site"
-    )]
-    pub async fn create<S, St>(
-        chain: &dyn ChainSource,
-        network: Network,
-        sealing: S,
-        storage: St,
-        birthday: BlockHeight,
-        options: WalletOptions,
-    ) -> Result<(Self, AccountId, Mnemonic), WalletError>
+    /// The builder collapses the three lifecycle entry points (`create`, `open`,
+    /// `open_or_create_account`) into one fluent shape; each terminal method takes only the
+    /// fields it actually needs (chain + birthday for the create paths; nothing extra for
+    /// open).
+    #[must_use]
+    pub fn builder<S, St>(network: Network, sealing: S, storage: St) -> WalletBuilder<S, St>
     where
         S: SeedSealing,
         St: WalletStorage,
     {
-        let sealing_capability = capability_for_sealing::<S>();
-        let storage_capability = capability_for_storage::<St>();
-
-        if chain.network() != network {
-            return Err(WalletError::NetworkMismatch {
-                storage: chain.network(),
-                requested: network,
-            });
-        }
-        if storage.network() != network {
-            return Err(WalletError::NetworkMismatch {
-                storage: storage.network(),
-                requested: network,
-            });
-        }
-
-        storage.open_or_create().await?;
-
-        match sealing.unseal_seed().await {
-            Ok(existing_seed) => {
-                let existing = storage.find_account_for_seed(&existing_seed).await?;
-                if existing.is_some() {
-                    return Err(WalletError::AccountAlreadyExists);
-                }
-                return Err(WalletError::AccountAlreadyExists);
-            }
-            Err(SealingError::NoSealedSeed) => {}
-            Err(e) => return Err(WalletError::from(e)),
-        }
-
-        let mnemonic = Mnemonic::generate();
-        let seed = SeedMaterial::from_mnemonic(&mnemonic, "");
-        sealing.seal_seed(&seed).await?;
-        let prior_chain_state = fetch_prior_chain_state(chain, birthday).await?;
-        let account_id = storage
-            .create_account_for_seed(&seed, prior_chain_state)
-            .await?;
-
-        let capabilities = build_capabilities(network, sealing_capability, storage_capability);
-        emit_plaintext_warning_if_needed(&capabilities, "create");
-
-        let (event_tx, _rx_keepalive) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
-        let inner = Arc::new(WalletInner {
-            network,
-            sealing: Box::new(sealing),
-            storage: Box::new(storage),
-            base_capabilities: capabilities,
-            event_tx,
-            retry_policy: Mutex::new(RetryPolicy::default()),
-            circuit_breaker: CircuitBreaker::new(CircuitBreakerConfig::default()),
-            options,
-        });
-        Ok((Self { inner }, account_id, mnemonic))
-    }
-
-    /// Opens an existing wallet.
-    ///
-    /// Unseals the existing seed, opens (idempotently) the storage, and looks up the account
-    /// whose UFVK matches the seed.
-    ///
-    /// Returns [`WalletError::NoSealedSeed`] if no sealed seed exists; switch to
-    /// [`Wallet::create`]. Returns [`WalletError::AccountNotFound`] if no account in storage
-    /// matches the unsealed seed. Returns [`WalletError::NetworkMismatch`] if
-    /// `network != storage.network()`.
-    ///
-    /// `requires_operator` on `NoSealedSeed` or `AccountNotFound`. `retryable` on transient I/O.
-    pub async fn open<S, St>(
-        network: Network,
-        sealing: S,
-        storage: St,
-        options: WalletOptions,
-    ) -> Result<(Self, AccountId), WalletError>
-    where
-        S: SeedSealing,
-        St: WalletStorage,
-    {
-        let sealing_capability = capability_for_sealing::<S>();
-        let storage_capability = capability_for_storage::<St>();
-
-        if storage.network() != network {
-            return Err(WalletError::NetworkMismatch {
-                storage: storage.network(),
-                requested: network,
-            });
-        }
-
-        storage.open_or_create().await?;
-
-        let seed = match sealing.unseal_seed().await {
-            Ok(s) => s,
-            Err(SealingError::NoSealedSeed) => return Err(WalletError::NoSealedSeed),
-            Err(e) => return Err(WalletError::from(e)),
-        };
-        let account_id = storage
-            .find_account_for_seed(&seed)
-            .await?
-            .ok_or(WalletError::AccountNotFound)?;
-
-        let capabilities = build_capabilities(network, sealing_capability, storage_capability);
-        emit_plaintext_warning_if_needed(&capabilities, "open");
-
-        let (event_tx, _rx_keepalive) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
-        let inner = Arc::new(WalletInner {
-            network,
-            sealing: Box::new(sealing),
-            storage: Box::new(storage),
-            base_capabilities: capabilities,
-            event_tx,
-            retry_policy: Mutex::new(RetryPolicy::default()),
-            circuit_breaker: CircuitBreaker::new(CircuitBreakerConfig::default()),
-            options,
-        });
-        Ok((Self { inner }, account_id))
-    }
-
-    /// Opens an existing wallet, or creates its single account from the sealed seed.
-    ///
-    /// Behaves like [`Wallet::open`] when storage already has an account that matches the
-    /// unsealed seed. On a fresh persistent volume (storage is initialized but the account row
-    /// is missing), the call creates the account at `birthday` from the unsealed seed, then
-    /// returns the same handle. Idempotent across boots: once the account exists, `birthday` is
-    /// ignored.
-    ///
-    /// The intended caller is a deployment whose sealed seed is provisioned through a
-    /// secret store and whose persistent volume can be re-created from scratch. Operators
-    /// who run the wallet on the same machine that ran `Wallet::create` should keep using
-    /// [`Wallet::open`].
-    ///
-    /// Returns [`WalletError::NoSealedSeed`] if no sealed seed exists. Returns
-    /// [`WalletError::NetworkMismatch`] if `network != storage.network()`.
-    ///
-    /// `requires_operator` on `NoSealedSeed`. `retryable` on transient I/O.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "every parameter is mandatory wallet-construction context; grouping them into a single struct would obscure the call site"
-    )]
-    pub async fn open_or_create_account<S, St>(
-        chain: &dyn ChainSource,
-        network: Network,
-        sealing: S,
-        storage: St,
-        birthday: BlockHeight,
-        options: WalletOptions,
-    ) -> Result<(Self, AccountId), WalletError>
-    where
-        S: SeedSealing,
-        St: WalletStorage,
-    {
-        let sealing_capability = capability_for_sealing::<S>();
-        let storage_capability = capability_for_storage::<St>();
-
-        if chain.network() != network {
-            return Err(WalletError::NetworkMismatch {
-                storage: chain.network(),
-                requested: network,
-            });
-        }
-        if storage.network() != network {
-            return Err(WalletError::NetworkMismatch {
-                storage: storage.network(),
-                requested: network,
-            });
-        }
-
-        storage.open_or_create().await?;
-
-        let seed = match sealing.unseal_seed().await {
-            Ok(s) => s,
-            Err(SealingError::NoSealedSeed) => return Err(WalletError::NoSealedSeed),
-            Err(e) => return Err(WalletError::from(e)),
-        };
-
-        let account_id = if let Some(existing) = storage.find_account_for_seed(&seed).await? {
-            existing
-        } else {
-            let prior_chain_state = fetch_prior_chain_state(chain, birthday).await?;
-            storage
-                .create_account_for_seed(&seed, prior_chain_state)
-                .await?
-        };
-
-        let capabilities = build_capabilities(network, sealing_capability, storage_capability);
-        emit_plaintext_warning_if_needed(&capabilities, "open_or_create_account");
-
-        let (event_tx, _rx_keepalive) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
-        let inner = Arc::new(WalletInner {
-            network,
-            sealing: Box::new(sealing),
-            storage: Box::new(storage),
-            base_capabilities: capabilities,
-            event_tx,
-            retry_policy: Mutex::new(RetryPolicy::default()),
-            circuit_breaker: CircuitBreaker::new(CircuitBreakerConfig::default()),
-            options,
-        });
-        Ok((Self { inner }, account_id))
+        WalletBuilder::new(network, sealing, storage)
     }
 
     /// Returns the network this wallet is bound to.
@@ -329,7 +118,7 @@ impl Wallet {
             .storage
             .derive_next_address(account_id)
             .await
-            .map_err(lift_storage_to_wallet_error)
+            .map_err(WalletError::from)
     }
 
     /// Derives a Unified Address that also carries a P2PKH (transparent) receiver.
@@ -348,7 +137,7 @@ impl Wallet {
             .storage
             .derive_next_address_with_transparent(account_id)
             .await
-            .map_err(lift_storage_to_wallet_error)
+            .map_err(WalletError::from)
     }
 
     /// Returns every unspent Sapling and Orchard note owned by `account_id`.
@@ -370,14 +159,14 @@ impl Wallet {
             .storage
             .find_observed_tip()
             .await
-            .map_err(lift_storage_to_wallet_error)?;
+            .map_err(WalletError::from)?;
         let target = observed_tip.unwrap_or_else(|| BlockHeight::from(0));
         let rows = self
             .inner
             .storage
             .list_unspent_shielded_notes(account_id, target)
             .await
-            .map_err(lift_storage_to_wallet_error)?;
+            .map_err(WalletError::from)?;
         Ok(rows
             .into_iter()
             .map(|row| translate_unspent_note(row, observed_tip))
@@ -404,13 +193,13 @@ impl Wallet {
             .storage
             .list_pending_broadcast_inputs(account_id, after_at_ms)
             .await
-            .map_err(lift_storage_to_wallet_error)?;
+            .map_err(WalletError::from)?;
         let as_of_height = self
             .inner
             .storage
             .find_observed_tip()
             .await
-            .map_err(lift_storage_to_wallet_error)?;
+            .map_err(WalletError::from)?;
         let inputs = rows
             .into_iter()
             .map(translate_pending_broadcast_input)
@@ -443,7 +232,7 @@ impl Wallet {
             .storage
             .list_exposed_addresses(account_id)
             .await
-            .map_err(lift_storage_to_wallet_error)?;
+            .map_err(WalletError::from)?;
         let network = self.inner.network;
         Ok(rows
             .into_iter()
@@ -473,7 +262,7 @@ impl Wallet {
             .storage
             .get_account_balance(account_id)
             .await
-            .map_err(lift_storage_to_wallet_error)?;
+            .map_err(WalletError::from)?;
         Ok(translate_account_balance(row, self.inner.network))
     }
 
@@ -496,7 +285,7 @@ impl Wallet {
             .storage
             .list_shielded_receives_for_account(account_id)
             .await
-            .map_err(lift_storage_to_wallet_error)?;
+            .map_err(WalletError::from)?;
         Ok(rows.into_iter().map(translate_received_note).collect())
     }
 
@@ -518,6 +307,187 @@ impl Wallet {
     }
 }
 
+/// Builder for [`Wallet`] handles.
+///
+/// Holds the required `sealing` + `storage` + `network` triple; `options` defaults to
+/// [`WalletOptions::default`] and can be replaced with [`WalletBuilder::with_options`].
+/// Terminal methods [`WalletBuilder::create`], [`WalletBuilder::open`], and
+/// [`WalletBuilder::open_or_create_account`] consume the builder and produce the wallet
+/// handle.
+pub struct WalletBuilder<S, St> {
+    network: Network,
+    sealing: S,
+    storage: St,
+    options: WalletOptions,
+}
+
+impl<S, St> WalletBuilder<S, St>
+where
+    S: SeedSealing,
+    St: WalletStorage,
+{
+    fn new(network: Network, sealing: S, storage: St) -> Self {
+        Self {
+            network,
+            sealing,
+            storage,
+            options: WalletOptions::default(),
+        }
+    }
+
+    /// Replaces the open-time [`WalletOptions`].
+    #[must_use]
+    pub fn with_options(mut self, options: WalletOptions) -> Self {
+        self.options = options;
+        self
+    }
+
+    /// Creates a fresh wallet: generates a 24-word BIP-39 mnemonic, derives the seed,
+    /// seals it, opens (or creates) the storage, and creates the first account at
+    /// `birthday`. Returns [`WalletError::AccountAlreadyExists`] if the storage already
+    /// has an account.
+    pub async fn create(
+        self,
+        chain: &dyn ChainSource,
+        birthday: BlockHeight,
+    ) -> Result<(Wallet, AccountId, Mnemonic), WalletError> {
+        let Self {
+            network,
+            sealing,
+            storage,
+            options,
+        } = self;
+        validate_construction_networks(network, chain.network(), storage.network())?;
+        storage.open_or_create().await?;
+        match sealing.unseal_seed().await {
+            Ok(_) => return Err(WalletError::AccountAlreadyExists),
+            Err(SealingError::NoSealedSeed) => {}
+            Err(e) => return Err(WalletError::from(e)),
+        }
+        let mnemonic = Mnemonic::generate();
+        let seed = SeedMaterial::from_mnemonic(&mnemonic, "");
+        sealing.seal_seed(&seed).await?;
+        let prior_chain_state = fetch_prior_chain_state(chain, birthday).await?;
+        let account_id = storage
+            .create_account_for_seed(&seed, prior_chain_state)
+            .await?;
+        let wallet = assemble_wallet_inner(network, sealing, storage, options, "create");
+        Ok((wallet, account_id, mnemonic))
+    }
+
+    /// Opens an existing wallet by unsealing its seed and looking up the matching account.
+    /// Returns [`WalletError::NoSealedSeed`] if no sealed seed exists.
+    pub async fn open(self) -> Result<(Wallet, AccountId), WalletError> {
+        let Self {
+            network,
+            sealing,
+            storage,
+            options,
+        } = self;
+        if storage.network() != network {
+            return Err(WalletError::NetworkMismatch {
+                storage: storage.network(),
+                requested: network,
+            });
+        }
+        storage.open_or_create().await?;
+        let seed = match sealing.unseal_seed().await {
+            Ok(s) => s,
+            Err(SealingError::NoSealedSeed) => return Err(WalletError::NoSealedSeed),
+            Err(e) => return Err(WalletError::from(e)),
+        };
+        let account_id = storage
+            .find_account_for_seed(&seed)
+            .await?
+            .ok_or(WalletError::AccountNotFound)?;
+        let wallet = assemble_wallet_inner(network, sealing, storage, options, "open");
+        Ok((wallet, account_id))
+    }
+
+    /// Opens an existing wallet, or creates its single account from the sealed seed.
+    /// Behaves like [`WalletBuilder::open`] when the account already exists; otherwise
+    /// creates it at `birthday` from the unsealed seed.
+    pub async fn open_or_create_account(
+        self,
+        chain: &dyn ChainSource,
+        birthday: BlockHeight,
+    ) -> Result<(Wallet, AccountId), WalletError> {
+        let Self {
+            network,
+            sealing,
+            storage,
+            options,
+        } = self;
+        validate_construction_networks(network, chain.network(), storage.network())?;
+        storage.open_or_create().await?;
+        let seed = match sealing.unseal_seed().await {
+            Ok(s) => s,
+            Err(SealingError::NoSealedSeed) => return Err(WalletError::NoSealedSeed),
+            Err(e) => return Err(WalletError::from(e)),
+        };
+        let account_id = if let Some(existing) = storage.find_account_for_seed(&seed).await? {
+            existing
+        } else {
+            let prior_chain_state = fetch_prior_chain_state(chain, birthday).await?;
+            storage
+                .create_account_for_seed(&seed, prior_chain_state)
+                .await?
+        };
+        let wallet =
+            assemble_wallet_inner(network, sealing, storage, options, "open_or_create_account");
+        Ok((wallet, account_id))
+    }
+}
+
+fn validate_construction_networks(
+    requested: Network,
+    chain_network: Network,
+    storage_network: Network,
+) -> Result<(), WalletError> {
+    if chain_network != requested {
+        return Err(WalletError::NetworkMismatch {
+            storage: chain_network,
+            requested,
+        });
+    }
+    if storage_network != requested {
+        return Err(WalletError::NetworkMismatch {
+            storage: storage_network,
+            requested,
+        });
+    }
+    Ok(())
+}
+
+fn assemble_wallet_inner<S, St>(
+    network: Network,
+    sealing: S,
+    storage: St,
+    options: WalletOptions,
+    event_suffix: &'static str,
+) -> Wallet
+where
+    S: SeedSealing,
+    St: WalletStorage,
+{
+    let sealing_capability = sealing.kind();
+    let storage_capability = storage.kind();
+    let capabilities = build_capabilities(network, sealing_capability, storage_capability);
+    emit_plaintext_warning_if_needed(&capabilities, event_suffix);
+    let (event_tx, _rx_keepalive) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
+    let inner = Arc::new(WalletInner {
+        network,
+        sealing: Box::new(sealing),
+        storage: Box::new(storage),
+        base_capabilities: capabilities,
+        event_tx,
+        retry_policy: Mutex::new(RetryPolicy::default()),
+        circuit_breaker: CircuitBreaker::new(CircuitBreakerConfig::default()),
+        options,
+    });
+    Wallet { inner }
+}
+
 async fn fetch_prior_chain_state(
     chain: &dyn ChainSource,
     birthday: BlockHeight,
@@ -533,18 +503,6 @@ async fn fetch_prior_chain_state(
             ),
         })
     })
-}
-
-fn lift_storage_to_wallet_error(err: StorageError) -> WalletError {
-    #[allow(
-        clippy::wildcard_enum_match_arm,
-        reason = "StorageError is #[non_exhaustive]; the explicit arm names AccountNotFound \
-                  (lifted to WalletError::AccountNotFound), the rest delegates to the From impl"
-    )]
-    match err {
-        StorageError::AccountNotFound => WalletError::AccountNotFound,
-        other => WalletError::Storage(other),
-    }
 }
 
 fn build_capabilities(
@@ -573,43 +531,13 @@ fn build_capabilities(
 }
 
 fn emit_plaintext_warning_if_needed(capabilities: &WalletCapabilities, event_suffix: &str) {
-    #[cfg(feature = "unsafe_plaintext_seed")]
-    {
-        if capabilities.sealing == SealingCapability::Plaintext {
-            tracing::warn!(
-                target: "zally::wallet",
-                event = "plaintext_seed_in_use",
-                phase = event_suffix,
-                "wallet opened with plaintext seed sealing; never use in production"
-            );
-        }
-    }
-    let _ = (capabilities, event_suffix);
-}
-
-fn capability_for_sealing<S: SeedSealing>() -> SealingCapability {
-    let name = std::any::type_name::<S>();
-    if name.ends_with("AgeFileSealing") || name.contains("::AgeFileSealing<") {
-        SealingCapability::AgeFile
-    } else if name.ends_with("InMemorySealing") || name.contains("::InMemorySealing<") {
-        SealingCapability::InMemory
-    } else {
-        #[cfg(feature = "unsafe_plaintext_seed")]
-        {
-            if name.ends_with("PlaintextSealing") || name.contains("::PlaintextSealing<") {
-                return SealingCapability::Plaintext;
-            }
-        }
-        SealingCapability::Custom
-    }
-}
-
-fn capability_for_storage<St: WalletStorage>() -> StorageCapability {
-    let name = std::any::type_name::<St>();
-    if name.ends_with("SqliteWalletStorage") || name.contains("::SqliteWalletStorage<") {
-        StorageCapability::Sqlite
-    } else {
-        StorageCapability::Custom
+    if capabilities.sealing == SealingCapability::Plaintext {
+        tracing::warn!(
+            target: "zally::wallet",
+            event = "plaintext_seed_in_use",
+            phase = event_suffix,
+            "wallet opened with plaintext seed sealing; never use in production"
+        );
     }
 }
 
@@ -661,15 +589,9 @@ fn translate_account_balance(
 fn translate_received_note(
     row: zally_storage::ReceivedShieldedNoteRow,
 ) -> crate::received_note::ShieldedReceiveRecord {
-    let pool = match row.protocol {
-        zcash_protocol::ShieldedProtocol::Sapling => zally_chain::ShieldedPool::Sapling,
-        zcash_protocol::ShieldedProtocol::Orchard => zally_chain::ShieldedPool::Orchard,
-    };
-    let amount = zally_core::Zatoshis::try_from(row.value_zat)
-        .unwrap_or_else(|_| zally_core::Zatoshis::zero());
     crate::received_note::ShieldedReceiveRecord {
-        pool,
-        value: amount,
+        pool: shielded_pool_for(row.protocol),
+        value: row.value_zat,
         tx_id: row.tx_id,
         output_index: row.output_index,
         mined_height: row.mined_height,
@@ -683,12 +605,6 @@ fn translate_unspent_note(
     row: zally_storage::UnspentShieldedNoteRow,
     observed_tip: Option<BlockHeight>,
 ) -> crate::unspent_note::UnspentShieldedNote {
-    let pool = match row.protocol {
-        zcash_protocol::ShieldedProtocol::Sapling => zally_chain::ShieldedPool::Sapling,
-        zcash_protocol::ShieldedProtocol::Orchard => zally_chain::ShieldedPool::Orchard,
-    };
-    let amount = zally_core::Zatoshis::try_from(row.value_zat)
-        .unwrap_or_else(|_| zally_core::Zatoshis::zero());
     let confirmations = match observed_tip {
         Some(tip) if tip.as_u32() >= row.mined_height.as_u32() => tip
             .as_u32()
@@ -697,12 +613,21 @@ fn translate_unspent_note(
         _ => 0,
     };
     crate::unspent_note::UnspentShieldedNote {
-        pool,
-        value: amount,
+        pool: shielded_pool_for(row.protocol),
+        value: row.value_zat,
         tx_id: row.tx_id,
         output_index: row.output_index,
         mined_height: row.mined_height,
         confirmations,
+    }
+}
+
+const fn shielded_pool_for(
+    protocol: zcash_protocol::ShieldedProtocol,
+) -> zally_chain::ShieldedPool {
+    match protocol {
+        zcash_protocol::ShieldedProtocol::Sapling => zally_chain::ShieldedPool::Sapling,
+        zcash_protocol::ShieldedProtocol::Orchard => zally_chain::ShieldedPool::Orchard,
     }
 }
 

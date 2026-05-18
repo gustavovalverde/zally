@@ -5182,6 +5182,7 @@ dependencies = [
  "async-trait",
  "bip0039",
  "secrecy 0.8.0",
+ "serde",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
@@ -5214,10 +5215,13 @@ name = "zally-storage"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "orchard 0.13.1",
  "pczt",
  "rand",
  "rusqlite",
+ "sapling-crypto 0.7.0",
  "secrecy 0.8.0",
+ "serde",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
