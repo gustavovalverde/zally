@@ -3,10 +3,7 @@
 use tempfile::TempDir;
 use zally_core::{BlockHeight, TxId, Zatoshis};
 use zally_keys::{Mnemonic, SeedMaterial};
-use zally_storage::{
-    SqliteWalletStorage, SqliteWalletStorageOptions, StorageError, TransparentUtxoRow,
-    WalletStorage,
-};
+use zally_storage::{Sqlite, SqliteOptions, StorageError, TransparentUtxoRow, WalletStorage};
 use zcash_client_backend::data_api::chain::ChainState;
 use zcash_primitives::block::BlockHash;
 use zcash_transparent::address::Script;
@@ -14,7 +11,7 @@ use zcash_transparent::address::Script;
 #[tokio::test]
 async fn transparent_utxo_round_trip_records_exposed_receiver() -> Result<(), TestError> {
     let temp = TempDir::new()?;
-    let storage = SqliteWalletStorage::new(SqliteWalletStorageOptions::for_network(
+    let storage = Sqlite::new(SqliteOptions::for_network(
         zally_core::Network::regtest(),
         temp.path().join("wallet.db"),
     ));

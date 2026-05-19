@@ -7,7 +7,7 @@ use std::fs;
 
 use zally_core::{BlockHeight, Network};
 use zally_keys::{AgeFileSealing, AgeFileSealingOptions};
-use zally_storage::{SqliteWalletStorage, SqliteWalletStorageOptions};
+use zally_storage::{Sqlite, SqliteOptions};
 use zally_testkit::TempWalletPath;
 use zally_wallet::{Wallet, WalletError};
 
@@ -19,10 +19,7 @@ async fn open_or_create_account_recovers_account_on_fresh_storage() -> Result<()
     let network = Network::regtest();
 
     let sealing = AgeFileSealing::new(AgeFileSealingOptions::at_path(origin.seed_path()));
-    let storage = SqliteWalletStorage::new(SqliteWalletStorageOptions::for_network(
-        network,
-        origin.db_path(),
-    ));
+    let storage = Sqlite::new(SqliteOptions::for_network(network, origin.db_path()));
     let chain = zally_testkit::MockChainSource::new(network);
     let (_wallet, original_account_id, _mnemonic) = Wallet::builder(network, sealing, storage)
         .create(&chain, BlockHeight::from(1))
@@ -36,10 +33,7 @@ async fn open_or_create_account_recovers_account_on_fresh_storage() -> Result<()
     )?;
 
     let sealing = AgeFileSealing::new(AgeFileSealingOptions::at_path(restored.seed_path()));
-    let storage = SqliteWalletStorage::new(SqliteWalletStorageOptions::for_network(
-        network,
-        restored.db_path(),
-    ));
+    let storage = Sqlite::new(SqliteOptions::for_network(network, restored.db_path()));
     let chain = zally_testkit::MockChainSource::new(network);
     let (restored_wallet, restored_account_id) = Wallet::builder(network, sealing, storage)
         .open_or_create_account(&chain, BlockHeight::from(1))
@@ -67,20 +61,14 @@ async fn open_or_create_account_is_idempotent_on_warm_storage() -> Result<(), Te
     let network = Network::regtest();
 
     let sealing = AgeFileSealing::new(AgeFileSealingOptions::at_path(temp.seed_path()));
-    let storage = SqliteWalletStorage::new(SqliteWalletStorageOptions::for_network(
-        network,
-        temp.db_path(),
-    ));
+    let storage = Sqlite::new(SqliteOptions::for_network(network, temp.db_path()));
     let chain = zally_testkit::MockChainSource::new(network);
     let (_wallet, original_account_id, _mnemonic) = Wallet::builder(network, sealing, storage)
         .create(&chain, BlockHeight::from(1))
         .await?;
 
     let sealing = AgeFileSealing::new(AgeFileSealingOptions::at_path(temp.seed_path()));
-    let storage = SqliteWalletStorage::new(SqliteWalletStorageOptions::for_network(
-        network,
-        temp.db_path(),
-    ));
+    let storage = Sqlite::new(SqliteOptions::for_network(network, temp.db_path()));
     let chain = zally_testkit::MockChainSource::new(network);
     let (_reopened_wallet, reopened_account_id) = Wallet::builder(network, sealing, storage)
         .open_or_create_account(&chain, BlockHeight::from(99_999))
@@ -98,10 +86,7 @@ async fn open_or_create_account_without_seal_returns_no_sealed_seed() -> Result<
     let network = Network::regtest();
 
     let sealing = AgeFileSealing::new(AgeFileSealingOptions::at_path(temp.seed_path()));
-    let storage = SqliteWalletStorage::new(SqliteWalletStorageOptions::for_network(
-        network,
-        temp.db_path(),
-    ));
+    let storage = Sqlite::new(SqliteOptions::for_network(network, temp.db_path()));
     let chain = zally_testkit::MockChainSource::new(network);
     let outcome = Wallet::builder(network, sealing, storage)
         .open_or_create_account(&chain, BlockHeight::from(1))

@@ -7,13 +7,13 @@
 use rusqlite::params;
 use tempfile::TempDir;
 use zally_core::{BlockHeight, TxId};
-use zally_storage::{SqliteWalletStorage, SqliteWalletStorageOptions, StorageError, WalletStorage};
+use zally_storage::{Sqlite, SqliteOptions, StorageError, WalletStorage};
 
 #[tokio::test]
 async fn wallet_tx_ids_mined_in_range_round_trip() -> Result<(), TestError> {
     let temp = TempDir::new()?;
     let db_path = temp.path().join("wallet.db");
-    let storage = SqliteWalletStorage::new(SqliteWalletStorageOptions::for_network(
+    let storage = Sqlite::new(SqliteOptions::for_network(
         zally_core::Network::regtest(),
         db_path.clone(),
     ));

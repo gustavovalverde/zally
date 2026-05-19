@@ -4,12 +4,12 @@
 
 use tempfile::TempDir;
 use zally_core::BlockHeight;
-use zally_storage::{SqliteWalletStorage, SqliteWalletStorageOptions, StorageError, WalletStorage};
+use zally_storage::{Sqlite, SqliteOptions, StorageError, WalletStorage};
 
 #[tokio::test]
 async fn observed_tip_records_regress() -> Result<(), TestError> {
     let temp = TempDir::new()?;
-    let storage = SqliteWalletStorage::new(SqliteWalletStorageOptions::for_network(
+    let storage = Sqlite::new(SqliteOptions::for_network(
         zally_core::Network::regtest(),
         temp.path().join("wallet.db"),
     ));

@@ -1,7 +1,7 @@
 //! `Wallet::sync` with a chain source on a different network fails closed.
 
 use zally_core::{BlockHeight, Network};
-use zally_storage::{SqliteWalletStorage, SqliteWalletStorageOptions};
+use zally_storage::{Sqlite, SqliteOptions};
 use zally_testkit::{InMemorySealing, MockChainSource, TempWalletPath};
 use zally_wallet::{Wallet, WalletError};
 
@@ -11,10 +11,7 @@ async fn sync_network_mismatch_fails_closed() -> Result<(), TestError> {
     let regtest = Network::regtest();
 
     let sealing = InMemorySealing::new();
-    let storage = SqliteWalletStorage::new(SqliteWalletStorageOptions::for_network(
-        regtest,
-        temp.db_path(),
-    ));
+    let storage = Sqlite::new(SqliteOptions::for_network(regtest, temp.db_path()));
     let chain = zally_testkit::MockChainSource::new(regtest);
     let (wallet, _, _) = Wallet::builder(regtest, sealing, storage)
         .create(&chain, BlockHeight::from(1))

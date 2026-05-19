@@ -2,7 +2,7 @@
 //! to simulate process restart without touching the filesystem.
 
 use zally_core::{BlockHeight, Network};
-use zally_storage::{SqliteWalletStorage, SqliteWalletStorageOptions};
+use zally_storage::{Sqlite, SqliteOptions};
 use zally_testkit::{InMemorySealing, TempWalletPath};
 use zally_wallet::{Wallet, WalletError};
 
@@ -14,10 +14,7 @@ async fn create_then_open_round_trip_in_memory() -> Result<(), TestError> {
     let sealing_primary = InMemorySealing::new();
     let sealing_shadow = sealing_primary.shared_with();
 
-    let storage = SqliteWalletStorage::new(SqliteWalletStorageOptions::for_network(
-        network,
-        temp.db_path(),
-    ));
+    let storage = Sqlite::new(SqliteOptions::for_network(network, temp.db_path()));
     let chain = zally_testkit::MockChainSource::new(network);
     let (wallet, account_id, _mnemonic) = Wallet::builder(network, sealing_primary, storage)
         .create(&chain, BlockHeight::from(1))
@@ -29,10 +26,7 @@ async fn create_then_open_round_trip_in_memory() -> Result<(), TestError> {
         .encode(&params);
     drop(wallet);
 
-    let storage = SqliteWalletStorage::new(SqliteWalletStorageOptions::for_network(
-        network,
-        temp.db_path(),
-    ));
+    let storage = Sqlite::new(SqliteOptions::for_network(network, temp.db_path()));
     let (wallet, account_id_2) = Wallet::builder(network, sealing_shadow, storage)
         .open()
         .await?;

@@ -71,7 +71,7 @@ Forbidden verbs for domain operations: `handle_*`, `process_*`, `manage_*`, `do_
 A name must survive a change of its implementation.
 
 - Banned patterns: `new_x`, `x2`, `legacy_x`, `x_old`, `x_final`, `x_real`, `x_actual`, `x_improved`.
-- Banned implementation leaks: `sqlite_storage` (the implementation is `WalletStorage` with `SqliteWalletStorage` as one impl, not `SqliteStorage`), `zinder_chain` (`ChainSource` with `ZinderChainSource` as one impl).
+- Banned implementation leaks at the trait surface: a trait named after a backend (`SqliteStorage`, `ZinderChain`) ties the abstraction to one implementation. The trait is `WalletStorage` with `Sqlite` as one impl in `zally-storage`; the trait is `ChainSource` with `ZinderChainSource` as one impl in `zally-chain`. Implementation types are free to name the backend (`Sqlite`, `Zinder`) since they describe a single concrete backend, but the trait never does.
 - Protocol names are domain, not implementation, and stay: `pczt`, `frost`, `zip32`, `zip316`, `zip321`, `zip317`, `zip320`, `tex`. These appear verbatim in identifiers.
 
 ## Type conventions

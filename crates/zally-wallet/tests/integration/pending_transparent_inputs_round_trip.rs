@@ -3,9 +3,7 @@
 
 use zally_chain::ChainSource as _;
 use zally_core::{BlockHeight, OutPoint, TxId, Zatoshis};
-use zally_storage::{
-    PendingBroadcastRecord, SqliteWalletStorage, SqliteWalletStorageOptions, WalletStorage,
-};
+use zally_storage::{PendingBroadcastRecord, Sqlite, SqliteOptions, WalletStorage};
 use zally_testkit::MockChainSource;
 use zally_wallet::{WalletError, WalletOptions};
 
@@ -45,10 +43,7 @@ async fn get_pending_transparent_inputs_reports_recorded_rows() -> Result<(), Te
         account_id,
     } = create_test_wallet().await?;
     let network = wallet.network();
-    let storage = SqliteWalletStorage::new(SqliteWalletStorageOptions::for_network(
-        network,
-        temp.db_path(),
-    ));
+    let storage = Sqlite::new(SqliteOptions::for_network(network, temp.db_path()));
     storage.open_or_create().await?;
 
     let now_ms = unix_ms_now();
@@ -87,10 +82,7 @@ async fn get_pending_transparent_inputs_drops_rows_outside_window() -> Result<()
         account_id,
     } = create_test_wallet_with_options(options).await?;
     let network = wallet.network();
-    let storage = SqliteWalletStorage::new(SqliteWalletStorageOptions::for_network(
-        network,
-        temp.db_path(),
-    ));
+    let storage = Sqlite::new(SqliteOptions::for_network(network, temp.db_path()));
     storage.open_or_create().await?;
 
     let stale_at_ms = unix_ms_now().saturating_sub(10 * 60_000);
@@ -124,10 +116,7 @@ async fn sync_clears_expired_pending_broadcast_rows() -> Result<(), TestError> {
         account_id,
     } = create_test_wallet_with_options(options).await?;
     let network = wallet.network();
-    let storage = SqliteWalletStorage::new(SqliteWalletStorageOptions::for_network(
-        network,
-        temp.db_path(),
-    ));
+    let storage = Sqlite::new(SqliteOptions::for_network(network, temp.db_path()));
     storage.open_or_create().await?;
 
     let stale_at_ms = unix_ms_now().saturating_sub(10 * 60_000);

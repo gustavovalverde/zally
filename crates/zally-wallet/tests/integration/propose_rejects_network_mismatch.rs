@@ -1,7 +1,7 @@
 //! `Wallet::propose` refuses recipients on a different network.
 
 use zally_core::{BlockHeight, Network, PaymentRecipient, Zatoshis};
-use zally_storage::{SqliteWalletStorage, SqliteWalletStorageOptions};
+use zally_storage::{Sqlite, SqliteOptions};
 use zally_testkit::{InMemorySealing, TempWalletPath};
 use zally_wallet::{Wallet, WalletError};
 
@@ -10,10 +10,7 @@ async fn propose_rejects_network_mismatch() -> Result<(), TestError> {
     let temp = TempWalletPath::create()?;
     let network = Network::regtest();
     let sealing = InMemorySealing::new();
-    let storage = SqliteWalletStorage::new(SqliteWalletStorageOptions::for_network(
-        network,
-        temp.db_path(),
-    ));
+    let storage = Sqlite::new(SqliteOptions::for_network(network, temp.db_path()));
     let chain = zally_testkit::MockChainSource::new(network);
     let (wallet, account, _) = Wallet::builder(network, sealing, storage)
         .create(&chain, BlockHeight::from(1))

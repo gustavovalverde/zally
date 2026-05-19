@@ -7,7 +7,7 @@
 //! proposal construction can hold wallet-db access while proving. The actor makes
 //! that serialization explicit, bounded, and observable.
 //!
-//! [`SqliteWalletStorage`] is a cheap [`Clone`] handle holding only the
+//! [`Sqlite`] is a cheap [`Clone`] handle holding only the
 //! channel sender; the actor lives until every clone is dropped.
 
 use std::path::PathBuf;
@@ -61,7 +61,7 @@ const WALLET_DB_QUEUE_CAPACITY: usize = 256;
 /// calls it. This is the type-erasure that lets one `mpsc` channel carry every
 /// `with_db`, `with_db_mut`, `with_ledger`, and `open_or_create` request
 /// without a per-method message variant.
-type DbWork = Box<dyn FnOnce(&mut WalletDbState, &SqliteWalletStorageOptions) + Send>;
+type DbWork = Box<dyn FnOnce(&mut WalletDbState, &SqliteOptions) + Send>;
 
 /// State held on the actor thread.
 ///
@@ -77,10 +77,10 @@ enum WalletDbState {
     },
 }
 
-/// Options for [`SqliteWalletStorage`].
+/// Options for [`Sqlite`].
 #[derive(Clone, Debug)]
 #[non_exhaustive]
-pub struct SqliteWalletStorageOptions {
+pub struct SqliteOptions {
     /// Path at which the `SQLite` database is opened or created.
     pub db_path: PathBuf,
     /// Network bound to this storage instance.
@@ -89,7 +89,7 @@ pub struct SqliteWalletStorageOptions {
     pub account_name: String,
 }
 
-impl SqliteWalletStorageOptions {
+impl SqliteOptions {
     /// Storage options for a network-bound wallet. The account name defaults to `"primary"`.
     #[must_use]
     pub fn for_network(network: Network, db_path: PathBuf) -> Self {
@@ -104,7 +104,7 @@ impl SqliteWalletStorageOptions {
 /// `SQLite`-backed [`WalletStorage`] implementation.
 ///
 /// Wraps [`zcash_client_sqlite::WalletDb`]. The wallet database is opened lazily;
-/// the first [`SqliteWalletStorage::open_or_create`] call transitions the
+/// the first [`Sqlite::open_or_create`] call transitions the
 /// actor's state from `NotOpened` to `Opened`. Every public method routes its
 /// blocking sqlite work through the wallet-db actor described in the module
 /// docs.
@@ -112,20 +112,20 @@ impl SqliteWalletStorageOptions {
 /// Cloning yields another handle to the same actor; the actor lives until all
 /// clones are dropped.
 #[derive(Clone)]
-pub struct SqliteWalletStorage {
-    options: SqliteWalletStorageOptions,
+pub struct Sqlite {
+    options: SqliteOptions,
     request_tx: mpsc::Sender<DbWork>,
 }
 
-impl SqliteWalletStorage {
+impl Sqlite {
     /// Constructs a new storage handle and spawns the wallet-db actor. The
-    /// database is not opened until [`SqliteWalletStorage::open_or_create`] is
+    /// database is not opened until [`Sqlite::open_or_create`] is
     /// called (the actor starts unopened).
     ///
     /// Must be called from within a tokio runtime; the actor lives on the
     /// runtime's blocking pool until all handles are dropped.
     #[must_use]
-    pub fn new(options: SqliteWalletStorageOptions) -> Self {
+    pub fn new(options: SqliteOptions) -> Self {
         let (request_tx, request_rx) = mpsc::channel(WALLET_DB_QUEUE_CAPACITY);
         let actor_options = options.clone();
         drop(tokio::task::spawn_blocking(move || {
@@ -147,9 +147,7 @@ impl SqliteWalletStorage {
 
     async fn dispatch<F, T>(&self, run_on_actor: F) -> Result<T, StorageError>
     where
-        F: FnOnce(&mut WalletDbState, &SqliteWalletStorageOptions) -> Result<T, StorageError>
-            + Send
-            + 'static,
+        F: FnOnce(&mut WalletDbState, &SqliteOptions) -> Result<T, StorageError> + Send + 'static,
         T: Send + 'static,
     {
         let (reply_tx, reply_rx) = oneshot::channel();
@@ -222,10 +220,7 @@ impl SqliteWalletStorage {
     }
 }
 
-fn run_wallet_db_actor(
-    options: &SqliteWalletStorageOptions,
-    mut request_rx: mpsc::Receiver<DbWork>,
-) {
+fn run_wallet_db_actor(options: &SqliteOptions, mut request_rx: mpsc::Receiver<DbWork>) {
     let mut state = WalletDbState::NotOpened;
     while let Some(work) = request_rx.blocking_recv() {
         work(&mut state, options);
@@ -235,7 +230,7 @@ fn run_wallet_db_actor(
 /// Opens (or creates on first run) the underlying `WalletDb` and the Zally
 /// ledger connection backing the `ext_zally_*` tables. Runs on the actor
 /// thread; the file I/O and the schema migration happen here.
-fn open_wallet_db(options: &SqliteWalletStorageOptions) -> Result<WalletDbState, StorageError> {
+fn open_wallet_db(options: &SqliteOptions) -> Result<WalletDbState, StorageError> {
     if let Some(parent) = options.db_path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| StorageError::SqliteFailed {
             reason: format!("could not create database directory: {e}"),
@@ -300,7 +295,7 @@ fn open_wallet_db(options: &SqliteWalletStorageOptions) -> Result<WalletDbState,
     reason = "async-trait expands the WalletStorage impl; contiguous methods preserve the trait boundary"
 )]
 #[async_trait]
-impl WalletStorage for SqliteWalletStorage {
+impl WalletStorage for Sqlite {
     async fn open_or_create(&self) -> Result<(), StorageError> {
         self.dispatch(|state, options| {
             if matches!(state, WalletDbState::Opened { .. }) {

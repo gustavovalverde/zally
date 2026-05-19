@@ -22,7 +22,7 @@ use tracing_subscriber::EnvFilter;
 use zally_chain::{ChainSource, ZinderChainSource, ZinderRemoteOptions};
 use zally_core::{BlockHeight, Network, PaymentRecipient, Zatoshis};
 use zally_keys::{AgeFileSealing, AgeFileSealingOptions};
-use zally_storage::{SqliteWalletStorage, SqliteWalletStorageOptions};
+use zally_storage::{Sqlite, SqliteOptions};
 use zally_wallet::{ProposalPlan, Wallet, WalletError};
 
 #[tokio::main]
@@ -63,7 +63,7 @@ async fn main() -> Result<(), ExampleError> {
     let sealing = AgeFileSealing::new(AgeFileSealingOptions::at_path(
         temp.path().join("wallet.age"),
     ));
-    let storage = SqliteWalletStorage::new(SqliteWalletStorageOptions::for_network(
+    let storage = Sqlite::new(SqliteOptions::for_network(
         network,
         temp.path().join("wallet.db"),
     ));

@@ -8,7 +8,7 @@ use tracing::Subscriber;
 use tracing_subscriber::layer::SubscriberExt;
 use zally_core::{BlockHeight, Network};
 use zally_keys::PlaintextSealing;
-use zally_storage::{SqliteWalletStorage, SqliteWalletStorageOptions};
+use zally_storage::{Sqlite, SqliteOptions};
 use zally_testkit::TempWalletPath;
 use zally_wallet::{Wallet, WalletError};
 
@@ -24,20 +24,14 @@ async fn unsafe_plaintext_seed_warns() -> Result<(), TestError> {
     let _default_guard = tracing::subscriber::set_default(subscriber);
 
     let sealing = PlaintextSealing::new(temp.seed_path());
-    let storage = SqliteWalletStorage::new(SqliteWalletStorageOptions::for_network(
-        network,
-        temp.db_path(),
-    ));
+    let storage = Sqlite::new(SqliteOptions::for_network(network, temp.db_path()));
     let chain = zally_testkit::MockChainSource::new(network);
     let _ = Wallet::builder(network, sealing, storage)
         .create(&chain, BlockHeight::from(1))
         .await?;
 
     let sealing = PlaintextSealing::new(temp.seed_path());
-    let storage = SqliteWalletStorage::new(SqliteWalletStorageOptions::for_network(
-        network,
-        temp.db_path(),
-    ));
+    let storage = Sqlite::new(SqliteOptions::for_network(network, temp.db_path()));
     let _ = Wallet::builder(network, sealing, storage).open().await?;
 
     let plaintext_count = {

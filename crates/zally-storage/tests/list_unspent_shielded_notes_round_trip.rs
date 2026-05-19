@@ -9,14 +9,14 @@
 use tempfile::TempDir;
 use zally_core::{AccountId, BlockHeight};
 use zally_keys::{Mnemonic, SeedMaterial};
-use zally_storage::{SqliteWalletStorage, SqliteWalletStorageOptions, StorageError, WalletStorage};
+use zally_storage::{Sqlite, SqliteOptions, StorageError, WalletStorage};
 use zcash_client_backend::data_api::chain::ChainState;
 use zcash_primitives::block::BlockHash;
 
 #[tokio::test]
 async fn list_unspent_shielded_notes_round_trip_empty_account() -> Result<(), TestError> {
     let temp = TempDir::new()?;
-    let storage = SqliteWalletStorage::new(SqliteWalletStorageOptions::for_network(
+    let storage = Sqlite::new(SqliteOptions::for_network(
         zally_core::Network::regtest(),
         temp.path().join("wallet.db"),
     ));
@@ -41,7 +41,7 @@ async fn list_unspent_shielded_notes_round_trip_empty_account() -> Result<(), Te
 #[tokio::test]
 async fn list_unspent_shielded_notes_returns_empty_for_unknown_account() -> Result<(), TestError> {
     let temp = TempDir::new()?;
-    let storage = SqliteWalletStorage::new(SqliteWalletStorageOptions::for_network(
+    let storage = Sqlite::new(SqliteOptions::for_network(
         zally_core::Network::regtest(),
         temp.path().join("wallet.db"),
     ));

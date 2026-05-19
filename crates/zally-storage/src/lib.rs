@@ -12,7 +12,7 @@ pub use account_balance_row::AccountBalanceRow;
 pub use error::StorageError;
 pub use exposed_address_row::ExposedAddressRow;
 pub use pending_broadcast_input_row::PendingBroadcastInputRow;
-pub use sqlite::{SqliteWalletStorage, SqliteWalletStorageOptions};
+pub use sqlite::{Sqlite, SqliteOptions};
 pub use wallet::{
     PendingBroadcastRecord, PreparedTransaction, ProposalPaymentRequest, ProposalSummary,
     ReceivedShieldedNoteRow, ScanRequest, ScanResult, ShieldTransparentRequest, StorageKind,

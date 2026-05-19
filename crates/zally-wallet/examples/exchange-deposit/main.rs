@@ -17,7 +17,7 @@ use tracing::info;
 use tracing_subscriber::EnvFilter;
 use zally_core::{BlockHeight, Network};
 use zally_keys::{AgeFileSealing, AgeFileSealingOptions};
-use zally_storage::{SqliteWalletStorage, SqliteWalletStorageOptions};
+use zally_storage::{Sqlite, SqliteOptions};
 use zally_testkit::MockChainSource;
 use zally_wallet::{Wallet, WalletError};
 
@@ -34,7 +34,7 @@ async fn main() -> Result<(), ExampleError> {
     let sealing = AgeFileSealing::new(AgeFileSealingOptions::at_path(
         temp.path().join("wallet.age"),
     ));
-    let storage = SqliteWalletStorage::new(SqliteWalletStorageOptions::for_network(
+    let storage = Sqlite::new(SqliteOptions::for_network(
         network,
         temp.path().join("wallet.db"),
     ));

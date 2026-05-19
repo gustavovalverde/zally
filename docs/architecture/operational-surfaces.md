@@ -27,9 +27,9 @@ Zinder is a `ChainSource` and `Submitter` implementation. Zally public wallet AP
 
 ## Storage Execution
 
-`SqliteWalletStorage` is a cheap clone handle over one wallet-db actor. The actor owns the `zcash_client_sqlite::WalletDb` and the Zally ledger connection on one blocking thread. Public storage methods send bounded work items to that actor and await a typed reply.
+`Sqlite` is a cheap clone handle over one wallet-db actor. The actor owns the `zcash_client_sqlite::WalletDb` and the Zally ledger connection on one blocking thread. Public storage methods send bounded work items to that actor and await a typed reply.
 
-The actor provides one storage serialization point and one queue-depth signal. Callers observe pressure through `SqliteWalletStorage::queue_depth()`. Queue depth near capacity means storage cannot keep up with wallet sync, proposal construction, or balance reads.
+The actor provides one storage serialization point and one queue-depth signal. Callers observe pressure through `Sqlite::queue_depth()`. Queue depth near capacity means storage cannot keep up with wallet sync, proposal construction, or balance reads.
 
 ## Sync Driver
 

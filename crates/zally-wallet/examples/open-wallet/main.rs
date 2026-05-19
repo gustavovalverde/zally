@@ -25,7 +25,7 @@ use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 use zally_core::{BlockHeight, Network};
 use zally_keys::{AgeFileSealing, AgeFileSealingOptions};
-use zally_storage::{SqliteWalletStorage, SqliteWalletStorageOptions};
+use zally_storage::{Sqlite, SqliteOptions};
 use zally_wallet::{Wallet, WalletError};
 use zcash_keys::address::UnifiedAddress;
 
@@ -71,10 +71,7 @@ async fn bootstrap_wallet(
     db_path: &std::path::Path,
 ) -> Result<UnifiedAddress, WalletError> {
     let sealing = AgeFileSealing::new(AgeFileSealingOptions::at_path(seed_path.to_path_buf()));
-    let storage = SqliteWalletStorage::new(SqliteWalletStorageOptions::for_network(
-        network,
-        db_path.to_path_buf(),
-    ));
+    let storage = Sqlite::new(SqliteOptions::for_network(network, db_path.to_path_buf()));
 
     let chain = zally_testkit::MockChainSource::new(network);
     let (wallet, account_id, mnemonic) = Wallet::builder(network, sealing, storage)
@@ -106,10 +103,7 @@ async fn reopen_wallet(
     db_path: &std::path::Path,
 ) -> Result<UnifiedAddress, WalletError> {
     let sealing = AgeFileSealing::new(AgeFileSealingOptions::at_path(seed_path.to_path_buf()));
-    let storage = SqliteWalletStorage::new(SqliteWalletStorageOptions::for_network(
-        network,
-        db_path.to_path_buf(),
-    ));
+    let storage = Sqlite::new(SqliteOptions::for_network(network, db_path.to_path_buf()));
     let (wallet, account_id) = Wallet::builder(network, sealing, storage).open().await?;
     wallet.derive_next_address(account_id).await
 }
@@ -121,8 +115,7 @@ async fn plaintext_demo(network: Network, dir: &std::path::Path) -> Result<(), W
     let seed_path = dir.join("UNSAFE.seed");
     let db_path = dir.join("UNSAFE.db");
     let sealing = PlaintextSealing::new(seed_path);
-    let storage =
-        SqliteWalletStorage::new(SqliteWalletStorageOptions::for_network(network, db_path));
+    let storage = Sqlite::new(SqliteOptions::for_network(network, db_path));
     let chain = zally_testkit::MockChainSource::new(network);
     let (wallet, account_id, _mnemonic) = Wallet::builder(network, sealing, storage)
         .create(&chain, BlockHeight::from(1))

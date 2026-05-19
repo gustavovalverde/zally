@@ -13,7 +13,7 @@ use zally_core::{
     AccountId, BlockHeight, IdempotencyKey, Network, PaymentRecipient, TxId, Zatoshis,
 };
 use zally_keys::{AgeFileSealing, AgeFileSealingOptions};
-use zally_storage::{SqliteWalletStorage, SqliteWalletStorageOptions};
+use zally_storage::{Sqlite, SqliteOptions};
 use zally_testkit::{
     LiveTestError, TempWalletPath, init, require_live, require_network, require_zinder_endpoint,
 };
@@ -312,10 +312,7 @@ async fn create_wallet_at_tip(
 ) -> Result<(TempWalletPath, Wallet, AccountId), TestError> {
     let temp = TempWalletPath::create()?;
     let sealing = AgeFileSealing::new(AgeFileSealingOptions::at_path(temp.seed_path()));
-    let storage = SqliteWalletStorage::new(SqliteWalletStorageOptions::for_network(
-        network,
-        temp.db_path(),
-    ));
+    let storage = Sqlite::new(SqliteOptions::for_network(network, temp.db_path()));
     let birthday = BlockHeight::from(tip_height.as_u32().saturating_sub(10).max(1));
     let (wallet, account_id, _mnemonic) = Wallet::builder(network, sealing, storage)
         .create(chain, birthday)

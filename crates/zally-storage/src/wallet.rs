@@ -11,7 +11,7 @@ use zally_core::{AccountId, BlockHeight, IdempotencyKey, Network, OutPoint, TxId
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[non_exhaustive]
 pub enum StorageKind {
-    /// `zally_storage::SqliteWalletStorage`.
+    /// `zally_storage::Sqlite`.
     Sqlite,
     /// A custom storage backend provided by the operator.
     Custom,

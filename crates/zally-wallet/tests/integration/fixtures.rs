@@ -7,7 +7,7 @@
 
 use zally_core::{BlockHeight, Network};
 use zally_keys::{AgeFileSealing, AgeFileSealingOptions};
-use zally_storage::{SqliteWalletStorage, SqliteWalletStorageOptions};
+use zally_storage::{Sqlite, SqliteOptions};
 use zally_testkit::{MockChainSource, TempWalletPath};
 use zally_wallet::{Wallet, WalletError, WalletOptions};
 
@@ -35,10 +35,7 @@ pub(crate) async fn create_test_wallet_with_options(
     let temp = TempWalletPath::create()?;
     let network = Network::regtest();
     let sealing = AgeFileSealing::new(AgeFileSealingOptions::at_path(temp.seed_path()));
-    let storage = SqliteWalletStorage::new(SqliteWalletStorageOptions::for_network(
-        network,
-        temp.db_path(),
-    ));
+    let storage = Sqlite::new(SqliteOptions::for_network(network, temp.db_path()));
     let chain = MockChainSource::new(network);
     let (wallet, account_id, _mnemonic) = Wallet::builder(network, sealing, storage)
         .with_options(options)

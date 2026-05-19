@@ -2,12 +2,12 @@
 
 use tempfile::TempDir;
 use zally_core::{IdempotencyKey, TxId};
-use zally_storage::{SqliteWalletStorage, SqliteWalletStorageOptions, StorageError, WalletStorage};
+use zally_storage::{Sqlite, SqliteOptions, StorageError, WalletStorage};
 
 #[tokio::test]
 async fn idempotency_ledger_round_trip() -> Result<(), TestError> {
     let temp = TempDir::new()?;
-    let storage = SqliteWalletStorage::new(SqliteWalletStorageOptions::for_network(
+    let storage = Sqlite::new(SqliteOptions::for_network(
         zally_core::Network::regtest(),
         temp.path().join("wallet.db"),
     ));

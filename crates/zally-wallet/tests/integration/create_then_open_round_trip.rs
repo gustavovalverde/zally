@@ -2,7 +2,7 @@
 
 use zally_core::{BlockHeight, Network};
 use zally_keys::{AgeFileSealing, AgeFileSealingOptions};
-use zally_storage::{SqliteWalletStorage, SqliteWalletStorageOptions};
+use zally_storage::{Sqlite, SqliteOptions};
 use zally_testkit::TempWalletPath;
 use zally_wallet::{Wallet, WalletError};
 
@@ -12,10 +12,7 @@ async fn create_then_open_round_trip() -> Result<(), TestError> {
     let network = Network::regtest();
 
     let sealing = AgeFileSealing::new(AgeFileSealingOptions::at_path(temp.seed_path()));
-    let storage = SqliteWalletStorage::new(SqliteWalletStorageOptions::for_network(
-        network,
-        temp.db_path(),
-    ));
+    let storage = Sqlite::new(SqliteOptions::for_network(network, temp.db_path()));
     let chain = zally_testkit::MockChainSource::new(network);
     let (wallet, account_id, _mnemonic) = Wallet::builder(network, sealing, storage)
         .create(&chain, BlockHeight::from(1))
@@ -28,10 +25,7 @@ async fn create_then_open_round_trip() -> Result<(), TestError> {
     drop(wallet);
 
     let sealing = AgeFileSealing::new(AgeFileSealingOptions::at_path(temp.seed_path()));
-    let storage = SqliteWalletStorage::new(SqliteWalletStorageOptions::for_network(
-        network,
-        temp.db_path(),
-    ));
+    let storage = Sqlite::new(SqliteOptions::for_network(network, temp.db_path()));
     let (wallet, account_id_2) = Wallet::builder(network, sealing, storage).open().await?;
     assert_eq!(account_id, account_id_2);
     let ua_second = wallet
@@ -45,10 +39,7 @@ async fn create_then_open_round_trip() -> Result<(), TestError> {
     );
 
     let sealing = AgeFileSealing::new(AgeFileSealingOptions::at_path(temp.seed_path()));
-    let storage = SqliteWalletStorage::new(SqliteWalletStorageOptions::for_network(
-        network,
-        temp.db_path(),
-    ));
+    let storage = Sqlite::new(SqliteOptions::for_network(network, temp.db_path()));
     let (wallet, account_id_3) = Wallet::builder(network, sealing, storage).open().await?;
     assert_eq!(account_id, account_id_3);
     let ua_third = wallet
