@@ -10,9 +10,9 @@ use zally_chain::Submitter;
 use zally_core::{BlockHeight, Network};
 use zally_pczt::{PcztBytes, Prover, Signer};
 
+use crate::error::WalletError;
 use crate::spend::{ProposalPlan, SendOutcome};
 use crate::wallet::Wallet;
-use crate::wallet_error::WalletError;
 
 impl Wallet {
     /// Builds an unsigned PCZT for `plan` against the wallet's live notes.

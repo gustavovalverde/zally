@@ -10,7 +10,7 @@
 //!   ZALLY_NETWORK=regtest \
 //!   ZINDER_ENDPOINT=http://127.0.0.1:9101 \
 //!   cargo nextest run --profile=ci-live --features zinder --run-ignored=all \
-//!     -p zally-chain --test live_zinder_chain_source
+//!     -p zally-chain --test live_zinder_source
 //! ```
 
 #![cfg(feature = "zinder")]

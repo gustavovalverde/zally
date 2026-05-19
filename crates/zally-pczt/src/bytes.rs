@@ -2,7 +2,7 @@
 
 use zally_core::Network;
 
-use crate::pczt_error::PcztError;
+use crate::error::PcztError;
 
 /// Serialised PCZT bytes plus the network they are bound to.
 ///

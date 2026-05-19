@@ -12,7 +12,7 @@
 `zally-chain` exposed two retry-classification primitives:
 
 1. A boolean field `is_retryable: bool` carried on the catchall variants `ChainSourceError::Unavailable`, `ChainSourceError::UpstreamFailed`, `SubmitterError::Unavailable`, `SubmitterError::UpstreamFailed`, plus mirror copies on `WalletError::ChainSource` and `WalletError::SyncDriverFailed`.
-2. A 50-line mapping table `zinder_chain_source::zinder_error_to_chain_source` that collapsed thirteen typed `IndexerError` variants into the two zally-side catchalls, hand-picking `is_retryable` per variant.
+2. A 50-line mapping table `zinder_source::zinder_error_to_chain_source` that collapsed thirteen typed `IndexerError` variants into the two zally-side catchalls, hand-picking `is_retryable` per variant.
 
 This design is the same shape that produced the zinder 2026-05-15 production incident (writer exits on an unknown JSON-RPC error code). The bool cannot describe operator-action failures distinctly from caller-bug failures, and the mapping table loses every typed identity the upstream client already provides. New `IndexerError` variants default to `UpstreamFailed { is_retryable: false }` until the table is updated, which means a future zinder release can silently degrade.
 
@@ -26,7 +26,7 @@ In parallel, `zinder-client` already exposes `IndexerError::retry_policy() -> Re
 
 3. **`WalletError::ChainSource` becomes a tuple variant `ChainSource(#[from] ChainSourceError)`.** Same shape for `Submitter(#[from] SubmitterError)`. The `reason: String` and `is_retryable: bool` fields are removed; consumers read the inner error directly. `WalletError::SyncDriverFailed` keeps its `reason` field but replaces `is_retryable: bool` with `posture: FailurePosture` so a panicked driver surfaces as `RequiresOperator` rather than `is_retryable: true | false`.
 
-4. **One typed-error path, no string adapters.** The standalone mapper functions `zinder_chain_source::zinder_error_to_chain_source`, `zinder_submitter::zinder_error_to_submitter_error`, `sync::map_chain_source_error`, `wallet::map_chain_source_to_wallet_error`, `pczt::map_submitter_error`, and `spend::map_submitter_error` are deleted. The `#[from]` attributes on the new tuple variants let `?` carry zinder errors directly to the wallet boundary with the typed `IndexerError` preserved. The lossy `IndexerError::DataLoss` → `MalformedCompactBlock { block_height: BlockHeight::from(0), ... }` placeholder is gone.
+4. **One typed-error path, no string adapters.** The standalone mapper functions `zinder_source::zinder_error_to_chain_source`, `zinder_submitter::zinder_error_to_submitter_error`, `sync::map_chain_source_error`, `wallet::map_chain_source_to_wallet_error`, `pczt::map_submitter_error`, and `spend::map_submitter_error` are deleted. The `#[from]` attributes on the new tuple variants let `?` carry zinder errors directly to the wallet boundary with the typed `IndexerError` preserved. The lossy `IndexerError::DataLoss` → `MalformedCompactBlock { block_height: BlockHeight::from(0), ... }` placeholder is gone.
 
 5. **`IsRetryable` becomes `HasFailurePosture`.** The retry trait in `zally-wallet::retry` exposes `failure_posture() -> FailurePosture` instead of `is_retryable() -> bool`. `with_retry` retries only on `Retryable`; `with_breaker_and_retry` trips the circuit breaker only on `Retryable` failures. Operator-action and caller-bug failures bypass the breaker since neither is a symptom of a flaky backend.
 

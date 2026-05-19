@@ -7,7 +7,7 @@ use zally_core::{Network, TxId};
 use zinder_client::ChainIndex;
 use zinder_core::{RawTransactionBytes, TransactionBroadcastResult};
 
-use crate::chain_error::SubmitterError;
+use crate::error::SubmitterError;
 use crate::submitter::{SubmitOutcome, Submitter};
 
 /// Live `Submitter` backed by a [`zinder_client::ChainIndex`].

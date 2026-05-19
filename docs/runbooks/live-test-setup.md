@@ -67,7 +67,7 @@ ZALLY_TEST_LIVE=1 \
 
 ## Bringing up a zinder-backed chain source
 
-Tests that exercise `ZinderChainSource` need a running `zinder-ingest` + `zinder-query` pair against the node above. The `live_zinder_chain_source.rs` test target, the funded wallet proof, and the `live-zinder-probe` example all read `ZINDER_ENDPOINT` for the query process address.
+Tests that exercise `ZinderChainSource` need a running `zinder-ingest` + `zinder-query` pair against the node above. The `live_zinder_source.rs` test target, the funded wallet proof, and the `live-zinder-probe` example all read `ZINDER_ENDPOINT` for the query process address.
 
 Pre-requisites:
 

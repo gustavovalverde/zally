@@ -13,8 +13,8 @@ use zally_keys::SeedMaterial;
 use zcash_keys::keys::UnifiedSpendingKey;
 use zcash_proofs::prover::LocalTxProver;
 
-use crate::pczt_bytes::PcztBytes;
-use crate::pczt_error::PcztError;
+use crate::bytes::PcztBytes;
+use crate::error::PcztError;
 
 static ORCHARD_PROVING_KEY: OnceLock<orchard::circuit::ProvingKey> = OnceLock::new();
 

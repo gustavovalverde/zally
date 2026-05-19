@@ -31,8 +31,8 @@ use zinder_core::{
     TransactionId as ZinderTransactionId, TransparentAddressScriptHash, TxStatus as ZinderTxStatus,
 };
 
-use crate::chain_error::ChainSourceError;
-use crate::chain_source::{
+use crate::error::ChainSourceError;
+use crate::source::{
     BlockHeightRange, ChainEvent, ChainEventCursor, ChainEventEnvelope, ChainEventEnvelopeStream,
     ChainSource, CompactBlockStream, ShieldedPool, SubtreeIndex, SubtreeRoot, TransactionStatus,
     TransparentUtxo,

@@ -4,8 +4,8 @@ use pczt::roles::tx_extractor::TransactionExtractor;
 use zally_core::{Network, TxId};
 use zcash_proofs::prover::LocalTxProver;
 
-use crate::pczt_bytes::PcztBytes;
-use crate::pczt_error::PcztError;
+use crate::bytes::PcztBytes;
+use crate::error::PcztError;
 
 /// Final transaction bytes plus the network and txid the operator submits.
 #[derive(Clone, Debug, Eq, PartialEq)]

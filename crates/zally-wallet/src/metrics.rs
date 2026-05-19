@@ -3,8 +3,8 @@
 use zally_core::{BlockHeight, Network};
 
 use crate::circuit_breaker::CircuitBreakerState;
+use crate::error::WalletError;
 use crate::wallet::Wallet;
-use crate::wallet_error::WalletError;
 
 /// Typed snapshot of the wallet's observable state.
 ///

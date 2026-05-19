@@ -4,7 +4,7 @@ Zally public errors are typed, posture-classified, and part of the public API. N
 
 ## Failure Posture
 
-Every chain-source and wallet error exposes a `posture()` method returning a [`FailurePosture`](../../crates/zally-chain/src/chain_error.rs) value drawn from this three-class taxonomy. See [ADR-0002](../adrs/0002-source-failure-posture.md) for the architectural contract.
+Every chain-source and wallet error exposes a `posture()` method returning a [`FailurePosture`](../../crates/zally-chain/src/error.rs) value drawn from this three-class taxonomy. See [ADR-0002](../adrs/0002-source-failure-posture.md) for the architectural contract.
 
 | Posture | Meaning | Wallet behaviour |
 |---------|---------|------------------|

@@ -3,8 +3,8 @@
 use zally_core::{BlockHeight, Network};
 
 use crate::circuit_breaker::CircuitBreakerState;
+use crate::error::WalletError;
 use crate::wallet::Wallet;
-use crate::wallet_error::WalletError;
 
 /// Wallet scan state derived from persisted wallet progress.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

@@ -3,7 +3,7 @@
 use async_trait::async_trait;
 use zally_core::{Network, TxId};
 
-use crate::chain_error::SubmitterError;
+use crate::error::SubmitterError;
 
 /// Outcome of a transaction broadcast.
 #[derive(Clone, Debug, Eq, PartialEq)]

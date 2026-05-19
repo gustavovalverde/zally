@@ -39,9 +39,9 @@ use zcash_protocol::value::Zatoshis as UpstreamZatoshis;
 use zcash_transparent::address::Script;
 use zcash_transparent::bundle::{OutPoint as UpstreamOutPoint, TxOut};
 
+use crate::error::StorageError;
 use crate::filtered_wallet_db::FilteredWalletDb;
-use crate::storage_error::StorageError;
-use crate::wallet_storage::WalletStorage;
+use crate::wallet::WalletStorage;
 
 type Db = WalletDb<rusqlite::Connection, NetworkParameters, SystemClock, OsRng>;
 
@@ -404,7 +404,7 @@ impl WalletStorage for SqliteWalletStorage {
 
     async fn list_transparent_receivers(
         &self,
-    ) -> Result<Vec<crate::wallet_storage::TransparentReceiverRow>, StorageError> {
+    ) -> Result<Vec<crate::wallet::TransparentReceiverRow>, StorageError> {
         self.with_db(move |db| {
             let accounts = db
                 .get_unified_full_viewing_keys()
@@ -416,7 +416,7 @@ impl WalletStorage for SqliteWalletStorage {
                     .map_err(|e| map_sqlite_error(&e))?;
                 for address in transparent_addresses.into_keys() {
                     let script = Script::from(address.script());
-                    receivers.push(crate::wallet_storage::TransparentReceiverRow::new(
+                    receivers.push(crate::wallet::TransparentReceiverRow::new(
                         account_uuid_to_zally(account_uuid),
                         script.0.0,
                     ));
@@ -429,7 +429,7 @@ impl WalletStorage for SqliteWalletStorage {
 
     async fn record_transparent_utxos(
         &self,
-        utxos: Vec<crate::wallet_storage::TransparentUtxoRow>,
+        utxos: Vec<crate::wallet::TransparentUtxoRow>,
     ) -> Result<u64, StorageError> {
         self.with_db_mut(move |db| {
             let mut recorded_count = 0_u64;
@@ -448,14 +448,14 @@ impl WalletStorage for SqliteWalletStorage {
         self.options.network
     }
 
-    fn kind(&self) -> crate::wallet_storage::StorageKind {
-        crate::wallet_storage::StorageKind::Sqlite
+    fn kind(&self) -> crate::wallet::StorageKind {
+        crate::wallet::StorageKind::Sqlite
     }
 
     async fn scan_blocks(
         &self,
-        request: crate::wallet_storage::ScanRequest,
-    ) -> Result<crate::wallet_storage::ScanResult, StorageError> {
+        request: crate::wallet::ScanRequest,
+    ) -> Result<crate::wallet::ScanResult, StorageError> {
         let params = self.options.network.to_parameters();
         let from_height_proto: zcash_protocol::consensus::BlockHeight = request.from_height.into();
         let block_count = u64::try_from(request.blocks.len()).unwrap_or(u64::MAX);
@@ -477,7 +477,7 @@ impl WalletStorage for SqliteWalletStorage {
             .map_err(|err| map_scan_error(&err))
             .map(|summary| {
                 let scanned_to_u32 = u32::from(summary.scanned_range().end.saturating_sub(1));
-                crate::wallet_storage::ScanResult {
+                crate::wallet::ScanResult {
                     scanned_to_height: BlockHeight::from(scanned_to_u32),
                     block_count,
                 }
@@ -538,8 +538,8 @@ impl WalletStorage for SqliteWalletStorage {
 
     async fn propose_payment(
         &self,
-        request: crate::wallet_storage::ProposalPaymentRequest,
-    ) -> Result<crate::wallet_storage::ProposalSummary, StorageError> {
+        request: crate::wallet::ProposalPaymentRequest,
+    ) -> Result<crate::wallet::ProposalSummary, StorageError> {
         let params = self.options.network.to_parameters();
         let account_uuid = zally_to_account_uuid(request.account_id);
         let amount = zally_to_upstream_zatoshis(request.amount_zat);
@@ -565,7 +565,7 @@ impl WalletStorage for SqliteWalletStorage {
             let target_height: zcash_protocol::consensus::BlockHeight =
                 proposal.min_target_height().into();
 
-            Ok(crate::wallet_storage::ProposalSummary {
+            Ok(crate::wallet::ProposalSummary {
                 total_zat: Zatoshis::from(balance.total()),
                 fee_zat: Zatoshis::from(balance.fee_required()),
                 min_target_height: BlockHeight::from(u32::from(target_height)),
@@ -577,10 +577,10 @@ impl WalletStorage for SqliteWalletStorage {
 
     async fn prepare_payment(
         &self,
-        request: crate::wallet_storage::ProposalPaymentRequest,
+        request: crate::wallet::ProposalPaymentRequest,
         excluded_outpoints: std::collections::HashSet<zally_core::OutPoint>,
         seed: &SeedMaterial,
-    ) -> Result<Vec<crate::wallet_storage::PreparedTransaction>, StorageError> {
+    ) -> Result<Vec<crate::wallet::PreparedTransaction>, StorageError> {
         let params = self.options.network.to_parameters();
         let account_uuid = zally_to_account_uuid(request.account_id);
         let amount = zally_to_upstream_zatoshis(request.amount_zat);
@@ -647,10 +647,10 @@ impl WalletStorage for SqliteWalletStorage {
 
     async fn shield_transparent_funds(
         &self,
-        request: crate::wallet_storage::ShieldTransparentRequest,
+        request: crate::wallet::ShieldTransparentRequest,
         excluded_outpoints: std::collections::HashSet<zally_core::OutPoint>,
         seed: &SeedMaterial,
-    ) -> Result<Vec<crate::wallet_storage::PreparedTransaction>, StorageError> {
+    ) -> Result<Vec<crate::wallet::PreparedTransaction>, StorageError> {
         let params = self.options.network.to_parameters();
         let account_uuid = zally_to_account_uuid(request.account_id);
         let shielding_threshold = zally_to_upstream_zatoshis(request.shielding_threshold_zat);
@@ -730,7 +730,7 @@ impl WalletStorage for SqliteWalletStorage {
 
     async fn create_pczt(
         &self,
-        request: crate::wallet_storage::ProposalPaymentRequest,
+        request: crate::wallet::ProposalPaymentRequest,
     ) -> Result<Vec<u8>, StorageError> {
         let params = self.options.network.to_parameters();
         let account_uuid = zally_to_account_uuid(request.account_id);
@@ -776,7 +776,7 @@ impl WalletStorage for SqliteWalletStorage {
     async fn extract_and_store_pczt(
         &self,
         pczt_bytes: Vec<u8>,
-    ) -> Result<crate::wallet_storage::PreparedTransaction, StorageError> {
+    ) -> Result<crate::wallet::PreparedTransaction, StorageError> {
         let parsed = pczt::Pczt::parse(&pczt_bytes).map_err(|err| StorageError::SqliteFailed {
             reason: format!("pczt parse failed: {err:?}"),
             posture: FailurePosture::NotRetryable,
@@ -813,7 +813,7 @@ impl WalletStorage for SqliteWalletStorage {
             // envelope, so the resulting `PreparedTransaction` has no inputs to record in
             // the pending-broadcast filter. Future signer integrations that need
             // pending-broadcast protection should extend the PCZT envelope with the inputs.
-            Ok(crate::wallet_storage::PreparedTransaction::new(
+            Ok(crate::wallet::PreparedTransaction::new(
                 zally_core::TxId::from_bytes(*tx_id.as_ref()),
                 raw_bytes,
                 Vec::new(),
@@ -1005,7 +1005,7 @@ impl WalletStorage for SqliteWalletStorage {
 
     async fn record_pending_broadcast_inputs(
         &self,
-        record: crate::wallet_storage::PendingBroadcastRecord,
+        record: crate::wallet::PendingBroadcastRecord,
     ) -> Result<(), StorageError> {
         let account_uuid_bytes = record.account_id.as_uuid().as_bytes().to_vec();
         let broadcast_tx_bytes = record.broadcast_tx_id.as_bytes().to_vec();
@@ -1380,7 +1380,7 @@ impl WalletStorage for SqliteWalletStorage {
         &self,
         account_id: AccountId,
         target_height: BlockHeight,
-    ) -> Result<Vec<crate::wallet_storage::UnspentShieldedNoteRow>, StorageError> {
+    ) -> Result<Vec<crate::wallet::UnspentShieldedNoteRow>, StorageError> {
         let account_uuid = zally_to_account_uuid(account_id);
         let target = zcash_client_backend::data_api::wallet::TargetHeight::from(
             zcash_protocol::consensus::BlockHeight::from(target_height.as_u32()),
@@ -1412,7 +1412,7 @@ impl WalletStorage for SqliteWalletStorage {
                         raw: note.note().value().inner().to_string(),
                     }
                 })?;
-                rows.push(crate::wallet_storage::UnspentShieldedNoteRow {
+                rows.push(crate::wallet::UnspentShieldedNoteRow {
                     protocol: zcash_protocol::ShieldedProtocol::Sapling,
                     value_zat,
                     tx_id: zally_core::TxId::from_bytes(*note.txid().as_ref()),
@@ -1430,7 +1430,7 @@ impl WalletStorage for SqliteWalletStorage {
                         raw: note.note().value().inner().to_string(),
                     }
                 })?;
-                rows.push(crate::wallet_storage::UnspentShieldedNoteRow {
+                rows.push(crate::wallet::UnspentShieldedNoteRow {
                     protocol: zcash_protocol::ShieldedProtocol::Orchard,
                     value_zat,
                     tx_id: zally_core::TxId::from_bytes(*note.txid().as_ref()),
@@ -1447,7 +1447,7 @@ impl WalletStorage for SqliteWalletStorage {
         &self,
         from_height: BlockHeight,
         to_height: BlockHeight,
-    ) -> Result<Vec<crate::wallet_storage::ReceivedShieldedNoteRow>, StorageError> {
+    ) -> Result<Vec<crate::wallet::ReceivedShieldedNoteRow>, StorageError> {
         let from_h = i64::from(from_height.as_u32());
         let to_h = i64::from(to_height.as_u32());
         self.with_ledger(move |conn| {
@@ -1471,7 +1471,7 @@ impl WalletStorage for SqliteWalletStorage {
     async fn list_shielded_receives_for_account(
         &self,
         account_id: AccountId,
-    ) -> Result<Vec<crate::wallet_storage::ReceivedShieldedNoteRow>, StorageError> {
+    ) -> Result<Vec<crate::wallet::ReceivedShieldedNoteRow>, StorageError> {
         let account_uuid_bytes = account_id.as_uuid().as_bytes().to_vec();
         self.with_ledger(move |conn| {
             let mut stmt = conn
@@ -1648,7 +1648,7 @@ fn collect_received_shielded_note_rows(
         '_,
         impl FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<ReceivedShieldedNoteRowRaw>,
     >,
-) -> Result<Vec<crate::wallet_storage::ReceivedShieldedNoteRow>, StorageError> {
+) -> Result<Vec<crate::wallet::ReceivedShieldedNoteRow>, StorageError> {
     let mut rows = Vec::new();
     for raw in mapped {
         let (
@@ -1703,7 +1703,7 @@ fn collect_received_shielded_note_rows(
         let block_timestamp_ms = block_timestamp_ms
             .and_then(|raw| u64::try_from(raw).ok())
             .unwrap_or(0);
-        rows.push(crate::wallet_storage::ReceivedShieldedNoteRow {
+        rows.push(crate::wallet::ReceivedShieldedNoteRow {
             account_id: AccountId::from_uuid(account_uuid),
             protocol,
             value_zat,
@@ -1872,7 +1872,7 @@ fn prepared_transactions_with_inputs<'a, FeeRuleT, NoteRefT>(
     txids: impl IntoIterator<Item = &'a zcash_protocol::TxId>,
     proposal: &zcash_client_backend::proposal::Proposal<FeeRuleT, NoteRefT>,
     context: &'static str,
-) -> Result<Vec<crate::wallet_storage::PreparedTransaction>, StorageError> {
+) -> Result<Vec<crate::wallet::PreparedTransaction>, StorageError> {
     let steps = proposal.steps();
     let mut prepared = Vec::with_capacity(steps.len());
     for (step_index, tx_id) in txids.into_iter().enumerate() {
@@ -1906,7 +1906,7 @@ fn prepared_transactions_with_inputs<'a, FeeRuleT, NoteRefT>(
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
-        prepared.push(crate::wallet_storage::PreparedTransaction::new(
+        prepared.push(crate::wallet::PreparedTransaction::new(
             zally_core::TxId::from_bytes(*tx_id.as_ref()),
             raw_bytes,
             transparent_inputs,
@@ -2040,7 +2040,7 @@ fn zally_to_account_uuid(id: AccountId) -> AccountUuid {
 }
 
 fn transparent_utxo_row_to_output(
-    row: crate::wallet_storage::TransparentUtxoRow,
+    row: crate::wallet::TransparentUtxoRow,
 ) -> Result<WalletTransparentOutput, StorageError> {
     let outpoint = UpstreamOutPoint::new(*row.tx_id.as_bytes(), row.output_index);
     let txout = TxOut::new(

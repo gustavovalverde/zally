@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use futures_util::{Stream, StreamExt as _};
 use zally_core::{BlockHeight, Network, TxId};
 
-use crate::chain_error::ChainSourceError;
+use crate::error::ChainSourceError;
 
 /// Inclusive block-height range.
 ///

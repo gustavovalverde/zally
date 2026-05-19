@@ -21,7 +21,7 @@ use zally_pczt::PcztError;
 use zally_storage::StorageError;
 
 use crate::circuit_breaker::CircuitBreaker;
-use crate::wallet_error::WalletError;
+use crate::error::WalletError;
 
 /// Retry policy applied to outbound wallet IO.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

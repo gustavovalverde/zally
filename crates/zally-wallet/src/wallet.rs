@@ -14,10 +14,10 @@ use zcash_keys::address::UnifiedAddress;
 
 use crate::capabilities::{Capability, SealingCapability, StorageCapability, WalletCapabilities};
 use crate::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig, CircuitBreakerState};
+use crate::error::WalletError;
 use crate::event::{WalletEvent, WalletEventStream};
+use crate::options::WalletOptions;
 use crate::retry::RetryPolicy;
-use crate::wallet_error::WalletError;
-use crate::wallet_options::WalletOptions;
 
 const EVENT_CHANNEL_CAPACITY: usize = 1024;
 

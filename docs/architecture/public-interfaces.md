@@ -170,15 +170,15 @@ When operators integrating Zally construct their own TOML or env-var layout:
 
 Per the Zally identifier-naming and codebase-structure rules:
 
-- File names match the primary export. `wallet.rs` exports `Wallet`; `chain_source.rs` exports the `ChainSource` trait and its default implementation.
+- File names match the primary export, with the crate-context prefix dropped. `zally-wallet/src/wallet.rs` exports `Wallet`; `zally-chain/src/source.rs` exports `ChainSource`; `zally-chain/src/error.rs` exports `ChainSourceError` and `SubmitterError`; `zally-wallet/src/error.rs` exports `WalletError`. The type retains the bounded-context prefix (`WalletError`, `ChainSourceError`, `PcztError`) so cross-workspace grep stays exact; the file drops it so in-crate paths stay short.
 - No `mod.rs` files. Use `{module_name}.rs` siblings.
 - No `index.rs`, no `lib_internal.rs`, no other barrel-shaped names. Each file declares what it exports.
-- No stuttering paths: inside the `keys/` directory the file is `sealing.rs`, not `keys_sealing.rs`.
+- No stuttering paths: inside `zally-pczt/src/` the error file is `error.rs`, not `pczt_error.rs`; inside `zally-chain/src/` the buffered adapter is `buffered_source.rs`, not `buffered_chain_source.rs`.
 - No single-file directories. If `keys/` contains only `sealing.rs`, promote to `keys_sealing.rs` at the crate root.
 
 ## Cross-domain disambiguation
 
-When two domains use the same word, prefix with the bounded context or rename to what each thing actually computes. Two `pczt.rs` files at different crate roots would be ambiguous; one is `pczt-signer.rs`, the other is `pczt-roles.rs`.
+When two domains use the same word, prefix with the bounded context or rename to what each thing actually computes. Two `pczt.rs` files at different crate roots would be ambiguous; one is `pczt_signer.rs`, the other is `pczt_roles.rs`.
 
 The same word that means different things in Zally vs librustzcash gets disambiguated in Zally:
 

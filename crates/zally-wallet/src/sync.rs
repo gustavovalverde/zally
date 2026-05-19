@@ -26,11 +26,11 @@ use zally_chain::{
 use zally_core::{BlockHeight, Network};
 use zally_storage::{ScanRequest, StorageError, TransparentUtxoRow};
 
+use crate::error::WalletError;
 use crate::event::WalletEvent;
 use crate::retry::with_breaker_and_retry;
 use crate::status::{SyncStatus, WalletStatus};
 use crate::wallet::Wallet;
-use crate::wallet_error::WalletError;
 
 const MAX_BLOCKS_PER_SYNC: u32 = 1_000;
 

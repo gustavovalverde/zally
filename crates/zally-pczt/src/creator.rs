@@ -6,8 +6,8 @@
 
 use zally_core::Network;
 
-use crate::pczt_bytes::PcztBytes;
-use crate::pczt_error::PcztError;
+use crate::bytes::PcztBytes;
+use crate::error::PcztError;
 
 /// Builds a PCZT from a Zally proposal.
 #[derive(Debug)]

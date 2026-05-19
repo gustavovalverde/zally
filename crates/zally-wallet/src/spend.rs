@@ -13,8 +13,8 @@ use zally_core::{
     TxId, Zatoshis,
 };
 
+use crate::error::WalletError;
 use crate::wallet::{Wallet, current_unix_ms};
-use crate::wallet_error::WalletError;
 
 /// Submit-time context bundled per spend call.
 ///

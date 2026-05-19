@@ -22,9 +22,9 @@ use zcash_client_backend::proto::compact_formats::CompactBlock;
 use zcash_keys::address::UnifiedAddress;
 
 use crate::account_balance_row::AccountBalanceRow;
+use crate::error::StorageError;
 use crate::exposed_address_row::ExposedAddressRow;
 use crate::pending_broadcast_input_row::PendingBroadcastInputRow;
-use crate::storage_error::StorageError;
 
 /// Request body for [`WalletStorage::scan_blocks`].
 ///

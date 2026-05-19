@@ -14,8 +14,8 @@ use zcash_keys::keys::UnifiedSpendingKey;
 use zcash_transparent::address::TransparentAddress;
 use zcash_transparent::keys::{AccountPrivKey, NonHardenedChildIndex};
 
-use crate::pczt_bytes::PcztBytes;
-use crate::pczt_error::PcztError;
+use crate::bytes::PcztBytes;
+use crate::error::PcztError;
 
 /// Maximum number of non-hardened child indices to enumerate per scope when matching
 /// transparent inputs to wallet-owned keys.

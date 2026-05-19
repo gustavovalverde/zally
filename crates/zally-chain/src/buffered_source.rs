@@ -1,24 +1,25 @@
-//! In-memory [`BlockSource`] adapter built from a vector of compact blocks.
+//! In-memory bridge from Zally's async [`ChainSource`] to the upstream synchronous
+//! [`BlockSource`] consumed by [`zcash_client_backend::data_api::chain::scan_cached_blocks`].
 //!
-//! Zally's [`ChainSource`] streams compact blocks asynchronously, but
-//! [`zcash_client_backend::data_api::chain::scan_cached_blocks`] consumes a synchronous
-//! [`BlockSource`]. `BufferedBlockSource` is the bridge: callers fetch compact blocks via
-//! `ChainSource::compact_blocks`, drain them into a `Vec<CompactBlock>`, and hand the
-//! vector to the scanner through this adapter.
+//! Callers fetch compact blocks via [`ChainSource::compact_blocks`], drain them into a
+//! `Vec<CompactBlock>`, and hand the vector to the scanner through this adapter.
+//!
+//! [`ChainSource`]: crate::ChainSource
+//! [`ChainSource::compact_blocks`]: crate::ChainSource::compact_blocks
 
 use zcash_client_backend::data_api::chain::{BlockSource, error::Error as ScanError};
 use zcash_client_backend::proto::compact_formats::CompactBlock;
 use zcash_protocol::consensus::BlockHeight as ProtocolBlockHeight;
 
-/// In-memory block source that yields compact blocks in ascending height order.
+/// In-memory chain source that yields compact blocks in ascending height order.
 ///
 /// The vector is consumed in `with_blocks` calls; consumers that re-scan must re-buffer.
 #[derive(Debug)]
-pub struct BufferedBlockSource {
+pub struct BufferedChainSource {
     blocks: Vec<CompactBlock>,
 }
 
-impl BufferedBlockSource {
+impl BufferedChainSource {
     /// Constructs a buffered source from `blocks`. Blocks must already be sorted in
     /// ascending height order; the scanner relies on this ordering.
     #[must_use]
@@ -33,17 +34,17 @@ impl BufferedBlockSource {
     }
 }
 
-/// Error variant returned by [`BufferedBlockSource`]. Always `Infallible` because the
+/// Error variant returned by [`BufferedChainSource`]. Always `Infallible` because the
 /// source is in-memory; the variant exists so `BlockSource::Error` has a concrete type.
 #[derive(Debug, thiserror::Error)]
-pub enum BufferedBlockSourceError {
+pub enum BufferedChainSourceError {
     /// Unreachable; kept to give the `BlockSource::Error` type a name.
-    #[error("buffered block source has no error variants")]
+    #[error("buffered chain source has no error variants")]
     Unreachable,
 }
 
-impl BlockSource for BufferedBlockSource {
-    type Error = BufferedBlockSourceError;
+impl BlockSource for BufferedChainSource {
+    type Error = BufferedChainSourceError;
 
     fn with_blocks<F, WalletErrT>(
         &self,

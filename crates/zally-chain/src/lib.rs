@@ -5,22 +5,22 @@
 //! `ZinderSubmitter` implementation is available behind the `zinder` cargo feature;
 //! `zally_testkit::MockChainSource` and `MockSubmitter` cover unit-test wiring.
 
-mod buffered_block_source;
-mod chain_error;
-mod chain_source;
+mod buffered_source;
+mod error;
+mod source;
 mod submitter;
 #[cfg(feature = "zinder")]
-mod zinder_chain_source;
+mod zinder_source;
 #[cfg(feature = "zinder")]
 mod zinder_submitter;
 
-pub use buffered_block_source::{BufferedBlockSource, BufferedBlockSourceError};
-pub use chain_error::{ChainSourceError, SubmitterError};
+pub use buffered_source::{BufferedChainSource, BufferedChainSourceError};
+pub use error::{ChainSourceError, SubmitterError};
 /// Re-export of [`zally_core::FailurePosture`] so chain consumers can keep importing the
 /// posture type from `zally_chain` without taking a direct `zally_core` dependency.
 pub use zally_core::FailurePosture;
 
-pub use chain_source::{
+pub use source::{
     BlockHeightRange, ChainEvent, ChainEventCursor, ChainEventEnvelope, ChainEventEnvelopeStream,
     ChainEventStream, ChainSource, CompactBlockStream, ShieldedPool, SubtreeIndex, SubtreeRoot,
     TransactionStatus, TransparentUtxo,
@@ -30,6 +30,6 @@ pub use submitter::{SubmitOutcome, Submitter};
 /// scan API do not need to depend on `zcash_client_backend` directly.
 pub use zcash_client_backend::data_api::chain::ChainState;
 #[cfg(feature = "zinder")]
-pub use zinder_chain_source::{ZinderChainSource, ZinderRemoteOptions};
+pub use zinder_source::{ZinderChainSource, ZinderRemoteOptions};
 #[cfg(feature = "zinder")]
 pub use zinder_submitter::ZinderSubmitter;
