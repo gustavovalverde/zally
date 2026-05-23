@@ -30,7 +30,7 @@ orchard.workspace = true
 sapling.workspace = true
 zcash_client_backend = { workspace = true, features = ["orchard", "transparent-inputs", "pczt"] }
 zcash_client_sqlite = { workspace = true, features = ["orchard", "transparent-inputs", "serde"] }
-zcash_keys = { workspace = true, features = ["orchard", "sapling", "transparent-inputs"] }
+zcash_keys = { workspace = true, features = ["orchard", "sapling", "transparent-inputs", "unstable"] }
 zcash_primitives.workspace = true
 zcash_proofs.workspace = true
 zcash_protocol.workspace = true

@@ -89,6 +89,7 @@ A name must survive a change of its implementation.
 | `ReceiverPurpose` | `zally-core` | Enum naming each receiver's role (`Mining`, `Donations`, `HotDispense`, `ColdReserve`, `Custom(String)`). |
 | `IdempotencyKey` | `zally-core` | Caller-supplied identifier for send-idempotency. `AsRef<str>` newtype. |
 | `Memo` | `zally-core` | ZIP-302 memo wrapper. Refuses construction over 512 bytes. |
+| `TransparentGapLimit` | `zally-core` | BIP-44 gap-limit policy (`external`, `internal`, `ephemeral`). Zally raises the external/ephemeral defaults above the upstream `GapLimits::default()` to avoid Sapling-diversifier-driven first-reservation failures on a randomly-seeded fresh wallet. |
 | `Wallet` | `zally-wallet` | The operator-facing handle. Async API. |
 | `AccountBalance` | `zally-wallet` | Per-pool balance snapshot anchored to the last observed chain tip; network-tagged with mature/immature transparent split. |
 | `ExposedAddress` | `zally-wallet` | Previously-derived Unified Address in derivation order, with diversifier index and transparent-receiver flag. |

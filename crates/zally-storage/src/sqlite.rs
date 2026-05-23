@@ -18,8 +18,8 @@ use rusqlite::OptionalExtension as _;
 use secrecy::{ExposeSecret as _, SecretVec};
 use tokio::sync::{mpsc, oneshot};
 use zally_core::{
-    AccountId, BlockHeight, FailurePosture, IdempotencyKey, Network, NetworkParameters, TxId,
-    Zatoshis,
+    AccountId, BlockHeight, FailurePosture, IdempotencyKey, Network, NetworkParameters,
+    TransparentGapLimit, TxId, Zatoshis,
 };
 use zally_keys::{KeyDerivationError, SeedMaterial, derive_ufvk};
 use zcash_client_backend::data_api::chain::ChainState;
@@ -35,6 +35,7 @@ use zcash_client_sqlite::util::SystemClock;
 use zcash_client_sqlite::wallet::init::WalletMigrator;
 use zcash_keys::address::UnifiedAddress;
 use zcash_keys::keys::UnifiedAddressRequest;
+use zcash_keys::keys::transparent::gap_limits::GapLimits;
 use zcash_protocol::value::Zatoshis as UpstreamZatoshis;
 use zcash_transparent::address::Script;
 use zcash_transparent::bundle::{OutPoint as UpstreamOutPoint, TxOut};
@@ -87,16 +88,23 @@ pub struct SqliteOptions {
     pub network: Network,
     /// Human-readable account name recorded during `create_account_for_seed`.
     pub account_name: String,
+    /// BIP-44 transparent gap-limit policy applied when the underlying
+    /// `WalletDb` opens. Carried through here so storage, signer, and any
+    /// other crate that walks the BIP-44 window honor the same wallet-policy
+    /// invariant.
+    pub gap_limit: TransparentGapLimit,
 }
 
 impl SqliteOptions {
-    /// Storage options for a network-bound wallet. The account name defaults to `"primary"`.
+    /// Storage options for a network-bound wallet. The account name defaults to `"primary"`
+    /// and the gap-limit policy defaults to [`TransparentGapLimit::DEFAULT`].
     #[must_use]
     pub fn for_network(network: Network, db_path: PathBuf) -> Self {
         Self {
             db_path,
             network,
             account_name: DEFAULT_ACCOUNT_NAME.to_owned(),
+            gap_limit: TransparentGapLimit::DEFAULT,
         }
     }
 }
@@ -238,12 +246,17 @@ fn open_wallet_db(options: &SqliteOptions) -> Result<WalletDbState, StorageError
         })?;
     }
     let params = options.network.to_parameters();
-    let mut db = WalletDb::for_path(&options.db_path, params, SystemClock, OsRng).map_err(|e| {
-        StorageError::SqliteFailed {
+    let gap_limits = GapLimits::new(
+        options.gap_limit.external,
+        options.gap_limit.internal,
+        options.gap_limit.ephemeral,
+    );
+    let mut db = WalletDb::for_path(&options.db_path, params, SystemClock, OsRng)
+        .map_err(|e| StorageError::SqliteFailed {
             reason: e.to_string(),
             posture: FailurePosture::NotRetryable,
-        }
-    })?;
+        })?
+        .with_gap_limits(gap_limits);
     WalletMigrator::new()
         .init_or_migrate(&mut db)
         .map_err(|e| StorageError::MigrationFailed {

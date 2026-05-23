@@ -8,7 +8,7 @@
 
 use pczt::roles::signer::{Error as UpstreamSignerError, Signer as UpstreamSigner};
 use secp256k1::{PublicKey, Secp256k1, SecretKey, SignOnly};
-use zally_core::Network;
+use zally_core::{Network, TransparentGapLimit};
 use zally_keys::SeedMaterial;
 use zcash_keys::keys::UnifiedSpendingKey;
 use zcash_transparent::address::TransparentAddress;
@@ -20,10 +20,13 @@ use crate::error::PcztError;
 /// Maximum number of non-hardened child indices to enumerate per scope when matching
 /// transparent inputs to wallet-owned keys.
 ///
-/// ZIP-32 and BIP-44 use 20 as the conventional address gap limit. The signer
-/// searches that full window so single-receiver and multi-receiver wallets use
-/// the same key-matching path.
-const TRANSPARENT_ADDRESS_GAP_LIMIT: u32 = 20;
+/// Pinned to [`TransparentGapLimit::DEFAULT.external`] so the signer's
+/// key-matching window stays in lockstep with the wallet's externally-visible
+/// reservation policy. A single-receiver wallet that has only reserved a few
+/// transparent addresses still pays the full window's cost; that keeps the
+/// key-matching path identical across single-receiver and multi-receiver
+/// wallets.
+const TRANSPARENT_ADDRESS_GAP_LIMIT: u32 = TransparentGapLimit::DEFAULT.external;
 
 /// Signs a PCZT with keys derived from a sealed seed.
 #[derive(Debug)]

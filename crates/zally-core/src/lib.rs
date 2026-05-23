@@ -20,6 +20,7 @@ mod network;
 mod outpoint;
 mod payment_recipient;
 mod receiver_purpose;
+mod transparent_gap;
 mod txid;
 mod zatoshis;
 
@@ -33,5 +34,6 @@ pub use network::{Network, NetworkParameters};
 pub use outpoint::OutPoint;
 pub use payment_recipient::PaymentRecipient;
 pub use receiver_purpose::ReceiverPurpose;
+pub use transparent_gap::TransparentGapLimit;
 pub use txid::TxId;
 pub use zatoshis::{Zatoshis, ZatoshisError};
