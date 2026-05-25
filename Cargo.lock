@@ -5380,6 +5380,7 @@ dependencies = [
  "zally-pczt",
  "zally-storage",
  "zally-testkit",
+ "zcash_address 0.11.0",
  "zcash_client_backend",
  "zcash_keys",
  "zcash_primitives 0.27.1",
