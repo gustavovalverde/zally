@@ -29,5 +29,6 @@ mod sync_driver_follows_chain;
 mod sync_emits_reorg_when_tip_regresses;
 mod sync_network_mismatch;
 mod sync_retries_retryable_chain_failures;
+mod to_uri_round_trips_through_propose;
 #[cfg(feature = "unsafe_plaintext_seed")]
 mod unsafe_plaintext_seed_warns;
