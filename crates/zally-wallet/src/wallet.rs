@@ -6,7 +6,7 @@ use std::sync::Arc;
 use parking_lot::Mutex;
 use tokio::sync::broadcast;
 use zally_chain::{ChainSource, ChainSourceError};
-use zally_core::{AccountId, BlockHeight, Network};
+use zally_core::{AccountId, BlockHeight, Network, TxId};
 use zally_keys::{Mnemonic, SealingError, SeedMaterial, SeedSealing};
 use zally_storage::WalletStorage;
 use zcash_client_backend::data_api::chain::ChainState;
@@ -287,6 +287,30 @@ impl Wallet {
             .await
             .map_err(WalletError::from)?;
         Ok(rows.into_iter().map(translate_received_note).collect())
+    }
+
+    /// Returns the decoded text memo for a shielded note the wallet owns.
+    ///
+    /// Returns `Ok(Some(text))` only when the memo encodes a UTF-8 string per
+    /// ZIP 302's text-memo case. Empty memos, arbitrary memos, future-reserved
+    /// memos, and notes the wallet does not know all return `Ok(None)`. The
+    /// implementation resolves across Sapling and Orchard transparently.
+    ///
+    /// Callers that surface memos to a public audience should only project
+    /// the text variant: the other variants are opaque by construction and
+    /// unsafe to render as strings.
+    ///
+    /// `not_retryable` on schema errors; `retryable` on transient I/O.
+    pub async fn read_text_memo(
+        &self,
+        tx_id: TxId,
+        output_index: u16,
+    ) -> Result<Option<String>, WalletError> {
+        self.inner
+            .storage
+            .read_text_memo(tx_id, output_index)
+            .await
+            .map_err(WalletError::from)
     }
 
     /// Subscribes to wallet events. The returned stream stays valid until either the wallet

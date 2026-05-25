@@ -28,7 +28,7 @@ use zcash_client_backend::data_api::wallet::{
 };
 use zcash_client_backend::data_api::{Account, AccountBirthday, WalletRead, WalletWrite};
 use zcash_client_backend::fees::{DustOutputPolicy, StandardFeeRule, standard};
-use zcash_client_backend::wallet::WalletTransparentOutput;
+use zcash_client_backend::wallet::{NoteId, WalletTransparentOutput};
 use zcash_client_sqlite::AccountUuid;
 use zcash_client_sqlite::WalletDb;
 use zcash_client_sqlite::util::SystemClock;
@@ -36,6 +36,8 @@ use zcash_client_sqlite::wallet::init::WalletMigrator;
 use zcash_keys::address::UnifiedAddress;
 use zcash_keys::keys::UnifiedAddressRequest;
 use zcash_keys::keys::transparent::gap_limits::GapLimits;
+use zcash_protocol::ShieldedProtocol;
+use zcash_protocol::memo::Memo;
 use zcash_protocol::value::Zatoshis as UpstreamZatoshis;
 use zcash_transparent::address::Script;
 use zcash_transparent::bundle::{OutPoint as UpstreamOutPoint, TxOut};
@@ -1495,6 +1497,39 @@ impl WalletStorage for Sqlite {
                     posture: FailurePosture::NotRetryable,
                 })?;
             collect_received_shielded_note_rows(mapped)
+        })
+        .await
+    }
+
+    async fn read_text_memo(
+        &self,
+        tx_id: TxId,
+        output_index: u16,
+    ) -> Result<Option<String>, StorageError> {
+        let upstream_tx_id = zcash_protocol::TxId::from_bytes(*tx_id.as_bytes());
+        self.with_db(move |db| {
+            // Caller does not know which pool the note lives on; try Sapling
+            // first (the dominant pool for current donations), then Orchard.
+            // `get_memo` returns `Ok(None)` when the note is unknown to that
+            // pool, which lets the loop fall through. Once we find a memo on
+            // either pool we return immediately: a single (tx, output_index)
+            // pair belongs to at most one pool.
+            for protocol in [ShieldedProtocol::Sapling, ShieldedProtocol::Orchard] {
+                let note_id = NoteId::new(upstream_tx_id, protocol, output_index);
+                let memo = db
+                    .get_memo(note_id)
+                    .map_err(|err| StorageError::SqliteFailed {
+                        reason: format!("read_text_memo get_memo failed: {err}"),
+                        posture: FailurePosture::Retryable,
+                    })?;
+                if let Some(memo) = memo {
+                    return Ok(match memo {
+                        Memo::Text(text) => Some(text.to_string()),
+                        Memo::Empty | Memo::Future(_) | Memo::Arbitrary(_) => None,
+                    });
+                }
+            }
+            Ok(None)
         })
         .await
     }

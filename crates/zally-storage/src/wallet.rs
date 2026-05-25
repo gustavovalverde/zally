@@ -735,4 +735,25 @@ pub trait WalletStorage: Send + Sync + 'static {
         &self,
         account_id: AccountId,
     ) -> Result<Vec<ReceivedShieldedNoteRow>, StorageError>;
+
+    /// Returns the decoded text memo for a shielded note the wallet owns.
+    ///
+    /// Returns `Ok(Some(text))` only when the memo encodes a UTF-8 string per
+    /// ZIP 302's text-memo case (first byte `0x00..=0xF4`, trailing zeros stripped,
+    /// remainder decodes as UTF-8). Empty memos (`0xF6` padding), arbitrary
+    /// memos (`0xF5`, `0xFF`), future-reserved memos (`0xF7..=0xFE`), and notes
+    /// the wallet does not know all return `Ok(None)`. Callers that surface
+    /// memos to the public must only project the text variant; the other
+    /// variants are opaque by construction and unsafe to render as strings.
+    ///
+    /// `tx_id` and `output_index` together identify the note; the implementation
+    /// resolves across Sapling and Orchard without requiring the caller to know
+    /// which pool the note lives on.
+    ///
+    /// `not_retryable` on schema errors; `retryable` on transient I/O.
+    async fn read_text_memo(
+        &self,
+        tx_id: TxId,
+        output_index: u16,
+    ) -> Result<Option<String>, StorageError>;
 }
