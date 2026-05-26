@@ -10,6 +10,7 @@
 //! [`Sqlite`] is a cheap [`Clone`] handle holding only the
 //! channel sender; the actor lives until every clone is dropped.
 
+use std::num::NonZeroU32;
 use std::path::PathBuf;
 
 use async_trait::async_trait;
@@ -709,7 +710,7 @@ impl WalletStorage for Sqlite {
                     shielding_threshold,
                     &from_addrs,
                     account_uuid,
-                    ConfirmationsPolicy::default(),
+                    coinbase_safe_shielding_policy(),
                     zcash_client_backend::data_api::TransparentOutputFilter::All,
                 )
                 .map_err(|err| classify_proposal_build_error(&err))?
@@ -1884,6 +1885,58 @@ where
     .map_err(|err| classify_proposal_build_error(&err))
 }
 
+/// Confirmation policy used when proposing transparent-to-shielded sweeps.
+///
+/// Zcash consensus requires every coinbase output to have at least 100
+/// confirmations before it can be spent (`COINBASE_MATURITY = 100`). The
+/// upstream default policy ([`ConfirmationsPolicy::default`]) sets
+/// `allow_zero_conf_shielding = true`, which collapses the per-shielding
+/// minimum-confirmation count to zero. `zcash_client_sqlite` has a per-row SQL
+/// filter that excludes immature coinbase outputs, but it only fires when
+/// the wallet has populated `transactions.tx_index = 0`; the
+/// `put_received_transparent_utxo` path used by chain-source-driven UTXO
+/// ingestion leaves that column NULL. The filter's `IFNULL(tx_index, 1)`
+/// fallback then makes it a no-op for those rows, and `propose_shielding`
+/// happily builds a transaction that spends an immature coinbase; Zebra
+/// rejects the broadcast at consensus with `immature transparent coinbase
+/// spend`.
+///
+/// Setting `allow_zero_conf_shielding = false` plus
+/// `untrusted = 100` routes the SQL clause
+/// `target_height - mined_height >= :min_confirmations` through a hard
+/// 100-block check, which is exactly the coinbase consensus rule and
+/// strictly subsumes any per-row coinbase test. Non-coinbase transparent
+/// shields then also require 100 confirmations; that is slightly more
+/// conservative than upstream defaults but is the right ceiling for any
+/// wallet that cannot prove `tx_index` and is the correct policy for
+/// faucet-style deployments whose transparent income is mining coinbase.
+///
+/// `trusted` is kept at the upstream default (3) because shielded-note
+/// confirmation policy takes a separate code path and is unaffected by
+/// this helper.
+pub(crate) fn coinbase_safe_shielding_policy() -> ConfirmationsPolicy {
+    const COINBASE_MATURITY_CONFIRMATIONS: u32 = 100;
+    const TRUSTED_DEFAULT_CONFIRMATIONS: u32 = 3;
+    #[allow(
+        clippy::expect_used,
+        reason = "constants are non-zero by construction; the conversion cannot fail"
+    )]
+    let trusted = NonZeroU32::new(TRUSTED_DEFAULT_CONFIRMATIONS)
+        .expect("TRUSTED_DEFAULT_CONFIRMATIONS is non-zero");
+    #[allow(
+        clippy::expect_used,
+        reason = "constants are non-zero by construction; the conversion cannot fail"
+    )]
+    let untrusted = NonZeroU32::new(COINBASE_MATURITY_CONFIRMATIONS)
+        .expect("COINBASE_MATURITY_CONFIRMATIONS is non-zero");
+    #[allow(
+        clippy::expect_used,
+        reason = "trusted <= untrusted by construction; the policy invariant is upheld"
+    )]
+    ConfirmationsPolicy::new(trusted, untrusted, false)
+        .expect("trusted=3 <= untrusted=100 satisfies the policy invariant")
+}
+
 /// Classifies a proposal-build error into a typed [`StorageError`] variant.
 ///
 /// Distinguishes insufficient funds from other build failures so the wallet boundary does
@@ -2132,5 +2185,19 @@ mod tests {
         let back = account_uuid_to_zally(sqlite_uuid);
         assert_eq!(zally_id, back);
         assert_eq!(uuid, back.as_uuid());
+    }
+
+    #[test]
+    fn coinbase_safe_shielding_policy_requires_100_confirmations_with_no_zero_conf() {
+        let policy = coinbase_safe_shielding_policy();
+        assert!(
+            !policy.allow_zero_conf_shielding(),
+            "shielding policy must disable zero-conf so the min_confirmations SQL filter actually fires; otherwise the immature-coinbase tx_index check is the only line of defense and it silently no-ops when chain-source-ingested UTXOs leave tx_index NULL"
+        );
+        assert_eq!(
+            u32::from(policy.untrusted()),
+            100,
+            "untrusted confirmations must equal Zcash's COINBASE_MATURITY (100) so the SQL clause target_height - mined_height >= :min_confirmations rejects any immature coinbase even when the per-row tx_index filter is unreliable"
+        );
     }
 }
