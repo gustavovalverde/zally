@@ -167,6 +167,22 @@ pub enum StorageError {
         /// Operator-facing posture for this failure.
         posture: FailurePosture,
     },
+
+    /// `release_dispense_reservation` or `finalize_dispense_reservation` was called for an
+    /// identifier the storage layer has no row for.
+    ///
+    /// Posture: [`FailurePosture::NotRetryable`]; the caller already released, finalized,
+    /// or never created this reservation.
+    #[error("dispense reservation not found")]
+    DispenseReservationNotFound,
+
+    /// A `create_dispense_reservation` call supplied a `request_id` already bound to another
+    /// active reservation.
+    ///
+    /// Posture: [`FailurePosture::NotRetryable`]; the wallet boundary should look up the
+    /// existing reservation by request id and surface it idempotently.
+    #[error("dispense reservation request id is already bound to a prior reservation")]
+    DispenseReservationRequestConflict,
 }
 
 impl StorageError {
@@ -181,7 +197,9 @@ impl StorageError {
             | Self::IdempotencyKeyConflict
             | Self::TransparentOutputNotRecognized { .. }
             | Self::TransparentOutputValueOutOfRange { .. }
-            | Self::InsufficientFunds { .. } => FailurePosture::NotRetryable,
+            | Self::InsufficientFunds { .. }
+            | Self::DispenseReservationNotFound
+            | Self::DispenseReservationRequestConflict => FailurePosture::NotRetryable,
             Self::MigrationFailed { .. }
             | Self::ProverUnavailable
             | Self::RowValueOutOfRange { .. } => FailurePosture::RequiresOperator,
@@ -242,6 +260,8 @@ mod tests {
                 reason: "x".into(),
                 posture: FailurePosture::NotRetryable,
             },
+            StorageError::DispenseReservationNotFound,
+            StorageError::DispenseReservationRequestConflict,
         ];
         for e in variants {
             let _ = e.posture();

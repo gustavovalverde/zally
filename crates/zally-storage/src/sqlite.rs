@@ -20,7 +20,7 @@ use secrecy::{ExposeSecret as _, SecretVec};
 use tokio::sync::{mpsc, oneshot};
 use zally_core::{
     AccountId, BlockHeight, FailurePosture, IdempotencyKey, Network, NetworkParameters,
-    TransparentGapLimit, TxId, Zatoshis,
+    ReservationId, TransparentGapLimit, TxId, Zatoshis,
 };
 use zally_keys::{KeyDerivationError, SeedMaterial, derive_ufvk};
 use zcash_client_backend::data_api::chain::ChainState;
@@ -293,7 +293,24 @@ fn open_wallet_db(options: &SqliteOptions) -> Result<WalletDbState, StorageError
                  PRIMARY KEY (broadcast_tx_id, outpoint_tx_id, outpoint_index)\
              ); \
              CREATE INDEX IF NOT EXISTS idx_pending_broadcast_inputs_account_window \
-                 ON ext_zally_pending_broadcast_inputs(account_id, broadcast_at_ms);",
+                 ON ext_zally_pending_broadcast_inputs(account_id, broadcast_at_ms); \
+             CREATE TABLE IF NOT EXISTS ext_zally_dispense_reservations (\
+                 reservation_id BLOB PRIMARY KEY NOT NULL,\
+                 request_id TEXT NOT NULL,\
+                 idempotency_key TEXT NOT NULL,\
+                 account_id BLOB NOT NULL,\
+                 amount_zat INTEGER NOT NULL,\
+                 locked_notes BLOB NOT NULL,\
+                 reserved_at_ms INTEGER NOT NULL,\
+                 finalized_tx_id BLOB,\
+                 released_at_ms INTEGER\
+             ); \
+             CREATE UNIQUE INDEX IF NOT EXISTS idx_dispense_reservations_active_request \
+                 ON ext_zally_dispense_reservations(request_id) \
+                 WHERE finalized_tx_id IS NULL AND released_at_ms IS NULL; \
+             CREATE INDEX IF NOT EXISTS idx_dispense_reservations_account_active \
+                 ON ext_zally_dispense_reservations(account_id) \
+                 WHERE finalized_tx_id IS NULL AND released_at_ms IS NULL;",
         )
         .map_err(|e| StorageError::SqliteFailed {
             reason: format!("ext_zally schema init failed: {e}"),
@@ -1534,6 +1551,253 @@ impl WalletStorage for Sqlite {
         })
         .await
     }
+
+    async fn create_dispense_reservation(
+        &self,
+        record: crate::wallet::DispenseReservationRecord,
+    ) -> Result<(), StorageError> {
+        let crate::wallet::DispenseReservationRecord {
+            reservation_id,
+            request_id,
+            idempotency_key,
+            account_id,
+            amount_zat,
+            spendable_for_check_zat,
+            locked_notes,
+            reserved_at_ms,
+        } = record;
+        let reservation_uuid_bytes = reservation_id.as_uuid().as_bytes().to_vec();
+        let request_id_str = request_id.as_str().to_owned();
+        let idempotency_key_str = idempotency_key.as_str().to_owned();
+        let account_uuid_bytes = account_id.as_uuid().as_bytes().to_vec();
+        let amount_zat_i64 = clamp_unsigned_to_i64(amount_zat.as_u64());
+        let spendable_zat_u64 = spendable_for_check_zat.as_u64();
+        let reserved_at_ms_i64 = clamp_unsigned_to_i64(reserved_at_ms);
+        let locked_notes_blob = encode_locked_notes(&locked_notes);
+
+        self.with_ledger(move |conn| {
+            let tx = conn
+                .unchecked_transaction()
+                .map_err(|err| StorageError::SqliteFailed {
+                    reason: format!("dispense reservation tx start failed: {err}"),
+                    posture: FailurePosture::Retryable,
+                })?;
+
+            if find_active_reservation_id_by_request(&tx, &request_id_str)?.is_some() {
+                return Err(StorageError::DispenseReservationRequestConflict);
+            }
+
+            let active_sum = sum_active_reservations(&tx, &account_uuid_bytes)?;
+            let projected = active_sum.saturating_add(amount_zat.as_u64());
+            if projected > spendable_zat_u64 {
+                let available_zat = Zatoshis::try_from(spendable_zat_u64.saturating_sub(active_sum))
+                    .unwrap_or_else(|_| Zatoshis::zero());
+                return Err(StorageError::InsufficientFunds {
+                    required_zat: amount_zat,
+                    available_zat,
+                });
+            }
+
+            tx.execute(
+                "INSERT INTO ext_zally_dispense_reservations \
+                     (reservation_id, request_id, idempotency_key, account_id, amount_zat, \
+                      locked_notes, reserved_at_ms, finalized_tx_id, released_at_ms) \
+                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, NULL)",
+                rusqlite::params![
+                    &reservation_uuid_bytes,
+                    &request_id_str,
+                    &idempotency_key_str,
+                    &account_uuid_bytes,
+                    amount_zat_i64,
+                    &locked_notes_blob,
+                    reserved_at_ms_i64,
+                ],
+            )
+            .map_err(|err| StorageError::SqliteFailed {
+                reason: format!("dispense reservation insert failed: {err}"),
+                posture: FailurePosture::NotRetryable,
+            })?;
+
+            tx.commit().map_err(|err| StorageError::SqliteFailed {
+                reason: format!("dispense reservation tx commit failed: {err}"),
+                posture: FailurePosture::Retryable,
+            })
+        })
+        .await
+    }
+
+    async fn release_dispense_reservation(
+        &self,
+        reservation_id: ReservationId,
+        released_at_ms: u64,
+    ) -> Result<(), StorageError> {
+        let reservation_uuid_bytes = reservation_id.as_uuid().as_bytes().to_vec();
+        let released_at_ms_i64 = clamp_unsigned_to_i64(released_at_ms);
+        self.with_ledger(move |conn| {
+            let exists = conn
+                .query_row(
+                    "SELECT released_at_ms, finalized_tx_id \
+                     FROM ext_zally_dispense_reservations \
+                     WHERE reservation_id = ?1",
+                    [&reservation_uuid_bytes],
+                    |row| {
+                        let released: Option<i64> = row.get(0)?;
+                        let finalized: Option<Vec<u8>> = row.get(1)?;
+                        Ok((released, finalized))
+                    },
+                )
+                .optional()
+                .map_err(|err| StorageError::SqliteFailed {
+                    reason: format!("dispense reservation release lookup failed: {err}"),
+                    posture: FailurePosture::NotRetryable,
+                })?;
+            let Some((released, _finalized)) = exists else {
+                return Err(StorageError::DispenseReservationNotFound);
+            };
+            if released.is_some() {
+                return Ok(());
+            }
+            conn.execute(
+                "UPDATE ext_zally_dispense_reservations \
+                 SET released_at_ms = ?2 \
+                 WHERE reservation_id = ?1 AND released_at_ms IS NULL",
+                rusqlite::params![&reservation_uuid_bytes, released_at_ms_i64],
+            )
+            .map_err(|err| StorageError::SqliteFailed {
+                reason: format!("dispense reservation release update failed: {err}"),
+                posture: FailurePosture::NotRetryable,
+            })?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn finalize_dispense_reservation(
+        &self,
+        reservation_id: ReservationId,
+        tx_id: TxId,
+    ) -> Result<(), StorageError> {
+        let reservation_uuid_bytes = reservation_id.as_uuid().as_bytes().to_vec();
+        let tx_bytes = tx_id.as_bytes().to_vec();
+        self.with_ledger(move |conn| {
+            let exists = conn
+                .query_row(
+                    "SELECT finalized_tx_id FROM ext_zally_dispense_reservations \
+                     WHERE reservation_id = ?1",
+                    [&reservation_uuid_bytes],
+                    |row| row.get::<_, Option<Vec<u8>>>(0),
+                )
+                .optional()
+                .map_err(|err| StorageError::SqliteFailed {
+                    reason: format!("dispense reservation finalize lookup failed: {err}"),
+                    posture: FailurePosture::NotRetryable,
+                })?;
+            let Some(prior_finalized) = exists else {
+                return Err(StorageError::DispenseReservationNotFound);
+            };
+            if prior_finalized.is_some() {
+                return Ok(());
+            }
+            conn.execute(
+                "UPDATE ext_zally_dispense_reservations \
+                 SET finalized_tx_id = ?2 \
+                 WHERE reservation_id = ?1 AND finalized_tx_id IS NULL",
+                rusqlite::params![&reservation_uuid_bytes, &tx_bytes],
+            )
+            .map_err(|err| StorageError::SqliteFailed {
+                reason: format!("dispense reservation finalize update failed: {err}"),
+                posture: FailurePosture::NotRetryable,
+            })?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn find_dispense_reservation_by_request_id(
+        &self,
+        request_id: &IdempotencyKey,
+    ) -> Result<Option<crate::DispenseReservationRow>, StorageError> {
+        let request_id_str = request_id.as_str().to_owned();
+        self.with_ledger(move |conn| {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT reservation_id, request_id, idempotency_key, account_id, amount_zat, \
+                            locked_notes, reserved_at_ms, finalized_tx_id, released_at_ms \
+                     FROM ext_zally_dispense_reservations \
+                     WHERE request_id = ?1 \
+                     ORDER BY reserved_at_ms DESC LIMIT 1",
+                )
+                .map_err(|err| StorageError::SqliteFailed {
+                    reason: format!("dispense reservation lookup-by-request prepare failed: {err}"),
+                    posture: FailurePosture::NotRetryable,
+                })?;
+            let mut rows = stmt
+                .query([&request_id_str])
+                .map_err(|err| StorageError::SqliteFailed {
+                    reason: format!("dispense reservation lookup-by-request query failed: {err}"),
+                    posture: FailurePosture::NotRetryable,
+                })?;
+            let next = rows.next().map_err(|err| StorageError::SqliteFailed {
+                reason: format!("dispense reservation lookup-by-request row failed: {err}"),
+                posture: FailurePosture::NotRetryable,
+            })?;
+            next.map_or(Ok(None), |row| decode_dispense_reservation_row(row).map(Some))
+        })
+        .await
+    }
+
+    async fn list_active_dispense_reservations(
+        &self,
+        account_id: AccountId,
+    ) -> Result<Vec<crate::DispenseReservationRow>, StorageError> {
+        let account_uuid_bytes = account_id.as_uuid().as_bytes().to_vec();
+        self.with_ledger(move |conn| {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT reservation_id, request_id, idempotency_key, account_id, amount_zat, \
+                            locked_notes, reserved_at_ms, finalized_tx_id, released_at_ms \
+                     FROM ext_zally_dispense_reservations \
+                     WHERE account_id = ?1 \
+                       AND finalized_tx_id IS NULL \
+                       AND released_at_ms IS NULL \
+                     ORDER BY reserved_at_ms ASC, reservation_id ASC",
+                )
+                .map_err(|err| StorageError::SqliteFailed {
+                    reason: format!("list active dispense reservations prepare failed: {err}"),
+                    posture: FailurePosture::NotRetryable,
+                })?;
+            let mut rows = stmt
+                .query([&account_uuid_bytes])
+                .map_err(|err| StorageError::SqliteFailed {
+                    reason: format!("list active dispense reservations query failed: {err}"),
+                    posture: FailurePosture::NotRetryable,
+                })?;
+            let mut out = Vec::new();
+            while let Some(row) = rows.next().map_err(|err| StorageError::SqliteFailed {
+                reason: format!("list active dispense reservations row failed: {err}"),
+                posture: FailurePosture::NotRetryable,
+            })? {
+                out.push(decode_dispense_reservation_row(row)?);
+            }
+            Ok(out)
+        })
+        .await
+    }
+
+    async fn sum_active_dispense_reserved_zat(
+        &self,
+        account_id: AccountId,
+    ) -> Result<Zatoshis, StorageError> {
+        let account_uuid_bytes = account_id.as_uuid().as_bytes().to_vec();
+        self.with_ledger(move |conn| {
+            let total_u64 = sum_active_reservations(conn, &account_uuid_bytes)?;
+            Zatoshis::try_from(total_u64).map_err(|_| StorageError::RowValueOutOfRange {
+                column: "ext_zally_dispense_reservations.amount_zat (sum)",
+                raw: total_u64.to_string(),
+            })
+        })
+        .await
+    }
 }
 
 /// Upsert SQL for [`crate::WalletStorage::record_pending_broadcast_inputs`].
@@ -2169,6 +2433,240 @@ fn map_sqlite_error<E: std::fmt::Display>(err: &E) -> StorageError {
 fn map_derivation_error(err: &KeyDerivationError) -> StorageError {
     StorageError::KeyDerivationFailed {
         reason: err.to_string(),
+    }
+}
+
+/// Tag bytes for `ShieldedProtocol` in the `locked_notes` blob. Stable across releases;
+/// changing them requires a migration step.
+const LOCKED_NOTE_TAG_SAPLING: u8 = 0;
+const LOCKED_NOTE_TAG_ORCHARD: u8 = 1;
+
+/// Byte size of one encoded reserved note (tag + value + `tx_id` + `output_index`).
+const LOCKED_NOTE_RECORD_BYTES: usize = 1 + 8 + 32 + 4;
+
+/// Encodes a list of [`DispenseReservedNote`] values into the compact byte layout
+/// stored in `ext_zally_dispense_reservations.locked_notes`.
+///
+/// Layout: `u32` BE note count, then per-note records of fixed size
+/// `[u8 protocol_tag][u64_be value_zat][32 bytes tx_id][u32_be output_index]`.
+fn encode_locked_notes(notes: &[crate::DispenseReservedNote]) -> Vec<u8> {
+    let count = u32::try_from(notes.len()).unwrap_or(u32::MAX);
+    let mut blob = Vec::with_capacity(4_usize.saturating_add(notes.len().saturating_mul(LOCKED_NOTE_RECORD_BYTES)));
+    blob.extend_from_slice(&count.to_be_bytes());
+    for note in notes {
+        let tag = match note.protocol {
+            ShieldedProtocol::Sapling => LOCKED_NOTE_TAG_SAPLING,
+            ShieldedProtocol::Orchard => LOCKED_NOTE_TAG_ORCHARD,
+        };
+        blob.push(tag);
+        blob.extend_from_slice(&note.value_zat.as_u64().to_be_bytes());
+        blob.extend_from_slice(note.tx_id.as_bytes());
+        blob.extend_from_slice(&note.output_index.to_be_bytes());
+    }
+    blob
+}
+
+/// Reverses [`encode_locked_notes`].
+fn decode_locked_notes(blob: &[u8]) -> Result<Vec<crate::DispenseReservedNote>, StorageError> {
+    if blob.len() < 4 {
+        return Err(StorageError::RowValueOutOfRange {
+            column: "ext_zally_dispense_reservations.locked_notes",
+            raw: format!("blob length {} below 4-byte header", blob.len()),
+        });
+    }
+    let header_bytes: [u8; 4] = blob[0..4].try_into().map_err(|_| StorageError::RowValueOutOfRange {
+        column: "ext_zally_dispense_reservations.locked_notes",
+        raw: "could not read count header".to_owned(),
+    })?;
+    let count = u32::from_be_bytes(header_bytes);
+    let expected_bytes =
+        4_usize.saturating_add((count as usize).saturating_mul(LOCKED_NOTE_RECORD_BYTES));
+    if blob.len() != expected_bytes {
+        return Err(StorageError::RowValueOutOfRange {
+            column: "ext_zally_dispense_reservations.locked_notes",
+            raw: format!(
+                "blob length {} does not match header count {count} (expected {expected_bytes})",
+                blob.len()
+            ),
+        });
+    }
+    let mut notes = Vec::with_capacity(count as usize);
+    let mut cursor = 4;
+    for _ in 0..count {
+        let record = &blob[cursor..cursor + LOCKED_NOTE_RECORD_BYTES];
+        let tag = record[0];
+        let protocol = match tag {
+            LOCKED_NOTE_TAG_SAPLING => ShieldedProtocol::Sapling,
+            LOCKED_NOTE_TAG_ORCHARD => ShieldedProtocol::Orchard,
+            other => {
+                return Err(StorageError::RowValueOutOfRange {
+                    column: "ext_zally_dispense_reservations.locked_notes (protocol tag)",
+                    raw: other.to_string(),
+                });
+            }
+        };
+        let value_bytes: [u8; 8] = record[1..9].try_into().map_err(|_| {
+            StorageError::RowValueOutOfRange {
+                column: "ext_zally_dispense_reservations.locked_notes (value_zat)",
+                raw: "could not read value bytes".to_owned(),
+            }
+        })?;
+        let value_u64 = u64::from_be_bytes(value_bytes);
+        let value_zat = Zatoshis::try_from(value_u64).map_err(|_| {
+            StorageError::RowValueOutOfRange {
+                column: "ext_zally_dispense_reservations.locked_notes (value_zat)",
+                raw: value_u64.to_string(),
+            }
+        })?;
+        let tx_id_bytes: [u8; 32] = record[9..41].try_into().map_err(|_| {
+            StorageError::RowValueOutOfRange {
+                column: "ext_zally_dispense_reservations.locked_notes (tx_id)",
+                raw: "could not read 32-byte tx_id".to_owned(),
+            }
+        })?;
+        let output_index_bytes: [u8; 4] = record[41..45].try_into().map_err(|_| {
+            StorageError::RowValueOutOfRange {
+                column: "ext_zally_dispense_reservations.locked_notes (output_index)",
+                raw: "could not read output_index bytes".to_owned(),
+            }
+        })?;
+        let output_index = u32::from_be_bytes(output_index_bytes);
+        notes.push(crate::DispenseReservedNote {
+            protocol,
+            value_zat,
+            tx_id: TxId::from_bytes(tx_id_bytes),
+            output_index,
+        });
+        cursor += LOCKED_NOTE_RECORD_BYTES;
+    }
+    Ok(notes)
+}
+
+fn find_active_reservation_id_by_request(
+    conn: &rusqlite::Connection,
+    request_id: &str,
+) -> Result<Option<Vec<u8>>, StorageError> {
+    conn.query_row(
+        "SELECT reservation_id FROM ext_zally_dispense_reservations \
+         WHERE request_id = ?1 \
+           AND finalized_tx_id IS NULL \
+           AND released_at_ms IS NULL",
+        [request_id],
+        |row| row.get::<_, Vec<u8>>(0),
+    )
+    .optional()
+    .map_err(|err| StorageError::SqliteFailed {
+        reason: format!("dispense reservation request-id lookup failed: {err}"),
+        posture: FailurePosture::NotRetryable,
+    })
+}
+
+fn sum_active_reservations(
+    conn: &rusqlite::Connection,
+    account_uuid_bytes: &[u8],
+) -> Result<u64, StorageError> {
+    let sum_i64: i64 = conn
+        .query_row(
+            "SELECT COALESCE(SUM(amount_zat), 0) \
+             FROM ext_zally_dispense_reservations \
+             WHERE account_id = ?1 \
+               AND finalized_tx_id IS NULL \
+               AND released_at_ms IS NULL",
+            [account_uuid_bytes],
+            |row| row.get(0),
+        )
+        .map_err(|err| StorageError::SqliteFailed {
+            reason: format!("dispense reservation active-sum query failed: {err}"),
+            posture: FailurePosture::NotRetryable,
+        })?;
+    u64::try_from(sum_i64).map_err(|_| StorageError::RowValueOutOfRange {
+        column: "ext_zally_dispense_reservations.amount_zat (sum)",
+        raw: sum_i64.to_string(),
+    })
+}
+
+fn decode_dispense_reservation_row(
+    row: &rusqlite::Row<'_>,
+) -> Result<crate::DispenseReservationRow, StorageError> {
+    let reservation_uuid_bytes: Vec<u8> = row.get(0).map_err(|e| map_row_decode_error(&e))?;
+    let request_id_str: String = row.get(1).map_err(|e| map_row_decode_error(&e))?;
+    let idempotency_key_str: String = row.get(2).map_err(|e| map_row_decode_error(&e))?;
+    let account_uuid_bytes: Vec<u8> = row.get(3).map_err(|e| map_row_decode_error(&e))?;
+    let amount_zat_raw: i64 = row.get(4).map_err(|e| map_row_decode_error(&e))?;
+    let locked_notes_blob: Vec<u8> = row.get(5).map_err(|e| map_row_decode_error(&e))?;
+    let reserved_at_ms_raw: i64 = row.get(6).map_err(|e| map_row_decode_error(&e))?;
+    let finalized_tx_bytes: Option<Vec<u8>> = row.get(7).map_err(|e| map_row_decode_error(&e))?;
+    let released_at_ms_raw: Option<i64> = row.get(8).map_err(|e| map_row_decode_error(&e))?;
+
+    let reservation_uuid_array: [u8; 16] = reservation_uuid_bytes
+        .try_into()
+        .map_err(|raw: Vec<u8>| StorageError::RowValueOutOfRange {
+            column: "ext_zally_dispense_reservations.reservation_id",
+            raw: format!("uuid byte length {}", raw.len()),
+        })?;
+    let account_uuid_array: [u8; 16] = account_uuid_bytes
+        .try_into()
+        .map_err(|raw: Vec<u8>| StorageError::RowValueOutOfRange {
+            column: "ext_zally_dispense_reservations.account_id",
+            raw: format!("uuid byte length {}", raw.len()),
+        })?;
+    let request_id = IdempotencyKey::try_from(request_id_str).map_err(|err| {
+        StorageError::RowValueOutOfRange {
+            column: "ext_zally_dispense_reservations.request_id",
+            raw: format!("invalid idempotency key: {err}"),
+        }
+    })?;
+    let idempotency_key =
+        IdempotencyKey::try_from(idempotency_key_str).map_err(|err| StorageError::RowValueOutOfRange {
+            column: "ext_zally_dispense_reservations.idempotency_key",
+            raw: format!("invalid idempotency key: {err}"),
+        })?;
+    let amount_u64 = u64::try_from(amount_zat_raw).map_err(|_| {
+        StorageError::RowValueOutOfRange {
+            column: "ext_zally_dispense_reservations.amount_zat",
+            raw: amount_zat_raw.to_string(),
+        }
+    })?;
+    let amount_zat = Zatoshis::try_from(amount_u64).map_err(|_| StorageError::RowValueOutOfRange {
+        column: "ext_zally_dispense_reservations.amount_zat",
+        raw: amount_u64.to_string(),
+    })?;
+    let reserved_at_ms = u64::try_from(reserved_at_ms_raw).map_err(|_| {
+        StorageError::RowValueOutOfRange {
+            column: "ext_zally_dispense_reservations.reserved_at_ms",
+            raw: reserved_at_ms_raw.to_string(),
+        }
+    })?;
+    let finalized_tx_id = finalized_tx_bytes
+        .map(|bytes| decode_txid_bytes(bytes, "ext_zally_dispense_reservations.finalized_tx_id"))
+        .transpose()?;
+    let released_at_ms = released_at_ms_raw
+        .map(|raw| {
+            u64::try_from(raw).map_err(|_| StorageError::RowValueOutOfRange {
+                column: "ext_zally_dispense_reservations.released_at_ms",
+                raw: raw.to_string(),
+            })
+        })
+        .transpose()?;
+    let locked_notes = decode_locked_notes(&locked_notes_blob)?;
+
+    Ok(crate::DispenseReservationRow {
+        reservation_id: ReservationId::from_uuid(uuid::Uuid::from_bytes(reservation_uuid_array)),
+        request_id,
+        idempotency_key,
+        account_id: AccountId::from_uuid(uuid::Uuid::from_bytes(account_uuid_array)),
+        amount_zat,
+        locked_notes,
+        reserved_at_ms,
+        finalized_tx_id,
+        released_at_ms,
+    })
+}
+
+fn map_row_decode_error(err: &rusqlite::Error) -> StorageError {
+    StorageError::SqliteFailed {
+        reason: format!("dispense reservation row decode failed: {err}"),
+        posture: FailurePosture::NotRetryable,
     }
 }
 

@@ -1,7 +1,9 @@
 //! `WalletStorage` trait.
 
 use async_trait::async_trait;
-use zally_core::{AccountId, BlockHeight, IdempotencyKey, Network, OutPoint, TxId, Zatoshis};
+use zally_core::{
+    AccountId, BlockHeight, IdempotencyKey, Network, OutPoint, ReservationId, TxId, Zatoshis,
+};
 
 /// The storage backend behind a wallet handle.
 ///
@@ -22,6 +24,7 @@ use zcash_client_backend::proto::compact_formats::CompactBlock;
 use zcash_keys::address::UnifiedAddress;
 
 use crate::account_balance_row::AccountBalanceRow;
+use crate::dispense_reservation_row::{DispenseReservationRow, DispenseReservedNote};
 use crate::error::StorageError;
 use crate::exposed_address_row::ExposedAddressRow;
 use crate::pending_broadcast_input_row::PendingBroadcastInputRow;
@@ -299,6 +302,36 @@ pub struct ProposalSummary {
     pub min_target_height: BlockHeight,
     /// Number of payment outputs in the proposal.
     pub output_count: usize,
+}
+
+/// Request body for [`WalletStorage::create_dispense_reservation`].
+///
+/// Carries everything the storage layer needs to persist a fresh dispense reservation
+/// row and enforce the "amount sum stays within spendable" invariant atomically with
+/// any concurrent reservation attempt.
+#[derive(Clone, Debug)]
+pub struct DispenseReservationRecord {
+    /// Wallet-issued identifier for the new reservation.
+    pub reservation_id: ReservationId,
+    /// Caller-supplied request identifier (idempotency anchor) for the reservation.
+    pub request_id: IdempotencyKey,
+    /// Caller-supplied idempotency key for the eventual broadcast.
+    pub idempotency_key: IdempotencyKey,
+    /// Account the reservation belongs to.
+    pub account_id: AccountId,
+    /// Amount the caller wants to reserve.
+    pub amount_zat: Zatoshis,
+    /// Spendable amount the wallet observed at reservation time, used by the storage
+    /// layer to enforce the amount-sum invariant. Callers compute this as
+    /// `total_spendable - sum_active_reservations`; the storage layer rechecks the same
+    /// invariant inside its sqlite transaction so two concurrent reservations cannot
+    /// both pass an overlapping pre-check.
+    pub spendable_for_check_zat: Zatoshis,
+    /// Notes the wallet considered locked at reservation time. Informational only;
+    /// the enforcement contract is amount-based.
+    pub locked_notes: Vec<DispenseReservedNote>,
+    /// Unix milliseconds when the reservation was recorded.
+    pub reserved_at_ms: u64,
 }
 
 /// Request body for [`WalletStorage::record_pending_broadcast_inputs`].
@@ -756,4 +789,94 @@ pub trait WalletStorage: Send + Sync + 'static {
         tx_id: TxId,
         output_index: u16,
     ) -> Result<Option<String>, StorageError>;
+
+    /// Persists a fresh dispense reservation row, enforcing the
+    /// "amount sum stays within spendable" invariant inside a single sqlite transaction.
+    ///
+    /// The storage layer rechecks `record.spendable_for_check_zat` against the live sum of
+    /// active reservations for the same account before inserting; if the new row would
+    /// push the total above `spendable_for_check_zat`, the call fails closed with
+    /// [`StorageError::InsufficientFunds`].
+    ///
+    /// `request_id` is unique across active rows. A second call with the same
+    /// `request_id` while a row exists returns
+    /// [`StorageError::DispenseReservationRequestConflict`] so the wallet boundary can
+    /// look up the existing reservation and surface it idempotently rather than
+    /// double-reserve.
+    ///
+    /// `not_retryable` on `InsufficientFunds` and `DispenseReservationRequestConflict`;
+    /// `retryable` on transient I/O.
+    async fn create_dispense_reservation(
+        &self,
+        record: DispenseReservationRecord,
+    ) -> Result<(), StorageError>;
+
+    /// Marks `reservation_id` as released. The row stays in storage for audit; subsequent
+    /// reads see `released_at_ms = Some(now)` and the reservation no longer contributes
+    /// to `sum_active_dispense_reserved_zat`.
+    ///
+    /// Idempotent: a second call on the same identifier observes the prior
+    /// `released_at_ms` and returns `Ok(())`. A row that was already finalized stays
+    /// finalized; this method only updates `released_at_ms` when the row is still active.
+    ///
+    /// Returns [`StorageError::DispenseReservationNotFound`] when no row matches.
+    ///
+    /// `not_retryable` on `DispenseReservationNotFound`; `retryable` on transient I/O.
+    async fn release_dispense_reservation(
+        &self,
+        reservation_id: ReservationId,
+        released_at_ms: u64,
+    ) -> Result<(), StorageError>;
+
+    /// Marks `reservation_id` as finalized by a specific broadcast transaction.
+    ///
+    /// Idempotent: a second call with the same `tx_id` observes the prior
+    /// `finalized_tx_id` and returns `Ok(())`. Calling with a different `tx_id` after a
+    /// prior finalize is treated as a no-op as well, on the assumption that the caller
+    /// is replaying a recovery path; the persisted `tx_id` is the authoritative one.
+    ///
+    /// Returns [`StorageError::DispenseReservationNotFound`] when no row matches.
+    ///
+    /// `not_retryable` on `DispenseReservationNotFound`; `retryable` on transient I/O.
+    async fn finalize_dispense_reservation(
+        &self,
+        reservation_id: ReservationId,
+        tx_id: TxId,
+    ) -> Result<(), StorageError>;
+
+    /// Returns the persisted reservation row whose caller-supplied `request_id` matches,
+    /// regardless of whether it is still active, finalized, or released.
+    ///
+    /// Powers idempotent reservation: when the wallet boundary observes a request id
+    /// already recorded, it can return the prior reservation summary instead of trying
+    /// to create a new row that would conflict.
+    ///
+    /// `not_retryable` on schema errors; `retryable` on transient I/O.
+    async fn find_dispense_reservation_by_request_id(
+        &self,
+        request_id: &IdempotencyKey,
+    ) -> Result<Option<DispenseReservationRow>, StorageError>;
+
+    /// Returns every active reservation row for `account_id`: rows with both
+    /// `finalized_tx_id` and `released_at_ms` still `None`.
+    ///
+    /// Powers `Wallet::spendable_for_next_dispense` and the operator-facing view of
+    /// what the wallet has currently locked.
+    ///
+    /// `not_retryable` on schema errors; `retryable` on transient I/O.
+    async fn list_active_dispense_reservations(
+        &self,
+        account_id: AccountId,
+    ) -> Result<Vec<DispenseReservationRow>, StorageError>;
+
+    /// Returns the sum of `amount_zat` across every active reservation row for
+    /// `account_id`. Equivalent to summing the rows from
+    /// [`Self::list_active_dispense_reservations`] but avoids the per-row decode cost
+    /// for the steady-state spendable-balance read path.
+    ///
+    /// `not_retryable` on schema errors; `retryable` on transient I/O.
+    async fn sum_active_dispense_reserved_zat(
+        &self,
+        account_id: AccountId,
+    ) -> Result<Zatoshis, StorageError>;
 }
