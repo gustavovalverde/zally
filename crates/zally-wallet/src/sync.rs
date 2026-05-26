@@ -819,7 +819,7 @@ impl Wallet {
         {
             match decode_cached_tree_state(cached_height, &encoded) {
                 Ok(state) => {
-                    tracing::debug!(
+                    tracing::info!(
                         event = "wallet_chain_state_anchor_cache_hit",
                         prior_height = prior_height.as_u32(),
                         "served prior chain state from local anchor cache"
@@ -889,7 +889,7 @@ impl Wallet {
                 "could not persist chain-state anchor; next resume will refetch from the chain source"
             );
         } else {
-            tracing::debug!(
+            tracing::info!(
                 event = "wallet_chain_state_anchor_cached",
                 returned_height = returned_height.as_u32(),
                 "cached chain-state anchor from chain source"
