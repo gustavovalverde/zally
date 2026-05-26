@@ -20,9 +20,9 @@ use zally_core::{BlockHeight, Network, TxId};
 use zcash_client_backend::proto::compact_formats::CompactBlock;
 use zcash_client_backend::proto::service::TreeState;
 use zinder_client::{
-    ChainEvent as ZinderChainEvent, ChainEventCursor as ZinderChainEventCursor,
-    ChainEventEnvelope as ZinderChainEventEnvelope, ChainIndex, RemoteChainIndex,
-    RemoteOpenOptions, TransparentAddressUtxosQuery,
+    AddressOutputIndexQuery, ChainEvent as ZinderChainEvent,
+    ChainEventCursor as ZinderChainEventCursor, ChainEventEnvelope as ZinderChainEventEnvelope,
+    ChainIndex, RemoteChainIndex, RemoteOpenOptions,
 };
 use zinder_core::{
     BlockHeight as ZinderBlockHeight, BlockHeightRange as ZinderBlockHeightRange,
@@ -142,7 +142,7 @@ impl ChainSource for ZinderChainSource {
     ) -> Result<TreeState, ChainSourceError> {
         let artifact = self
             .inner
-            .tree_state_at(ZinderBlockHeight::new(block_height.as_u32()), None)
+            .tree_state_checkpoint_at_or_before(ZinderBlockHeight::new(block_height.as_u32()), None)
             .await?;
         decode_tree_state(&artifact.payload_bytes, block_height, self.network)
     }
@@ -180,7 +180,7 @@ impl ChainSource for ZinderChainSource {
         let translated = match status {
             ZinderTxStatus::Mined(mined) => TransactionStatus::Confirmed {
                 tx_id,
-                confirmed_at_height: BlockHeight::from(mined.artifact.block_height.value()),
+                confirmed_at_height: BlockHeight::from(mined.location.block_height.value()),
             },
             ZinderTxStatus::InMempool(_) => TransactionStatus::InMempool { tx_id },
             ZinderTxStatus::NotFound | ZinderTxStatus::ConflictingChain => {
@@ -197,15 +197,15 @@ impl ChainSource for ZinderChainSource {
     ) -> Result<Vec<TransparentUtxo>, ChainSourceError> {
         let address_script_hash =
             TransparentAddressScriptHash::of_script_pub_key(script_pub_key_bytes);
-        let query = TransparentAddressUtxosQuery {
+        let query = AddressOutputIndexQuery {
             address_script_hash,
             start_height: ZinderBlockHeight::new(0),
             max_entries: None,
             from_cursor: None,
         };
-        let view = self.inner.transparent_address_utxos(query, None).await?;
+        let view = self.inner.address_output_index(query, None).await?;
         Ok(view
-            .utxos
+            .outputs
             .into_iter()
             .map(|artifact| TransparentUtxo {
                 tx_id: TxId::from_bytes(artifact.outpoint.transaction_id.as_bytes()),
