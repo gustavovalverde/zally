@@ -615,6 +615,51 @@ pub trait WalletStorage: Send + Sync + 'static {
     /// `not_retryable` on schema errors; `retryable` on transient I/O.
     async fn record_observed_tip(&self, new_tip: BlockHeight) -> Result<(), StorageError>;
 
+    /// Caches a chain-state anchor for `block_height` so a subsequent sync resume can
+    /// reconstruct the wallet's prior `ChainState` from the wallet's own storage instead
+    /// of an RPC to the chain source. `encoded_tree_state` is the opaque
+    /// `zcash_client_backend::proto::service::TreeState` proto-encoded blob the wallet
+    /// received from the chain source; the storage layer does not interpret it.
+    ///
+    /// Calls are idempotent on `block_height`: an existing row at the same height is
+    /// replaced. The wallet records one anchor per sync cycle (at the height it queries
+    /// the chain source), so the cache grows linearly with sync runs until
+    /// [`Self::prune_chain_state_anchors_below`] retires older rows.
+    ///
+    /// `not_retryable` on schema errors; `retryable` on transient I/O.
+    async fn record_chain_state_anchor(
+        &self,
+        block_height: BlockHeight,
+        encoded_tree_state: Vec<u8>,
+        recorded_at_ms: u64,
+    ) -> Result<(), StorageError>;
+
+    /// Returns the highest cached chain-state anchor whose height is at-or-below
+    /// `target_height`, together with the opaque encoded `TreeState` bytes.
+    ///
+    /// Used by `Wallet::sync` to satisfy the prior-state lookup from local storage
+    /// before falling back to the chain source's `tree_state_at` RPC. Returns `None`
+    /// when no cached anchor satisfies the bound (typically on the wallet's first sync
+    /// after a fresh install or after a cache prune drops every prior anchor).
+    ///
+    /// `not_retryable` on schema errors; `retryable` on transient I/O.
+    async fn find_chain_state_anchor_at_or_below(
+        &self,
+        target_height: BlockHeight,
+    ) -> Result<Option<(BlockHeight, Vec<u8>)>, StorageError>;
+
+    /// Drops every chain-state anchor strictly below `floor_height`. Called by
+    /// `Wallet::sync` after each successful run to keep the cache bounded to the most
+    /// recent anchors; the floor is chosen as `floor = fully_scanned - retention_window`
+    /// where `retention_window` is sized to comfortably cover the librustzcash rewind
+    /// cap and the operator's expected stall window combined.
+    ///
+    /// `not_retryable` on schema errors; `retryable` on transient I/O.
+    async fn prune_chain_state_anchors_below(
+        &self,
+        floor_height: BlockHeight,
+    ) -> Result<(), StorageError>;
+
     /// Informs the underlying `WalletDb` of the raw chain tip so transaction proposals
     /// compute a valid `expiry_height` against the live chain.
     ///

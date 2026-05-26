@@ -86,6 +86,7 @@ tokio-stream = { version = "0.1", features = ["sync"] }
 futures-util = "0.3"
 async-trait = "0.1"
 parking_lot = "0.12"
+prost = "0.14"
 
 # Error handling and serialization.
 thiserror = "2.0"

@@ -28,6 +28,7 @@ zinder = ["zally-chain/zinder"]
 [dependencies]
 futures-util.workspace = true
 parking_lot.workspace = true
+prost.workspace = true
 serde = { workspace = true, optional = true }
 thiserror.workspace = true
 tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }

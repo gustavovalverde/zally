@@ -241,6 +241,10 @@ fn run_wallet_db_actor(options: &SqliteOptions, mut request_rx: mpsc::Receiver<D
 /// Opens (or creates on first run) the underlying `WalletDb` and the Zally
 /// ledger connection backing the `ext_zally_*` tables. Runs on the actor
 /// thread; the file I/O and the schema migration happen here.
+#[allow(
+    clippy::too_many_lines,
+    reason = "ext_zally schema DDL is one transactional batch; splitting it would obscure the atomic-init contract"
+)]
 fn open_wallet_db(options: &SqliteOptions) -> Result<WalletDbState, StorageError> {
     if let Some(parent) = options.db_path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| StorageError::SqliteFailed {
@@ -310,7 +314,12 @@ fn open_wallet_db(options: &SqliteOptions) -> Result<WalletDbState, StorageError
                  WHERE finalized_tx_id IS NULL AND released_at_ms IS NULL; \
              CREATE INDEX IF NOT EXISTS idx_dispense_reservations_account_active \
                  ON ext_zally_dispense_reservations(account_id) \
-                 WHERE finalized_tx_id IS NULL AND released_at_ms IS NULL;",
+                 WHERE finalized_tx_id IS NULL AND released_at_ms IS NULL; \
+             CREATE TABLE IF NOT EXISTS ext_zally_chain_state_anchors (\
+                 block_height       INTEGER PRIMARY KEY,\
+                 encoded_tree_state BLOB    NOT NULL,\
+                 recorded_at_ms     INTEGER NOT NULL\
+             );",
         )
         .map_err(|e| StorageError::SqliteFailed {
             reason: format!("ext_zally schema init failed: {e}"),
@@ -1024,6 +1033,88 @@ impl WalletStorage for Sqlite {
             )
             .map_err(|err| StorageError::SqliteFailed {
                 reason: format!("ext_zally_observed_tip upsert failed: {err}"),
+                posture: FailurePosture::NotRetryable,
+            })?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn record_chain_state_anchor(
+        &self,
+        block_height: BlockHeight,
+        encoded_tree_state: Vec<u8>,
+        recorded_at_ms: u64,
+    ) -> Result<(), StorageError> {
+        let block_height_i64 = i64::from(block_height.as_u32());
+        let recorded_at_ms_i64 = clamp_unsigned_to_i64(recorded_at_ms);
+        self.with_ledger(move |conn| {
+            conn.execute(
+                "INSERT INTO ext_zally_chain_state_anchors \
+                     (block_height, encoded_tree_state, recorded_at_ms) \
+                 VALUES (?1, ?2, ?3) \
+                 ON CONFLICT(block_height) DO UPDATE SET \
+                     encoded_tree_state = excluded.encoded_tree_state, \
+                     recorded_at_ms     = excluded.recorded_at_ms",
+                rusqlite::params![block_height_i64, encoded_tree_state, recorded_at_ms_i64],
+            )
+            .map_err(|err| StorageError::SqliteFailed {
+                reason: format!("ext_zally_chain_state_anchors upsert failed: {err}"),
+                posture: FailurePosture::NotRetryable,
+            })?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn find_chain_state_anchor_at_or_below(
+        &self,
+        target_height: BlockHeight,
+    ) -> Result<Option<(BlockHeight, Vec<u8>)>, StorageError> {
+        let target_i64 = i64::from(target_height.as_u32());
+        self.with_ledger(move |conn| {
+            let outcome = conn
+                .query_row(
+                    "SELECT block_height, encoded_tree_state \
+                     FROM ext_zally_chain_state_anchors \
+                     WHERE block_height <= ?1 \
+                     ORDER BY block_height DESC LIMIT 1",
+                    [target_i64],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?)),
+                )
+                .optional()
+                .map_err(|err| StorageError::SqliteFailed {
+                    reason: format!("ext_zally_chain_state_anchors lookup failed: {err}"),
+                    posture: FailurePosture::NotRetryable,
+                })?;
+            outcome
+                .map(|(height_i64, encoded)| {
+                    u32::try_from(height_i64)
+                        .map(|h| (BlockHeight::from(h), encoded))
+                        .map_err(|_| StorageError::SqliteFailed {
+                            reason: format!(
+                                "ext_zally_chain_state_anchors.block_height out of u32: {height_i64}"
+                            ),
+                            posture: FailurePosture::NotRetryable,
+                        })
+                })
+                .transpose()
+        })
+        .await
+    }
+
+    async fn prune_chain_state_anchors_below(
+        &self,
+        floor_height: BlockHeight,
+    ) -> Result<(), StorageError> {
+        let floor_i64 = i64::from(floor_height.as_u32());
+        self.with_ledger(move |conn| {
+            conn.execute(
+                "DELETE FROM ext_zally_chain_state_anchors WHERE block_height < ?1",
+                [floor_i64],
+            )
+            .map_err(|err| StorageError::SqliteFailed {
+                reason: format!("ext_zally_chain_state_anchors prune failed: {err}"),
                 posture: FailurePosture::NotRetryable,
             })?;
             Ok(())

@@ -5366,6 +5366,7 @@ dependencies = [
  "async-trait",
  "futures-util",
  "parking_lot",
+ "prost",
  "serde",
  "serde_json",
  "tempfile",
