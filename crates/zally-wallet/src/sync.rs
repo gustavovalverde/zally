@@ -745,6 +745,24 @@ impl Wallet {
                 transparent_utxo_count,
             ));
         }
+        // Resolve the prior chain state first because the chain source may only
+        // hold a checkpoint at a height *below* `scanned_from - 1` (tree-state
+        // checkpoints are materialized at subtree boundaries, not at every
+        // block). When that happens, the wallet's stored fully-scanned height
+        // is ahead of any checkpoint the chain source can serve, so resuming
+        // from `scanned_from` would feed `scan_cached_blocks` a `from_height`
+        // that disagrees with `from_state.block_height() + 1`. Rather than
+        // panicking inside librustzcash, truncate the wallet down to the
+        // checkpoint and rescan from there.
+        let from_state = fetch_prior_chain_state(chain, scanned_from).await?;
+        let from_state_height = BlockHeight::from(u32::from(from_state.block_height()));
+        let scanned_from = if from_state_height.as_u32().saturating_add(1) == scanned_from.as_u32()
+        {
+            scanned_from
+        } else {
+            self.realign_to_available_checkpoint(scanned_from, from_state_height)
+                .await?
+        };
         let blocks = fetch_compact_blocks(chain, scanned_from, chain_tip).await?;
         let block_count = u64::try_from(blocks.len()).unwrap_or(u64::MAX);
         if blocks.is_empty() {
@@ -756,7 +774,6 @@ impl Wallet {
                 transparent_utxo_count,
             ));
         }
-        let from_state = fetch_prior_chain_state(chain, scanned_from).await?;
         self.scan_and_emit(
             ScanContext {
                 blocks,
@@ -769,6 +786,36 @@ impl Wallet {
             chain,
         )
         .await
+    }
+
+    /// Truncates the wallet down to the height of the latest available
+    /// chain-state checkpoint and returns the new `scanned_from` aligned to
+    /// the checkpoint. Called when the chain source's nearest checkpoint sits
+    /// strictly below the wallet's recorded fully-scanned height; the wallet's
+    /// own state past the checkpoint is unreachable without re-deriving the
+    /// commitment trees, so the only correct move is to roll back to the
+    /// checkpoint and rescan forward.
+    async fn realign_to_available_checkpoint(
+        &self,
+        scanned_from: BlockHeight,
+        checkpoint_height: BlockHeight,
+    ) -> Result<BlockHeight, WalletError> {
+        tracing::warn!(
+            event = "wallet_sync_realign_to_checkpoint",
+            requested_scanned_from = scanned_from.as_u32(),
+            checkpoint_height = checkpoint_height.as_u32(),
+            "wallet fully-scanned height is past the latest available chain-state checkpoint; truncating to checkpoint and rescanning"
+        );
+        let new_fully_scanned = self
+            .inner
+            .storage
+            .truncate_to_height(checkpoint_height)
+            .await?;
+        self.publish_event(WalletEvent::ReorgDetected {
+            rolled_back_to_height: new_fully_scanned,
+            new_tip_height: scanned_from,
+        });
+        Ok(BlockHeight::from(new_fully_scanned.as_u32().saturating_add(1)))
     }
 
     fn detect_tip_regress(
