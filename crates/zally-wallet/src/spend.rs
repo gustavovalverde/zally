@@ -578,9 +578,8 @@ fn resolve_send_outcome(
         // verification. The pending-broadcast row recorded just before `submit` stays
         // in place so the wallet still treats the inputs as in-flight, and the caller
         // observes the tx id it computed at proposal time.
-        zally_chain::SubmitOutcome::Duplicate { .. } | zally_chain::SubmitOutcome::Queued { .. } => {
-            Ok(fallback_tx_id)
-        }
+        zally_chain::SubmitOutcome::Duplicate { .. }
+        | zally_chain::SubmitOutcome::Queued { .. } => Ok(fallback_tx_id),
         zally_chain::SubmitOutcome::Rejected { reason, detail } => {
             Err(WalletError::SubmissionRejected { reason, detail })
         }

@@ -11,9 +11,11 @@
 //! `BranchId` plus the regtest `LocalNetwork` carried inside [`Network::Regtest`].
 
 mod account_id;
+mod block_hash;
 mod block_height;
 mod branch_id;
 mod failure_posture;
+mod hash_hex;
 mod idempotency_key;
 mod memo;
 mod network;
@@ -26,9 +28,11 @@ mod txid;
 mod zatoshis;
 
 pub use account_id::AccountId;
+pub use block_hash::BlockHash;
 pub use block_height::BlockHeight;
 pub use branch_id::BranchId;
 pub use failure_posture::FailurePosture;
+pub use hash_hex::FromRpcHexError;
 pub use idempotency_key::{IdempotencyKey, IdempotencyKeyError};
 pub use memo::{Memo, MemoBytes, MemoError};
 pub use network::{Network, NetworkParameters};

@@ -84,7 +84,9 @@ A name must survive a change of its implementation.
 | `Zatoshis` | `zally-core` | `u64` non-negative newtype for transaction amounts. Never bare `u64`. |
 | `BlockHeight` | `zally-core` | `u32` newtype. Never bare `u32` for height. |
 | `BranchId` | `zally-core` | ZIP-200 branch identifier; required at transaction construction time. |
-| `TxId` | `zally-core` | Non-malleable txid per ZIP-244. Never bare `[u8; 32]`. |
+| `TxId` | `zally-core` | Non-malleable txid per ZIP-244. Never bare `[u8; 32]`. Text boundaries (`Display`, `Debug`, `FromStr`, `to_rpc_hex`, `from_rpc_hex`) use RPC byte order; `from_bytes` / `as_bytes` use internal byte order. See [ADR-0004](../adrs/0004-rpc-byte-order-hex-conversion.md). |
+| `BlockHash` | `zally-core` | Canonical Zcash block hash. Never bare `[u8; 32]`. Same byte-order discipline as `TxId`. See [ADR-0004](../adrs/0004-rpc-byte-order-hex-conversion.md). |
+| `FromRpcHexError` | `zally-core` | Shared error returned when parsing `TxId` or `BlockHash` from RPC byte order hex. |
 | `AccountId` | `zally-core` | Opaque identifier for an account within a wallet. |
 | `ReceiverPurpose` | `zally-core` | Enum naming each receiver's role (`Mining`, `Donations`, `HotDispense`, `ColdReserve`, `Custom(String)`). |
 | `IdempotencyKey` | `zally-core` | Caller-supplied identifier for send-idempotency. `AsRef<str>` newtype. |
@@ -111,6 +113,17 @@ A name must survive a change of its implementation.
 | `Submitter` | `zally-chain` | Trait for transaction broadcast. |
 | `SeedSealing` | `zally-keys` | Trait for at-rest seed encryption. |
 | `WalletCapabilities` | `zally-wallet` | Runtime descriptor of supported features (ZIP coverage, PCZT version, sealing impl). |
+
+### Byte order for hash newtypes
+
+A 32-byte Zcash hash (txid, block hash) exists in two byte orders. Zally exposes both in one place so consumers never reinvent the conversion:
+
+- **Internal byte order**: the raw SHA-256d output bytes used in consensus serialization. Reference: Zcash protocol spec, protocol.tex:13560-13564. This is what `TxId::from_bytes` / `as_bytes` and `BlockHash::from_bytes` / `as_bytes` carry; storage and direct consensus-serialization paths use these accessors.
+- **RPC byte order**: the byte-reversed form every `zcash-cli` reply, every wallet UI, every block explorer URL, and the specification itself print. Reference: Zcash protocol spec, term `\rpcByteOrder` (protocol.tex:1127, defining sentence at :4036).
+
+The rule: Zally's hash newtypes accept and emit RPC byte order at every text boundary (`Display`, `Debug`, `FromStr`, `to_rpc_hex`, `from_rpc_hex`); internal byte order is reserved for the `from_bytes` / `as_bytes` accessors that exist for storage and direct consensus serialization. See [ADR-0004](../adrs/0004-rpc-byte-order-hex-conversion.md) for rationale.
+
+Every new `[u8; 32]` hash newtype in `zally-core` ships with the same surface; new hash kinds reuse [`FromRpcHexError`](../../crates/zally-core/src/hash_hex.rs).
 
 ### Discriminated unions
 

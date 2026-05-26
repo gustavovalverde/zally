@@ -60,11 +60,7 @@ impl MockSubmitter {
     /// Constructs a submitter that always returns `SubmitOutcome::Rejected` with the
     /// supplied typed reason and operator-facing detail.
     #[must_use]
-    pub fn rejecting(
-        network: Network,
-        reason: RejectionReason,
-        detail: impl Into<String>,
-    ) -> Self {
+    pub fn rejecting(network: Network, reason: RejectionReason, detail: impl Into<String>) -> Self {
         Self::with_outcome(
             network,
             MockOutcome::Rejecting {
@@ -155,9 +151,7 @@ impl Submitter for MockSubmitter {
             MockOutcome::Accepting => SubmitOutcome::Accepted { tx_id },
             MockOutcome::Duplicating => SubmitOutcome::Duplicate { tx_id },
             MockOutcome::Queuing => SubmitOutcome::Queued { tx_id },
-            MockOutcome::Rejecting { reason, detail } => {
-                SubmitOutcome::Rejected { reason, detail }
-            }
+            MockOutcome::Rejecting { reason, detail } => SubmitOutcome::Rejected { reason, detail },
         })
     }
 }
@@ -189,8 +183,11 @@ mod tests {
 
     #[tokio::test]
     async fn mock_submitter_rejects_with_reason() -> Result<(), SubmitterError> {
-        let submitter =
-            MockSubmitter::rejecting(Network::Mainnet, RejectionReason::MempoolFull, "fee too low");
+        let submitter = MockSubmitter::rejecting(
+            Network::Mainnet,
+            RejectionReason::MempoolFull,
+            "fee too low",
+        );
         let outcome = submitter.submit(&[0; 4]).await?;
         assert!(matches!(
             outcome,
