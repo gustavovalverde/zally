@@ -114,7 +114,7 @@ impl MockSubmitterHandle {
     /// failure off the queue; once empty, calls return the configured outcome.
     ///
     /// `produce_error` is invoked once per queued failure; see
-    /// [`crate::MockChainSourceHandle::fail_chain_tip_next`] for the closure-factory rationale.
+    /// [`crate::MockChainSourceHandle::fail_safe_chain_tip_next`] for the closure-factory rationale.
     pub fn fail_submit_next(&self, count: u32, mut produce_error: impl FnMut() -> SubmitterError) {
         let mut guard = self.state.lock();
         for _ in 0..count {

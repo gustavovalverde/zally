@@ -78,42 +78,42 @@ pub struct MockChainSourceHandle {
 }
 
 impl MockChainSourceHandle {
-    /// Sets the visible chain tip to `new_tip_height` and emits `ChainTipAdvanced`.
-    pub fn advance_tip(&self, new_tip_height: BlockHeight) {
+    /// Sets the visible chain tip to `new_safe_chain_tip_height` and emits `SafeChainTipAdvanced`.
+    pub fn advance_tip(&self, new_safe_chain_tip_height: BlockHeight) {
         let committed_range = {
             let mut guard = self.state.lock();
             let prior_tip = guard.tip_height;
-            guard.tip_height = new_tip_height;
+            guard.tip_height = new_safe_chain_tip_height;
             drop(guard);
             BlockHeightRange::new(
                 BlockHeight::from(prior_tip.as_u32().saturating_add(1)),
-                new_tip_height,
+                new_safe_chain_tip_height,
             )
         };
         if let Some(range) = committed_range {
-            let _ = self.event_tx.send(ChainEvent::ChainTipAdvanced {
+            let _ = self.event_tx.send(ChainEvent::SafeChainTipAdvanced {
                 committed_range: range,
-                new_tip_height,
+                new_safe_chain_tip_height,
             });
         }
     }
 
     /// Reverts to `reorg_from_height - 1` and announces a reorg that re-commits up to
-    /// `new_tip_height`.
-    pub fn trigger_reorg(&self, reorg_from_height: BlockHeight, new_tip_height: BlockHeight) {
+    /// `new_safe_chain_tip_height`.
+    pub fn trigger_reorg(&self, reorg_from_height: BlockHeight, new_safe_chain_tip_height: BlockHeight) {
         let prior_tip;
         {
             let mut guard = self.state.lock();
             prior_tip = guard.tip_height;
-            guard.tip_height = new_tip_height;
+            guard.tip_height = new_safe_chain_tip_height;
         }
         let reverted = BlockHeightRange::new(reorg_from_height, prior_tip);
-        let committed = BlockHeightRange::new(reorg_from_height, new_tip_height);
+        let committed = BlockHeightRange::new(reorg_from_height, new_safe_chain_tip_height);
         if let (Some(reverted_range), Some(committed_range)) = (reverted, committed) {
             let _ = self.event_tx.send(ChainEvent::ChainReorged {
                 reverted_range,
                 committed_range,
-                new_tip_height,
+                new_safe_chain_tip_height,
             });
         }
     }
@@ -124,7 +124,7 @@ impl MockChainSourceHandle {
         self.state.lock().tip_height
     }
 
-    /// Queues `count` consecutive failures for `chain_tip` calls. Each subsequent call pops
+    /// Queues `count` consecutive failures for `safe_chain_tip` calls. Each subsequent call pops
     /// one failure off the queue; once empty, calls succeed normally. Failures are returned
     /// in the order they were queued.
     ///
@@ -132,7 +132,7 @@ impl MockChainSourceHandle {
     /// same error each time (`|| ChainSourceError::Unavailable { ... }`) or vary the error
     /// per attempt. The closure avoids requiring `Clone` on the error type, which would
     /// otherwise force [`ChainSourceError::Indexer`] to carry an `Arc<IndexerError>`.
-    pub fn fail_chain_tip_next(
+    pub fn fail_safe_chain_tip_next(
         &self,
         count: u32,
         mut produce_error: impl FnMut() -> ChainSourceError,
@@ -156,7 +156,7 @@ impl ChainSource for MockChainSource {
         self.state.lock().network
     }
 
-    async fn chain_tip(&self) -> Result<BlockHeight, ChainSourceError> {
+    async fn safe_chain_tip(&self) -> Result<BlockHeight, ChainSourceError> {
         let mut guard = self.state.lock();
         if !guard.chain_tip_failures.is_empty() {
             let injected = guard.chain_tip_failures.remove(0);
@@ -172,9 +172,9 @@ impl ChainSource for MockChainSource {
     ) -> Result<CompactBlockStream, ChainSourceError> {
         let tip = self.state.lock().tip_height;
         if block_range.end_height.as_u32() > tip.as_u32() {
-            return Err(ChainSourceError::BlockHeightAboveTip {
+            return Err(ChainSourceError::BlockHeightAboveSafeChainTip {
                 requested_height: block_range.end_height,
-                tip_height: tip,
+                safe_chain_tip_height: tip,
             });
         }
         // Mock returns an empty stream: tests cover sync orchestration. Tests that need
@@ -230,11 +230,11 @@ impl ChainSource for MockChainSource {
         let receiver = self.event_tx.subscribe();
         let stream = BroadcastStream::new(receiver).filter_map(|delivery| match delivery {
             Ok(event) => {
-                let new_tip_height = event_tip_height(&event);
+                let new_safe_chain_tip_height = event_tip_height(&event);
                 Some(Ok(ChainEventEnvelope::new(
-                    ChainEventCursor::from_bytes(new_tip_height.as_u32().to_be_bytes().to_vec()),
-                    u64::from(new_tip_height.as_u32()),
-                    new_tip_height,
+                    ChainEventCursor::from_bytes(new_safe_chain_tip_height.as_u32().to_be_bytes().to_vec()),
+                    u64::from(new_safe_chain_tip_height.as_u32()),
+                    new_safe_chain_tip_height,
                     event,
                 )))
             }
@@ -250,8 +250,8 @@ fn event_tip_height(event: &ChainEvent) -> BlockHeight {
         reason = "non_exhaustive chain events map unknown variants to the genesis cursor"
     )]
     match event {
-        ChainEvent::ChainTipAdvanced { new_tip_height, .. }
-        | ChainEvent::ChainReorged { new_tip_height, .. } => *new_tip_height,
+        ChainEvent::SafeChainTipAdvanced { new_safe_chain_tip_height, .. }
+        | ChainEvent::ChainReorged { new_safe_chain_tip_height, .. } => *new_safe_chain_tip_height,
         _ => BlockHeight::GENESIS,
     }
 }
@@ -265,22 +265,25 @@ mod tests {
     async fn mock_chain_tip_advances_on_handle_call() -> Result<(), ChainSourceError> {
         let mock = MockChainSource::new(Network::regtest());
         let handle = mock.handle();
-        assert_eq!(mock.chain_tip().await?, BlockHeight::GENESIS);
+        assert_eq!(mock.safe_chain_tip().await?, BlockHeight::GENESIS);
         handle.advance_tip(BlockHeight::from(10));
-        assert_eq!(mock.chain_tip().await?, BlockHeight::from(10));
+        assert_eq!(mock.safe_chain_tip().await?, BlockHeight::from(10));
         Ok(())
     }
 
     #[tokio::test]
     async fn mock_emits_chain_tip_advanced_event() -> Result<(), ChainSourceError> {
         let mock = MockChainSource::new(Network::regtest());
-        let mut events = mock.chain_events().await?;
+        let mut envelopes = mock.chain_event_envelopes(None).await?;
         let handle = mock.handle();
         handle.advance_tip(BlockHeight::from(3));
-        let first = _FuturesStreamExt::next(&mut events).await;
+        let first = _FuturesStreamExt::next(&mut envelopes).await;
         assert!(matches!(
             first,
-            Some(Ok(ChainEvent::ChainTipAdvanced { new_tip_height, .. })) if new_tip_height == BlockHeight::from(3)
+            Some(Ok(envelope)) if matches!(
+                envelope.event,
+                ChainEvent::SafeChainTipAdvanced { new_safe_chain_tip_height, .. } if new_safe_chain_tip_height == BlockHeight::from(3)
+            )
         ));
         Ok(())
     }
@@ -290,12 +293,15 @@ mod tests {
         let mock = MockChainSource::new(Network::regtest());
         let handle = mock.handle();
         handle.advance_tip(BlockHeight::from(10));
-        let mut events = mock.chain_events().await?;
+        let mut envelopes = mock.chain_event_envelopes(None).await?;
         handle.trigger_reorg(BlockHeight::from(7), BlockHeight::from(11));
-        let event = _FuturesStreamExt::next(&mut events).await;
+        let event = _FuturesStreamExt::next(&mut envelopes).await;
         assert!(matches!(
             event,
-            Some(Ok(ChainEvent::ChainReorged { new_tip_height, .. })) if new_tip_height == BlockHeight::from(11)
+            Some(Ok(envelope)) if matches!(
+                envelope.event,
+                ChainEvent::ChainReorged { new_safe_chain_tip_height, .. } if new_safe_chain_tip_height == BlockHeight::from(11)
+            )
         ));
         Ok(())
     }
@@ -325,7 +331,7 @@ mod tests {
         let outcome = mock.compact_blocks(range).await;
         assert!(matches!(
             outcome,
-            Err(ChainSourceError::BlockHeightAboveTip { .. })
+            Err(ChainSourceError::BlockHeightAboveSafeChainTip { .. })
         ));
         Ok(())
     }

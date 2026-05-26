@@ -64,16 +64,37 @@ pub enum ChainSourceError {
         earliest_height: BlockHeight,
     },
 
-    /// Requested height is above the source's current tip.
+    /// Requested height is above the source's safe chain tip.
     ///
     /// Posture: [`FailurePosture::NotRetryable`] until the chain advances; caller
-    /// should re-query `chain_tip()`.
-    #[error("block height {requested_height} is above source's current tip {tip_height}")]
-    BlockHeightAboveTip {
+    /// should re-query `safe_chain_tip()`.
+    #[error(
+        "block height {requested_height} is above source's safe chain tip {safe_chain_tip_height}"
+    )]
+    BlockHeightAboveSafeChainTip {
         /// Height the caller requested.
         requested_height: BlockHeight,
-        /// Tip height the source currently exposes.
-        tip_height: BlockHeight,
+        /// Safe chain tip height the source currently exposes.
+        safe_chain_tip_height: BlockHeight,
+    },
+
+    /// The chain source returned a tree-state anchor at a height other than
+    /// the one requested. The chain-source contract requires
+    /// `tree_state_at(h)` to land at exactly `h` (or a height within the
+    /// wallet's rewind cap that the wallet can realign to). This variant
+    /// fires when a custom chain source violates the cadence contract from
+    /// ADR-0005 and the wallet cannot recover.
+    ///
+    /// Posture: [`FailurePosture::RequiresOperator`]. The operator must
+    /// investigate the chain source: re-querying yields the same answer.
+    #[error(
+        "chain source returned tree-state anchor at height {returned_height} for requested height {requested_height}; the chain source is violating the safe-chain-tip cadence contract"
+    )]
+    TreeStateAnchorHeightMismatch {
+        /// Height the wallet requested.
+        requested_height: BlockHeight,
+        /// Height the chain source actually returned.
+        returned_height: BlockHeight,
     },
 
     /// Configuration mismatch between the source and the caller.
@@ -128,12 +149,12 @@ impl ChainSourceError {
     pub fn posture(&self) -> FailurePosture {
         match self {
             Self::Unavailable { .. } | Self::BlockingTaskFailed { .. } => FailurePosture::Retryable,
-            Self::BlockHeightBelowFloor { .. } | Self::BlockHeightAboveTip { .. } => {
+            Self::BlockHeightBelowFloor { .. } | Self::BlockHeightAboveSafeChainTip { .. } => {
                 FailurePosture::NotRetryable
             }
-            Self::NetworkMismatch { .. } | Self::MalformedCompactBlock { .. } => {
-                FailurePosture::RequiresOperator
-            }
+            Self::NetworkMismatch { .. }
+            | Self::MalformedCompactBlock { .. }
+            | Self::TreeStateAnchorHeightMismatch { .. } => FailurePosture::RequiresOperator,
             #[cfg(feature = "zinder")]
             Self::Indexer(err) => posture_for_indexer(err.retry_policy()),
         }
@@ -231,9 +252,9 @@ mod tests {
                 FailurePosture::NotRetryable,
             ),
             (
-                ChainSourceError::BlockHeightAboveTip {
+                ChainSourceError::BlockHeightAboveSafeChainTip {
                     requested_height: BlockHeight::from(2),
-                    tip_height: BlockHeight::from(1),
+                    safe_chain_tip_height: BlockHeight::from(1),
                 },
                 FailurePosture::NotRetryable,
             ),
@@ -248,6 +269,13 @@ mod tests {
                 ChainSourceError::MalformedCompactBlock {
                     block_height: BlockHeight::from(1),
                     reason: "x".into(),
+                },
+                FailurePosture::RequiresOperator,
+            ),
+            (
+                ChainSourceError::TreeStateAnchorHeightMismatch {
+                    requested_height: BlockHeight::from(2),
+                    returned_height: BlockHeight::from(0),
                 },
                 FailurePosture::RequiresOperator,
             ),

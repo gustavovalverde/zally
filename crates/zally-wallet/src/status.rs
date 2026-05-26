@@ -32,17 +32,17 @@ pub enum SyncStatus {
         /// Number of blocks between `scanned_height` and `target_height`.
         lag_blocks: u32,
     },
-    /// The wallet has scanned to the most recently observed chain tip.
+    /// The wallet has scanned to the most recently observed safe chain tip.
     AtTip {
-        /// Tip height the wallet has scanned to.
-        tip_height: BlockHeight,
+        /// Safe chain tip height the wallet has scanned to.
+        safe_chain_tip_height: BlockHeight,
     },
     /// The last observed chain tip is lower than the wallet's scanned height.
     TipRegressed {
         /// Highest block height the wallet has scanned.
         scanned_height: BlockHeight,
         /// Lower chain tip most recently observed.
-        chain_tip_height: BlockHeight,
+        safe_chain_tip_height: BlockHeight,
     },
 }
 
@@ -61,8 +61,8 @@ pub struct WalletStatus {
     /// Highest block height the wallet has scanned, if any.
     pub scanned_height: Option<BlockHeight>,
     /// Chain tip the wallet most recently observed, if any.
-    pub chain_tip_height: Option<BlockHeight>,
-    /// Number of blocks between `scanned_height` and `chain_tip_height`, if both are known
+    pub safe_chain_tip_height: Option<BlockHeight>,
+    /// Number of blocks between `scanned_height` and `safe_chain_tip_height`, if both are known
     /// and the tip has not regressed.
     pub lag_blocks: Option<u32>,
     /// Number of accounts the wallet manages. Always 1: Zally holds one account per wallet.
@@ -80,14 +80,14 @@ impl Wallet {
     /// failures surfaced by the storage implementation.
     pub async fn status_snapshot(&self) -> Result<WalletStatus, WalletError> {
         let scanned_height = self.inner.storage.fully_scanned_height().await?;
-        let chain_tip_height = self.inner.storage.find_observed_tip().await?;
-        let sync_status = sync_status_from_heights(scanned_height, chain_tip_height);
+        let safe_chain_tip_height = self.inner.storage.find_observed_tip().await?;
+        let sync_status = sync_status_from_heights(scanned_height, safe_chain_tip_height);
         Ok(WalletStatus {
             network: self.network(),
             sync_status,
             scanned_height,
-            chain_tip_height,
-            lag_blocks: compute_lag_blocks(scanned_height, chain_tip_height),
+            safe_chain_tip_height,
+            lag_blocks: compute_lag_blocks(scanned_height, safe_chain_tip_height),
             account_count: 1,
             event_subscriber_count: self.observer_count(),
             circuit_breaker: self.circuit_breaker_state(),
@@ -97,9 +97,9 @@ impl Wallet {
 
 fn sync_status_from_heights(
     scanned_height: Option<BlockHeight>,
-    chain_tip_height: Option<BlockHeight>,
+    safe_chain_tip_height: Option<BlockHeight>,
 ) -> SyncStatus {
-    match (scanned_height, chain_tip_height) {
+    match (scanned_height, safe_chain_tip_height) {
         (None, None) => SyncStatus::NotStarted,
         (Some(scanned), None) => SyncStatus::WaitingForTip {
             scanned_height: scanned,
@@ -111,10 +111,12 @@ fn sync_status_from_heights(
                 target_height: tip,
                 lag_blocks: tip.as_u32() - scanned.as_u32(),
             },
-            std::cmp::Ordering::Equal => SyncStatus::AtTip { tip_height: tip },
+            std::cmp::Ordering::Equal => SyncStatus::AtTip {
+                safe_chain_tip_height: tip,
+            },
             std::cmp::Ordering::Greater => SyncStatus::TipRegressed {
                 scanned_height: scanned,
-                chain_tip_height: tip,
+                safe_chain_tip_height: tip,
             },
         },
     }
@@ -122,10 +124,10 @@ fn sync_status_from_heights(
 
 fn compute_lag_blocks(
     scanned_height: Option<BlockHeight>,
-    chain_tip_height: Option<BlockHeight>,
+    safe_chain_tip_height: Option<BlockHeight>,
 ) -> Option<u32> {
     let scanned = scanned_height?;
-    let tip = chain_tip_height?;
+    let tip = safe_chain_tip_height?;
     if tip.as_u32() < scanned.as_u32() {
         None
     } else {
@@ -165,7 +167,7 @@ mod tests {
             sync_status_from_heights(Some(BlockHeight::from(10)), Some(BlockHeight::from(7))),
             SyncStatus::TipRegressed {
                 scanned_height: BlockHeight::from(10),
-                chain_tip_height: BlockHeight::from(7),
+                safe_chain_tip_height: BlockHeight::from(7),
             }
         );
         assert_eq!(

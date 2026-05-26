@@ -40,7 +40,7 @@ async fn transparent_utxo_round_trip_records_exposed_receiver() -> Result<(), Te
         "derived transparent receiver must be returned for sync refresh"
     );
 
-    storage.update_chain_tip(BlockHeight::from(10)).await?;
+    storage.update_safe_chain_tip(BlockHeight::from(10)).await?;
     let recorded_count = storage
         .record_transparent_utxos(vec![TransparentUtxoRow::new(
             TxId::from_bytes([0x11_u8; 32]),

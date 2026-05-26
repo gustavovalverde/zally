@@ -52,7 +52,7 @@ async fn get_account_balance_anchors_to_observed_tip_after_sync() -> Result<(), 
     let chain = MockChainSource::new(network);
     chain.handle().advance_tip(BlockHeight::from(200));
     wallet.sync(&chain).await?;
-    let tip = chain.chain_tip().await.map_err(|err| TestError::Chain {
+    let tip = chain.safe_chain_tip().await.map_err(|err| TestError::Chain {
         reason: err.to_string(),
     })?;
     assert_eq!(tip.as_u32(), 200, "mock chain tip must be set");

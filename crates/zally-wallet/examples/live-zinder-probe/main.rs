@@ -51,7 +51,7 @@ async fn main() -> Result<(), ExampleError> {
     })
     .map_err(ExampleError::Chain)?;
 
-    let tip = chain.chain_tip().await.map_err(ExampleError::Chain)?;
+    let tip = chain.safe_chain_tip().await.map_err(ExampleError::Chain)?;
     info!(
         target: "zally::example",
         event = "live_zinder_tip_observed",

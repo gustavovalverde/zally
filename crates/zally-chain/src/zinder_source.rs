@@ -111,8 +111,8 @@ impl ChainSource for ZinderChainSource {
         self.network
     }
 
-    async fn chain_tip(&self) -> Result<BlockHeight, ChainSourceError> {
-        let block_id = self.inner.latest_block(None).await?;
+    async fn safe_chain_tip(&self) -> Result<BlockHeight, ChainSourceError> {
+        let block_id = self.inner.latest_safe_block(None).await?;
         Ok(BlockHeight::from(block_id.height.value()))
     }
 
@@ -237,20 +237,21 @@ fn translate_chain_event_envelope(envelope: &ZinderChainEventEnvelope) -> ChainE
     ChainEventEnvelope::new(
         ChainEventCursor::from_bytes(envelope.cursor.as_bytes().to_vec()),
         envelope.event_sequence,
-        BlockHeight::from(envelope.finalized_height.value()),
+        BlockHeight::from(envelope.safe_tip_height.value()),
         translate_chain_event(envelope),
     )
 }
 
 #[allow(
     clippy::wildcard_enum_match_arm,
-    reason = "non_exhaustive zinder chain events map unknown variants to ChainTipAdvanced"
+    reason = "non_exhaustive zinder chain events map unknown variants to SafeChainTipAdvanced"
 )]
 fn translate_chain_event(envelope: &ZinderChainEventEnvelope) -> ChainEvent {
+    let safe_chain_tip = BlockHeight::from(envelope.safe_tip_height.value());
     match &envelope.event {
-        ZinderChainEvent::ChainCommitted { committed } => ChainEvent::ChainTipAdvanced {
+        ZinderChainEvent::ChainCommitted { committed } => ChainEvent::SafeChainTipAdvanced {
             committed_range: zinder_range_to_zally(committed.block_range),
-            new_tip_height: BlockHeight::from(committed.block_range.end.value()),
+            new_safe_chain_tip_height: safe_chain_tip,
         },
         ZinderChainEvent::ChainReorged {
             reverted,
@@ -258,18 +259,15 @@ fn translate_chain_event(envelope: &ZinderChainEventEnvelope) -> ChainEvent {
         } => ChainEvent::ChainReorged {
             reverted_range: zinder_range_to_zally(reverted.block_range),
             committed_range: zinder_range_to_zally(committed.block_range),
-            new_tip_height: BlockHeight::from(committed.block_range.end.value()),
+            new_safe_chain_tip_height: safe_chain_tip,
         },
-        _ => {
-            let finalized = BlockHeight::from(envelope.finalized_height.value());
-            ChainEvent::ChainTipAdvanced {
-                committed_range: BlockHeightRange {
-                    start_height: finalized,
-                    end_height: finalized,
-                },
-                new_tip_height: finalized,
-            }
-        }
+        _ => ChainEvent::SafeChainTipAdvanced {
+            committed_range: BlockHeightRange {
+                start_height: safe_chain_tip,
+                end_height: safe_chain_tip,
+            },
+            new_safe_chain_tip_height: safe_chain_tip,
+        },
     }
 }
 

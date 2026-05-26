@@ -76,9 +76,9 @@ zip32 = "0.2"
 # crates from a pinned git revision so the wallet integration tracks the zinder typed-
 # client surface directly. The [patch.crates-io] core2 pin below resolves the yanked
 # equihash-transitive dep.
-zinder-client = { git = "https://github.com/gustavovalverde/zinder", rev = "74847fd66fa121723a1daed15768b2e63b044d70" }
-zinder-core = { git = "https://github.com/gustavovalverde/zinder", rev = "74847fd66fa121723a1daed15768b2e63b044d70" }
-zinder-testkit = { git = "https://github.com/gustavovalverde/zinder", rev = "74847fd66fa121723a1daed15768b2e63b044d70" }
+zinder-client = { git = "https://github.com/gustavovalverde/zinder", rev = "572acc9cce25010f9e1695d63ada246f7f681c22" }
+zinder-core = { git = "https://github.com/gustavovalverde/zinder", rev = "572acc9cce25010f9e1695d63ada246f7f681c22" }
+zinder-testkit = { git = "https://github.com/gustavovalverde/zinder", rev = "572acc9cce25010f9e1695d63ada246f7f681c22" }
 
 # Async runtime and concurrency.
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "fs", "io-util"] }

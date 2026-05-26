@@ -23,7 +23,7 @@ async fn sync_emits_reorg_when_tip_regresses() -> Result<(), TestError> {
     wallet.sync(&chain).await?;
 
     chain.handle().advance_tip(BlockHeight::from(20));
-    let final_tip = chain.chain_tip().await.map_err(|err| TestError::Chain {
+    let final_tip = chain.safe_chain_tip().await.map_err(|err| TestError::Chain {
         reason: err.to_string(),
     })?;
     assert_eq!(final_tip.as_u32(), 20, "mock must report the regressed tip");
@@ -37,16 +37,16 @@ async fn sync_emits_reorg_when_tip_regresses() -> Result<(), TestError> {
     while let Some(event) = events.next().await {
         if let WalletEvent::ReorgDetected {
             rolled_back_to_height,
-            new_tip_height,
+            new_safe_chain_tip_height,
         } = event
         {
-            reorg_event = Some((rolled_back_to_height, new_tip_height));
+            reorg_event = Some((rolled_back_to_height, new_safe_chain_tip_height));
             break;
         }
     }
-    let (rolled_back_to_height, new_tip_height) = reorg_event.ok_or(TestError::NoReorgEvent)?;
+    let (rolled_back_to_height, new_safe_chain_tip_height) = reorg_event.ok_or(TestError::NoReorgEvent)?;
     assert_eq!(rolled_back_to_height.as_u32(), 20);
-    assert_eq!(new_tip_height.as_u32(), 20);
+    assert_eq!(new_safe_chain_tip_height.as_u32(), 20);
     Ok(())
 }
 

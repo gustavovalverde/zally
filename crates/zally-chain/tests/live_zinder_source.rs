@@ -33,7 +33,7 @@ async fn zinder_chain_source_reports_tip_and_streams_blocks() -> Result<(), Test
 
     let chain = ZinderChainSource::connect_remote(ZinderRemoteOptions { endpoint, network })?;
 
-    let tip = chain.chain_tip().await?;
+    let tip = chain.safe_chain_tip().await?;
     assert!(tip.as_u32() > 0, "live zinder reported tip height 0");
 
     let span = 5_u32.min(tip.as_u32().saturating_sub(1));

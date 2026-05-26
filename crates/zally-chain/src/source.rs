@@ -3,7 +3,7 @@
 use std::pin::Pin;
 
 use async_trait::async_trait;
-use futures_util::{Stream, StreamExt as _};
+use futures_util::Stream;
 use zally_core::{BlockHeight, Network, TxId};
 
 use crate::error::ChainSourceError;
@@ -109,12 +109,13 @@ pub enum TransactionStatus {
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[non_exhaustive]
 pub enum ChainEvent {
-    /// Chain tip advanced (no reorg).
-    ChainTipAdvanced {
-        /// Block range that was finalized.
+    /// Safe chain tip advanced (no reorg). Carries the new safe-tip height
+    /// the wallet may scan to.
+    SafeChainTipAdvanced {
+        /// Block range that was committed.
         committed_range: BlockHeightRange,
-        /// New tip height.
-        new_tip_height: BlockHeight,
+        /// New safe chain tip height.
+        new_safe_chain_tip_height: BlockHeight,
     },
     /// Reorg detected: reverted blocks were replaced.
     ChainReorged {
@@ -122,8 +123,8 @@ pub enum ChainEvent {
         reverted_range: BlockHeightRange,
         /// Block range that was committed in its place.
         committed_range: BlockHeightRange,
-        /// New tip height.
-        new_tip_height: BlockHeight,
+        /// New safe chain tip height after the reorg.
+        new_safe_chain_tip_height: BlockHeight,
     },
 }
 
@@ -165,8 +166,9 @@ pub struct ChainEventEnvelope {
     pub cursor: ChainEventCursor,
     /// Monotonic sequence in this event stream.
     pub event_sequence: u64,
-    /// Finalized height reported with this event.
-    pub finalized_height: BlockHeight,
+    /// Safe chain tip height reported with this event (the wallet's scan
+    /// ceiling at delivery time).
+    pub safe_chain_tip_height: BlockHeight,
     /// Source-neutral chain transition.
     pub event: ChainEvent,
 }
@@ -177,13 +179,13 @@ impl ChainEventEnvelope {
     pub const fn new(
         cursor: ChainEventCursor,
         event_sequence: u64,
-        finalized_height: BlockHeight,
+        safe_chain_tip_height: BlockHeight,
         event: ChainEvent,
     ) -> Self {
         Self {
             cursor,
             event_sequence,
-            finalized_height,
+            safe_chain_tip_height,
             event,
         }
     }
@@ -219,11 +221,15 @@ pub trait ChainSource: Send + Sync + 'static {
     /// Network this chain source is bound to.
     fn network(&self) -> Network;
 
-    /// Current visible chain tip height.
+    /// Highest height the wallet may safely scan to.
     ///
-    /// This is the chain source's best tip; it may still be reorged away. Consumers handle
-    /// reorgs at the wallet layer rather than expecting a reorg-free value here.
-    async fn chain_tip(&self) -> Result<BlockHeight, ChainSourceError>;
+    /// Contract: the chain source guarantees that for any height `h` at or
+    /// below the returned value, (a) the compact block at `h` is available
+    /// and (b) a tree-state checkpoint is available at some height `k` with
+    /// `h - k < REWIND_CAP` (the librustzcash 100-block rewind cap). This
+    /// is the wallet's scan ceiling and the only tip-like concept Zally
+    /// exposes. The unfiltered chain head is an indexer-internal concern.
+    async fn safe_chain_tip(&self) -> Result<BlockHeight, ChainSourceError>;
 
     /// Streams compact blocks in `block_range` (inclusive on both ends).
     async fn compact_blocks(
@@ -262,11 +268,4 @@ pub trait ChainSource: Send + Sync + 'static {
         &self,
         from_cursor: Option<ChainEventCursor>,
     ) -> Result<ChainEventEnvelopeStream, ChainSourceError>;
-
-    /// Subscribes to chain events without exposing cursors.
-    async fn chain_events(&self) -> Result<ChainEventStream, ChainSourceError> {
-        let stream = self.chain_event_envelopes(None).await?;
-        let mapped = stream.map(|envelope| envelope.map(|event_envelope| event_envelope.event));
-        Ok(Box::pin(mapped) as ChainEventStream)
-    }
 }

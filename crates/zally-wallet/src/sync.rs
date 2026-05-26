@@ -178,8 +178,8 @@ pub struct SyncSnapshot {
     /// Highest block height the wallet has scanned, if any.
     pub scanned_height: Option<BlockHeight>,
     /// Chain tip the wallet most recently observed, if any.
-    pub chain_tip_height: Option<BlockHeight>,
-    /// Number of blocks between `scanned_height` and `chain_tip_height`, if known.
+    pub safe_chain_tip_height: Option<BlockHeight>,
+    /// Number of blocks between `scanned_height` and `safe_chain_tip_height`, if known.
     pub lag_blocks: Option<u32>,
     /// Most recent [`Wallet::sync`] run summary.
     pub last_sync_outcome: Option<SyncOutcome>,
@@ -194,7 +194,7 @@ impl SyncSnapshot {
             driver_status: SyncDriverStatus::Starting,
             sync_status: SyncStatus::NotStarted,
             scanned_height: None,
-            chain_tip_height: None,
+            safe_chain_tip_height: None,
             lag_blocks: None,
             last_sync_outcome: None,
             last_error: None,
@@ -212,7 +212,7 @@ impl SyncSnapshot {
             driver_status,
             sync_status: wallet_status.sync_status,
             scanned_height: wallet_status.scanned_height,
-            chain_tip_height: wallet_status.chain_tip_height,
+            safe_chain_tip_height: wallet_status.safe_chain_tip_height,
             lag_blocks: wallet_status.lag_blocks,
             last_sync_outcome,
             last_error,
@@ -584,10 +584,10 @@ fn should_continue_syncing(outcome: SyncOutcome, wallet_status: &WalletStatus) -
     if outcome.reorgs_observed > 0 {
         return true;
     }
-    let Some(chain_tip_height) = wallet_status.chain_tip_height else {
+    let Some(safe_chain_tip_height) = wallet_status.safe_chain_tip_height else {
         return false;
     };
-    outcome.block_count > 0 && outcome.scanned_to_height.as_u32() < chain_tip_height.as_u32()
+    outcome.block_count > 0 && outcome.scanned_to_height.as_u32() < safe_chain_tip_height.as_u32()
 }
 
 async fn publish_driver_snapshot(
@@ -624,7 +624,7 @@ fn publish_fallback_snapshot(
             driver_status: SyncDriverStatus::Waiting,
             sync_status: prior.sync_status,
             scanned_height: prior.scanned_height,
-            chain_tip_height: prior.chain_tip_height,
+            safe_chain_tip_height: prior.safe_chain_tip_height,
             lag_blocks: prior.lag_blocks,
             last_sync_outcome,
             last_error,
@@ -669,7 +669,7 @@ async fn next_chain_event_envelope(
 }
 
 impl Wallet {
-    /// Advances the wallet from its last-scanned height up to `chain.chain_tip()`.
+    /// Advances the wallet from its last-scanned height up to `chain.safe_chain_tip()`.
     ///
     /// Scanning reaches the chain tip so the commitment tree, note witnesses, and the
     /// `WalletDb` chain-tip notion all agree: `zcash_client_backend` only treats a note as
@@ -706,20 +706,20 @@ impl Wallet {
             });
         }
         let policy = self.retry_policy();
-        let chain_tip = with_breaker_and_retry(
+        let safe_chain_tip = with_breaker_and_retry(
             &self.inner.circuit_breaker,
             policy,
-            "sync.chain_tip",
-            || chain.chain_tip(),
+            "sync.safe_chain_tip",
+            || chain.safe_chain_tip(),
             WalletError::from,
         )
         .await?;
         let prior_observed_tip = self.inner.storage.find_observed_tip().await?;
-        let reorg = self.detect_tip_regress(prior_observed_tip, chain_tip);
-        self.inner.storage.record_observed_tip(chain_tip).await?;
+        let reorg = self.detect_tip_regress(prior_observed_tip, safe_chain_tip);
+        self.inner.storage.record_observed_tip(safe_chain_tip).await?;
         // Pin the WalletDb chain tip to the height this run scans to, so transaction
         // proposals compute expiry and anchor heights against a fully-scanned tip.
-        self.inner.storage.update_chain_tip(chain_tip).await?;
+        self.inner.storage.update_safe_chain_tip(safe_chain_tip).await?;
 
         let prior_fully_scanned_height = self.inner.storage.fully_scanned_height().await?;
         let scanned_from = match prior_fully_scanned_height {
@@ -733,41 +733,41 @@ impl Wallet {
         };
         self.publish_event(WalletEvent::ScanProgress {
             scanned_height: scanned_from,
-            target_height: chain_tip,
+            target_height: safe_chain_tip,
         });
 
-        if scanned_from.as_u32() > chain_tip.as_u32() {
+        if scanned_from.as_u32() > safe_chain_tip.as_u32() {
             let transparent_utxo_count = self.sync_transparent_utxos(chain).await?;
             return Ok(self.emit_already_caught_up(
                 scanned_from,
-                chain_tip,
+    safe_chain_tip,
                 reorg,
                 transparent_utxo_count,
             ));
         }
-        // Resolve the prior chain state from the chain source. Chain-source responses
-        // may land at a height strictly below `scanned_from - 1` when the chain
-        // source's checkpoint set is sparser than the wallet's scan position; the
-        // realign fallback below catches that case by truncating the wallet to the
-        // returned anchor height and rescanning forward. zinder closes that gap
-        // class by writing checkpoints at a fixed stride (every 100 blocks) in both
-        // bulk-catchup and tip-follow; see zally `docs/adrs/0005-wallet-sync-resume-anchor-cadence.md`.
+        // The chain source guarantees `tree_state_at(scanned_from - 1)` lands
+        // at exactly `scanned_from - 1` when the caller respects the safe
+        // chain tip contract. If it doesn't, the chain source is violating
+        // ADR-0005; surface a typed operator-visible error rather than
+        // truncating into the rewind cap.
         let from_state = fetch_prior_chain_state(chain, scanned_from).await?;
         let from_state_height = BlockHeight::from(u32::from(from_state.block_height()));
-        let scanned_from = if from_state_height.as_u32().saturating_add(1) == scanned_from.as_u32()
-        {
-            scanned_from
-        } else {
-            self.realign_to_available_checkpoint(scanned_from, from_state_height)
-                .await?
-        };
-        let blocks = fetch_compact_blocks(chain, scanned_from, chain_tip).await?;
+        let expected_prior = BlockHeight::from(scanned_from.as_u32().saturating_sub(1));
+        if from_state_height != expected_prior {
+            return Err(WalletError::ChainSource(
+                ChainSourceError::TreeStateAnchorHeightMismatch {
+                    requested_height: expected_prior,
+                    returned_height: from_state_height,
+                },
+            ));
+        }
+        let blocks = fetch_compact_blocks(chain, scanned_from, safe_chain_tip).await?;
         let block_count = u64::try_from(blocks.len()).unwrap_or(u64::MAX);
         if blocks.is_empty() {
             let transparent_utxo_count = self.sync_transparent_utxos(chain).await?;
             return Ok(self.emit_already_caught_up(
                 scanned_from,
-                chain_tip,
+    safe_chain_tip,
                 reorg,
                 transparent_utxo_count,
             ));
@@ -776,7 +776,7 @@ impl Wallet {
             ScanContext {
                 blocks,
                 scanned_from,
-                target_height: chain_tip,
+                target_height: safe_chain_tip,
                 block_count,
                 reorgs_observed: reorg,
             },
@@ -786,52 +786,20 @@ impl Wallet {
         .await
     }
 
-    /// Truncates the wallet down to the height of the latest available
-    /// chain-state checkpoint and returns the new `scanned_from` aligned to
-    /// the checkpoint. Called when the chain source's nearest checkpoint sits
-    /// strictly below the wallet's recorded fully-scanned height; the wallet's
-    /// own state past the checkpoint is unreachable without re-deriving the
-    /// commitment trees, so the only correct move is to roll back to the
-    /// checkpoint and rescan forward.
-    async fn realign_to_available_checkpoint(
-        &self,
-        scanned_from: BlockHeight,
-        checkpoint_height: BlockHeight,
-    ) -> Result<BlockHeight, WalletError> {
-        tracing::warn!(
-            event = "wallet_sync_realign_to_checkpoint",
-            requested_scanned_from = scanned_from.as_u32(),
-            checkpoint_height = checkpoint_height.as_u32(),
-            "wallet fully-scanned height is past the latest available chain-state checkpoint; truncating to checkpoint and rescanning"
-        );
-        let new_fully_scanned = self
-            .inner
-            .storage
-            .truncate_to_height(checkpoint_height)
-            .await?;
-        self.publish_event(WalletEvent::ReorgDetected {
-            rolled_back_to_height: new_fully_scanned,
-            new_tip_height: scanned_from,
-        });
-        Ok(BlockHeight::from(
-            new_fully_scanned.as_u32().saturating_add(1),
-        ))
-    }
-
     fn detect_tip_regress(
         &self,
         prior_observed_tip: Option<BlockHeight>,
-        new_tip_height: BlockHeight,
+        new_safe_chain_tip_height: BlockHeight,
     ) -> u32 {
         let Some(prior) = prior_observed_tip else {
             return 0;
         };
-        if new_tip_height.as_u32() >= prior.as_u32() {
+        if new_safe_chain_tip_height.as_u32() >= prior.as_u32() {
             return 0;
         }
         self.publish_event(WalletEvent::ReorgDetected {
-            rolled_back_to_height: new_tip_height,
-            new_tip_height,
+            rolled_back_to_height: new_safe_chain_tip_height,
+            new_safe_chain_tip_height,
         });
         1
     }
@@ -1048,7 +1016,7 @@ impl Wallet {
         );
         self.publish_event(WalletEvent::ReorgDetected {
             rolled_back_to_height: new_fully_scanned,
-            new_tip_height: target_height,
+            new_safe_chain_tip_height: target_height,
         });
         Ok(SyncOutcome {
             scanned_from_height: new_fully_scanned,
@@ -1115,11 +1083,16 @@ async fn fetch_compact_blocks(
     Ok(blocks)
 }
 
-async fn fetch_prior_chain_state(
+/// Fetches the `ChainState` anchor immediately below `at_height`.
+///
+/// Shared by `sync_inner` (for resume) and the wallet builder (for
+/// birthday). Returns a [`ChainSourceError::MalformedCompactBlock`] when
+/// the tree-state bytes cannot be decoded.
+pub(crate) async fn fetch_prior_chain_state(
     chain: &dyn ChainSource,
-    scanned_from: BlockHeight,
+    at_height: BlockHeight,
 ) -> Result<ChainState, WalletError> {
-    let prior_height = BlockHeight::from(scanned_from.as_u32().saturating_sub(1));
+    let prior_height = BlockHeight::from(at_height.as_u32().saturating_sub(1));
     let tree_state = chain.tree_state_at(prior_height).await?;
     tree_state.to_chain_state().map_err(|io| {
         WalletError::ChainSource(ChainSourceError::MalformedCompactBlock {

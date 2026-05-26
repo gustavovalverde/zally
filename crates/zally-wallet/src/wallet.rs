@@ -5,11 +5,10 @@ use std::sync::Arc;
 
 use parking_lot::Mutex;
 use tokio::sync::broadcast;
-use zally_chain::{ChainSource, ChainSourceError};
+use zally_chain::ChainSource;
 use zally_core::{AccountId, BlockHeight, IdempotencyKey, Network, ReservationId, TxId, Zatoshis};
 use zally_keys::{Mnemonic, SealingError, SeedMaterial, SeedSealing};
 use zally_storage::WalletStorage;
-use zcash_client_backend::data_api::chain::ChainState;
 use zcash_keys::address::UnifiedAddress;
 
 use crate::capabilities::{Capability, SealingCapability, StorageCapability, WalletCapabilities};
@@ -19,6 +18,7 @@ use crate::event::{WalletEvent, WalletEventStream};
 use crate::options::WalletOptions;
 use crate::reservation::{DispenseReservation, LockedNotesSummary};
 use crate::retry::RetryPolicy;
+use crate::sync::fetch_prior_chain_state;
 
 const EVENT_CHANNEL_CAPACITY: usize = 1024;
 
@@ -699,23 +699,6 @@ where
         options,
     });
     Wallet { inner }
-}
-
-async fn fetch_prior_chain_state(
-    chain: &dyn ChainSource,
-    birthday: BlockHeight,
-) -> Result<ChainState, WalletError> {
-    let prior_height = BlockHeight::from(birthday.as_u32().saturating_sub(1));
-    let tree_state = chain.tree_state_at(prior_height).await?;
-    tree_state.to_chain_state().map_err(|io| {
-        WalletError::ChainSource(ChainSourceError::MalformedCompactBlock {
-            block_height: prior_height,
-            reason: format!(
-                "invalid tree state for birthday {}: {io}",
-                birthday.as_u32()
-            ),
-        })
-    })
 }
 
 fn build_capabilities(

@@ -43,7 +43,7 @@ async fn sync_driver_wakes_from_chain_event() -> Result<(), TestError> {
     chain_handle.advance_tip(BlockHeight::from(42));
     let observed = wait_for_chain_tip(&mut snapshots, BlockHeight::from(42)).await?;
 
-    assert_eq!(observed.chain_tip_height, Some(BlockHeight::from(42)));
+    assert_eq!(observed.safe_chain_tip_height, Some(BlockHeight::from(42)));
     assert_eq!(
         observed.sync_status,
         SyncStatus::Starting {
@@ -106,7 +106,7 @@ async fn wait_for_chain_tip(
 ) -> Result<zally_wallet::SyncSnapshot, TestError> {
     tokio::time::timeout(Duration::from_secs(2), async {
         while let Some(snapshot) = snapshots.next().await {
-            if snapshot.chain_tip_height == Some(target_height) {
+            if snapshot.safe_chain_tip_height == Some(target_height) {
                 return Ok(snapshot);
             }
         }
@@ -132,7 +132,7 @@ impl ChainSource for StalledChainSource {
         self.network
     }
 
-    async fn chain_tip(&self) -> Result<BlockHeight, ChainSourceError> {
+    async fn safe_chain_tip(&self) -> Result<BlockHeight, ChainSourceError> {
         let _ = self.network;
         future::pending().await
     }

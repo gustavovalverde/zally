@@ -1,4 +1,4 @@
-//! Regression: `Wallet::sync` retries `chain.chain_tip()` for retryable failures.
+//! Regression: `Wallet::sync` retries `chain.safe_chain_tip()` for retryable failures.
 //!
 //! Retries continue until the call succeeds or the policy ceiling is reached. Operator-
 //! action and not-retryable failures surface immediately without burning the retry budget.
@@ -24,7 +24,7 @@ async fn sync_retries_until_chain_tip_recovers() -> Result<(), TestWalletError> 
     chain.handle().advance_tip(BlockHeight::from(50));
     chain
         .handle()
-        .fail_chain_tip_next(2, || ChainSourceError::Unavailable {
+        .fail_safe_chain_tip_next(2, || ChainSourceError::Unavailable {
             reason: "simulated upstream stall".into(),
         });
 
@@ -52,7 +52,7 @@ async fn sync_does_not_retry_operator_action_chain_failures() -> Result<(), Test
     chain.handle().advance_tip(BlockHeight::from(50));
     chain
         .handle()
-        .fail_chain_tip_next(1, || ChainSourceError::MalformedCompactBlock {
+        .fail_safe_chain_tip_next(1, || ChainSourceError::MalformedCompactBlock {
             block_height: BlockHeight::from(10),
             reason: "synthetic decode failure".into(),
         });
