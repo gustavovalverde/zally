@@ -155,7 +155,7 @@ impl WalletError {
     pub fn posture(&self) -> FailurePosture {
         match self {
             Self::Sealing(e) => bool_to_posture(e.is_retryable()),
-            Self::Storage(e) => bool_to_posture(e.is_retryable()),
+            Self::Storage(e) => e.posture(),
             Self::KeyDerivation(e) => bool_to_posture(e.is_retryable()),
             Self::Pczt(e) => bool_to_posture(e.is_retryable()),
             Self::ChainSource(e) => e.posture(),
