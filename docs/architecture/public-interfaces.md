@@ -88,6 +88,7 @@ A name must survive a change of its implementation.
 | `AccountId` | `zally-core` | Opaque identifier for an account within a wallet. |
 | `ReceiverPurpose` | `zally-core` | Enum naming each receiver's role (`Mining`, `Donations`, `HotDispense`, `ColdReserve`, `Custom(String)`). |
 | `IdempotencyKey` | `zally-core` | Caller-supplied identifier for send-idempotency. `AsRef<str>` newtype. |
+| `ReservationId` | `zally-core` | Wallet-issued opaque identifier for a `DispenseReservation`. UUID v4 by construction; safe to log. |
 | `Memo` | `zally-core` | ZIP-302 memo wrapper. Refuses construction over 512 bytes. |
 | `TransparentGapLimit` | `zally-core` | BIP-44 gap-limit policy (`external`, `internal`, `ephemeral`). Zally raises the external/ephemeral defaults above the upstream `GapLimits::default()` to avoid Sapling-diversifier-driven first-reservation failures on a randomly-seeded fresh wallet. |
 | `Wallet` | `zally-wallet` | The operator-facing handle. Async API. |
@@ -95,6 +96,9 @@ A name must survive a change of its implementation.
 | `ExposedAddress` | `zally-wallet` | Previously-derived Unified Address in derivation order, with diversifier index and transparent-receiver flag. |
 | `PendingTransparentInputs` | `zally-wallet` | Snapshot of transparent outpoints locked by wallet-owned broadcasts not yet observed mined. |
 | `PendingTransparentInput` | `zally-wallet` | Single locked outpoint, with `broadcast_tx_id`, `broadcast_at_ms`, and `broadcast_at_height`. The same field names appear on the storage-side row; no rename across layers. |
+| `DispenseReservation` | `zally-wallet` | Amount lock returned by `Wallet::reserve_for_dispense`. Carries the wallet-issued `ReservationId`, the caller-supplied `request_id` and `idempotency_key`, `amount_zat`, `locked_notes_summary`, and `available_after_release_zat`. |
+| `LockedNotesSummary` | `zally-wallet` | Count and total value of the shielded notes the wallet considered locked at reservation time. Informational; reservations enforce by amount, not by note identity. |
+| `ReserveForDispensePlan` | `zally-wallet` | Inputs to `Wallet::reserve_for_dispense`: `account_id`, `amount_zat`, `request_id`, `idempotency_key`. |
 | `WalletOptions` | `zally-wallet` | Open-time wallet configuration; currently carries the pending-broadcast inflight window. |
 | `OutPoint` | `zally-core` | Transparent transaction outpoint (`tx_id` + `output_index`). Zally-owned so the public surface composes only Zally domain types; inside `zally-storage` the upstream `zcash_transparent::bundle::OutPoint` is imported as `UpstreamOutPoint` to avoid the same-name collision. |
 | `WalletStatus` | `zally-wallet` | Operator readiness snapshot derived from persisted wallet progress. |
@@ -248,6 +252,7 @@ The contract surface Zally publishes, grouped by domain. Each item is a guarante
 - **SPEND-8**: `Wallet::get_account_balance(account_id) -> AccountBalance` returns a per-pool balance snapshot (Sapling, Orchard, transparent-mature, transparent-immature) anchored to the wallet's last observed chain tip. Read-only; composes the persisted wallet rows that drive `Wallet::sync` and `Wallet::list_unspent_shielded_notes`. Transparent values split by ZIP-213 coinbase maturity (100 confirmations) computed against `as_of_height + 1`, matching `zcash_client_backend`'s `chain_tip + 1` convention.
 - **SPEND-9**: `Wallet::get_pending_transparent_inputs(account_id) -> PendingTransparentInputs` returns the transparent outpoints currently locked by wallet-owned broadcasts not yet observed mined. The snapshot honours `WalletOptions::pending_broadcast_window_ms`: rows whose broadcast timestamp falls outside the window are excluded so a permanently-dropped broadcast eventually frees its outpoints.
 - **SPEND-10**: `Wallet::send_payment` excludes the same pending-broadcast outpoints as SPEND-7 from transparent input selection via the same `InputSource` override; no path-specific filter exists. Records its broadcast inputs to storage *before* calling `Submitter::submit`, so a crash window between submit and persistence does not leave an in-flight broadcast unrecorded.
+- **SPEND-11**: `Wallet::reserve_for_dispense(ReserveForDispensePlan) -> DispenseReservation` atomically locks `amount_zat` of the account's shielded balance against the caller-supplied `request_id`. The reservation persists in storage so it survives a process restart; concurrent reservations whose amounts sum above spendable cannot both pass (one returns `InsufficientBalance`). The wallet plane exposes `Wallet::release_dispense_reservation`, `Wallet::finalize_dispense_reservation`, and `Wallet::spendable_for_next_dispense` to complete the lifecycle; the latter subtracts every active reservation from the wallet's shielded view. See [ADR-0003](../adrs/0003-dispense-reservations.md).
 
 ### PCZT and external signing (PCZT)
 

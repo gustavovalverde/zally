@@ -815,7 +815,9 @@ impl Wallet {
             rolled_back_to_height: new_fully_scanned,
             new_tip_height: scanned_from,
         });
-        Ok(BlockHeight::from(new_fully_scanned.as_u32().saturating_add(1)))
+        Ok(BlockHeight::from(
+            new_fully_scanned.as_u32().saturating_add(1),
+        ))
     }
 
     fn detect_tip_regress(

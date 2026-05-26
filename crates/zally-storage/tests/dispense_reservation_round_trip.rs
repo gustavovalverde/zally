@@ -216,8 +216,7 @@ async fn dispense_reservations_admit_disjoint_concurrent_callers() -> Result<(),
     let active = storage.list_active_dispense_reservations(account).await?;
     assert_eq!(active.len(), 2, "both concurrent reservations must persist");
     let sum = storage.sum_active_dispense_reserved_zat(account).await?;
-    let expected =
-        Zatoshis::try_from(amount_a.as_u64().saturating_add(amount_b.as_u64()))?;
+    let expected = Zatoshis::try_from(amount_a.as_u64().saturating_add(amount_b.as_u64()))?;
     assert_eq!(sum, expected);
     Ok(())
 }
@@ -438,7 +437,11 @@ async fn dispense_reservations_survive_storage_restart() -> Result<(), TestError
     let storage_b = open_storage(db_path);
     storage_b.open_or_create().await?;
     let active = storage_b.list_active_dispense_reservations(account).await?;
-    assert_eq!(active.len(), 1, "reservation must survive a process restart");
+    assert_eq!(
+        active.len(),
+        1,
+        "reservation must survive a process restart"
+    );
     assert_eq!(active[0].reservation_id, reservation_id);
     assert_eq!(active[0].amount_zat, amount);
     Ok(())

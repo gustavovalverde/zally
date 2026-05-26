@@ -6,7 +6,7 @@ use std::sync::Arc;
 use parking_lot::Mutex;
 use tokio::sync::broadcast;
 use zally_chain::{ChainSource, ChainSourceError};
-use zally_core::{AccountId, BlockHeight, Network, TxId};
+use zally_core::{AccountId, BlockHeight, IdempotencyKey, Network, ReservationId, TxId, Zatoshis};
 use zally_keys::{Mnemonic, SealingError, SeedMaterial, SeedSealing};
 use zally_storage::WalletStorage;
 use zcash_client_backend::data_api::chain::ChainState;
@@ -17,6 +17,7 @@ use crate::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig, CircuitBreake
 use crate::error::WalletError;
 use crate::event::{WalletEvent, WalletEventStream};
 use crate::options::WalletOptions;
+use crate::reservation::{DispenseReservation, LockedNotesSummary};
 use crate::retry::RetryPolicy;
 
 const EVENT_CHANNEL_CAPACITY: usize = 1024;
@@ -313,6 +314,194 @@ impl Wallet {
             .map_err(WalletError::from)
     }
 
+    /// Returns the wallet's spendable view for the next dispense.
+    ///
+    /// Equal to the sum of the account's spendable Sapling and Orchard balances minus
+    /// every active dispense reservation persisted in storage. Locked transparent UTXOs
+    /// are already excluded from the shielded balances at the librustzcash boundary, so
+    /// they need no extra subtraction here. The result is what the next call to
+    /// [`Wallet::reserve_for_dispense`] is allowed to lock.
+    ///
+    /// `not_retryable` on unknown account; `retryable` on transient storage I/O.
+    pub async fn spendable_for_next_dispense(
+        &self,
+        account_id: AccountId,
+    ) -> Result<Zatoshis, WalletError> {
+        let balance_row = self
+            .inner
+            .storage
+            .get_account_balance(account_id)
+            .await
+            .map_err(WalletError::from)?;
+        let reserved = self
+            .inner
+            .storage
+            .sum_active_dispense_reserved_zat(account_id)
+            .await
+            .map_err(WalletError::from)?;
+        let shielded_spendable = balance_row
+            .sapling_zat
+            .as_u64()
+            .saturating_add(balance_row.orchard_zat.as_u64());
+        let remaining = shielded_spendable.saturating_sub(reserved.as_u64());
+        Ok(Zatoshis::try_from(remaining).unwrap_or(Zatoshis::zero()))
+    }
+
+    /// Atomically reserves `amount_zat` of the account's shielded balance for a future
+    /// dispense transaction.
+    ///
+    /// The reservation is keyed by `request_id` and persists in zally's storage so the
+    /// lock survives a process restart. While the reservation is active, the locked
+    /// amount is subtracted from [`Wallet::spendable_for_next_dispense`] and from
+    /// every concurrent `reserve_for_dispense` precondition: two concurrent reservations
+    /// for amounts that sum to more than spendable cannot both succeed.
+    ///
+    /// Idempotency: a second call with the same `request_id` whose prior reservation is
+    /// still active returns the prior reservation unchanged. Once that reservation is
+    /// finalized or released the `request_id` becomes reusable; a fresh call records a
+    /// new row.
+    ///
+    /// Fails with [`WalletError::InsufficientBalance`] when `amount_zat` exceeds the
+    /// current `spendable_for_next_dispense` view.
+    ///
+    /// `not_retryable` on `InsufficientBalance` or `AccountNotFound`; `retryable` on
+    /// transient storage I/O.
+    pub async fn reserve_for_dispense(
+        &self,
+        plan: ReserveForDispensePlan,
+    ) -> Result<DispenseReservation, WalletError> {
+        let ReserveForDispensePlan {
+            account_id,
+            amount_zat,
+            request_id,
+            idempotency_key,
+        } = plan;
+        if amount_zat.as_u64() == 0 {
+            return Err(WalletError::ProposalRejected {
+                reason: "reservation amount must be greater than zero zatoshis".into(),
+            });
+        }
+
+        if let Some(existing) = self
+            .inner
+            .storage
+            .find_dispense_reservation_by_request_id(&request_id)
+            .await?
+            && existing.is_active()
+        {
+            let available_after_release = self
+                .compute_available_after_release(account_id, existing.amount_zat)
+                .await?;
+            return Ok(DispenseReservation {
+                network: self.inner.network,
+                reservation_id: existing.reservation_id,
+                request_id: existing.request_id,
+                idempotency_key: existing.idempotency_key,
+                amount_zat: existing.amount_zat,
+                locked_notes_summary: summarize_locked_notes(&existing.locked_notes),
+                available_after_release_zat: available_after_release,
+            });
+        }
+
+        let observed_tip = self
+            .inner
+            .storage
+            .find_observed_tip()
+            .await?
+            .unwrap_or_else(|| BlockHeight::from(0));
+        let candidate_notes = self
+            .inner
+            .storage
+            .list_unspent_shielded_notes(account_id, observed_tip)
+            .await?;
+        let spendable = self.spendable_for_next_dispense(account_id).await?;
+        if amount_zat.as_u64() > spendable.as_u64() {
+            return Err(WalletError::InsufficientBalance {
+                requested_zat: amount_zat,
+                spendable_zat: spendable,
+            });
+        }
+
+        let locked_notes = select_locked_notes(&candidate_notes, amount_zat);
+        let reservation_id = ReservationId::new();
+        let reserved_at_ms = current_unix_ms();
+        let record = zally_storage::DispenseReservationRecord {
+            reservation_id,
+            request_id: request_id.clone(),
+            idempotency_key: idempotency_key.clone(),
+            account_id,
+            amount_zat,
+            spendable_for_check_zat: spendable,
+            locked_notes: locked_notes.clone(),
+            reserved_at_ms,
+        };
+        self.inner
+            .storage
+            .create_dispense_reservation(record)
+            .await
+            .map_err(WalletError::from)?;
+
+        let summary = summarize_locked_notes(&locked_notes);
+        Ok(DispenseReservation {
+            network: self.inner.network,
+            reservation_id,
+            request_id,
+            idempotency_key,
+            amount_zat,
+            locked_notes_summary: summary,
+            available_after_release_zat: spendable,
+        })
+    }
+
+    /// Releases a previously-recorded reservation without spending it.
+    ///
+    /// Idempotent: a second call on the same identifier returns `Ok(())`. Fails with
+    /// [`WalletError::Storage`] wrapping
+    /// [`zally_storage::StorageError::DispenseReservationNotFound`] when no row matches.
+    ///
+    /// `not_retryable` on unknown reservation; `retryable` on transient storage I/O.
+    pub async fn release_dispense_reservation(
+        &self,
+        reservation_id: ReservationId,
+    ) -> Result<(), WalletError> {
+        self.inner
+            .storage
+            .release_dispense_reservation(reservation_id, current_unix_ms())
+            .await
+            .map_err(WalletError::from)
+    }
+
+    /// Marks a previously-recorded reservation as consumed by `tx_id`.
+    ///
+    /// Idempotent: a second call returns `Ok(())`. Fails with [`WalletError::Storage`]
+    /// wrapping [`zally_storage::StorageError::DispenseReservationNotFound`] when no row
+    /// matches.
+    ///
+    /// `not_retryable` on unknown reservation; `retryable` on transient storage I/O.
+    pub async fn finalize_dispense_reservation(
+        &self,
+        reservation_id: ReservationId,
+        tx_id: TxId,
+    ) -> Result<(), WalletError> {
+        self.inner
+            .storage
+            .finalize_dispense_reservation(reservation_id, tx_id)
+            .await
+            .map_err(WalletError::from)
+    }
+
+    async fn compute_available_after_release(
+        &self,
+        account_id: AccountId,
+        existing_amount_zat: Zatoshis,
+    ) -> Result<Zatoshis, WalletError> {
+        let current = self.spendable_for_next_dispense(account_id).await?;
+        let projected = current
+            .as_u64()
+            .saturating_add(existing_amount_zat.as_u64());
+        Ok(Zatoshis::try_from(projected).unwrap_or(Zatoshis::zero()))
+    }
+
     /// Subscribes to wallet events. The returned stream stays valid until either the wallet
     /// is dropped or the consumer drops the stream.
     #[must_use]
@@ -569,6 +758,85 @@ pub(crate) fn current_unix_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0_u64, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+}
+
+/// Inputs to [`Wallet::reserve_for_dispense`].
+///
+/// `request_id` is the idempotency anchor for the reservation itself: a second call with
+/// the same `request_id` while a prior reservation is still active returns the prior
+/// reservation. `idempotency_key` is the eventual broadcast's idempotency key, recorded on
+/// the row so the dispense path can pair the reservation with its idempotent submission.
+///
+/// `request_id` and `idempotency_key` are reusable when callers prefer to keep them
+/// identical; the storage layer treats them as separate string columns either way.
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub struct ReserveForDispensePlan {
+    /// Account that funds the reservation.
+    pub account_id: AccountId,
+    /// Amount to reserve.
+    pub amount_zat: Zatoshis,
+    /// Caller-supplied request identifier (idempotency anchor for the reservation).
+    pub request_id: IdempotencyKey,
+    /// Caller-supplied idempotency key for the eventual broadcast.
+    pub idempotency_key: IdempotencyKey,
+}
+
+impl ReserveForDispensePlan {
+    /// Constructs a plan for reserving `amount_zat` against `account_id`.
+    #[must_use]
+    pub const fn new(
+        account_id: AccountId,
+        amount_zat: Zatoshis,
+        request_id: IdempotencyKey,
+        idempotency_key: IdempotencyKey,
+    ) -> Self {
+        Self {
+            account_id,
+            amount_zat,
+            request_id,
+            idempotency_key,
+        }
+    }
+}
+
+fn summarize_locked_notes(notes: &[zally_storage::DispenseReservedNote]) -> LockedNotesSummary {
+    let note_count = u32::try_from(notes.len()).unwrap_or(u32::MAX);
+    let total = notes
+        .iter()
+        .fold(0_u64, |acc, n| acc.saturating_add(n.value_zat.as_u64()));
+    LockedNotesSummary::new(
+        note_count,
+        Zatoshis::try_from(total).unwrap_or(Zatoshis::zero()),
+    )
+}
+
+/// Greedy selection of unspent notes whose cumulative value covers `amount_zat`.
+///
+/// Records the resulting note set on the reservation row for operator visibility;
+/// the storage layer enforces the reservation as an amount lock, not a note-level
+/// lock, so a slightly different selection at proposal time is fine.
+fn select_locked_notes(
+    candidates: &[zally_storage::UnspentShieldedNoteRow],
+    amount_zat: Zatoshis,
+) -> Vec<zally_storage::DispenseReservedNote> {
+    let mut sorted: Vec<&zally_storage::UnspentShieldedNoteRow> = candidates.iter().collect();
+    sorted.sort_by_key(|n| std::cmp::Reverse(n.value_zat));
+    let mut taken = Vec::new();
+    let mut running = 0_u64;
+    for note in sorted {
+        if running >= amount_zat.as_u64() {
+            break;
+        }
+        running = running.saturating_add(note.value_zat.as_u64());
+        taken.push(zally_storage::DispenseReservedNote::new(
+            note.protocol,
+            note.value_zat,
+            note.tx_id,
+            note.output_index,
+        ));
+    }
+    taken
 }
 
 fn translate_pending_broadcast_input(

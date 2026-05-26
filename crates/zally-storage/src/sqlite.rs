@@ -1590,8 +1590,9 @@ impl WalletStorage for Sqlite {
             let active_sum = sum_active_reservations(&tx, &account_uuid_bytes)?;
             let projected = active_sum.saturating_add(amount_zat.as_u64());
             if projected > spendable_zat_u64 {
-                let available_zat = Zatoshis::try_from(spendable_zat_u64.saturating_sub(active_sum))
-                    .unwrap_or_else(|_| Zatoshis::zero());
+                let available_zat =
+                    Zatoshis::try_from(spendable_zat_u64.saturating_sub(active_sum))
+                        .unwrap_or_else(|_| Zatoshis::zero());
                 return Err(StorageError::InsufficientFunds {
                     required_zat: amount_zat,
                     available_zat,
@@ -1731,17 +1732,21 @@ impl WalletStorage for Sqlite {
                     reason: format!("dispense reservation lookup-by-request prepare failed: {err}"),
                     posture: FailurePosture::NotRetryable,
                 })?;
-            let mut rows = stmt
-                .query([&request_id_str])
-                .map_err(|err| StorageError::SqliteFailed {
-                    reason: format!("dispense reservation lookup-by-request query failed: {err}"),
-                    posture: FailurePosture::NotRetryable,
-                })?;
+            let mut rows =
+                stmt.query([&request_id_str])
+                    .map_err(|err| StorageError::SqliteFailed {
+                        reason: format!(
+                            "dispense reservation lookup-by-request query failed: {err}"
+                        ),
+                        posture: FailurePosture::NotRetryable,
+                    })?;
             let next = rows.next().map_err(|err| StorageError::SqliteFailed {
                 reason: format!("dispense reservation lookup-by-request row failed: {err}"),
                 posture: FailurePosture::NotRetryable,
             })?;
-            next.map_or(Ok(None), |row| decode_dispense_reservation_row(row).map(Some))
+            next.map_or(Ok(None), |row| {
+                decode_dispense_reservation_row(row).map(Some)
+            })
         })
         .await
     }
@@ -1766,12 +1771,12 @@ impl WalletStorage for Sqlite {
                     reason: format!("list active dispense reservations prepare failed: {err}"),
                     posture: FailurePosture::NotRetryable,
                 })?;
-            let mut rows = stmt
-                .query([&account_uuid_bytes])
-                .map_err(|err| StorageError::SqliteFailed {
-                    reason: format!("list active dispense reservations query failed: {err}"),
-                    posture: FailurePosture::NotRetryable,
-                })?;
+            let mut rows =
+                stmt.query([&account_uuid_bytes])
+                    .map_err(|err| StorageError::SqliteFailed {
+                        reason: format!("list active dispense reservations query failed: {err}"),
+                        posture: FailurePosture::NotRetryable,
+                    })?;
             let mut out = Vec::new();
             while let Some(row) = rows.next().map_err(|err| StorageError::SqliteFailed {
                 reason: format!("list active dispense reservations row failed: {err}"),
@@ -2451,7 +2456,9 @@ const LOCKED_NOTE_RECORD_BYTES: usize = 1 + 8 + 32 + 4;
 /// `[u8 protocol_tag][u64_be value_zat][32 bytes tx_id][u32_be output_index]`.
 fn encode_locked_notes(notes: &[crate::DispenseReservedNote]) -> Vec<u8> {
     let count = u32::try_from(notes.len()).unwrap_or(u32::MAX);
-    let mut blob = Vec::with_capacity(4_usize.saturating_add(notes.len().saturating_mul(LOCKED_NOTE_RECORD_BYTES)));
+    let mut blob = Vec::with_capacity(
+        4_usize.saturating_add(notes.len().saturating_mul(LOCKED_NOTE_RECORD_BYTES)),
+    );
     blob.extend_from_slice(&count.to_be_bytes());
     for note in notes {
         let tag = match note.protocol {
@@ -2474,10 +2481,13 @@ fn decode_locked_notes(blob: &[u8]) -> Result<Vec<crate::DispenseReservedNote>, 
             raw: format!("blob length {} below 4-byte header", blob.len()),
         });
     }
-    let header_bytes: [u8; 4] = blob[0..4].try_into().map_err(|_| StorageError::RowValueOutOfRange {
-        column: "ext_zally_dispense_reservations.locked_notes",
-        raw: "could not read count header".to_owned(),
-    })?;
+    let header_bytes: [u8; 4] =
+        blob[0..4]
+            .try_into()
+            .map_err(|_| StorageError::RowValueOutOfRange {
+                column: "ext_zally_dispense_reservations.locked_notes",
+                raw: "could not read count header".to_owned(),
+            })?;
     let count = u32::from_be_bytes(header_bytes);
     let expected_bytes =
         4_usize.saturating_add((count as usize).saturating_mul(LOCKED_NOTE_RECORD_BYTES));
@@ -2505,31 +2515,33 @@ fn decode_locked_notes(blob: &[u8]) -> Result<Vec<crate::DispenseReservedNote>, 
                 });
             }
         };
-        let value_bytes: [u8; 8] = record[1..9].try_into().map_err(|_| {
-            StorageError::RowValueOutOfRange {
-                column: "ext_zally_dispense_reservations.locked_notes (value_zat)",
-                raw: "could not read value bytes".to_owned(),
-            }
-        })?;
+        let value_bytes: [u8; 8] =
+            record[1..9]
+                .try_into()
+                .map_err(|_| StorageError::RowValueOutOfRange {
+                    column: "ext_zally_dispense_reservations.locked_notes (value_zat)",
+                    raw: "could not read value bytes".to_owned(),
+                })?;
         let value_u64 = u64::from_be_bytes(value_bytes);
-        let value_zat = Zatoshis::try_from(value_u64).map_err(|_| {
-            StorageError::RowValueOutOfRange {
+        let value_zat =
+            Zatoshis::try_from(value_u64).map_err(|_| StorageError::RowValueOutOfRange {
                 column: "ext_zally_dispense_reservations.locked_notes (value_zat)",
                 raw: value_u64.to_string(),
-            }
-        })?;
-        let tx_id_bytes: [u8; 32] = record[9..41].try_into().map_err(|_| {
-            StorageError::RowValueOutOfRange {
-                column: "ext_zally_dispense_reservations.locked_notes (tx_id)",
-                raw: "could not read 32-byte tx_id".to_owned(),
-            }
-        })?;
-        let output_index_bytes: [u8; 4] = record[41..45].try_into().map_err(|_| {
-            StorageError::RowValueOutOfRange {
-                column: "ext_zally_dispense_reservations.locked_notes (output_index)",
-                raw: "could not read output_index bytes".to_owned(),
-            }
-        })?;
+            })?;
+        let tx_id_bytes: [u8; 32] =
+            record[9..41]
+                .try_into()
+                .map_err(|_| StorageError::RowValueOutOfRange {
+                    column: "ext_zally_dispense_reservations.locked_notes (tx_id)",
+                    raw: "could not read 32-byte tx_id".to_owned(),
+                })?;
+        let output_index_bytes: [u8; 4] =
+            record[41..45]
+                .try_into()
+                .map_err(|_| StorageError::RowValueOutOfRange {
+                    column: "ext_zally_dispense_reservations.locked_notes (output_index)",
+                    raw: "could not read output_index bytes".to_owned(),
+                })?;
         let output_index = u32::from_be_bytes(output_index_bytes);
         notes.push(crate::DispenseReservedNote {
             protocol,
@@ -2598,45 +2610,47 @@ fn decode_dispense_reservation_row(
     let finalized_tx_bytes: Option<Vec<u8>> = row.get(7).map_err(|e| map_row_decode_error(&e))?;
     let released_at_ms_raw: Option<i64> = row.get(8).map_err(|e| map_row_decode_error(&e))?;
 
-    let reservation_uuid_array: [u8; 16] = reservation_uuid_bytes
-        .try_into()
-        .map_err(|raw: Vec<u8>| StorageError::RowValueOutOfRange {
-            column: "ext_zally_dispense_reservations.reservation_id",
-            raw: format!("uuid byte length {}", raw.len()),
+    let reservation_uuid_array: [u8; 16] =
+        reservation_uuid_bytes.try_into().map_err(|raw: Vec<u8>| {
+            StorageError::RowValueOutOfRange {
+                column: "ext_zally_dispense_reservations.reservation_id",
+                raw: format!("uuid byte length {}", raw.len()),
+            }
         })?;
-    let account_uuid_array: [u8; 16] = account_uuid_bytes
-        .try_into()
-        .map_err(|raw: Vec<u8>| StorageError::RowValueOutOfRange {
-            column: "ext_zally_dispense_reservations.account_id",
-            raw: format!("uuid byte length {}", raw.len()),
-        })?;
+    let account_uuid_array: [u8; 16] =
+        account_uuid_bytes
+            .try_into()
+            .map_err(|raw: Vec<u8>| StorageError::RowValueOutOfRange {
+                column: "ext_zally_dispense_reservations.account_id",
+                raw: format!("uuid byte length {}", raw.len()),
+            })?;
     let request_id = IdempotencyKey::try_from(request_id_str).map_err(|err| {
         StorageError::RowValueOutOfRange {
             column: "ext_zally_dispense_reservations.request_id",
             raw: format!("invalid idempotency key: {err}"),
         }
     })?;
-    let idempotency_key =
-        IdempotencyKey::try_from(idempotency_key_str).map_err(|err| StorageError::RowValueOutOfRange {
+    let idempotency_key = IdempotencyKey::try_from(idempotency_key_str).map_err(|err| {
+        StorageError::RowValueOutOfRange {
             column: "ext_zally_dispense_reservations.idempotency_key",
             raw: format!("invalid idempotency key: {err}"),
-        })?;
-    let amount_u64 = u64::try_from(amount_zat_raw).map_err(|_| {
-        StorageError::RowValueOutOfRange {
+        }
+    })?;
+    let amount_u64 =
+        u64::try_from(amount_zat_raw).map_err(|_| StorageError::RowValueOutOfRange {
             column: "ext_zally_dispense_reservations.amount_zat",
             raw: amount_zat_raw.to_string(),
-        }
-    })?;
-    let amount_zat = Zatoshis::try_from(amount_u64).map_err(|_| StorageError::RowValueOutOfRange {
-        column: "ext_zally_dispense_reservations.amount_zat",
-        raw: amount_u64.to_string(),
-    })?;
-    let reserved_at_ms = u64::try_from(reserved_at_ms_raw).map_err(|_| {
-        StorageError::RowValueOutOfRange {
+        })?;
+    let amount_zat =
+        Zatoshis::try_from(amount_u64).map_err(|_| StorageError::RowValueOutOfRange {
+            column: "ext_zally_dispense_reservations.amount_zat",
+            raw: amount_u64.to_string(),
+        })?;
+    let reserved_at_ms =
+        u64::try_from(reserved_at_ms_raw).map_err(|_| StorageError::RowValueOutOfRange {
             column: "ext_zally_dispense_reservations.reserved_at_ms",
             raw: reserved_at_ms_raw.to_string(),
-        }
-    })?;
+        })?;
     let finalized_tx_id = finalized_tx_bytes
         .map(|bytes| decode_txid_bytes(bytes, "ext_zally_dispense_reservations.finalized_tx_id"))
         .transpose()?;

@@ -23,6 +23,7 @@ mod open_without_seal_returns_no_sealed_seed;
 mod pending_transparent_inputs_round_trip;
 mod propose_rejects_memo_on_transparent;
 mod propose_rejects_network_mismatch;
+mod reserve_for_dispense_round_trip;
 mod send_payment_short_circuits_on_known_idempotency_key;
 mod sync_catches_up_to_tip;
 mod sync_driver_follows_chain;
