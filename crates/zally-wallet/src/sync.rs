@@ -30,7 +30,7 @@ use crate::error::WalletError;
 use crate::event::WalletEvent;
 use crate::retry::with_breaker_and_retry;
 use crate::status::{SyncStatus, WalletStatus};
-use crate::wallet::{Wallet, current_unix_ms};
+use crate::wallet::Wallet;
 
 const MAX_BLOCKS_PER_SYNC: u32 = 1_000;
 
@@ -745,15 +745,14 @@ impl Wallet {
                 transparent_utxo_count,
             ));
         }
-        // Resolve the prior chain state. The wallet's own anchor cache is consulted
-        // first; on miss, the chain source is queried and its response is cached so
-        // the next resume hits a local row instead of an RPC. Chain-source responses
+        // Resolve the prior chain state from the chain source. Chain-source responses
         // may land at a height strictly below `scanned_from - 1` when the chain
-        // source's checkpoint set is sparser than the wallet's scan position
-        // (tree-state checkpoints are materialized at subtree boundaries, not at
-        // every block); the realign fallback below catches that case by truncating
-        // the wallet to the returned anchor height and rescanning forward.
-        let from_state = self.fetch_prior_chain_state(chain, scanned_from).await?;
+        // source's checkpoint set is sparser than the wallet's scan position; the
+        // realign fallback below catches that case by truncating the wallet to the
+        // returned anchor height and rescanning forward. zinder closes that gap
+        // class by writing checkpoints at a fixed stride (every 100 blocks) in both
+        // bulk-catchup and tip-follow; see zally `docs/adrs/0005-wallet-sync-resume-anchor-cadence.md`.
+        let from_state = fetch_prior_chain_state(chain, scanned_from).await?;
         let from_state_height = BlockHeight::from(u32::from(from_state.block_height()));
         let scanned_from = if from_state_height.as_u32().saturating_add(1) == scanned_from.as_u32()
         {
@@ -785,136 +784,6 @@ impl Wallet {
             chain,
         )
         .await
-    }
-
-    /// Resolves the `ChainState` for `scanned_from - 1`.
-    ///
-    /// Reads the wallet's own anchor cache first. On miss (cold start or a long
-    /// stall outside the retention window), falls back to the chain source's
-    /// `tree_state_at` RPC and caches the response so the next resume hits the
-    /// local row. The chain source may answer with a state at a height strictly
-    /// below `scanned_from - 1` when its checkpoint set is sparse; the realign
-    /// path in `sync_inner` handles that fallback case.
-    #[allow(
-        clippy::too_many_lines,
-        reason = "the cache-check / chain-fallback / record / prune sequence is one logical operation; splitting it would obscure the boundary between local and remote state"
-    )]
-    async fn fetch_prior_chain_state(
-        &self,
-        chain: &dyn ChainSource,
-        scanned_from: BlockHeight,
-    ) -> Result<ChainState, WalletError> {
-        let prior_height = BlockHeight::from(scanned_from.as_u32().saturating_sub(1));
-
-        // Local anchor cache: serve from the wallet's own row when we have one at
-        // exactly the requested height. An at-or-below hit at a lower height is
-        // unusable here (scan_cached_blocks asserts the chain state is at
-        // `scanned_from - 1`), so we let it fall through to the chain source.
-        if let Some((cached_height, encoded)) = self
-            .inner
-            .storage
-            .find_chain_state_anchor_at_or_below(prior_height)
-            .await?
-            && cached_height == prior_height
-        {
-            match decode_cached_tree_state(cached_height, &encoded) {
-                Ok(state) => {
-                    tracing::info!(
-                        event = "wallet_chain_state_anchor_cache_hit",
-                        prior_height = prior_height.as_u32(),
-                        "served prior chain state from local anchor cache"
-                    );
-                    return Ok(state);
-                }
-                Err(err) => {
-                    tracing::warn!(
-                        event = "wallet_chain_state_anchor_decode_failed",
-                        prior_height = prior_height.as_u32(),
-                        error = %err,
-                        "cached anchor failed to decode; falling back to chain source"
-                    );
-                    // Drop the corrupt row so the next resume does not retry it.
-                    let _ = self
-                        .inner
-                        .storage
-                        .prune_chain_state_anchors_below(BlockHeight::from(
-                            cached_height.as_u32().saturating_add(1),
-                        ))
-                        .await;
-                }
-            }
-        }
-
-        let tree_state = chain.tree_state_at(prior_height).await?;
-        let returned_height_raw =
-            u32::try_from(tree_state.height).map_err(|_| {
-                WalletError::ChainSource(ChainSourceError::MalformedCompactBlock {
-                    block_height: prior_height,
-                    reason: format!("tree state height out of u32: {}", tree_state.height),
-                })
-            })?;
-        let returned_height = BlockHeight::from(returned_height_raw);
-        let chain_state = tree_state.clone().to_chain_state().map_err(|io| {
-            WalletError::ChainSource(ChainSourceError::MalformedCompactBlock {
-                block_height: prior_height,
-                reason: format!("invalid tree state: {io}"),
-            })
-        })?;
-
-        // Cache the response. We persist at whatever height the chain source
-        // actually returned (which may be lower than requested under the
-        // sparse-checkpoint fallback); the realign path consumes the
-        // `chain_state.block_height()` independently.
-        let encoded = {
-            use prost::Message as _;
-            let mut buf = Vec::with_capacity(tree_state.encoded_len());
-            tree_state.encode(&mut buf).map_err(|err| {
-                WalletError::ChainSource(ChainSourceError::MalformedCompactBlock {
-                    block_height: returned_height,
-                    reason: format!("encode tree state for anchor cache failed: {err}"),
-                })
-            })?;
-            buf
-        };
-        if let Err(failure) = self
-            .inner
-            .storage
-            .record_chain_state_anchor(returned_height, encoded, current_unix_ms())
-            .await
-        {
-            tracing::warn!(
-                event = "wallet_chain_state_anchor_persist_failed",
-                returned_height = returned_height.as_u32(),
-                failure = %failure,
-                "could not persist chain-state anchor; next resume will refetch from the chain source"
-            );
-        } else {
-            tracing::info!(
-                event = "wallet_chain_state_anchor_cached",
-                returned_height = returned_height.as_u32(),
-                "cached chain-state anchor from chain source"
-            );
-            let floor = BlockHeight::from(
-                returned_height
-                    .as_u32()
-                    .saturating_sub(CHAIN_STATE_ANCHOR_RETENTION_BLOCKS),
-            );
-            if let Err(failure) = self
-                .inner
-                .storage
-                .prune_chain_state_anchors_below(floor)
-                .await
-            {
-                tracing::warn!(
-                    event = "wallet_chain_state_anchor_prune_failed",
-                    floor = floor.as_u32(),
-                    failure = %failure,
-                    "could not prune older chain-state anchors; the cache will keep growing until the next successful prune"
-                );
-            }
-        }
-
-        Ok(chain_state)
     }
 
     /// Truncates the wallet down to the height of the latest available
@@ -1246,36 +1115,18 @@ async fn fetch_compact_blocks(
     Ok(blocks)
 }
 
-/// Retention window for cached chain-state anchors.
-///
-/// Set well above the librustzcash rewind cap so a wallet that has stalled across
-/// that window still finds a usable local anchor on resume. Units: blocks behind
-/// the wallet's fully-scanned height.
-const CHAIN_STATE_ANCHOR_RETENTION_BLOCKS: u32 = 1_000;
-
-/// Decodes cached `TreeState` proto bytes into a fresh `ChainState`.
-///
-/// Surfaces a malformed-compact-block error against the cached height when the
-/// bytes fail to decode (e.g. on-disk corruption); callers treat that as a cache
-/// miss and fall back to the chain source.
-fn decode_cached_tree_state(
-    height: BlockHeight,
-    encoded: &[u8],
-) -> Result<ChainState, ChainSourceError> {
-    use prost::Message as _;
-    let tree_state =
-        zcash_client_backend::proto::service::TreeState::decode(encoded).map_err(|err| {
-            ChainSourceError::MalformedCompactBlock {
-                block_height: height,
-                reason: format!("cached tree state decode failed: {err}"),
-            }
-        })?;
-    tree_state
-        .to_chain_state()
-        .map_err(|io| ChainSourceError::MalformedCompactBlock {
-            block_height: height,
-            reason: format!("cached tree state malformed: {io}"),
+async fn fetch_prior_chain_state(
+    chain: &dyn ChainSource,
+    scanned_from: BlockHeight,
+) -> Result<ChainState, WalletError> {
+    let prior_height = BlockHeight::from(scanned_from.as_u32().saturating_sub(1));
+    let tree_state = chain.tree_state_at(prior_height).await?;
+    tree_state.to_chain_state().map_err(|io| {
+        WalletError::ChainSource(ChainSourceError::MalformedCompactBlock {
+            block_height: prior_height,
+            reason: format!("invalid tree state: {io}"),
         })
+    })
 }
 
 #[cfg(test)]
