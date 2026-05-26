@@ -31,6 +31,8 @@ Three earlier attempts targeted the symptom rather than the contract: a consumer
 
 5. **`realign_to_available_checkpoint` is deleted.** With the contract enforced on both sides, the realign branch is unreachable. The helper had two costs: it silently rewound the wallet by an arbitrary amount on every checkpoint mismatch (masking the producer-side bug), and it emitted a `ReorgDetected` event for a condition that was not a reorg (misleading the operator). Removing it makes the contract violation an explicit, debuggable error instead of a hidden recovery action.
 
+5a. **`roll_back_after_reorg` is also deleted.** Same reasoning, applied to the scan-time recovery path: under the safe-chain-tip contract, scanned blocks are past the reorg window by construction. A divergence reported by `scan_cached_blocks` therefore signals either a chain-source contract violation (the source served blocks above its advertised safe tip) or stale wallet state from before the contract was enforced. Neither is recoverable by auto-rewind because the librustzcash backend caps `WalletWrite::truncate_to_height` at the `COINBASE_MATURITY` window (~100 blocks), and any divergence the scanner detects is structurally outside that cap. The prior implementation hard-coded a rollback depth of 160 blocks, which violated the cap on every fire and produced the same `NotRetryable` wedge that motivated this ADR (observed in production immediately after the safe-chain-tip deploy on 2026-05-26 when stale pre-contract wallet state surfaced as `ChainReorgDetected` in the new sync ceiling range). `StorageError::ChainReorgDetected` now has posture `RequiresOperator`; the sync loop propagates it without recovery. Operator action is documented under **Operator runbook** below.
+
 6. **`safe_chain_tip` is the only vocabulary used across the contract.** zally renames every operator-facing field, event, and trait method that referenced the old `chain_tip` (which silently meant "head, may include unconfirmed") to `safe_chain_tip`. zinder renames its proto and Rust field `finalized_height` to `safe_tip_height` to avoid colliding with the consensus-level `finalized` concept Zcash NU7/Crosslink introduces. The chain-event stream family renames `Finalized` to `Safe` for the same reason.
 
 ## Consequences
@@ -40,6 +42,14 @@ Three earlier attempts targeted the symptom rather than the contract: a consumer
 - The deletion of `realign_to_available_checkpoint` makes contract violations visible. Operators see `wallet_sync_snapshot_error` with `error="...TreeStateAnchorHeightMismatch..."` and `posture=RequiresOperator`. The circuit breaker does not interact with this class.
 - Operators running custom chain sources must honor the contract or accept that the wallet will refuse to sync until they do. The contract is named, documented, and observable.
 - The vocabulary alignment (`safe_chain_tip` in zally, `safe_tip_height` in zinder) preserves the `finalized` namespace for the consensus-level finality concept that Zcash NU7/Crosslink will introduce.
+
+## Operator runbook
+
+When `wallet_sync_snapshot_error` fires with a typed `ChainReorgDetected` or `TreeStateAnchorHeightMismatch` posture `RequiresOperator`:
+
+1. Confirm the chain source is reporting a sane `safe_chain_tip`: query the indexer's `LatestSafeBlock` RPC and compare against its `LatestBlock`. The gap should be at or above the reorg window (zinder default: 100 blocks). A gap of zero or negative means the chain source is violating the contract; fix the chain source.
+2. If the chain source is healthy, the wallet has stale scanned state from before the contract was enforced. Reset the wallet storage (the `wallet.db` SQLite file) while preserving the sealed key material. The wallet will re-scan from birthday against the now-correct contract. Time-to-recover is one bulk-catchup of the chain (minutes to hours depending on birthday).
+3. The error does not trip the wallet circuit breaker (`RequiresOperator` postures are excluded from breaker counting), so other wallet operations remain available; the sync loop alone is paused.
 
 ## Alternatives considered
 

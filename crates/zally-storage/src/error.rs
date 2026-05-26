@@ -94,12 +94,21 @@ pub enum StorageError {
     )]
     IdempotencyKeyConflict,
 
-    /// `scan_blocks` rejected the batch because the chain rolled back. The wallet's view at
-    /// `at_height` does not match the parent hash of the next block the chain source served.
+    /// `scan_blocks` rejected the batch because the chain source served a block whose parent
+    /// hash does not match the wallet's stored view at `at_height`.
     ///
-    /// Posture: [`FailurePosture::Retryable`]; callers truncate the wallet to before
-    /// `at_height` and re-run the sync.
-    #[error("chain reorg detected at height {at_height}; wallet state must roll back")]
+    /// Posture: [`FailurePosture::RequiresOperator`]. Under the safe-chain-tip contract
+    /// (`ChainSource::safe_chain_tip`), scanned blocks are past the reorg window and must
+    /// not change. A divergence in scanned data means either a chain-source contract
+    /// violation (the source served blocks above its advertised safe tip) or stale wallet
+    /// state from before the contract was enforced. Auto-recovery via rewind is not
+    /// possible: the librustzcash 100-block rewind cap (`COINBASE_MATURITY`) bounds how far
+    /// `WalletWrite::truncate_to_height` can roll back, and any divergence detected by the
+    /// scanner is by definition outside that cap. Operator action is required (investigate
+    /// the chain source; reset the wallet storage if state is stale).
+    #[error(
+        "chain reorg detected at height {at_height}; the chain source violated the safe-chain-tip contract or the wallet has stale scanned state requiring operator reset"
+    )]
     ChainReorgDetected {
         /// Height at which the proposed-block parent hash diverged from the wallet's view.
         at_height: BlockHeight,
@@ -202,10 +211,9 @@ impl StorageError {
             | Self::DispenseReservationRequestConflict => FailurePosture::NotRetryable,
             Self::MigrationFailed { .. }
             | Self::ProverUnavailable
-            | Self::RowValueOutOfRange { .. } => FailurePosture::RequiresOperator,
-            Self::BlockingTaskFailed { .. } | Self::ChainReorgDetected { .. } => {
-                FailurePosture::Retryable
-            }
+            | Self::RowValueOutOfRange { .. }
+            | Self::ChainReorgDetected { .. } => FailurePosture::RequiresOperator,
+            Self::BlockingTaskFailed { .. } => FailurePosture::Retryable,
             Self::SqliteFailed { posture, .. } | Self::ProposalBuildFailed { posture, .. } => {
                 *posture
             }
