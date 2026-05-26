@@ -15,6 +15,7 @@ default = []
 serde = ["dep:serde", "uuid/serde"]
 
 [dependencies]
+hex.workspace = true
 serde = { workspace = true, optional = true }
 thiserror.workspace = true
 uuid = { workspace = true }
