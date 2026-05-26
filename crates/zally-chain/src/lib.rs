@@ -25,7 +25,7 @@ pub use source::{
     ChainEventStream, ChainSource, CompactBlockStream, ShieldedPool, SubtreeIndex, SubtreeRoot,
     TransactionStatus, TransparentUtxo,
 };
-pub use submitter::{SubmitOutcome, Submitter};
+pub use submitter::{RejectionReason, SubmitOutcome, Submitter};
 /// Re-export of `zcash_client_backend::data_api::chain::ChainState` so callers of the Zally
 /// scan API do not need to depend on `zcash_client_backend` directly.
 pub use zcash_client_backend::data_api::chain::ChainState;

@@ -104,15 +104,18 @@ pub enum WalletError {
         reason: String,
     },
 
-    /// The submission did not produce an `Accepted` or `Duplicate` outcome. The submitter
-    /// returned `Rejected` with the carried reason.
+    /// The submission did not produce an `Accepted`, `Duplicate`, or `Queued` outcome. The
+    /// submitter returned `Rejected` with the carried typed reason and operator-facing
+    /// detail.
     ///
     /// Posture: [`FailurePosture::NotRetryable`]: retrying the same bytes will not change
     /// the outcome.
-    #[error("submission rejected: {reason}")]
+    #[error("submission rejected ({reason:?}): {detail}")]
     SubmissionRejected {
-        /// Reason carried by the submitter.
-        reason: String,
+        /// Typed rejection reason from the upstream node.
+        reason: zally_chain::RejectionReason,
+        /// Operator-facing detail describing the rejection.
+        detail: String,
     },
 
     /// A PCZT role (Creator, Prover, Signer, Combiner, Extractor) returned an error.
@@ -242,7 +245,10 @@ mod tests {
             },
             WalletError::PaymentRequestParseFailed { reason: "x".into() },
             WalletError::ProposalRejected { reason: "x".into() },
-            WalletError::SubmissionRejected { reason: "x".into() },
+            WalletError::SubmissionRejected {
+                reason: zally_chain::RejectionReason::Unknown,
+                detail: "x".into(),
+            },
             WalletError::Pczt(PcztError::NoMatchingKeys),
             WalletError::CircuitBroken { operation: "test" },
             WalletError::SyncDriverFailed {

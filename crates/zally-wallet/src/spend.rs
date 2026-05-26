@@ -565,7 +565,7 @@ impl Wallet {
 
 #[allow(
     clippy::wildcard_enum_match_arm,
-    reason = "non_exhaustive submit outcomes map unknown variants to ProposalRejected"
+    reason = "non_exhaustive submit outcomes fall through to SubmissionRejected with a placeholder typed reason"
 )]
 fn resolve_send_outcome(
     outcome: zally_chain::SubmitOutcome,
@@ -573,12 +573,20 @@ fn resolve_send_outcome(
 ) -> Result<TxId, WalletError> {
     match outcome {
         zally_chain::SubmitOutcome::Accepted { tx_id } => Ok(tx_id),
-        zally_chain::SubmitOutcome::Duplicate { .. } => Ok(fallback_tx_id),
-        zally_chain::SubmitOutcome::Rejected { reason } => {
-            Err(WalletError::ProposalRejected { reason })
+        // Duplicate and Queued are success-equivalent for idempotency: the upstream node
+        // either already has this byte-identical transaction or has it queued for
+        // verification. The pending-broadcast row recorded just before `submit` stays
+        // in place so the wallet still treats the inputs as in-flight, and the caller
+        // observes the tx id it computed at proposal time.
+        zally_chain::SubmitOutcome::Duplicate { .. } | zally_chain::SubmitOutcome::Queued { .. } => {
+            Ok(fallback_tx_id)
         }
-        _ => Err(WalletError::ProposalRejected {
-            reason: "submitter returned an unrecognised outcome variant".into(),
+        zally_chain::SubmitOutcome::Rejected { reason, detail } => {
+            Err(WalletError::SubmissionRejected { reason, detail })
+        }
+        _ => Err(WalletError::SubmissionRejected {
+            reason: zally_chain::RejectionReason::Unknown,
+            detail: "submitter returned an unrecognised outcome variant".into(),
         }),
     }
 }
@@ -852,5 +860,71 @@ mod tests {
         let regenerated_uri = parsed.to_uri()?;
         assert!(regenerated_uri.starts_with("zcash:"));
         Ok(())
+    }
+
+    #[allow(
+        clippy::expect_used,
+        clippy::panic,
+        clippy::wildcard_enum_match_arm,
+        reason = "tests assert on exact outcome shapes; expect/panic make failing assertions readable, and wildcard arms catch future SubmitOutcome variants intentionally"
+    )]
+    mod resolve_send_outcome {
+        use super::*;
+
+        #[test]
+        fn returns_accepted_tx_id() {
+            let accepted_tx_id = TxId::from_bytes([7_u8; 32]);
+            let fallback_tx_id = TxId::from_bytes([1_u8; 32]);
+            let outcome = zally_chain::SubmitOutcome::Accepted {
+                tx_id: accepted_tx_id,
+            };
+            let tx_id = resolve_send_outcome(outcome, fallback_tx_id).expect("Accepted is Ok");
+            assert_eq!(tx_id, accepted_tx_id);
+        }
+
+        #[test]
+        fn returns_fallback_on_duplicate() {
+            let fallback_tx_id = TxId::from_bytes([1_u8; 32]);
+            let outcome = zally_chain::SubmitOutcome::Duplicate {
+                tx_id: TxId::from_bytes([0_u8; 32]),
+            };
+            let tx_id = resolve_send_outcome(outcome, fallback_tx_id).expect("Duplicate is Ok");
+            assert_eq!(
+                tx_id, fallback_tx_id,
+                "Duplicate must surface the caller-computed fallback tx id, not the zinder placeholder"
+            );
+        }
+
+        #[test]
+        fn returns_fallback_on_queued() {
+            let fallback_tx_id = TxId::from_bytes([1_u8; 32]);
+            let outcome = zally_chain::SubmitOutcome::Queued {
+                tx_id: TxId::from_bytes([0_u8; 32]),
+            };
+            let tx_id = resolve_send_outcome(outcome, fallback_tx_id).expect("Queued is Ok");
+            assert_eq!(
+                tx_id, fallback_tx_id,
+                "Queued is success-equivalent: the caller observes its own tx id and the pending-broadcast row stays in place"
+            );
+        }
+
+        #[test]
+        fn maps_rejected_to_submission_rejected_with_typed_reason() {
+            let fallback_tx_id = TxId::from_bytes([1_u8; 32]);
+            let outcome = zally_chain::SubmitOutcome::Rejected {
+                reason: zally_chain::RejectionReason::MempoolFull,
+                detail: "queue at capacity".to_owned(),
+            };
+            let err = resolve_send_outcome(outcome, fallback_tx_id).expect_err("Rejected is Err");
+            match err {
+                WalletError::SubmissionRejected { reason, detail } => {
+                    assert_eq!(reason, zally_chain::RejectionReason::MempoolFull);
+                    assert_eq!(detail, "queue at capacity");
+                }
+                other => panic!(
+                    "expected WalletError::SubmissionRejected with typed reason, got {other:?}"
+                ),
+            }
+        }
     }
 }

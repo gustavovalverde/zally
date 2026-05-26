@@ -412,8 +412,13 @@ fn zally_transparent_to_funding_transparent(
 )]
 fn require_accepted(outcome: SubmitOutcome, context: &'static str) -> Result<TxId, TestError> {
     match outcome {
-        SubmitOutcome::Accepted { tx_id } | SubmitOutcome::Duplicate { tx_id } => Ok(tx_id),
-        SubmitOutcome::Rejected { reason } => Err(TestError::SubmitRejected { context, reason }),
+        SubmitOutcome::Accepted { tx_id }
+        | SubmitOutcome::Duplicate { tx_id }
+        | SubmitOutcome::Queued { tx_id } => Ok(tx_id),
+        SubmitOutcome::Rejected { reason, detail } => Err(TestError::SubmitRejected {
+            context,
+            reason: format!("{reason:?}: {detail}"),
+        }),
         _ => Err(TestError::SubmitRejected {
             context,
             reason: "submitter returned an unrecognised outcome".to_owned(),

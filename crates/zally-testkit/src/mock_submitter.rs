@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use parking_lot::Mutex;
-use zally_chain::{SubmitOutcome, Submitter, SubmitterError};
+use zally_chain::{RejectionReason, SubmitOutcome, Submitter, SubmitterError};
 use zally_core::{Network, TxId};
 
 /// Outcome the mock should return for the next submission.
@@ -12,7 +12,11 @@ use zally_core::{Network, TxId};
 enum MockOutcome {
     Accepting,
     Duplicating,
-    Rejecting { reason: String },
+    Queuing,
+    Rejecting {
+        reason: RejectionReason,
+        detail: String,
+    },
 }
 
 struct MockState {
@@ -43,13 +47,29 @@ impl MockSubmitter {
         Self::with_outcome(network, MockOutcome::Duplicating)
     }
 
-    /// Constructs a submitter that always returns `SubmitOutcome::Rejected` with `reason`.
+    /// Constructs a submitter that always returns `SubmitOutcome::Queued`.
+    ///
+    /// Used by tests that exercise the success-equivalent in-flight handling: the
+    /// caller observes the fallback tx id and the pending-broadcast row stays in
+    /// place, just like for `Duplicate`.
     #[must_use]
-    pub fn rejecting(network: Network, reason: impl Into<String>) -> Self {
+    pub fn queuing(network: Network) -> Self {
+        Self::with_outcome(network, MockOutcome::Queuing)
+    }
+
+    /// Constructs a submitter that always returns `SubmitOutcome::Rejected` with the
+    /// supplied typed reason and operator-facing detail.
+    #[must_use]
+    pub fn rejecting(
+        network: Network,
+        reason: RejectionReason,
+        detail: impl Into<String>,
+    ) -> Self {
         Self::with_outcome(
             network,
             MockOutcome::Rejecting {
-                reason: reason.into(),
+                reason,
+                detail: detail.into(),
             },
         )
     }
@@ -134,7 +154,10 @@ impl Submitter for MockSubmitter {
         Ok(match outcome {
             MockOutcome::Accepting => SubmitOutcome::Accepted { tx_id },
             MockOutcome::Duplicating => SubmitOutcome::Duplicate { tx_id },
-            MockOutcome::Rejecting { reason } => SubmitOutcome::Rejected { reason },
+            MockOutcome::Queuing => SubmitOutcome::Queued { tx_id },
+            MockOutcome::Rejecting { reason, detail } => {
+                SubmitOutcome::Rejected { reason, detail }
+            }
         })
     }
 }
@@ -166,12 +189,22 @@ mod tests {
 
     #[tokio::test]
     async fn mock_submitter_rejects_with_reason() -> Result<(), SubmitterError> {
-        let submitter = MockSubmitter::rejecting(Network::Mainnet, "fee too low");
+        let submitter =
+            MockSubmitter::rejecting(Network::Mainnet, RejectionReason::MempoolFull, "fee too low");
         let outcome = submitter.submit(&[0; 4]).await?;
         assert!(matches!(
             outcome,
-            SubmitOutcome::Rejected { ref reason } if reason == "fee too low"
+            SubmitOutcome::Rejected { reason: RejectionReason::MempoolFull, ref detail }
+                if detail == "fee too low"
         ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn mock_submitter_queues_returns_caller_tx_id() -> Result<(), SubmitterError> {
+        let submitter = MockSubmitter::queuing(Network::Testnet);
+        let outcome = submitter.submit(b"raw").await?;
+        assert!(matches!(outcome, SubmitOutcome::Queued { .. }));
         Ok(())
     }
 

@@ -172,22 +172,28 @@ fn translate_submit_outcome(
 ) -> Result<SendOutcome, WalletError> {
     #[allow(
         clippy::wildcard_enum_match_arm,
-        reason = "non_exhaustive submit outcomes map unknown variants to ProposalRejected"
+        reason = "non_exhaustive submit outcomes fall through to SubmissionRejected with a placeholder typed reason"
     )]
     match outcome {
         zally_chain::SubmitOutcome::Accepted { tx_id } => Ok(SendOutcome {
             tx_id,
             broadcast_at_height: BlockHeight::from(0),
         }),
-        zally_chain::SubmitOutcome::Duplicate { .. } => Ok(SendOutcome {
-            tx_id: fallback_tx_id,
-            broadcast_at_height: BlockHeight::from(0),
-        }),
-        zally_chain::SubmitOutcome::Rejected { reason } => {
-            Err(WalletError::SubmissionRejected { reason })
+        // Duplicate and Queued are success-equivalent for idempotency; preserve the
+        // caller-provided fallback tx id (see `spend.rs::resolve_send_outcome` for the
+        // matching rationale on the high-level send path).
+        zally_chain::SubmitOutcome::Duplicate { .. } | zally_chain::SubmitOutcome::Queued { .. } => {
+            Ok(SendOutcome {
+                tx_id: fallback_tx_id,
+                broadcast_at_height: BlockHeight::from(0),
+            })
         }
-        _ => Err(WalletError::ProposalRejected {
-            reason: "submitter returned an unrecognised outcome variant".into(),
+        zally_chain::SubmitOutcome::Rejected { reason, detail } => {
+            Err(WalletError::SubmissionRejected { reason, detail })
+        }
+        _ => Err(WalletError::SubmissionRejected {
+            reason: zally_chain::RejectionReason::Unknown,
+            detail: "submitter returned an unrecognised outcome variant".into(),
         }),
     }
 }

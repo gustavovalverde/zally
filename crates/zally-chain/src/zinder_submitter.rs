@@ -8,7 +8,7 @@ use zinder_client::ChainIndex;
 use zinder_core::{RawTransactionBytes, TransactionBroadcastResult};
 
 use crate::error::SubmitterError;
-use crate::submitter::{SubmitOutcome, Submitter};
+use crate::submitter::{RejectionReason, SubmitOutcome, Submitter};
 
 /// Live `Submitter` backed by a [`zinder_client::ChainIndex`].
 ///
@@ -48,6 +48,14 @@ impl Submitter for ZinderSubmitter {
     }
 }
 
+/// Sentinel for outcome variants the upstream node does not echo a tx id on.
+///
+/// `Duplicate` and `Queued` both fall into this bucket: zinder forwards the
+/// upstream Zebra reply, which omits the transaction identifier in both
+/// cases. Callers that need the actual tx id pass their pre-computed value
+/// as the fallback at the next layer up (`spend.rs::resolve_send_outcome`).
+const ECHO_TX_ID_PLACEHOLDER: [u8; 32] = [0_u8; 32];
+
 #[allow(
     clippy::wildcard_enum_match_arm,
     reason = "non_exhaustive zinder broadcast outcomes map unknown variants to Rejected"
@@ -58,27 +66,26 @@ fn translate_broadcast_outcome(outcome: TransactionBroadcastResult) -> SubmitOut
             tx_id: TxId::from_bytes(accepted.transaction_id.as_bytes()),
         },
         TransactionBroadcastResult::Duplicate(_duplicate) => SubmitOutcome::Duplicate {
-            // zinder's BroadcastDuplicate does not echo the transaction_id back. The
-            // Duplicate variant signals idempotency-preserving acceptance.
-            tx_id: TxId::from_bytes([0_u8; 32]),
+            tx_id: TxId::from_bytes(ECHO_TX_ID_PLACEHOLDER),
+        },
+        TransactionBroadcastResult::Queued(_queued) => SubmitOutcome::Queued {
+            tx_id: TxId::from_bytes(ECHO_TX_ID_PLACEHOLDER),
         },
         TransactionBroadcastResult::InvalidEncoding(invalid) => SubmitOutcome::Rejected {
-            reason: format!("invalid encoding: {}", invalid.message),
+            reason: RejectionReason::Unknown,
+            detail: format!("invalid encoding: {}", invalid.message),
         },
         TransactionBroadcastResult::Rejected(rejected) => SubmitOutcome::Rejected {
-            reason: format!(
-                "rejected ({}): {}",
-                rejected
-                    .error_code
-                    .map_or_else(|| "no-code".into(), |c| c.to_string()),
-                rejected.message
-            ),
+            reason: rejected.kind,
+            detail: rejected.message,
         },
         TransactionBroadcastResult::Unknown(unknown) => SubmitOutcome::Rejected {
-            reason: format!("unknown outcome: {}", unknown.message),
+            reason: RejectionReason::Unknown,
+            detail: format!("unknown outcome: {}", unknown.message),
         },
         _ => SubmitOutcome::Rejected {
-            reason: "zinder returned an unrecognised broadcast outcome variant".into(),
+            reason: RejectionReason::Unknown,
+            detail: "zinder returned an unrecognised broadcast outcome variant".into(),
         },
     }
 }
