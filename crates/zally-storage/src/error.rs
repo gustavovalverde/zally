@@ -97,17 +97,16 @@ pub enum StorageError {
     /// `scan_blocks` rejected the batch because the chain source served a block whose parent
     /// hash does not match the wallet's stored view at `at_height`.
     ///
-    /// Posture: [`FailurePosture::RequiresOperator`]. Under the safe-chain-tip contract
-    /// (`ChainSource::safe_chain_tip`), scanned blocks are past the reorg window and must
-    /// not change. A divergence in scanned data means either a chain-source contract
-    /// violation (the source served blocks above its advertised safe tip) or stale wallet
-    /// state from before the contract was enforced. Auto-recovery via rewind is not
-    /// possible: the librustzcash 100-block rewind cap (`COINBASE_MATURITY`) bounds how far
-    /// `WalletWrite::truncate_to_height` can roll back, and any divergence detected by the
-    /// scanner is by definition outside that cap. Operator action is required (investigate
-    /// the chain source; reset the wallet storage if state is stale).
+    /// Posture: [`FailurePosture::Retryable`]. The wallet scans to the live chain tip, so a
+    /// divergence at `at_height` is an ordinary reorg of the head. The caller catches this
+    /// and rolls the wallet back to `at_height - 1` via `WalletStorage::truncate_to_height`,
+    /// then re-runs sync. The librustzcash rewind cap (100 blocks = `COINBASE_MATURITY`)
+    /// bounds how far the truncate can go; if the divergence is deeper than the cap, the
+    /// truncate call surfaces a separate `NotRetryable` storage failure and the operator
+    /// must reset the wallet.
     #[error(
-        "chain reorg detected at height {at_height}; the chain source violated the safe-chain-tip contract or the wallet has stale scanned state requiring operator reset"
+        "chain reorg detected at height {at_height}; wallet must roll back to {} and re-sync",
+        at_height.as_u32().saturating_sub(1)
     )]
     ChainReorgDetected {
         /// Height at which the proposed-block parent hash diverged from the wallet's view.
@@ -211,8 +210,8 @@ impl StorageError {
             | Self::DispenseReservationRequestConflict => FailurePosture::NotRetryable,
             Self::MigrationFailed { .. }
             | Self::ProverUnavailable
-            | Self::RowValueOutOfRange { .. }
-            | Self::ChainReorgDetected { .. } => FailurePosture::RequiresOperator,
+            | Self::RowValueOutOfRange { .. } => FailurePosture::RequiresOperator,
+            Self::ChainReorgDetected { .. } => FailurePosture::Retryable,
             Self::BlockingTaskFailed { .. } => FailurePosture::Retryable,
             Self::SqliteFailed { posture, .. } | Self::ProposalBuildFailed { posture, .. } => {
                 *posture

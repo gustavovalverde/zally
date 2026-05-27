@@ -575,10 +575,10 @@ fn should_continue_syncing(outcome: SyncOutcome, wallet_status: &WalletStatus) -
     if outcome.reorgs_observed > 0 {
         return true;
     }
-    let Some(safe_chain_tip_height) = wallet_status.safe_chain_tip_height else {
+    let Some(chain_tip_height) = wallet_status.safe_chain_tip_height else {
         return false;
     };
-    outcome.block_count > 0 && outcome.scanned_to_height.as_u32() < safe_chain_tip_height.as_u32()
+    outcome.block_count > 0 && outcome.scanned_to_height.as_u32() < chain_tip_height.as_u32()
 }
 
 async fn publish_driver_snapshot(
@@ -660,14 +660,16 @@ async fn next_chain_event_envelope(
 }
 
 impl Wallet {
-    /// Advances the wallet from its last-scanned height up to `chain.safe_chain_tip()`.
+    /// Advances the wallet from its last-scanned height up to `chain.chain_tip()`.
     ///
-    /// Scanning reaches the chain tip so the commitment tree, note witnesses, and the
+    /// Scanning reaches the live chain tip so the commitment tree, note witnesses, and the
     /// `WalletDb` chain-tip notion all agree: `zcash_client_backend` only treats a note as
     /// spendable when its witness is anchored within a fully-scanned tip, and transaction
     /// expiry heights are computed against that same tip. Reorg safety comes from the
-    /// spend-time confirmation depth (ZIP 315) and from `roll_back_after_reorg` recovery, not
-    /// from withholding recent blocks from the scan.
+    /// spend-time confirmation depth (ZIP 315) and from in-loop rewind recovery: a
+    /// `ChainReorgDetected` from the scanner triggers `truncate_to_height(at_height - 1)`
+    /// and a re-scan on the next tick. Divergences deeper than the librustzcash 100-block
+    /// rewind cap (`COINBASE_MATURITY`) surface as `RequiresOperator`.
     ///
     /// Fails closed on network mismatch. Emits `ScanProgress` events at the start and end of
     /// the run; per-block events are emitted by the storage scanner.
@@ -691,7 +693,7 @@ impl Wallet {
 
     #[allow(
         clippy::too_many_lines,
-        reason = "the sync loop coordinates two tip queries, breaker-and-retry plumbing, anchor coherence checks, and three early-exit paths; splitting further obscures the control flow"
+        reason = "the sync loop coordinates tip queries, breaker-and-retry plumbing, reorg rewind, and three early-exit paths; splitting further obscures the control flow"
     )]
     async fn sync_inner(&self, chain: &dyn ChainSource) -> Result<SyncOutcome, WalletError> {
         if chain.network() != self.network() {
@@ -701,14 +703,6 @@ impl Wallet {
             });
         }
         let policy = self.retry_policy();
-        let safe_chain_tip = with_breaker_and_retry(
-            &self.inner.circuit_breaker,
-            policy,
-            "sync.safe_chain_tip",
-            || chain.safe_chain_tip(),
-            WalletError::from,
-        )
-        .await?;
         let chain_tip = with_breaker_and_retry(
             &self.inner.circuit_breaker,
             policy,
@@ -718,14 +712,8 @@ impl Wallet {
         )
         .await?;
         let prior_observed_tip = self.inner.storage.find_observed_tip().await?;
-        let reorg = self.detect_tip_regress(prior_observed_tip, safe_chain_tip);
-        self.inner.storage.record_observed_tip(safe_chain_tip).await?;
-        // Anchor selection and scan range use `safe_chain_tip` (past the
-        // reorg window). Transaction-construction math (target height,
-        // expiry) uses the unfiltered `chain_tip`: submitted txs are
-        // validated against the chain's current head, so an expiry pinned
-        // to the safe tip would land below the head and be rejected as
-        // `BadExpiryHeight`. ADR-0005 documents the separation.
+        let reorg = self.detect_tip_regress(prior_observed_tip, chain_tip);
+        self.inner.storage.record_observed_tip(chain_tip).await?;
         self.inner.storage.update_chain_tip(chain_tip).await?;
 
         let prior_fully_scanned_height = self.inner.storage.fully_scanned_height().await?;
@@ -740,57 +728,80 @@ impl Wallet {
         };
         self.publish_event(WalletEvent::ScanProgress {
             scanned_height: scanned_from,
-            target_height: safe_chain_tip,
+            target_height: chain_tip,
         });
 
-        if scanned_from.as_u32() > safe_chain_tip.as_u32() {
+        if scanned_from.as_u32() > chain_tip.as_u32() {
             let transparent_utxo_count = self.sync_transparent_utxos(chain).await?;
             return Ok(self.emit_already_caught_up(
                 scanned_from,
-    safe_chain_tip,
+                chain_tip,
                 reorg,
                 transparent_utxo_count,
             ));
         }
-        // The chain source guarantees `tree_state_at(scanned_from - 1)` lands
-        // at exactly `scanned_from - 1` when the caller respects the safe
-        // chain tip contract. If it doesn't, the chain source is violating
-        // ADR-0005; surface a typed operator-visible error rather than
-        // truncating into the rewind cap.
         let from_state = fetch_prior_chain_state(chain, scanned_from).await?;
-        let from_state_height = BlockHeight::from(u32::from(from_state.block_height()));
-        let expected_prior = BlockHeight::from(scanned_from.as_u32().saturating_sub(1));
-        if from_state_height != expected_prior {
-            return Err(WalletError::ChainSource(
-                ChainSourceError::TreeStateAnchorHeightMismatch {
-                    requested_height: expected_prior,
-                    returned_height: from_state_height,
-                },
-            ));
-        }
-        let blocks = fetch_compact_blocks(chain, scanned_from, safe_chain_tip).await?;
+        let blocks = fetch_compact_blocks(chain, scanned_from, chain_tip).await?;
         let block_count = u64::try_from(blocks.len()).unwrap_or(u64::MAX);
         if blocks.is_empty() {
             let transparent_utxo_count = self.sync_transparent_utxos(chain).await?;
             return Ok(self.emit_already_caught_up(
                 scanned_from,
-    safe_chain_tip,
+                chain_tip,
                 reorg,
                 transparent_utxo_count,
             ));
         }
-        self.scan_and_emit(
-            ScanContext {
-                blocks,
-                scanned_from,
-                target_height: safe_chain_tip,
-                block_count,
-                reorgs_observed: reorg,
-            },
-            from_state,
-            chain,
-        )
-        .await
+        match self
+            .scan_and_emit(
+                ScanContext {
+                    blocks,
+                    scanned_from,
+                    target_height: chain_tip,
+                    block_count,
+                    reorgs_observed: reorg,
+                },
+                from_state,
+                chain,
+            )
+            .await
+        {
+            Ok(outcome) => Ok(outcome),
+            Err(WalletError::Storage(zally_storage::StorageError::ChainReorgDetected {
+                at_height,
+            })) => self.recover_from_reorg(at_height, reorg).await,
+            Err(other) => Err(other),
+        }
+    }
+
+    /// Rolls the wallet back to `at_height - 1` after the scanner reported a chain
+    /// divergence. The next sync tick re-scans from the new fully-scanned height.
+    ///
+    /// `not_retryable` if the rewind target is below the librustzcash 100-block
+    /// `COINBASE_MATURITY` cap; the operator must reset the wallet.
+    async fn recover_from_reorg(
+        &self,
+        at_height: BlockHeight,
+        prior_reorgs: u32,
+    ) -> Result<SyncOutcome, WalletError> {
+        let rollback_to = BlockHeight::from(at_height.as_u32().saturating_sub(1));
+        let new_fully_scanned = self
+            .inner
+            .storage
+            .truncate_to_height(rollback_to)
+            .await
+            .map_err(WalletError::from)?;
+        self.publish_event(WalletEvent::ReorgDetected {
+            rolled_back_to_height: new_fully_scanned,
+            new_safe_chain_tip_height: new_fully_scanned,
+        });
+        Ok(SyncOutcome {
+            scanned_from_height: new_fully_scanned,
+            scanned_to_height: new_fully_scanned,
+            block_count: 0,
+            transparent_utxo_count: 0,
+            reorgs_observed: prior_reorgs.saturating_add(1),
+        })
     }
 
     fn detect_tip_regress(

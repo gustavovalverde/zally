@@ -124,7 +124,7 @@ impl MockChainSourceHandle {
         self.state.lock().tip_height
     }
 
-    /// Queues `count` consecutive failures for `safe_chain_tip` calls. Each subsequent call pops
+    /// Queues `count` consecutive failures for `chain_tip` calls. Each subsequent call pops
     /// one failure off the queue; once empty, calls succeed normally. Failures are returned
     /// in the order they were queued.
     ///
@@ -132,7 +132,7 @@ impl MockChainSourceHandle {
     /// same error each time (`|| ChainSourceError::Unavailable { ... }`) or vary the error
     /// per attempt. The closure avoids requiring `Clone` on the error type, which would
     /// otherwise force [`ChainSourceError::Indexer`] to carry an `Arc<IndexerError>`.
-    pub fn fail_safe_chain_tip_next(
+    pub fn fail_chain_tip_next(
         &self,
         count: u32,
         mut produce_error: impl FnMut() -> ChainSourceError,
@@ -157,6 +157,10 @@ impl ChainSource for MockChainSource {
     }
 
     async fn safe_chain_tip(&self) -> Result<BlockHeight, ChainSourceError> {
+        Ok(self.state.lock().tip_height)
+    }
+
+    async fn chain_tip(&self) -> Result<BlockHeight, ChainSourceError> {
         let mut guard = self.state.lock();
         if !guard.chain_tip_failures.is_empty() {
             let injected = guard.chain_tip_failures.remove(0);
@@ -164,10 +168,6 @@ impl ChainSource for MockChainSource {
             return Err(injected);
         }
         Ok(guard.tip_height)
-    }
-
-    async fn chain_tip(&self) -> Result<BlockHeight, ChainSourceError> {
-        Ok(self.state.lock().tip_height)
     }
 
     async fn compact_blocks(

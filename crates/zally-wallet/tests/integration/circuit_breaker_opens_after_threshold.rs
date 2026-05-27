@@ -25,7 +25,7 @@ async fn circuit_breaker_opens_after_threshold_retryable_failures() -> Result<()
     chain.handle().advance_tip(BlockHeight::from(50));
     chain
         .handle()
-        .fail_safe_chain_tip_next(20, || ChainSourceError::Unavailable {
+        .fail_chain_tip_next(20, || ChainSourceError::Unavailable {
             reason: "simulated outage".into(),
         });
 
@@ -77,7 +77,7 @@ async fn circuit_breaker_does_not_trip_on_requires_operator_failures() -> Result
     chain.handle().advance_tip(BlockHeight::from(50));
     chain
         .handle()
-        .fail_safe_chain_tip_next(20, || ChainSourceError::MalformedCompactBlock {
+        .fail_chain_tip_next(20, || ChainSourceError::MalformedCompactBlock {
             block_height: BlockHeight::from(10),
             reason: "synthetic upstream malformed".into(),
         });

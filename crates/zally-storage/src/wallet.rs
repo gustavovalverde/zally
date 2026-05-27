@@ -737,12 +737,10 @@ pub trait WalletStorage: Send + Sync + 'static {
     ///
     /// The librustzcash backend bounds the depth of a valid rewind at the
     /// `COINBASE_MATURITY` window (100 blocks): `max_height` must be at or above
-    /// `fully_scanned_height - 99`. Calls with a deeper target fail `NotRetryable`. The
-    /// sync loop relies on the safe-chain-tip contract (`ChainSource::safe_chain_tip`) to
-    /// keep scanned blocks past the reorg window, so this method is exercised only at
-    /// scan-time bookkeeping (account creation, birthday seeding) and never as a recovery
-    /// path after [`StorageError::ChainReorgDetected`]; that error is `RequiresOperator`
-    /// and must be handled out of band (operator reset).
+    /// `fully_scanned_height - 99`. Calls with a deeper target fail `NotRetryable`; the
+    /// caller surfaces this to the operator. The sync loop scans to the live chain tip and
+    /// catches [`StorageError::ChainReorgDetected`] (`Retryable`) to call this method with
+    /// `max_height = at_height - 1`, then re-runs sync.
     ///
     /// `not_retryable` on schema errors; `retryable` on transient I/O.
     async fn truncate_to_height(
