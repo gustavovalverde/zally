@@ -226,10 +226,24 @@ pub trait ChainSource: Send + Sync + 'static {
     /// Contract: the chain source guarantees that for any height `h` at or
     /// below the returned value, (a) the compact block at `h` is available
     /// and (b) a tree-state checkpoint is available at some height `k` with
-    /// `h - k < REWIND_CAP` (the librustzcash 100-block rewind cap). This
-    /// is the wallet's scan ceiling and the only tip-like concept Zally
-    /// exposes. The unfiltered chain head is an indexer-internal concern.
+    /// `h - k < REWIND_CAP` (the librustzcash 100-block rewind cap). The
+    /// wallet uses this as its scan ceiling and as the anchor frontier for
+    /// note-commitment-tree lookups. Always trails [`Self::chain_tip`] by
+    /// at least `reorg_window_blocks` (default 100).
     async fn safe_chain_tip(&self) -> Result<BlockHeight, ChainSourceError>;
+
+    /// Current chain head height: the highest block the chain source has
+    /// observed, including blocks still inside the reorg window.
+    ///
+    /// The wallet uses this for transaction-construction math: target
+    /// height (`chain_tip + 1`) and expiry height
+    /// (`target + tx_expiry_delta`). Both values must reference the
+    /// chain's current best block, not the safe-tip floor, so submitted
+    /// transactions land before consensus rejects them as
+    /// `BadExpiryHeight`. Anchor selection and scan ceilings must use
+    /// [`Self::safe_chain_tip`] instead; mixing the two is the wedge
+    /// class ADR-0005 closed.
+    async fn chain_tip(&self) -> Result<BlockHeight, ChainSourceError>;
 
     /// Streams compact blocks in `block_range` (inclusive on both ends).
     async fn compact_blocks(

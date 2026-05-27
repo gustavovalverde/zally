@@ -116,6 +116,11 @@ impl ChainSource for ZinderChainSource {
         Ok(BlockHeight::from(block_id.height.value()))
     }
 
+    async fn chain_tip(&self) -> Result<BlockHeight, ChainSourceError> {
+        let block_id = self.inner.latest_block(None).await?;
+        Ok(BlockHeight::from(block_id.height.value()))
+    }
+
     async fn compact_blocks(
         &self,
         block_range: BlockHeightRange,

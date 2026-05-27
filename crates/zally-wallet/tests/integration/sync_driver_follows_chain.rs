@@ -137,6 +137,11 @@ impl ChainSource for StalledChainSource {
         future::pending().await
     }
 
+    async fn chain_tip(&self) -> Result<BlockHeight, ChainSourceError> {
+        let _ = self.network;
+        future::pending().await
+    }
+
     async fn compact_blocks(
         &self,
         _block_range: BlockHeightRange,

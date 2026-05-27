@@ -689,6 +689,10 @@ impl Wallet {
         Ok(())
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the sync loop coordinates two tip queries, breaker-and-retry plumbing, anchor coherence checks, and three early-exit paths; splitting further obscures the control flow"
+    )]
     async fn sync_inner(&self, chain: &dyn ChainSource) -> Result<SyncOutcome, WalletError> {
         if chain.network() != self.network() {
             return Err(WalletError::NetworkMismatch {
@@ -705,12 +709,24 @@ impl Wallet {
             WalletError::from,
         )
         .await?;
+        let chain_tip = with_breaker_and_retry(
+            &self.inner.circuit_breaker,
+            policy,
+            "sync.chain_tip",
+            || chain.chain_tip(),
+            WalletError::from,
+        )
+        .await?;
         let prior_observed_tip = self.inner.storage.find_observed_tip().await?;
         let reorg = self.detect_tip_regress(prior_observed_tip, safe_chain_tip);
         self.inner.storage.record_observed_tip(safe_chain_tip).await?;
-        // Pin the WalletDb chain tip to the height this run scans to, so transaction
-        // proposals compute expiry and anchor heights against a fully-scanned tip.
-        self.inner.storage.update_safe_chain_tip(safe_chain_tip).await?;
+        // Anchor selection and scan range use `safe_chain_tip` (past the
+        // reorg window). Transaction-construction math (target height,
+        // expiry) uses the unfiltered `chain_tip`: submitted txs are
+        // validated against the chain's current head, so an expiry pinned
+        // to the safe tip would land below the head and be rejected as
+        // `BadExpiryHeight`. ADR-0005 documents the separation.
+        self.inner.storage.update_chain_tip(chain_tip).await?;
 
         let prior_fully_scanned_height = self.inner.storage.fully_scanned_height().await?;
         let scanned_from = match prior_fully_scanned_height {

@@ -625,7 +625,7 @@ pub trait WalletStorage: Send + Sync + 'static {
     /// passed by the time they reach the network.
     ///
     /// `not_retryable` on schema errors; `retryable` on transient I/O.
-    async fn update_safe_chain_tip(&self, tip_height: BlockHeight) -> Result<(), StorageError>;
+    async fn update_chain_tip(&self, tip_height: BlockHeight) -> Result<(), StorageError>;
 
     /// Returns every unspent Sapling and Orchard note owned by `account_id` against
     /// `target_height` (typically the wallet's current chain tip). Spent notes, locked

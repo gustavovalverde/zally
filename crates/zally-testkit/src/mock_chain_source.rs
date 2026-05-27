@@ -166,6 +166,10 @@ impl ChainSource for MockChainSource {
         Ok(guard.tip_height)
     }
 
+    async fn chain_tip(&self) -> Result<BlockHeight, ChainSourceError> {
+        Ok(self.state.lock().tip_height)
+    }
+
     async fn compact_blocks(
         &self,
         block_range: BlockHeightRange,
