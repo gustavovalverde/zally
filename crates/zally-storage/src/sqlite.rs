@@ -837,6 +837,7 @@ impl WalletStorage for Sqlite {
                     reason: format!("transaction serialize failed: {err}"),
                     posture: FailurePosture::NotRetryable,
                 })?;
+            let tx_expiry_height = BlockHeight::from(u32::from(stored.expiry_height()));
             // PCZT extraction does not currently propagate transparent inputs through the
             // envelope, so the resulting `PreparedTransaction` has no inputs to record in
             // the pending-broadcast filter. Future signer integrations that need
@@ -845,6 +846,7 @@ impl WalletStorage for Sqlite {
                 zally_core::TxId::from_bytes(*tx_id.as_ref()),
                 raw_bytes,
                 Vec::new(),
+                tx_expiry_height,
             ))
         })
         .await
@@ -2254,6 +2256,8 @@ fn prepared_transactions_with_inputs<'a, FeeRuleT, NoteRefT>(
                 reason: format!("transaction serialize failed: {err}"),
                 posture: FailurePosture::NotRetryable,
             })?;
+        let tx_expiry_height =
+            BlockHeight::from(u32::from(stored.expiry_height()));
         let transparent_inputs = steps
             .get(step_index)
             .map(|step| {
@@ -2275,6 +2279,7 @@ fn prepared_transactions_with_inputs<'a, FeeRuleT, NoteRefT>(
             zally_core::TxId::from_bytes(*tx_id.as_ref()),
             raw_bytes,
             transparent_inputs,
+            tx_expiry_height,
         ));
     }
     Ok(prepared)

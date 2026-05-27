@@ -147,6 +147,10 @@ pub struct PreparedTransaction {
     pub raw_bytes: Vec<u8>,
     /// Transparent outpoints consumed by this transaction, with their values.
     pub transparent_inputs: Vec<(OutPoint, Zatoshis)>,
+    /// Block height at which Zcash consensus will reject this transaction if it has
+    /// not been mined. Callers use this to bound the time they wait for confirmation
+    /// before classifying the broadcast as expired.
+    pub tx_expiry_height: BlockHeight,
 }
 
 impl PreparedTransaction {
@@ -156,11 +160,13 @@ impl PreparedTransaction {
         tx_id: TxId,
         raw_bytes: Vec<u8>,
         transparent_inputs: Vec<(OutPoint, Zatoshis)>,
+        tx_expiry_height: BlockHeight,
     ) -> Self {
         Self {
             tx_id,
             raw_bytes,
             transparent_inputs,
+            tx_expiry_height,
         }
     }
 }

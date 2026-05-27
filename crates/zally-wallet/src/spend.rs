@@ -248,6 +248,10 @@ pub struct SendOutcome {
     pub tx_id: TxId,
     /// Height at which the chain source confirmed the broadcast.
     pub broadcast_at_height: BlockHeight,
+    /// Block height at which Zcash consensus will reject this transaction if it has
+    /// not been mined. Callers use this to bound the time they wait for confirmation
+    /// before classifying the broadcast as expired.
+    pub tx_expiry_height: BlockHeight,
 }
 
 impl Wallet {
@@ -313,6 +317,7 @@ impl Wallet {
             return Ok(SendOutcome {
                 tx_id: prior_tx_id,
                 broadcast_at_height: self.observed_tip_or_zero().await?,
+                tx_expiry_height: BlockHeight::from(0),
             });
         }
 
@@ -343,7 +348,7 @@ impl Wallet {
             .await
             .map_err(WalletError::from)?;
         let observed_tip = self.inner.storage.find_observed_tip().await?;
-        let result_tx_id = self
+        let (result_tx_id, tx_expiry_height) = self
             .submit_and_record_pending(
                 SubmissionContext {
                     operation: "send_payment.submit",
@@ -363,6 +368,7 @@ impl Wallet {
         Ok(SendOutcome {
             tx_id: result_tx_id,
             broadcast_at_height: observed_tip.unwrap_or_else(|| BlockHeight::from(0)),
+            tx_expiry_height,
         })
     }
 
@@ -397,6 +403,7 @@ impl Wallet {
             return Ok(SendOutcome {
                 tx_id: prior_tx_id,
                 broadcast_at_height: self.observed_tip_or_zero().await?,
+                tx_expiry_height: BlockHeight::from(0),
             });
         }
 
@@ -423,7 +430,7 @@ impl Wallet {
             .await
             .map_err(WalletError::from)?;
         let observed_tip = self.inner.storage.find_observed_tip().await?;
-        let result_tx_id = self
+        let (result_tx_id, tx_expiry_height) = self
             .submit_and_record_pending(
                 SubmissionContext {
                     operation: "shield_transparent_funds.submit",
@@ -443,6 +450,7 @@ impl Wallet {
         Ok(SendOutcome {
             tx_id: result_tx_id,
             broadcast_at_height: observed_tip.unwrap_or_else(|| BlockHeight::from(0)),
+            tx_expiry_height,
         })
     }
 
@@ -450,14 +458,18 @@ impl Wallet {
     /// filter **before** the submit call so a crash between submit-accept and
     /// row-persistence cannot leave an in-flight broadcast unrecorded. On submit rejection
     /// the just-recorded row is removed so the outpoints become spendable again.
+    ///
+    /// Returns the first transaction's `(tx_id, tx_expiry_height)` pair so callers can
+    /// pass expiry through to consumers that need to bound their wait for confirmation.
     async fn submit_and_record_pending(
         &self,
         submission: SubmissionContext<'_>,
         prepared: Vec<zally_storage::PreparedTransaction>,
-    ) -> Result<TxId, WalletError> {
-        let mut first_tx_id = None;
+    ) -> Result<(TxId, BlockHeight), WalletError> {
+        let mut first_result = None;
         let broadcast_at_ms = current_unix_ms();
         for transaction in prepared {
+            let tx_expiry_height = transaction.tx_expiry_height;
             self.record_broadcast_inputs(
                 submission.account_id,
                 PendingBroadcastSnapshot {
@@ -494,11 +506,11 @@ impl Wallet {
                     return Err(err);
                 }
             };
-            if first_tx_id.is_none() {
-                first_tx_id = Some(tx_id);
+            if first_result.is_none() {
+                first_result = Some((tx_id, tx_expiry_height));
             }
         }
-        first_tx_id.ok_or_else(|| WalletError::ProposalRejected {
+        first_result.ok_or_else(|| WalletError::ProposalRejected {
             reason: "transaction construction returned no transactions".into(),
         })
     }

@@ -123,7 +123,7 @@ impl Wallet {
             WalletError::from,
         )
         .await?;
-        translate_submit_outcome(outcome, prepared.tx_id)
+        translate_submit_outcome(outcome, prepared.tx_id, prepared.tx_expiry_height)
     }
 }
 
@@ -169,6 +169,7 @@ fn memo_to_wire_bytes(memo: &zally_core::Memo) -> Vec<u8> {
 fn translate_submit_outcome(
     outcome: zally_chain::SubmitOutcome,
     fallback_tx_id: zally_core::TxId,
+    tx_expiry_height: BlockHeight,
 ) -> Result<SendOutcome, WalletError> {
     #[allow(
         clippy::wildcard_enum_match_arm,
@@ -178,6 +179,7 @@ fn translate_submit_outcome(
         zally_chain::SubmitOutcome::Accepted { tx_id } => Ok(SendOutcome {
             tx_id,
             broadcast_at_height: BlockHeight::from(0),
+            tx_expiry_height,
         }),
         // Duplicate and Queued are success-equivalent for idempotency; preserve the
         // caller-provided fallback tx id (see `spend.rs::resolve_send_outcome` for the
@@ -186,6 +188,7 @@ fn translate_submit_outcome(
         | zally_chain::SubmitOutcome::Queued { .. } => Ok(SendOutcome {
             tx_id: fallback_tx_id,
             broadcast_at_height: BlockHeight::from(0),
+            tx_expiry_height,
         }),
         zally_chain::SubmitOutcome::Rejected { reason, detail } => {
             Err(WalletError::SubmissionRejected { reason, detail })
