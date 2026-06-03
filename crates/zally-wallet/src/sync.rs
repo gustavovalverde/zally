@@ -747,8 +747,23 @@ impl Wallet {
             scanned_height: scanned_from,
             target_height: chain_tip,
         });
+        tracing::info!(
+            target: "zally::sync",
+            event = "wallet_sync_cycle",
+            scanned_from = scanned_from.as_u32(),
+            chain_tip = chain_tip.as_u32(),
+            prior_fully_scanned = prior_fully_scanned_height.map_or(0, BlockHeight::as_u32),
+            "sync cycle: planning scan"
+        );
 
         if scanned_from.as_u32() > chain_tip.as_u32() {
+            tracing::warn!(
+                target: "zally::sync",
+                event = "wallet_sync_past_tip",
+                scanned_from = scanned_from.as_u32(),
+                chain_tip = chain_tip.as_u32(),
+                "scanned_from is past chain_tip; caught up without fetching"
+            );
             let transparent_utxo_count = self.sync_transparent_utxos(chain).await?;
             return Ok(self.emit_already_caught_up(
                 scanned_from,
@@ -760,7 +775,22 @@ impl Wallet {
         let from_state = fetch_prior_chain_state(chain, scanned_from).await?;
         let blocks = fetch_compact_blocks(chain, scanned_from, chain_tip).await?;
         let block_count = u64::try_from(blocks.len()).unwrap_or(u64::MAX);
+        tracing::info!(
+            target: "zally::sync",
+            event = "wallet_sync_fetched",
+            scanned_from = scanned_from.as_u32(),
+            chain_tip = chain_tip.as_u32(),
+            block_count,
+            "fetched compact blocks for scan"
+        );
         if blocks.is_empty() {
+            tracing::warn!(
+                target: "zally::sync",
+                event = "wallet_sync_empty_fetch",
+                scanned_from = scanned_from.as_u32(),
+                chain_tip = chain_tip.as_u32(),
+                "compact-block fetch returned no blocks below the tip; caught up"
+            );
             let transparent_utxo_count = self.sync_transparent_utxos(chain).await?;
             return Ok(self.emit_already_caught_up(
                 scanned_from,
@@ -806,6 +836,13 @@ impl Wallet {
         prior_reorgs: u32,
     ) -> Result<SyncOutcome, WalletError> {
         let rollback_to = reorg_rollback_target(at_height);
+        tracing::warn!(
+            target: "zally::sync",
+            event = "wallet_sync_reorg_recover",
+            at_height = at_height.as_u32(),
+            rollback_to = rollback_to.as_u32(),
+            "scan-time reorg detected; rewinding below the orphaned block"
+        );
         let new_fully_scanned = self
             .inner
             .storage
