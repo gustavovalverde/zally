@@ -211,8 +211,9 @@ impl StorageError {
             Self::MigrationFailed { .. }
             | Self::ProverUnavailable
             | Self::RowValueOutOfRange { .. } => FailurePosture::RequiresOperator,
-            Self::ChainReorgDetected { .. } => FailurePosture::Retryable,
-            Self::BlockingTaskFailed { .. } => FailurePosture::Retryable,
+            Self::ChainReorgDetected { .. } | Self::BlockingTaskFailed { .. } => {
+                FailurePosture::Retryable
+            }
             Self::SqliteFailed { posture, .. } | Self::ProposalBuildFailed { posture, .. } => {
                 *posture
             }

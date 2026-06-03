@@ -232,7 +232,7 @@ impl SyncSnapshotStream {
 /// Source-neutral long-lived wallet sync driver.
 ///
 /// The host process owns the Tokio runtime and shutdown policy. `SyncDriver` only owns the
-/// wallet catch-up loop: it listens for [`ChainSource::chain_events`] when available,
+/// wallet catch-up loop: it listens for [`ChainSource::chain_event_envelopes`] when available,
 /// falls back to polling, repeatedly calls [`Wallet::sync`] until the observed tip is
 /// reached, and publishes [`SyncSnapshot`] values.
 pub struct SyncDriver {
