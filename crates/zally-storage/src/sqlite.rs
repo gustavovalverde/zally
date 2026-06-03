@@ -234,7 +234,27 @@ impl Sqlite {
 fn run_wallet_db_actor(options: &SqliteOptions, mut request_rx: mpsc::Receiver<DbWork>) {
     let mut state = WalletDbState::NotOpened;
     while let Some(work) = request_rx.blocking_recv() {
-        work(&mut state, options);
+        // Isolate each work item. A panic inside one DB closure (for example an upstream
+        // scan-continuity assertion) must not kill the actor and wedge every future request:
+        // the panicking caller already observes a dropped reply (a Recoverable
+        // BlockingTaskFailed), and the actor stays alive to serve the next request. Any
+        // uncommitted sqlite transaction is rolled back as its guard unwinds, so the
+        // connection remains usable.
+        if let Err(panic) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            work(&mut state, options);
+        })) {
+            let detail = panic
+                .downcast_ref::<&str>()
+                .map(|s| (*s).to_owned())
+                .or_else(|| panic.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "unknown panic payload".to_owned());
+            tracing::error!(
+                target: "zally::storage",
+                event = "wallet_db_actor_work_panicked",
+                detail = %detail,
+                "wallet-db work item panicked; reply dropped, actor continues"
+            );
+        }
     }
 }
 
