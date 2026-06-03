@@ -49,6 +49,7 @@ impl Network {
             nu5: Some(height_two),
             nu6: Some(height_two),
             nu6_1: None,
+            nu6_2: None,
         })
     }
 
@@ -147,6 +148,7 @@ struct RegtestActivations {
     nu5: Option<u32>,
     nu6: Option<u32>,
     nu6_1: Option<u32>,
+    nu6_2: Option<u32>,
 }
 
 #[cfg(feature = "serde")]
@@ -164,6 +166,7 @@ impl From<Network> for NetworkWire {
                 nu5: local.nu5.map(u32::from),
                 nu6: local.nu6.map(u32::from),
                 nu6_1: local.nu6_1.map(u32::from),
+                nu6_2: local.nu6_2.map(u32::from),
             }),
         }
     }
@@ -199,6 +202,9 @@ impl From<NetworkWire> for Network {
                     .map(zcash_protocol::consensus::BlockHeight::from_u32),
                 nu6_1: activations
                     .nu6_1
+                    .map(zcash_protocol::consensus::BlockHeight::from_u32),
+                nu6_2: activations
+                    .nu6_2
                     .map(zcash_protocol::consensus::BlockHeight::from_u32),
             }),
         }

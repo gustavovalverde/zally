@@ -56,29 +56,28 @@ redundant_pub_crate = "allow"
 # Foundation: librustzcash crates. Pin minor versions; bump deliberately in a
 # dedicated ADR. Zally absorbs the upstream churn behind its own surface;
 # operators do not see these version numbers in Zally's public API.
-zcash_client_backend = "0.22"
-zcash_client_sqlite = "0.20"
-zcash_keys = "0.13"
-zcash_primitives = "0.27"
-zcash_protocol = { version = "0.8", features = ["local-consensus"] }
-zcash_address = "0.11"
-zcash_proofs = "0.27"
-zcash_transparent = { version = "0.7", default-features = false, features = ["transparent-inputs"] }
+zcash_client_backend = "0.23"
+zcash_client_sqlite = "0.21"
+zcash_keys = "0.14"
+zcash_primitives = "0.28"
+zcash_protocol = { version = "0.9", features = ["local-consensus"] }
+zcash_address = "0.12"
+zcash_proofs = "0.28"
+zcash_transparent = { version = "0.8", default-features = false, features = ["transparent-inputs"] }
 zcash_script = "0.4"
-pczt = { version = "0.6", features = ["orchard", "sapling", "transparent", "signer", "prover", "tx-extractor"] }
+pczt = { version = "0.7", features = ["orchard", "sapling", "transparent", "signer", "prover", "tx-extractor"] }
 secp256k1 = "0.29"
-orchard = "0.13"
+orchard = "0.14"
 sapling = { package = "sapling-crypto", version = "0.7" }
-zip321 = "0.7"
+zip321 = "0.8"
 zip32 = "0.2"
 
 # Optional chain-plane backend. The `zinder` cargo feature on zally-chain pulls these
 # crates from a pinned git revision so the wallet integration tracks the zinder typed-
-# client surface directly. The [patch.crates-io] core2 pin below resolves the yanked
-# equihash-transitive dep.
-zinder-client = { git = "https://github.com/gustavovalverde/zinder", rev = "572acc9cce25010f9e1695d63ada246f7f681c22" }
-zinder-core = { git = "https://github.com/gustavovalverde/zinder", rev = "572acc9cce25010f9e1695d63ada246f7f681c22" }
-zinder-testkit = { git = "https://github.com/gustavovalverde/zinder", rev = "572acc9cce25010f9e1695d63ada246f7f681c22" }
+# client surface directly.
+zinder-client = { git = "https://github.com/gustavovalverde/zinder", rev = "9063ada7ae8f0575a33c1eae667efe4f76a64f2e" }
+zinder-core = { git = "https://github.com/gustavovalverde/zinder", rev = "9063ada7ae8f0575a33c1eae667efe4f76a64f2e" }
+zinder-testkit = { git = "https://github.com/gustavovalverde/zinder", rev = "9063ada7ae8f0575a33c1eae667efe4f76a64f2e" }
 
 # Async runtime and concurrency.
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "fs", "io-util"] }
@@ -115,9 +114,3 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Test infrastructure.
 proptest = "1.5"
 tempfile = "3.13"
-
-[patch.crates-io]
-# Zebra 6.0.2 (pulled through zinder-client) resolves through equihash 0.2.2, whose
-# core2 0.3.x dependency was yanked on crates.io. Mirror zinder's pin to the last
-# published source rev until equihash or Zebra publishes a clean resolution path.
-core2 = { git = "https://github.com/bbqsrc/core2", rev = "7bf2611" }
