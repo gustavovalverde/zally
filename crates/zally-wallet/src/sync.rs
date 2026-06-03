@@ -773,29 +773,6 @@ impl Wallet {
             ));
         }
         let from_state = fetch_prior_chain_state(chain, scanned_from).await?;
-        // `scan_cached_blocks` requires `from_height == from_state.block_height() + 1`; it
-        // panics otherwise (zcash_client_backend data_api::chain). The chain source serves
-        // tree-state checkpoints sparsely, so the prior state can sit below our frontier.
-        // Re-align the scan start to that checkpoint, dropping any unaligned tail, so the
-        // invariant holds and the wallet-db actor never hits the assertion.
-        let checkpoint_height = BlockHeight::from(u32::from(from_state.block_height()));
-        let scanned_from = if checkpoint_height.as_u32().saturating_add(1) < scanned_from.as_u32() {
-            tracing::warn!(
-                target: "zally::sync",
-                event = "wallet_sync_realign_to_checkpoint",
-                frontier = scanned_from.as_u32().saturating_sub(1),
-                checkpoint = checkpoint_height.as_u32(),
-                "prior tree state is below the frontier; truncating to the checkpoint and re-scanning"
-            );
-            self.inner
-                .storage
-                .truncate_to_height(checkpoint_height)
-                .await
-                .map_err(WalletError::from)?;
-            BlockHeight::from(checkpoint_height.as_u32().saturating_add(1))
-        } else {
-            scanned_from
-        };
         let blocks = fetch_compact_blocks(chain, scanned_from, chain_tip).await?;
         let block_count = u64::try_from(blocks.len()).unwrap_or(u64::MAX);
         tracing::info!(
