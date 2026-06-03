@@ -34,6 +34,23 @@ use crate::wallet::Wallet;
 
 const MAX_BLOCKS_PER_SYNC: u32 = 1_000;
 
+/// Blocks to roll back below a scan-time chain divergence.
+///
+/// A continuity error (`PrevHashMismatch`) at height `H` means the wallet's block at
+/// `H - 1` sits on an orphaned fork. `truncate_to_height(T)` retains block `T`, so rolling
+/// back to `H - 1` keeps the orphan and re-triggers the same mismatch on the next tick,
+/// wedging the scan permanently. Rolling back a margin below the orphan drops it and lets a
+/// multi-block reorg re-converge in a single pass.
+const REORG_REWIND_MARGIN: u32 = 10;
+
+/// Height to truncate to after a scan-time continuity error at `at_height`.
+///
+/// Drops the orphaned block at `at_height - 1` plus a [`REORG_REWIND_MARGIN`] buffer,
+/// saturating at the genesis floor.
+fn reorg_rollback_target(at_height: BlockHeight) -> BlockHeight {
+    BlockHeight::from(at_height.as_u32().saturating_sub(1 + REORG_REWIND_MARGIN))
+}
+
 struct ScanContext {
     blocks: Vec<zcash_client_backend::proto::compact_formats::CompactBlock>,
     scanned_from: BlockHeight,
@@ -774,8 +791,12 @@ impl Wallet {
         }
     }
 
-    /// Rolls the wallet back to `at_height - 1` after the scanner reported a chain
-    /// divergence. The next sync tick re-scans from the new fully-scanned height.
+    /// Recovers from a scan-time chain divergence by rewinding below the orphaned block.
+    ///
+    /// Rolls the wallet back below `at_height - 1` by a [`REORG_REWIND_MARGIN`] safety
+    /// margin; the next sync tick re-scans from the new fully-scanned height. Rolling back
+    /// only to `at_height - 1` would retain the orphan (`truncate_to_height` keeps its
+    /// target) and re-trigger the same mismatch forever.
     ///
     /// `not_retryable` if the rewind target is below the librustzcash 100-block
     /// `COINBASE_MATURITY` cap; the operator must reset the wallet.
@@ -784,7 +805,7 @@ impl Wallet {
         at_height: BlockHeight,
         prior_reorgs: u32,
     ) -> Result<SyncOutcome, WalletError> {
-        let rollback_to = BlockHeight::from(at_height.as_u32().saturating_sub(1));
+        let rollback_to = reorg_rollback_target(at_height);
         let new_fully_scanned = self
             .inner
             .storage
@@ -1048,5 +1069,34 @@ pub(crate) async fn fetch_prior_chain_state(
             reason: format!("invalid tree state: {io}"),
         })
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{REORG_REWIND_MARGIN, reorg_rollback_target};
+    use zally_core::BlockHeight;
+
+    #[test]
+    fn reorg_rollback_drops_the_orphaned_block() {
+        // A PrevHashMismatch at H means the wallet's block at H-1 is the orphan, and
+        // truncate_to_height retains its target. The rollback target must be strictly
+        // below H-1 or the orphan survives and the scan wedges. (This guards the bug that
+        // froze a faucet wallet ~11.5k blocks behind the tip: rolling back to H-1 kept the
+        // orphaned block, so every tick re-hit the same mismatch.)
+        let at_height = BlockHeight::from(4_033_661_u32);
+        let orphan = at_height.as_u32() - 1;
+        let target = reorg_rollback_target(at_height);
+        assert!(
+            target.as_u32() < orphan,
+            "rollback target {} must drop the orphaned block {orphan}",
+            target.as_u32()
+        );
+        assert_eq!(target.as_u32(), at_height.as_u32() - 1 - REORG_REWIND_MARGIN);
+    }
+
+    #[test]
+    fn reorg_rollback_saturates_at_genesis() {
+        assert_eq!(reorg_rollback_target(BlockHeight::from(3_u32)).as_u32(), 0);
+    }
 }
 
