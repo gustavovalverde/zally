@@ -53,11 +53,6 @@ allow-git = [
     # branch reference; always pin a commit so supply-chain review has a
     # fixed artifact to evaluate.
     #
-    # core2 0.3.x was yanked from crates.io; the last published source rev is
-    # pinned in [patch.crates-io] so the equihash 0.2.2 -> core2 -> ... dep
-    # tree pulled in transitively via zebra-chain resolves cleanly. Mirrors
-    # the same pin in zinder's workspace.
-    "https://github.com/bbqsrc/core2",
     # zinder-client and zinder-core back the optional `zinder` feature on
     # zally-chain. Pulled from a pinned git revision so external consumers can
     # build Zally without a local checkout. Pin a specific commit rather than
