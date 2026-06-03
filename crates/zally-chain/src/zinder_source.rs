@@ -147,7 +147,7 @@ impl ChainSource for ZinderChainSource {
     ) -> Result<TreeState, ChainSourceError> {
         let artifact = self
             .inner
-            .tree_state_checkpoint_at_or_before(ZinderBlockHeight::new(block_height.as_u32()), None)
+            .tree_state_at(ZinderBlockHeight::new(block_height.as_u32()), None)
             .await?;
         decode_tree_state(&artifact.payload_bytes, block_height, self.network)
     }
@@ -171,6 +171,9 @@ impl ChainSource for ZinderChainSource {
             .map(|artifact| SubtreeRoot {
                 index: SubtreeIndex(artifact.subtree_index.value()),
                 root_bytes: artifact.root_hash.as_bytes(),
+                completing_block_height: BlockHeight::from(
+                    artifact.completing_block_height.value(),
+                ),
             })
             .collect())
     }

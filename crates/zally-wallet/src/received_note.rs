@@ -33,7 +33,7 @@ pub struct ShieldedReceiveRecord {
     pub mined_height: BlockHeight,
     /// Block header timestamp in milliseconds (Unix epoch), sourced from the
     /// `blocks.time` column at `mined_height`. Zero when the wallet's local blocks
-    /// table does not retain the row (e.g., truncated by `truncate_to_height`).
+    /// table does not retain the row (e.g., dropped by a reorg rewind).
     pub block_timestamp_ms: u64,
     /// `zcash_client_sqlite` marked this note as change for the receiving account.
     pub is_change: bool,

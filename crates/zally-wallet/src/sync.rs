@@ -21,10 +21,11 @@ use tokio::time::{MissedTickBehavior, interval, timeout};
 use tokio_stream::wrappers::WatchStream;
 use zally_chain::{
     BlockHeightRange, ChainEventCursor, ChainEventEnvelope, ChainEventEnvelopeStream, ChainSource,
-    ChainSourceError, ChainState, FailurePosture, ShieldedPool,
+    ChainSourceError, ChainState, FailurePosture, ShieldedPool, SubtreeIndex,
 };
 use zally_core::{BlockHeight, Network};
 use zally_storage::{ScanRequest, TransparentUtxoRow};
+use zcash_client_backend::data_api::scanning::ScanPriority;
 
 use crate::error::WalletError;
 use crate::event::WalletEvent;
@@ -32,31 +33,27 @@ use crate::retry::with_breaker_and_retry;
 use crate::status::{SyncStatus, WalletStatus};
 use crate::wallet::Wallet;
 
+/// Maximum compact blocks scanned in one `Wallet::sync` call. A suggested range larger than
+/// this is scanned across successive calls; the driver loops until the scan queue drains.
 const MAX_BLOCKS_PER_SYNC: u32 = 1_000;
 
-/// Blocks to roll back below a scan-time chain divergence.
-///
-/// A continuity error (`PrevHashMismatch`) at height `H` means the wallet's block at
-/// `H - 1` sits on an orphaned fork. `truncate_to_height(T)` retains block `T`, so rolling
-/// back to `H - 1` keeps the orphan and re-triggers the same mismatch on the next tick,
-/// wedging the scan permanently. Rolling back a margin below the orphan drops it and lets a
-/// multi-block reorg re-converge in a single pass.
-const REORG_REWIND_MARGIN: u32 = 10;
+/// Subtree-root page size for the per-cycle backfill. Zinder clamps to its own page cap.
+const SUBTREE_ROOT_PAGE: u32 = 128;
 
-/// Height to truncate to after a scan-time continuity error at `at_height`.
+/// Blocks to rewind below a scan-time continuity error before re-planning.
 ///
-/// Drops the orphaned block at `at_height - 1` plus a [`REORG_REWIND_MARGIN`] buffer,
-/// saturating at the genesis floor.
-fn reorg_rollback_target(at_height: BlockHeight) -> BlockHeight {
-    BlockHeight::from(at_height.as_u32().saturating_sub(1 + REORG_REWIND_MARGIN))
-}
+/// A `PrevHashMismatch` at height `H` means the wallet's block at `H - 1` is orphaned, so the
+/// rewind must drop it; a margin lets a multi-block reorg re-converge in one pass.
+/// [`WalletStorage::truncate_to_chain_state`] lands the wallet at exactly the rewind height
+/// (unlike a checkpoint-snapping truncation, which lands below the target and spirals), so the
+/// margin is a reorg-depth heuristic, not a correctness crutch.
+const REORG_REWIND_BLOCKS: u32 = 10;
 
 struct ScanContext {
     blocks: Vec<zcash_client_backend::proto::compact_formats::CompactBlock>,
     scanned_from: BlockHeight,
     target_height: BlockHeight,
     block_count: u64,
-    reorgs_observed: u32,
 }
 
 /// Summary of a `Wallet::sync` run.
@@ -507,7 +504,7 @@ async fn run_sync_wakeup(
                 run_state.last_sync_outcome = Some(outcome);
                 run_state.last_error = None;
                 let wallet_status = scope.wallet.status_snapshot().await?;
-                let should_continue = should_continue_syncing(outcome, &wallet_status);
+                let should_continue = should_continue_syncing(outcome);
                 publish_snapshot(
                     scope.status_tx,
                     SyncSnapshot::from_wallet_status(
@@ -588,14 +585,13 @@ async fn run_one_sync(
     }
 }
 
-fn should_continue_syncing(outcome: SyncOutcome, wallet_status: &WalletStatus) -> bool {
-    if outcome.reorgs_observed > 0 {
-        return true;
-    }
-    let Some(chain_tip_height) = wallet_status.safe_chain_tip_height else {
-        return false;
-    };
-    outcome.block_count > 0 && outcome.scanned_to_height.as_u32() < chain_tip_height.as_u32()
+/// Whether the driver should run another sync iteration in this wakeup.
+///
+/// A cycle that scanned a chunk (`block_count > 0`) or rewound a reorg
+/// (`reorgs_observed > 0`) leaves more scan-queue work; a caught-up cycle reports neither and
+/// stops the loop until the next chain event or poll.
+fn should_continue_syncing(outcome: SyncOutcome) -> bool {
+    outcome.block_count > 0 || outcome.reorgs_observed > 0
 }
 
 async fn publish_driver_snapshot(
@@ -677,16 +673,17 @@ async fn next_chain_event_envelope(
 }
 
 impl Wallet {
-    /// Advances the wallet from its last-scanned height up to `chain.chain_tip()`.
+    /// Advances the wallet by one bounded scan step toward `chain.chain_tip()`.
     ///
-    /// Scanning reaches the live chain tip so the commitment tree, note witnesses, and the
-    /// `WalletDb` chain-tip notion all agree: `zcash_client_backend` only treats a note as
-    /// spendable when its witness is anchored within a fully-scanned tip, and transaction
-    /// expiry heights are computed against that same tip. Reorg safety comes from the
-    /// spend-time confirmation depth (ZIP 315) and from in-loop rewind recovery: a
-    /// `ChainReorgDetected` from the scanner triggers `truncate_to_height(at_height - 1)`
-    /// and a re-scan on the next tick. Divergences deeper than the librustzcash 100-block
-    /// rewind cap (`COINBASE_MATURITY`) surface as `RequiresOperator`.
+    /// Each call primes commitment-tree subtree roots, calls `update_chain_tip` with the live
+    /// tip, then scans the highest-priority range `suggest_scan_ranges` returns (chunked to
+    /// [`MAX_BLOCKS_PER_SYNC`]). The `SyncDriver` loops until the scan queue drains. Subtree
+    /// roots let the wallet witness a note from its subtree root without scanning every block,
+    /// so spendability does not require a full linear scan; transaction expiry heights are
+    /// computed against the live tip. Reorg safety comes from the spend-time confirmation depth
+    /// (ZIP 315) and from in-loop recovery: a `ChainReorgDetected` triggers a precise rewind
+    /// via `truncate_to_chain_state` and a re-plan on the next tick. Divergences deeper than the
+    /// librustzcash 100-block rewind cap (`COINBASE_MATURITY`) surface as `RequiresOperator`.
     ///
     /// Fails closed on network mismatch. Emits `ScanProgress` events at the start and end of
     /// the run; per-block events are emitted by the storage scanner.
@@ -708,10 +705,6 @@ impl Wallet {
         Ok(())
     }
 
-    #[allow(
-        clippy::too_many_lines,
-        reason = "the sync loop coordinates tip queries, breaker-and-retry plumbing, reorg rewind, and three early-exit paths; splitting further obscures the control flow"
-    )]
     async fn sync_inner(&self, chain: &dyn ChainSource) -> Result<SyncOutcome, WalletError> {
         if chain.network() != self.network() {
             return Err(WalletError::NetworkMismatch {
@@ -728,58 +721,40 @@ impl Wallet {
             WalletError::from,
         )
         .await?;
-        let prior_observed_tip = self.inner.storage.find_observed_tip().await?;
-        let reorg = self.detect_tip_regress(prior_observed_tip, chain_tip);
         self.inner.storage.record_observed_tip(chain_tip).await?;
         self.inner.storage.update_chain_tip(chain_tip).await?;
 
-        let prior_fully_scanned_height = self.inner.storage.fully_scanned_height().await?;
-        let scanned_from = match prior_fully_scanned_height {
-            Some(h) => BlockHeight::from(h.as_u32().saturating_add(1)),
-            None => self
-                .inner
-                .storage
-                .wallet_birthday()
-                .await?
-                .unwrap_or_else(|| BlockHeight::from(1)),
+        // Prime commitment-tree subtree roots before planning: the wallet witnesses notes in a
+        // completed subtree from its root without scanning every block it spans, and
+        // suggest_scan_ranges needs the shard metadata to plan subtree-aligned work.
+        self.backfill_subtree_roots(chain).await?;
+
+        let Some((scan_start, scan_end, priority)) = self.next_scan_range(chain_tip).await? else {
+            let transparent_utxo_count = self.sync_transparent_utxos(chain).await?;
+            return Ok(self.emit_caught_up(chain_tip, transparent_utxo_count));
         };
         self.publish_event(WalletEvent::ScanProgress {
-            scanned_height: scanned_from,
+            scanned_height: scan_start,
             target_height: chain_tip,
         });
         tracing::info!(
             target: "zally::sync",
             event = "wallet_sync_cycle",
-            scanned_from = scanned_from.as_u32(),
+            scanned_from = scan_start.as_u32(),
+            scan_end = scan_end.as_u32(),
             chain_tip = chain_tip.as_u32(),
-            prior_fully_scanned = prior_fully_scanned_height.map_or(0, BlockHeight::as_u32),
-            "sync cycle: planning scan"
+            priority,
+            "sync cycle: scanning a suggested range chunk"
         );
 
-        if scanned_from.as_u32() > chain_tip.as_u32() {
-            tracing::warn!(
-                target: "zally::sync",
-                event = "wallet_sync_past_tip",
-                scanned_from = scanned_from.as_u32(),
-                chain_tip = chain_tip.as_u32(),
-                "scanned_from is past chain_tip; caught up without fetching"
-            );
-            let transparent_utxo_count = self.sync_transparent_utxos(chain).await?;
-            return Ok(self.emit_already_caught_up(
-                scanned_from,
-                chain_tip,
-                reorg,
-                transparent_utxo_count,
-            ));
-        }
-        let from_state = fetch_prior_chain_state(chain, scanned_from).await?;
-        let blocks = fetch_compact_blocks(chain, scanned_from, chain_tip).await?;
+        let from_state = fetch_prior_chain_state(chain, scan_start).await?;
+        let blocks = fetch_compact_blocks(chain, scan_start, scan_end).await?;
         let block_count = u64::try_from(blocks.len()).unwrap_or(u64::MAX);
         tracing::info!(
             target: "zally::sync",
             event = "wallet_sync_fetched",
-            scanned_from = scanned_from.as_u32(),
-            chain_tip = chain_tip.as_u32(),
+            scanned_from = scan_start.as_u32(),
+            scan_end = scan_end.as_u32(),
             block_count,
             "fetched compact blocks for scan"
         );
@@ -787,26 +762,21 @@ impl Wallet {
             tracing::warn!(
                 target: "zally::sync",
                 event = "wallet_sync_empty_fetch",
-                scanned_from = scanned_from.as_u32(),
-                chain_tip = chain_tip.as_u32(),
-                "compact-block fetch returned no blocks below the tip; caught up"
+                scanned_from = scan_start.as_u32(),
+                scan_end = scan_end.as_u32(),
+                "suggested-range fetch returned no blocks"
             );
             let transparent_utxo_count = self.sync_transparent_utxos(chain).await?;
-            return Ok(self.emit_already_caught_up(
-                scanned_from,
-                chain_tip,
-                reorg,
-                transparent_utxo_count,
-            ));
+            return Ok(self.emit_caught_up(chain_tip, transparent_utxo_count));
         }
+
         match self
             .scan_and_emit(
                 ScanContext {
                     blocks,
-                    scanned_from,
+                    scanned_from: scan_start,
                     target_height: chain_tip,
                     block_count,
-                    reorgs_observed: reorg,
                 },
                 from_state,
                 chain,
@@ -816,87 +786,140 @@ impl Wallet {
             Ok(outcome) => Ok(outcome),
             Err(WalletError::Storage(zally_storage::StorageError::ChainReorgDetected {
                 at_height,
-            })) => self.recover_from_reorg(at_height, reorg).await,
+            })) => self.recover_from_reorg(chain, at_height).await,
             Err(other) => Err(other),
         }
     }
 
-    /// Recovers from a scan-time chain divergence by rewinding below the orphaned block.
+    /// Returns the highest-priority suggested scan range that lies at or below `chain_tip`,
+    /// chunked to at most [`MAX_BLOCKS_PER_SYNC`] blocks, as `(start, end_inclusive,
+    /// priority_label)`. `None` when nothing at or below the tip remains to scan.
     ///
-    /// Rolls the wallet back below `at_height - 1` by a [`REORG_REWIND_MARGIN`] safety
-    /// margin; the next sync tick re-scans from the new fully-scanned height. Rolling back
-    /// only to `at_height - 1` would retain the orphan (`truncate_to_height` keeps its
-    /// target) and re-trigger the same mismatch forever.
+    /// Ranges are clamped to `chain_tip`: a suggested range can start above the tip when the
+    /// wallet birthday is ahead of the chain (the chain has not reached it yet), and a range
+    /// can extend past the tip if the queue was planned against a higher tip; neither is
+    /// fetchable, so both are skipped or trimmed.
+    async fn next_scan_range(
+        &self,
+        chain_tip: BlockHeight,
+    ) -> Result<Option<(BlockHeight, BlockHeight, &'static str)>, WalletError> {
+        let tip = chain_tip.as_u32();
+        for range in self.inner.storage.suggest_scan_ranges().await? {
+            if range.is_empty() {
+                continue;
+            }
+            let block_range = range.block_range();
+            let start = u32::from(block_range.start);
+            if start > tip {
+                continue;
+            }
+            let end_inclusive = u32::from(block_range.end).saturating_sub(1).min(tip);
+            let chunk_end = start
+                .saturating_add(MAX_BLOCKS_PER_SYNC.saturating_sub(1))
+                .min(end_inclusive);
+            return Ok(Some((
+                BlockHeight::from(start),
+                BlockHeight::from(chunk_end),
+                scan_priority_label(range.priority()),
+            )));
+        }
+        Ok(None)
+    }
+
+    /// Fetches and records every new subtree root for both shielded pools.
+    ///
+    /// Idempotent: re-recording a root the wallet already holds is a no-op, so this runs from
+    /// index 0 each cycle and stops at the first short page.
+    async fn backfill_subtree_roots(&self, chain: &dyn ChainSource) -> Result<(), WalletError> {
+        for (pool, protocol) in [
+            (ShieldedPool::Sapling, zcash_protocol::ShieldedProtocol::Sapling),
+            (ShieldedPool::Orchard, zcash_protocol::ShieldedProtocol::Orchard),
+        ] {
+            let mut next_index = 0_u32;
+            loop {
+                let policy = self.retry_policy();
+                let roots = with_breaker_and_retry(
+                    &self.inner.circuit_breaker,
+                    policy,
+                    "sync.subtree_roots",
+                    || chain.subtree_roots(pool, SubtreeIndex(next_index), SUBTREE_ROOT_PAGE),
+                    WalletError::from,
+                )
+                .await?;
+                let (Some(first), Some(last)) = (roots.first(), roots.last()) else {
+                    break;
+                };
+                let start_index = u64::from(first.index.0);
+                let last_index = last.index.0;
+                let page_len = roots.len();
+                let entries: Vec<(BlockHeight, [u8; 32])> = roots
+                    .into_iter()
+                    .map(|root| (root.completing_block_height, root.root_bytes))
+                    .collect();
+                self.inner
+                    .storage
+                    .put_subtree_roots(protocol, start_index, entries)
+                    .await?;
+                if page_len < SUBTREE_ROOT_PAGE as usize {
+                    break;
+                }
+                next_index = last_index.saturating_add(1);
+            }
+        }
+        Ok(())
+    }
+
+    /// Recovers from a scan-time chain divergence by rewinding to the exact prior chain state.
+    ///
+    /// Fetches the chain state at `at_height - REORG_REWIND_BLOCKS` from the chain source and
+    /// truncates the wallet precisely to it (via [`WalletStorage::truncate_to_chain_state`]),
+    /// then returns an outcome that re-triggers a sync tick so `suggest_scan_ranges` re-plans
+    /// from the rewound frontier.
     ///
     /// `not_retryable` if the rewind target is below the librustzcash 100-block
     /// `COINBASE_MATURITY` cap; the operator must reset the wallet.
     async fn recover_from_reorg(
         &self,
+        chain: &dyn ChainSource,
         at_height: BlockHeight,
-        prior_reorgs: u32,
     ) -> Result<SyncOutcome, WalletError> {
-        let rollback_to = reorg_rollback_target(at_height);
+        let rewind_to = BlockHeight::from(at_height.as_u32().saturating_sub(REORG_REWIND_BLOCKS));
         tracing::warn!(
             target: "zally::sync",
             event = "wallet_sync_reorg_recover",
             at_height = at_height.as_u32(),
-            rollback_to = rollback_to.as_u32(),
-            "scan-time reorg detected; rewinding below the orphaned block"
+            rewind_to = rewind_to.as_u32(),
+            "scan-time reorg detected; rewinding to the exact prior chain state"
         );
-        let new_fully_scanned = self
-            .inner
+        let chain_state = chain_state_at(chain, rewind_to).await?;
+        self.inner
             .storage
-            .truncate_to_height(rollback_to)
-            .await
-            .map_err(WalletError::from)?;
+            .truncate_to_chain_state(chain_state)
+            .await?;
         self.publish_event(WalletEvent::ReorgDetected {
-            rolled_back_to_height: new_fully_scanned,
-            new_safe_chain_tip_height: new_fully_scanned,
+            rolled_back_to_height: rewind_to,
+            new_safe_chain_tip_height: rewind_to,
         });
         Ok(SyncOutcome {
-            scanned_from_height: new_fully_scanned,
-            scanned_to_height: new_fully_scanned,
+            scanned_from_height: rewind_to,
+            scanned_to_height: rewind_to,
             block_count: 0,
             transparent_utxo_count: 0,
-            reorgs_observed: prior_reorgs.saturating_add(1),
+            reorgs_observed: 1,
         })
     }
 
-    fn detect_tip_regress(
-        &self,
-        prior_observed_tip: Option<BlockHeight>,
-        new_safe_chain_tip_height: BlockHeight,
-    ) -> u32 {
-        let Some(prior) = prior_observed_tip else {
-            return 0;
-        };
-        if new_safe_chain_tip_height.as_u32() >= prior.as_u32() {
-            return 0;
-        }
-        self.publish_event(WalletEvent::ReorgDetected {
-            rolled_back_to_height: new_safe_chain_tip_height,
-            new_safe_chain_tip_height,
-        });
-        1
-    }
-
-    fn emit_already_caught_up(
-        &self,
-        scanned_from: BlockHeight,
-        target_height: BlockHeight,
-        reorgs_observed: u32,
-        transparent_utxo_count: u64,
-    ) -> SyncOutcome {
+    fn emit_caught_up(&self, target_height: BlockHeight, transparent_utxo_count: u64) -> SyncOutcome {
         self.publish_event(WalletEvent::ScanProgress {
             scanned_height: target_height,
             target_height,
         });
         SyncOutcome {
-            scanned_from_height: scanned_from,
+            scanned_from_height: target_height,
             scanned_to_height: target_height,
             block_count: 0,
             transparent_utxo_count,
-            reorgs_observed,
+            reorgs_observed: 0,
         }
     }
 
@@ -911,16 +934,13 @@ impl Wallet {
             scanned_from,
             target_height,
             block_count,
-            reorgs_observed,
         } = context;
         let timestamps_by_height = block_timestamp_index(&blocks);
         let outcome = self
             .inner
             .storage
             .scan_blocks(ScanRequest::new(blocks, scanned_from, from_state))
-            .await
-            .map_err(WalletError::from)?;
-        let _ = reorgs_observed;
+            .await?;
 
         let newly_confirmed = self
             .inner
@@ -974,7 +994,7 @@ impl Wallet {
             scanned_to_height: outcome.scanned_to_height,
             block_count,
             transparent_utxo_count,
-            reorgs_observed,
+            reorgs_observed: 0,
         })
     }
 
@@ -1068,18 +1088,26 @@ const fn shielded_pool_for(protocol: zcash_protocol::ShieldedProtocol) -> Shield
     }
 }
 
+const fn scan_priority_label(priority: ScanPriority) -> &'static str {
+    match priority {
+        ScanPriority::Ignored => "ignored",
+        ScanPriority::Scanned => "scanned",
+        ScanPriority::Historic => "historic",
+        ScanPriority::OpenAdjacent => "open_adjacent",
+        ScanPriority::FoundNote => "found_note",
+        ScanPriority::ChainTip => "chain_tip",
+        ScanPriority::Verify => "verify",
+    }
+}
+
 async fn fetch_compact_blocks(
     chain: &dyn ChainSource,
-    scanned_from: BlockHeight,
-    target_height: BlockHeight,
+    start_height: BlockHeight,
+    end_height: BlockHeight,
 ) -> Result<Vec<zcash_client_backend::proto::compact_formats::CompactBlock>, WalletError> {
-    let span_end = scanned_from
-        .as_u32()
-        .saturating_add(MAX_BLOCKS_PER_SYNC.saturating_sub(1))
-        .min(target_height.as_u32());
     let range = BlockHeightRange {
-        start_height: scanned_from,
-        end_height: BlockHeight::from(span_end),
+        start_height,
+        end_height,
     };
     let mut stream = chain.compact_blocks(range).await?;
     let mut blocks = Vec::new();
@@ -1089,51 +1117,35 @@ async fn fetch_compact_blocks(
     Ok(blocks)
 }
 
-/// Fetches the `ChainState` anchor immediately below `at_height`.
+/// Fetches the `ChainState` at exactly `height` (the note-commitment frontier after `height`).
 ///
-/// Shared by `sync_inner` (for resume) and the wallet builder (for
-/// birthday). Returns a [`ChainSourceError::MalformedCompactBlock`] when
-/// the tree-state bytes cannot be decoded.
-pub(crate) async fn fetch_prior_chain_state(
+/// Returns a [`ChainSourceError::MalformedCompactBlock`] when the tree-state bytes cannot be
+/// decoded.
+pub(crate) async fn chain_state_at(
     chain: &dyn ChainSource,
-    at_height: BlockHeight,
+    height: BlockHeight,
 ) -> Result<ChainState, WalletError> {
-    let prior_height = BlockHeight::from(at_height.as_u32().saturating_sub(1));
-    let tree_state = chain.tree_state_at(prior_height).await?;
+    let tree_state = chain.tree_state_at(height).await?;
     tree_state.to_chain_state().map_err(|io| {
         WalletError::ChainSource(ChainSourceError::MalformedCompactBlock {
-            block_height: prior_height,
+            block_height: height,
             reason: format!("invalid tree state: {io}"),
         })
     })
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{REORG_REWIND_MARGIN, reorg_rollback_target};
-    use zally_core::BlockHeight;
-
-    #[test]
-    fn reorg_rollback_drops_the_orphaned_block() {
-        // A PrevHashMismatch at H means the wallet's block at H-1 is the orphan, and
-        // truncate_to_height retains its target. The rollback target must be strictly
-        // below H-1 or the orphan survives and the scan wedges. (This guards the bug that
-        // froze a faucet wallet ~11.5k blocks behind the tip: rolling back to H-1 kept the
-        // orphaned block, so every tick re-hit the same mismatch.)
-        let at_height = BlockHeight::from(4_033_661_u32);
-        let orphan = at_height.as_u32() - 1;
-        let target = reorg_rollback_target(at_height);
-        assert!(
-            target.as_u32() < orphan,
-            "rollback target {} must drop the orphaned block {orphan}",
-            target.as_u32()
-        );
-        assert_eq!(target.as_u32(), at_height.as_u32() - 1 - REORG_REWIND_MARGIN);
-    }
-
-    #[test]
-    fn reorg_rollback_saturates_at_genesis() {
-        assert_eq!(reorg_rollback_target(BlockHeight::from(3_u32)).as_u32(), 0);
-    }
+/// Fetches the `ChainState` anchor immediately below `at_height`.
+///
+/// Shared by `sync_inner` (the `from_state` for a scan range) and the wallet builder (for
+/// birthday). The chain source serves the tree state at the exact prior height.
+pub(crate) async fn fetch_prior_chain_state(
+    chain: &dyn ChainSource,
+    at_height: BlockHeight,
+) -> Result<ChainState, WalletError> {
+    chain_state_at(
+        chain,
+        BlockHeight::from(at_height.as_u32().saturating_sub(1)),
+    )
+    .await
 }
 

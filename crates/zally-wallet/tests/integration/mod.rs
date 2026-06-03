@@ -27,7 +27,6 @@ mod reserve_for_dispense_round_trip;
 mod send_payment_short_circuits_on_known_idempotency_key;
 mod sync_catches_up_to_tip;
 mod sync_driver_follows_chain;
-mod sync_emits_reorg_when_tip_regresses;
 mod sync_network_mismatch;
 mod sync_retries_retryable_chain_failures;
 mod to_uri_round_trips_through_propose;

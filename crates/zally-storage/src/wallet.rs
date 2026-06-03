@@ -20,8 +20,10 @@ pub enum StorageKind {
 }
 use zally_keys::SeedMaterial;
 use zcash_client_backend::data_api::chain::ChainState;
+use zcash_client_backend::data_api::scanning::ScanRange;
 use zcash_client_backend::proto::compact_formats::CompactBlock;
 use zcash_keys::address::UnifiedAddress;
+use zcash_protocol::ShieldedProtocol;
 
 use crate::account_balance_row::AccountBalanceRow;
 use crate::dispense_reservation_row::{DispenseReservationRow, DispenseReservedNote};
@@ -470,6 +472,27 @@ pub trait WalletStorage: Send + Sync + 'static {
     /// `not_retryable` on malformed blocks or chain-state mismatch; `retryable` on transient I/O.
     async fn scan_blocks(&self, request: ScanRequest) -> Result<ScanResult, StorageError>;
 
+    /// Returns the scan ranges the wallet wants scanned, highest priority first.
+    ///
+    /// Wraps `WalletRead::suggest_scan_ranges`. A `Verify`-priority range, when present, is
+    /// always first; it must be scanned before any other range to catch reorgs. The ranges
+    /// are aligned to commitment-tree subtree boundaries, so the chain state for
+    /// `range.start - 1` is always available at a real frontier.
+    async fn suggest_scan_ranges(&self) -> Result<Vec<ScanRange>, StorageError>;
+
+    /// Records commitment-tree subtree roots for `pool`, starting at subtree index
+    /// `start_index`. Each entry is `(subtree_end_height, 32-byte root hash)`.
+    ///
+    /// Wraps `WalletCommitmentTrees::put_{sapling,orchard}_subtree_roots`. Priming these is
+    /// what lets the wallet witness notes in a subtree without scanning every block it spans,
+    /// and is a prerequisite for `suggest_scan_ranges` to plan subtree-aligned work.
+    async fn put_subtree_roots(
+        &self,
+        pool: ShieldedProtocol,
+        start_index: u64,
+        roots: Vec<(BlockHeight, [u8; 32])>,
+    ) -> Result<(), StorageError>;
+
     /// Returns the height the wallet has been fully scanned to, or `None` for a fresh wallet.
     async fn fully_scanned_height(&self) -> Result<Option<BlockHeight>, StorageError>;
 
@@ -732,21 +755,22 @@ pub trait WalletStorage: Send + Sync + 'static {
         account_id: AccountId,
     ) -> Result<AccountBalanceRow, StorageError>;
 
-    /// Rolls the wallet back so that no scanned block above `max_height` is retained.
-    /// Returns the new fully-scanned height after truncation.
+    /// Truncates the wallet precisely to the supplied chain state, inserting that frontier
+    /// as a checkpoint at its exact height and rewinding to it.
     ///
-    /// The librustzcash backend bounds the depth of a valid rewind at the
-    /// `COINBASE_MATURITY` window (100 blocks): `max_height` must be at or above
-    /// `fully_scanned_height - 99`. Calls with a deeper target fail `NotRetryable`; the
-    /// caller surfaces this to the operator. The sync loop scans to the live chain tip and
-    /// catches [`StorageError::ChainReorgDetected`] (`Retryable`) to call this method with
-    /// `max_height = at_height - 1`, then re-runs sync.
+    /// Wraps `WalletWrite::truncate_to_chain_state`. It lands the wallet at exactly
+    /// `chain_state.block_height()` (rather than snapping down to the nearest existing wallet
+    /// checkpoint), so reorg recovery does not re-open a gap below the rewind target. The
+    /// caller fetches the chain state for the rewind height from the chain source. The
+    /// librustzcash backend bounds a valid rewind at the `COINBASE_MATURITY` window (100
+    /// blocks); a deeper target fails `NotRetryable` and the caller surfaces it to the
+    /// operator.
     ///
     /// `not_retryable` on schema errors; `retryable` on transient I/O.
-    async fn truncate_to_height(
+    async fn truncate_to_chain_state(
         &self,
-        max_height: BlockHeight,
-    ) -> Result<BlockHeight, StorageError>;
+        chain_state: ChainState,
+    ) -> Result<(), StorageError>;
 
     /// Returns every Sapling and Orchard note received in the inclusive height range
     /// `[from_height, to_height]`, regardless of current spent state.

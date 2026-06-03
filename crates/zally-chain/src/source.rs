@@ -65,6 +65,10 @@ pub struct SubtreeRoot {
     pub index: SubtreeIndex,
     /// 32-byte digest of the subtree's root.
     pub root_bytes: [u8; 32],
+    /// Height of the block that completed this subtree. `put_*_subtree_roots`
+    /// records it as the shard checkpoint, so a wallet can witness notes in the
+    /// subtree without scanning every block it spans.
+    pub completing_block_height: BlockHeight,
 }
 
 /// A spendable transparent UTXO at the source's current tip.

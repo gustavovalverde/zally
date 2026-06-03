@@ -23,11 +23,14 @@ use zally_core::{
     ReservationId, TransparentGapLimit, TxId, Zatoshis,
 };
 use zally_keys::{KeyDerivationError, SeedMaterial, derive_ufvk};
-use zcash_client_backend::data_api::chain::ChainState;
+use zcash_client_backend::data_api::chain::{ChainState, CommitmentTreeRoot};
+use zcash_client_backend::data_api::scanning::ScanRange;
 use zcash_client_backend::data_api::wallet::{
     ConfirmationsPolicy, SpendingKeys, input_selection::GreedyInputSelector,
 };
-use zcash_client_backend::data_api::{Account, AccountBirthday, WalletRead, WalletWrite};
+use zcash_client_backend::data_api::{
+    Account, AccountBirthday, WalletCommitmentTrees, WalletRead, WalletWrite,
+};
 use zcash_client_backend::fees::{DustOutputPolicy, StandardFeeRule, standard};
 use zcash_client_backend::wallet::{NoteId, WalletTransparentOutput};
 use zcash_client_sqlite::AccountUuid;
@@ -37,6 +40,8 @@ use zcash_client_sqlite::wallet::init::WalletMigrator;
 use zcash_keys::address::UnifiedAddress;
 use zcash_keys::keys::UnifiedAddressRequest;
 use zcash_keys::keys::transparent::gap_limits::GapLimits;
+use orchard::tree::MerkleHashOrchard;
+use sapling::Node as SaplingNode;
 use zcash_protocol::ShieldedProtocol;
 use zcash_protocol::memo::Memo;
 use zcash_protocol::value::Zatoshis as UpstreamZatoshis;
@@ -534,18 +539,78 @@ impl WalletStorage for Sqlite {
         .await
     }
 
-    async fn truncate_to_height(
+    async fn suggest_scan_ranges(&self) -> Result<Vec<ScanRange>, StorageError> {
+        self.with_db(move |db| {
+            WalletRead::suggest_scan_ranges(db).map_err(|err| StorageError::SqliteFailed {
+                reason: format!("suggest_scan_ranges failed: {err}"),
+                posture: FailurePosture::NotRetryable,
+            })
+        })
+        .await
+    }
+
+    async fn put_subtree_roots(
         &self,
-        max_height: BlockHeight,
-    ) -> Result<BlockHeight, StorageError> {
-        let target = zcash_protocol::consensus::BlockHeight::from(max_height.as_u32());
+        pool: ShieldedProtocol,
+        start_index: u64,
+        roots: Vec<(BlockHeight, [u8; 32])>,
+    ) -> Result<(), StorageError> {
+        self.with_db_mut(move |db| match pool {
+            ShieldedProtocol::Sapling => {
+                let typed = roots
+                    .into_iter()
+                    .map(|(height, bytes)| {
+                        let node = SaplingNode::from_bytes(bytes).into_option().ok_or_else(|| {
+                            StorageError::SqliteFailed {
+                                reason: "invalid sapling subtree root hash".to_owned(),
+                                posture: FailurePosture::NotRetryable,
+                            }
+                        })?;
+                        let end = zcash_protocol::consensus::BlockHeight::from(height.as_u32());
+                        Ok(CommitmentTreeRoot::from_parts(end, node))
+                    })
+                    .collect::<Result<Vec<_>, StorageError>>()?;
+                db.put_sapling_subtree_roots(start_index, &typed)
+                    .map_err(|err| StorageError::SqliteFailed {
+                        reason: format!("put_sapling_subtree_roots failed: {err}"),
+                        posture: FailurePosture::NotRetryable,
+                    })
+            }
+            ShieldedProtocol::Orchard => {
+                let typed = roots
+                    .into_iter()
+                    .map(|(height, bytes)| {
+                        let node = MerkleHashOrchard::from_bytes(&bytes).into_option().ok_or_else(
+                            || StorageError::SqliteFailed {
+                                reason: "invalid orchard subtree root hash".to_owned(),
+                                posture: FailurePosture::NotRetryable,
+                            },
+                        )?;
+                        let end = zcash_protocol::consensus::BlockHeight::from(height.as_u32());
+                        Ok(CommitmentTreeRoot::from_parts(end, node))
+                    })
+                    .collect::<Result<Vec<_>, StorageError>>()?;
+                db.put_orchard_subtree_roots(start_index, &typed)
+                    .map_err(|err| StorageError::SqliteFailed {
+                        reason: format!("put_orchard_subtree_roots failed: {err}"),
+                        posture: FailurePosture::NotRetryable,
+                    })
+            }
+        })
+        .await
+    }
+
+    async fn truncate_to_chain_state(
+        &self,
+        chain_state: ChainState,
+    ) -> Result<(), StorageError> {
         self.with_db_mut(move |db| {
-            zcash_client_backend::data_api::WalletWrite::truncate_to_height(db, target)
-                .map(|new_height| BlockHeight::from(u32::from(new_height)))
-                .map_err(|err| StorageError::SqliteFailed {
-                    reason: format!("truncate_to_height failed: {err}"),
+            WalletWrite::truncate_to_chain_state(db, chain_state).map_err(|err| {
+                StorageError::SqliteFailed {
+                    reason: format!("truncate_to_chain_state failed: {err}"),
                     posture: FailurePosture::NotRetryable,
-                })
+                }
+            })
         })
         .await
     }
