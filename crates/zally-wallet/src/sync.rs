@@ -1023,16 +1023,17 @@ impl Wallet {
         })
     }
 
-    /// Diagnostic: checks the wallet's commitment-tree roots at `height` against the chain's
-    /// tree state at the same height.
+    /// Diagnostic: checks the wallet's full note-commitment tree roots against the chain's tree
+    /// state at the just-scanned `height`.
     ///
     /// A mismatch proves the wallet assembled a corrupt note-commitment tree, which the network
     /// rejects at spend time as an invalid shielded proof; a match clears the tree as the
-    /// suspect and points at the proving inputs instead. Both sides decode roots little-endian,
-    /// so the comparison is exact. Best-effort: any read or fetch failure is logged and
-    /// swallowed so the check never fails a sync.
+    /// suspect and points at the proving inputs instead. The wallet roots cover every appended
+    /// leaf, so when the wallet is caught up they correspond to exactly `height`. Both sides
+    /// decode roots little-endian, so the comparison is exact. Best-effort: any read or fetch
+    /// failure is logged and swallowed so the check never fails a sync.
     async fn verify_tree_roots(&self, chain: &dyn ChainSource, height: BlockHeight) {
-        let wallet_roots = match self.inner.storage.commitment_tree_roots_at(height).await {
+        let wallet_roots = match self.inner.storage.commitment_tree_roots().await {
             Ok(roots) => roots,
             Err(err) => {
                 tracing::warn!(
@@ -1068,7 +1069,7 @@ impl Wallet {
                 target: "zally::sync",
                 event = "wallet_tree_root_check_skipped",
                 height = height.as_u32(),
-                "wallet holds no commitment-tree checkpoint at the scanned height"
+                "wallet commitment trees are empty"
             ),
             _ if sapling_match != Some(false) && orchard_match != Some(false) => tracing::info!(
                 target: "zally::sync",

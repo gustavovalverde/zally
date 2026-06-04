@@ -511,17 +511,15 @@ pub trait WalletStorage: Send + Sync + 'static {
     /// Returns the height the wallet has been fully scanned to, or `None` for a fresh wallet.
     async fn fully_scanned_height(&self) -> Result<Option<BlockHeight>, StorageError>;
 
-    /// Computes the wallet's Sapling and Orchard note-commitment tree roots at the checkpoint
-    /// recorded for `height`.
+    /// Computes the wallet's current Sapling and Orchard note-commitment tree roots over every
+    /// leaf the wallet has appended.
     ///
     /// Wraps `WalletCommitmentTrees::with_{sapling,orchard}_tree_mut` plus
-    /// `ShardTree::root_at_checkpoint_id`. Compare the result against the chain's tree-state
-    /// root at the same height: a mismatch means the wallet assembled a corrupt commitment
-    /// tree, which the network rejects at spend time as an invalid shielded proof.
-    async fn commitment_tree_roots_at(
-        &self,
-        height: BlockHeight,
-    ) -> Result<CommitmentTreeRoots, StorageError>;
+    /// `ShardTree::root_at_checkpoint_depth(None)`, which needs no checkpoint (the scanner does
+    /// not retain a checkpoint at every height). After the wallet scans up to height `H`, these
+    /// roots equal the chain's tree-state root at `H` if and only if the wallet assembled the
+    /// tree correctly; a mismatch means a corrupt tree and a bad spend anchor.
+    async fn commitment_tree_roots(&self) -> Result<CommitmentTreeRoots, StorageError>;
 
     /// Returns the wallet's birthday height, the earliest block the operator-configured
     /// account expects to receive funds at. `Wallet::sync` starts from this height on a
