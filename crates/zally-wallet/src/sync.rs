@@ -1008,6 +1008,8 @@ impl Wallet {
 
         let transparent_utxo_count = self.sync_transparent_utxos(chain).await?;
 
+        self.verify_tree_roots(chain, outcome.scanned_to_height).await;
+
         self.publish_event(WalletEvent::ScanProgress {
             scanned_height: outcome.scanned_to_height,
             target_height,
@@ -1019,6 +1021,78 @@ impl Wallet {
             transparent_utxo_count,
             reorgs_observed: 0,
         })
+    }
+
+    /// Diagnostic: checks the wallet's commitment-tree roots at `height` against the chain's
+    /// tree state at the same height.
+    ///
+    /// A mismatch proves the wallet assembled a corrupt note-commitment tree, which the network
+    /// rejects at spend time as an invalid shielded proof; a match clears the tree as the
+    /// suspect and points at the proving inputs instead. Both sides decode roots little-endian,
+    /// so the comparison is exact. Best-effort: any read or fetch failure is logged and
+    /// swallowed so the check never fails a sync.
+    async fn verify_tree_roots(&self, chain: &dyn ChainSource, height: BlockHeight) {
+        let wallet_roots = match self.inner.storage.commitment_tree_roots_at(height).await {
+            Ok(roots) => roots,
+            Err(err) => {
+                tracing::warn!(
+                    target: "zally::sync",
+                    event = "wallet_tree_root_check_skipped",
+                    height = height.as_u32(),
+                    error = %err,
+                    "could not read wallet commitment-tree roots"
+                );
+                return;
+            }
+        };
+        let chain_state = match chain_state_at(chain, height).await {
+            Ok(state) => state,
+            Err(err) => {
+                tracing::warn!(
+                    target: "zally::sync",
+                    event = "wallet_tree_root_check_skipped",
+                    height = height.as_u32(),
+                    error = %err,
+                    "could not fetch chain tree state for root check"
+                );
+                return;
+            }
+        };
+        let chain_sapling = chain_state.final_sapling_tree().root().to_bytes();
+        let chain_orchard = chain_state.final_orchard_tree().root().to_bytes();
+        let sapling_match = wallet_roots.sapling.map(|root| root == chain_sapling);
+        let orchard_match = wallet_roots.orchard.map(|root| root == chain_orchard);
+
+        match (sapling_match, orchard_match) {
+            (None, None) => tracing::warn!(
+                target: "zally::sync",
+                event = "wallet_tree_root_check_skipped",
+                height = height.as_u32(),
+                "wallet holds no commitment-tree checkpoint at the scanned height"
+            ),
+            _ if sapling_match != Some(false) && orchard_match != Some(false) => tracing::info!(
+                target: "zally::sync",
+                event = "wallet_tree_root_check",
+                height = height.as_u32(),
+                result = "match",
+                sapling_checked = sapling_match.is_some(),
+                orchard_checked = orchard_match.is_some(),
+                "wallet commitment-tree roots agree with the chain"
+            ),
+            _ => tracing::warn!(
+                target: "zally::sync",
+                event = "wallet_tree_root_check",
+                height = height.as_u32(),
+                result = "mismatch",
+                sapling_match = ?sapling_match,
+                orchard_match = ?orchard_match,
+                wallet_sapling = %wallet_roots.sapling.map_or_else(String::new, hex::encode),
+                chain_sapling = %hex::encode(chain_sapling),
+                wallet_orchard = %wallet_roots.orchard.map_or_else(String::new, hex::encode),
+                chain_orchard = %hex::encode(chain_orchard),
+                "wallet commitment-tree roots diverge from the chain; spends will be rejected"
+            ),
+        }
     }
 
     async fn retire_pending_broadcasts_for_mined(

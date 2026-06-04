@@ -16,7 +16,8 @@ pub use exposed_address_row::ExposedAddressRow;
 pub use pending_broadcast_input_row::PendingBroadcastInputRow;
 pub use sqlite::{Sqlite, SqliteOptions};
 pub use wallet::{
-    DispenseReservationRecord, PendingBroadcastRecord, PreparedTransaction, ProposalPaymentRequest,
-    ProposalSummary, ReceivedShieldedNoteRow, ScanRequest, ScanResult, ShieldTransparentRequest,
-    StorageKind, TransparentReceiverRow, TransparentUtxoRow, UnspentShieldedNoteRow, WalletStorage,
+    CommitmentTreeRoots, DispenseReservationRecord, PendingBroadcastRecord, PreparedTransaction,
+    ProposalPaymentRequest, ProposalSummary, ReceivedShieldedNoteRow, ScanRequest, ScanResult,
+    ShieldTransparentRequest, StorageKind, TransparentReceiverRow, TransparentUtxoRow,
+    UnspentShieldedNoteRow, WalletStorage,
 };

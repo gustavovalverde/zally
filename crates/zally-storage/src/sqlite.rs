@@ -640,6 +640,31 @@ impl WalletStorage for Sqlite {
         .await
     }
 
+    async fn commitment_tree_roots_at(
+        &self,
+        height: BlockHeight,
+    ) -> Result<crate::wallet::CommitmentTreeRoots, StorageError> {
+        let checkpoint = zcash_protocol::consensus::BlockHeight::from(height.as_u32());
+        self.with_db_mut(move |db| {
+            let sapling = db
+                .with_sapling_tree_mut(|tree| tree.root_at_checkpoint_id(&checkpoint))
+                .map_err(|err| StorageError::SqliteFailed {
+                    reason: format!("sapling root_at_checkpoint_id failed: {err}"),
+                    posture: FailurePosture::NotRetryable,
+                })?
+                .map(|node| node.to_bytes());
+            let orchard = db
+                .with_orchard_tree_mut(|tree| tree.root_at_checkpoint_id(&checkpoint))
+                .map_err(|err| StorageError::SqliteFailed {
+                    reason: format!("orchard root_at_checkpoint_id failed: {err}"),
+                    posture: FailurePosture::NotRetryable,
+                })?
+                .map(|node| node.to_bytes());
+            Ok(crate::wallet::CommitmentTreeRoots { sapling, orchard })
+        })
+        .await
+    }
+
     async fn wallet_birthday(&self) -> Result<Option<BlockHeight>, StorageError> {
         self.with_db(move |db| {
             let height = zcash_client_backend::data_api::WalletRead::get_wallet_birthday(db)

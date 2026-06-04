@@ -72,6 +72,21 @@ pub struct ScanResult {
     pub block_count: u64,
 }
 
+/// Wallet note-commitment tree roots at a checkpoint height.
+///
+/// Each field is `None` when the wallet holds no checkpoint at the requested height (the
+/// scanner prunes old checkpoints). Compare these against the chain's tree-state root at the
+/// same height to detect commitment-tree corruption, which surfaces downstream as shielded
+/// proofs the network rejects.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub struct CommitmentTreeRoots {
+    /// Sapling note-commitment tree root, little-endian, or `None` if no checkpoint matches.
+    pub sapling: Option<[u8; 32]>,
+    /// Orchard note-commitment tree root, little-endian, or `None` if no checkpoint matches.
+    pub orchard: Option<[u8; 32]>,
+}
+
 /// Request body for [`WalletStorage::propose_payment`].
 ///
 /// Wraps `zcash_client_backend::data_api::wallet::propose_standard_transfer_to_address` so
@@ -495,6 +510,18 @@ pub trait WalletStorage: Send + Sync + 'static {
 
     /// Returns the height the wallet has been fully scanned to, or `None` for a fresh wallet.
     async fn fully_scanned_height(&self) -> Result<Option<BlockHeight>, StorageError>;
+
+    /// Computes the wallet's Sapling and Orchard note-commitment tree roots at the checkpoint
+    /// recorded for `height`.
+    ///
+    /// Wraps `WalletCommitmentTrees::with_{sapling,orchard}_tree_mut` plus
+    /// `ShardTree::root_at_checkpoint_id`. Compare the result against the chain's tree-state
+    /// root at the same height: a mismatch means the wallet assembled a corrupt commitment
+    /// tree, which the network rejects at spend time as an invalid shielded proof.
+    async fn commitment_tree_roots_at(
+        &self,
+        height: BlockHeight,
+    ) -> Result<CommitmentTreeRoots, StorageError>;
 
     /// Returns the wallet's birthday height, the earliest block the operator-configured
     /// account expects to receive funds at. `Wallet::sync` starts from this height on a
