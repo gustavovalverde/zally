@@ -722,14 +722,10 @@ impl Wallet {
         )
         .await?;
         self.inner.storage.record_observed_tip(chain_tip).await?;
-        self.inner.storage.update_chain_tip(chain_tip).await?;
 
-        // Prime commitment-tree subtree roots before planning: the wallet witnesses notes in a
-        // completed subtree from its root without scanning every block it spans, and
-        // suggest_scan_ranges needs the shard metadata to plan subtree-aligned work.
-        self.backfill_subtree_roots(chain).await?;
-
-        let Some((scan_start, scan_end, priority)) = self.next_scan_range(chain_tip).await? else {
+        let Some((scan_start, scan_end, priority)) =
+            self.plan_scan_range(chain, chain_tip).await?
+        else {
             let transparent_utxo_count = self.sync_transparent_utxos(chain).await?;
             return Ok(self.emit_caught_up(chain_tip, transparent_utxo_count));
         };
@@ -788,6 +784,33 @@ impl Wallet {
                 at_height,
             })) => self.recover_from_reorg(chain, at_height).await,
             Err(other) => Err(other),
+        }
+    }
+
+    /// Resolves the next scan range, advancing the chain tip only when the queue is drained.
+    ///
+    /// Each `update_chain_tip` call re-creates a short `Verify` range (`VERIFY_LOOKAHEAD`
+    /// blocks) at the scan frontier while the wallet is far behind, so calling it every cycle
+    /// would force catch-up into 10-block steps. This drains the existing queue first and
+    /// only advances the tip, re-priming subtree roots, once the queue is empty and the live
+    /// tip is ahead. That matches the library recipe: update the tip once, then scan all
+    /// suggested ranges (one `Verify`, then bulk `Historic`/`ChainTip`) before touching it
+    /// again.
+    async fn plan_scan_range(
+        &self,
+        chain: &dyn ChainSource,
+        chain_tip: BlockHeight,
+    ) -> Result<Option<(BlockHeight, BlockHeight, &'static str)>, WalletError> {
+        if let Some(range) = self.next_scan_range(chain_tip).await? {
+            return Ok(Some(range));
+        }
+        let fully_scanned = self.inner.storage.fully_scanned_height().await?;
+        if fully_scanned.is_none_or(|h| chain_tip.as_u32() > h.as_u32()) {
+            self.backfill_subtree_roots(chain).await?;
+            self.inner.storage.update_chain_tip(chain_tip).await?;
+            self.next_scan_range(chain_tip).await
+        } else {
+            Ok(None)
         }
     }
 
