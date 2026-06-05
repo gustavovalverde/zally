@@ -12,13 +12,9 @@ use std::sync::Arc;
 use tempfile::TempDir;
 use uuid::Uuid;
 use zally_core::{
-    AccountId, IdempotencyKey, IdempotencyKeyError, Network, ReservationId, TxId, Zatoshis,
-    ZatoshisError,
+    AccountId, HoldId, IdempotencyKey, IdempotencyKeyError, Network, TxId, Zatoshis, ZatoshisError,
 };
-use zally_storage::{
-    DispenseReservationRecord, DispenseReservedNote, Sqlite, SqliteOptions, StorageError,
-    WalletStorage,
-};
+use zally_storage::{HeldNote, HoldRecord, Sqlite, SqliteOptions, StorageError, WalletStorage};
 
 fn one_zec_in_zats() -> Result<Zatoshis, ZatoshisError> {
     Zatoshis::try_from(100_000_000_u64)
@@ -36,8 +32,8 @@ fn open_storage(db_path: PathBuf) -> Sqlite {
     Sqlite::new(SqliteOptions::for_network(Network::regtest(), db_path))
 }
 
-struct ReservationFixture {
-    reservation_id: ReservationId,
+struct HoldFixture {
+    hold_id: HoldId,
     request_id: IdempotencyKey,
     idempotency_key: IdempotencyKey,
     account_id: AccountId,
@@ -46,9 +42,9 @@ struct ReservationFixture {
     reserved_at_ms: u64,
 }
 
-fn make_record(fixture: ReservationFixture) -> DispenseReservationRecord {
-    let ReservationFixture {
-        reservation_id,
+fn make_record(fixture: HoldFixture) -> HoldRecord {
+    let HoldFixture {
+        hold_id,
         request_id,
         idempotency_key,
         account_id,
@@ -56,14 +52,14 @@ fn make_record(fixture: ReservationFixture) -> DispenseReservationRecord {
         spendable_for_check_zat,
         reserved_at_ms,
     } = fixture;
-    DispenseReservationRecord {
-        reservation_id,
+    HoldRecord {
+        hold_id,
         request_id,
         idempotency_key,
         account_id,
         amount_zat,
         spendable_for_check_zat,
-        locked_notes: vec![DispenseReservedNote::new(
+        locked_notes: vec![HeldNote::new(
             zcash_protocol::ShieldedProtocol::Orchard,
             amount_zat,
             TxId::from_bytes([0xAB; 32]),
@@ -74,7 +70,7 @@ fn make_record(fixture: ReservationFixture) -> DispenseReservationRecord {
 }
 
 #[tokio::test]
-async fn dispense_reservation_round_trip_persists_active_row() -> Result<(), TestError> {
+async fn hold_round_trip_persists_active_row() -> Result<(), TestError> {
     let temp = TempDir::new()?;
     let storage = open_storage(temp.path().join("wallet.db"));
     storage.open_or_create().await?;
@@ -83,11 +79,11 @@ async fn dispense_reservation_round_trip_persists_active_row() -> Result<(), Tes
     let request_id = make_request_id(0)?;
     let idempotency_key = IdempotencyKey::try_from("idempotency-00000000")?;
     let amount = Zatoshis::try_from(75_000_000_u64)?;
-    let reservation_id = ReservationId::new();
+    let hold_id = HoldId::new();
 
     storage
-        .create_dispense_reservation(make_record(ReservationFixture {
-            reservation_id,
+        .create_hold(make_record(HoldFixture {
+            hold_id,
             request_id: request_id.clone(),
             idempotency_key: idempotency_key.clone(),
             account_id: account,
@@ -97,9 +93,9 @@ async fn dispense_reservation_round_trip_persists_active_row() -> Result<(), Tes
         }))
         .await?;
 
-    let active = storage.list_active_dispense_reservations(account).await?;
+    let active = storage.list_active_holds(account).await?;
     assert_eq!(active.len(), 1, "one active reservation should be visible");
-    assert_eq!(active[0].reservation_id, reservation_id);
+    assert_eq!(active[0].hold_id, hold_id);
     assert_eq!(active[0].amount_zat, amount);
     assert!(active[0].is_active());
     assert_eq!(active[0].locked_notes.len(), 1);
@@ -112,17 +108,17 @@ async fn dispense_reservation_round_trip_persists_active_row() -> Result<(), Tes
     assert_eq!(sum, amount);
 
     let by_request = storage
-        .find_dispense_reservation_by_request_id(&request_id)
+        .find_hold_by_request_id(&request_id)
         .await?
         .ok_or(TestError::MissingByRequest)?;
-    assert_eq!(by_request.reservation_id, reservation_id);
+    assert_eq!(by_request.hold_id, hold_id);
     assert_eq!(by_request.idempotency_key, idempotency_key);
 
     Ok(())
 }
 
 #[tokio::test]
-async fn dispense_reservations_rejects_oversubscription() -> Result<(), TestError> {
+async fn holds_rejects_oversubscription() -> Result<(), TestError> {
     let temp = TempDir::new()?;
     let storage = open_storage(temp.path().join("wallet.db"));
     storage.open_or_create().await?;
@@ -132,8 +128,8 @@ async fn dispense_reservations_rejects_oversubscription() -> Result<(), TestErro
     let amount_each = Zatoshis::try_from(60_000_000_u64)?;
 
     storage
-        .create_dispense_reservation(make_record(ReservationFixture {
-            reservation_id: ReservationId::new(),
+        .create_hold(make_record(HoldFixture {
+            hold_id: HoldId::new(),
             request_id: make_request_id(1)?,
             idempotency_key: IdempotencyKey::try_from("idempotency-00000001")?,
             account_id: account,
@@ -144,8 +140,8 @@ async fn dispense_reservations_rejects_oversubscription() -> Result<(), TestErro
         .await?;
 
     let outcome = storage
-        .create_dispense_reservation(make_record(ReservationFixture {
-            reservation_id: ReservationId::new(),
+        .create_hold(make_record(HoldFixture {
+            hold_id: HoldId::new(),
             request_id: make_request_id(2)?,
             idempotency_key: IdempotencyKey::try_from("idempotency-00000002")?,
             account_id: account,
@@ -175,7 +171,7 @@ async fn dispense_reservations_rejects_oversubscription() -> Result<(), TestErro
 }
 
 #[tokio::test]
-async fn dispense_reservations_admit_disjoint_concurrent_callers() -> Result<(), TestError> {
+async fn holds_admit_disjoint_concurrent_callers() -> Result<(), TestError> {
     let temp = TempDir::new()?;
     let storage = Arc::new(open_storage(temp.path().join("wallet.db")));
     storage.open_or_create().await?;
@@ -187,8 +183,8 @@ async fn dispense_reservations_admit_disjoint_concurrent_callers() -> Result<(),
 
     let storage_a = Arc::clone(&storage);
     let storage_b = Arc::clone(&storage);
-    let record_a = make_record(ReservationFixture {
-        reservation_id: ReservationId::new(),
+    let record_a = make_record(HoldFixture {
+        hold_id: HoldId::new(),
         request_id: make_request_id(10)?,
         idempotency_key: IdempotencyKey::try_from("idempotency-0000000a")?,
         account_id: account,
@@ -196,8 +192,8 @@ async fn dispense_reservations_admit_disjoint_concurrent_callers() -> Result<(),
         spendable_for_check_zat: spendable,
         reserved_at_ms: 1_700_000_010_000,
     });
-    let record_b = make_record(ReservationFixture {
-        reservation_id: ReservationId::new(),
+    let record_b = make_record(HoldFixture {
+        hold_id: HoldId::new(),
         request_id: make_request_id(11)?,
         idempotency_key: IdempotencyKey::try_from("idempotency-0000000b")?,
         account_id: account,
@@ -207,13 +203,13 @@ async fn dispense_reservations_admit_disjoint_concurrent_callers() -> Result<(),
     });
 
     let (left, right) = tokio::join!(
-        async move { storage_a.create_dispense_reservation(record_a).await },
-        async move { storage_b.create_dispense_reservation(record_b).await },
+        async move { storage_a.create_hold(record_a).await },
+        async move { storage_b.create_hold(record_b).await },
     );
     left?;
     right?;
 
-    let active = storage.list_active_dispense_reservations(account).await?;
+    let active = storage.list_active_holds(account).await?;
     assert_eq!(active.len(), 2, "both concurrent reservations must persist");
     let sum = storage.sum_active_dispense_reserved_zat(account).await?;
     let expected = Zatoshis::try_from(amount_a.as_u64().saturating_add(amount_b.as_u64()))?;
@@ -222,7 +218,7 @@ async fn dispense_reservations_admit_disjoint_concurrent_callers() -> Result<(),
 }
 
 #[tokio::test]
-async fn dispense_reservations_admit_one_when_concurrent_oversubscribe() -> Result<(), TestError> {
+async fn holds_admit_one_when_concurrent_oversubscribe() -> Result<(), TestError> {
     let temp = TempDir::new()?;
     let storage = Arc::new(open_storage(temp.path().join("wallet.db")));
     storage.open_or_create().await?;
@@ -233,8 +229,8 @@ async fn dispense_reservations_admit_one_when_concurrent_oversubscribe() -> Resu
 
     let storage_a = Arc::clone(&storage);
     let storage_b = Arc::clone(&storage);
-    let record_a = make_record(ReservationFixture {
-        reservation_id: ReservationId::new(),
+    let record_a = make_record(HoldFixture {
+        hold_id: HoldId::new(),
         request_id: make_request_id(20)?,
         idempotency_key: IdempotencyKey::try_from("idempotency-00000014")?,
         account_id: account,
@@ -242,8 +238,8 @@ async fn dispense_reservations_admit_one_when_concurrent_oversubscribe() -> Resu
         spendable_for_check_zat: spendable,
         reserved_at_ms: 1_700_000_020_000,
     });
-    let record_b = make_record(ReservationFixture {
-        reservation_id: ReservationId::new(),
+    let record_b = make_record(HoldFixture {
+        hold_id: HoldId::new(),
         request_id: make_request_id(21)?,
         idempotency_key: IdempotencyKey::try_from("idempotency-00000015")?,
         account_id: account,
@@ -253,8 +249,8 @@ async fn dispense_reservations_admit_one_when_concurrent_oversubscribe() -> Resu
     });
 
     let (left, right) = tokio::join!(
-        async move { storage_a.create_dispense_reservation(record_a).await },
-        async move { storage_b.create_dispense_reservation(record_b).await },
+        async move { storage_a.create_hold(record_a).await },
+        async move { storage_b.create_hold(record_b).await },
     );
 
     let outcomes = vec![left, right];
@@ -278,17 +274,17 @@ async fn dispense_reservations_admit_one_when_concurrent_oversubscribe() -> Resu
 }
 
 #[tokio::test]
-async fn dispense_reservations_release_is_idempotent() -> Result<(), TestError> {
+async fn holds_release_is_idempotent() -> Result<(), TestError> {
     let temp = TempDir::new()?;
     let storage = open_storage(temp.path().join("wallet.db"));
     storage.open_or_create().await?;
 
     let account = make_account();
-    let reservation_id = ReservationId::new();
+    let hold_id = HoldId::new();
     let amount = Zatoshis::try_from(20_000_000_u64)?;
     storage
-        .create_dispense_reservation(make_record(ReservationFixture {
-            reservation_id,
+        .create_hold(make_record(HoldFixture {
+            hold_id,
             request_id: make_request_id(30)?,
             idempotency_key: IdempotencyKey::try_from("idempotency-0000001e")?,
             account_id: account,
@@ -298,24 +294,18 @@ async fn dispense_reservations_release_is_idempotent() -> Result<(), TestError> 
         }))
         .await?;
 
-    storage
-        .release_dispense_reservation(reservation_id, 1_700_000_040_000)
-        .await?;
-    storage
-        .release_dispense_reservation(reservation_id, 1_700_000_050_000)
-        .await?;
+    storage.release_hold(hold_id, 1_700_000_040_000).await?;
+    storage.release_hold(hold_id, 1_700_000_050_000).await?;
 
-    let active = storage.list_active_dispense_reservations(account).await?;
+    let active = storage.list_active_holds(account).await?;
     assert!(
         active.is_empty(),
         "released reservation must drop out of the active list"
     );
 
-    let missing = storage
-        .release_dispense_reservation(ReservationId::new(), 1_700_000_060_000)
-        .await;
+    let missing = storage.release_hold(HoldId::new(), 1_700_000_060_000).await;
     assert!(
-        matches!(missing, Err(StorageError::DispenseReservationNotFound)),
+        matches!(missing, Err(StorageError::HoldNotFound)),
         "release of a missing reservation must fail closed: {missing:?}"
     );
 
@@ -323,17 +313,17 @@ async fn dispense_reservations_release_is_idempotent() -> Result<(), TestError> 
 }
 
 #[tokio::test]
-async fn dispense_reservations_finalize_is_idempotent() -> Result<(), TestError> {
+async fn holds_finalize_is_idempotent() -> Result<(), TestError> {
     let temp = TempDir::new()?;
     let storage = open_storage(temp.path().join("wallet.db"));
     storage.open_or_create().await?;
 
     let account = make_account();
-    let reservation_id = ReservationId::new();
+    let hold_id = HoldId::new();
     let amount = Zatoshis::try_from(20_000_000_u64)?;
     storage
-        .create_dispense_reservation(make_record(ReservationFixture {
-            reservation_id,
+        .create_hold(make_record(HoldFixture {
+            hold_id,
             request_id: make_request_id(40)?,
             idempotency_key: IdempotencyKey::try_from("idempotency-00000028")?,
             account_id: account,
@@ -344,24 +334,18 @@ async fn dispense_reservations_finalize_is_idempotent() -> Result<(), TestError>
         .await?;
 
     let tx_id = TxId::from_bytes([0xCC; 32]);
-    storage
-        .finalize_dispense_reservation(reservation_id, tx_id)
-        .await?;
-    storage
-        .finalize_dispense_reservation(reservation_id, tx_id)
-        .await?;
+    storage.finalize_hold(hold_id, tx_id).await?;
+    storage.finalize_hold(hold_id, tx_id).await?;
 
-    let active = storage.list_active_dispense_reservations(account).await?;
+    let active = storage.list_active_holds(account).await?;
     assert!(
         active.is_empty(),
         "finalized reservation must drop out of the active list"
     );
 
-    let missing = storage
-        .finalize_dispense_reservation(ReservationId::new(), tx_id)
-        .await;
+    let missing = storage.finalize_hold(HoldId::new(), tx_id).await;
     assert!(
-        matches!(missing, Err(StorageError::DispenseReservationNotFound)),
+        matches!(missing, Err(StorageError::HoldNotFound)),
         "finalize of a missing reservation must fail closed: {missing:?}"
     );
 
@@ -369,7 +353,7 @@ async fn dispense_reservations_finalize_is_idempotent() -> Result<(), TestError>
 }
 
 #[tokio::test]
-async fn dispense_reservations_reject_duplicate_active_request_id() -> Result<(), TestError> {
+async fn holds_reject_duplicate_active_request_id() -> Result<(), TestError> {
     let temp = TempDir::new()?;
     let storage = open_storage(temp.path().join("wallet.db"));
     storage.open_or_create().await?;
@@ -379,8 +363,8 @@ async fn dispense_reservations_reject_duplicate_active_request_id() -> Result<()
     let idempotency_key = IdempotencyKey::try_from("idempotency-00000032")?;
     let amount = Zatoshis::try_from(10_000_000_u64)?;
     storage
-        .create_dispense_reservation(make_record(ReservationFixture {
-            reservation_id: ReservationId::new(),
+        .create_hold(make_record(HoldFixture {
+            hold_id: HoldId::new(),
             request_id: request_id.clone(),
             idempotency_key: idempotency_key.clone(),
             account_id: account,
@@ -391,8 +375,8 @@ async fn dispense_reservations_reject_duplicate_active_request_id() -> Result<()
         .await?;
 
     let outcome = storage
-        .create_dispense_reservation(make_record(ReservationFixture {
-            reservation_id: ReservationId::new(),
+        .create_hold(make_record(HoldFixture {
+            hold_id: HoldId::new(),
             request_id,
             idempotency_key,
             account_id: account,
@@ -402,28 +386,25 @@ async fn dispense_reservations_reject_duplicate_active_request_id() -> Result<()
         }))
         .await;
     assert!(
-        matches!(
-            outcome,
-            Err(StorageError::DispenseReservationRequestConflict)
-        ),
+        matches!(outcome, Err(StorageError::HoldRequestConflict)),
         "duplicate active request id must fail closed: {outcome:?}"
     );
     Ok(())
 }
 
 #[tokio::test]
-async fn dispense_reservations_survive_storage_restart() -> Result<(), TestError> {
+async fn holds_survive_storage_restart() -> Result<(), TestError> {
     let temp = TempDir::new()?;
     let db_path = temp.path().join("wallet.db");
     let storage_a = open_storage(db_path.clone());
     storage_a.open_or_create().await?;
 
     let account = make_account();
-    let reservation_id = ReservationId::new();
+    let hold_id = HoldId::new();
     let amount = Zatoshis::try_from(30_000_000_u64)?;
     storage_a
-        .create_dispense_reservation(make_record(ReservationFixture {
-            reservation_id,
+        .create_hold(make_record(HoldFixture {
+            hold_id,
             request_id: make_request_id(60)?,
             idempotency_key: IdempotencyKey::try_from("idempotency-0000003c")?,
             account_id: account,
@@ -436,13 +417,13 @@ async fn dispense_reservations_survive_storage_restart() -> Result<(), TestError
 
     let storage_b = open_storage(db_path);
     storage_b.open_or_create().await?;
-    let active = storage_b.list_active_dispense_reservations(account).await?;
+    let active = storage_b.list_active_holds(account).await?;
     assert_eq!(
         active.len(),
         1,
         "reservation must survive a process restart"
     );
-    assert_eq!(active[0].reservation_id, reservation_id);
+    assert_eq!(active[0].hold_id, hold_id);
     assert_eq!(active[0].amount_zat, amount);
     Ok(())
 }

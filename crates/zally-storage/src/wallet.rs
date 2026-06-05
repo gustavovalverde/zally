@@ -2,7 +2,7 @@
 
 use async_trait::async_trait;
 use zally_core::{
-    AccountId, BlockHeight, IdempotencyKey, Network, OutPoint, ReservationId, TxId, Zatoshis,
+    AccountId, BlockHeight, HoldId, IdempotencyKey, Network, OutPoint, TxId, Zatoshis,
 };
 
 /// The storage backend behind a wallet handle.
@@ -26,9 +26,9 @@ use zcash_keys::address::UnifiedAddress;
 use zcash_protocol::ShieldedProtocol;
 
 use crate::account_balance_row::AccountBalanceRow;
-use crate::dispense_reservation_row::{DispenseReservationRow, DispenseReservedNote};
 use crate::error::StorageError;
 use crate::exposed_address_row::ExposedAddressRow;
+use crate::hold_row::{HeldNote, HoldRow};
 use crate::pending_broadcast_input_row::PendingBroadcastInputRow;
 
 /// Request body for [`WalletStorage::scan_blocks`].
@@ -327,15 +327,15 @@ pub struct ProposalSummary {
     pub output_count: usize,
 }
 
-/// Request body for [`WalletStorage::create_dispense_reservation`].
+/// Request body for [`WalletStorage::create_hold`].
 ///
 /// Carries everything the storage layer needs to persist a fresh dispense reservation
 /// row and enforce the "amount sum stays within spendable" invariant atomically with
 /// any concurrent reservation attempt.
 #[derive(Clone, Debug)]
-pub struct DispenseReservationRecord {
+pub struct HoldRecord {
     /// Wallet-issued identifier for the new reservation.
-    pub reservation_id: ReservationId,
+    pub hold_id: HoldId,
     /// Caller-supplied request identifier (idempotency anchor) for the reservation.
     pub request_id: IdempotencyKey,
     /// Caller-supplied idempotency key for the eventual broadcast.
@@ -352,7 +352,7 @@ pub struct DispenseReservationRecord {
     pub spendable_for_check_zat: Zatoshis,
     /// Notes the wallet considered locked at reservation time. Informational only;
     /// the enforcement contract is amount-based.
-    pub locked_notes: Vec<DispenseReservedNote>,
+    pub locked_notes: Vec<HeldNote>,
     /// Unix milliseconds when the reservation was recorded.
     pub reserved_at_ms: u64,
 }
@@ -792,10 +792,7 @@ pub trait WalletStorage: Send + Sync + 'static {
     /// operator.
     ///
     /// `not_retryable` on schema errors; `retryable` on transient I/O.
-    async fn truncate_to_chain_state(
-        &self,
-        chain_state: ChainState,
-    ) -> Result<(), StorageError>;
+    async fn truncate_to_chain_state(&self, chain_state: ChainState) -> Result<(), StorageError>;
 
     /// Returns every Sapling and Orchard note received in the inclusive height range
     /// `[from_height, to_height]`, regardless of current spent state.
@@ -858,18 +855,15 @@ pub trait WalletStorage: Send + Sync + 'static {
     ///
     /// `request_id` is unique across active rows. A second call with the same
     /// `request_id` while a row exists returns
-    /// [`StorageError::DispenseReservationRequestConflict`] so the wallet boundary can
+    /// [`StorageError::HoldRequestConflict`] so the wallet boundary can
     /// look up the existing reservation and surface it idempotently rather than
     /// double-reserve.
     ///
-    /// `not_retryable` on `InsufficientFunds` and `DispenseReservationRequestConflict`;
+    /// `not_retryable` on `InsufficientFunds` and `HoldRequestConflict`;
     /// `retryable` on transient I/O.
-    async fn create_dispense_reservation(
-        &self,
-        record: DispenseReservationRecord,
-    ) -> Result<(), StorageError>;
+    async fn create_hold(&self, record: HoldRecord) -> Result<(), StorageError>;
 
-    /// Marks `reservation_id` as released. The row stays in storage for audit; subsequent
+    /// Marks `hold_id` as released. The row stays in storage for audit; subsequent
     /// reads see `released_at_ms = Some(now)` and the reservation no longer contributes
     /// to `sum_active_dispense_reserved_zat`.
     ///
@@ -877,30 +871,22 @@ pub trait WalletStorage: Send + Sync + 'static {
     /// `released_at_ms` and returns `Ok(())`. A row that was already finalized stays
     /// finalized; this method only updates `released_at_ms` when the row is still active.
     ///
-    /// Returns [`StorageError::DispenseReservationNotFound`] when no row matches.
+    /// Returns [`StorageError::HoldNotFound`] when no row matches.
     ///
-    /// `not_retryable` on `DispenseReservationNotFound`; `retryable` on transient I/O.
-    async fn release_dispense_reservation(
-        &self,
-        reservation_id: ReservationId,
-        released_at_ms: u64,
-    ) -> Result<(), StorageError>;
+    /// `not_retryable` on `HoldNotFound`; `retryable` on transient I/O.
+    async fn release_hold(&self, hold_id: HoldId, released_at_ms: u64) -> Result<(), StorageError>;
 
-    /// Marks `reservation_id` as finalized by a specific broadcast transaction.
+    /// Marks `hold_id` as finalized by a specific broadcast transaction.
     ///
     /// Idempotent: a second call with the same `tx_id` observes the prior
     /// `finalized_tx_id` and returns `Ok(())`. Calling with a different `tx_id` after a
     /// prior finalize is treated as a no-op as well, on the assumption that the caller
     /// is replaying a recovery path; the persisted `tx_id` is the authoritative one.
     ///
-    /// Returns [`StorageError::DispenseReservationNotFound`] when no row matches.
+    /// Returns [`StorageError::HoldNotFound`] when no row matches.
     ///
-    /// `not_retryable` on `DispenseReservationNotFound`; `retryable` on transient I/O.
-    async fn finalize_dispense_reservation(
-        &self,
-        reservation_id: ReservationId,
-        tx_id: TxId,
-    ) -> Result<(), StorageError>;
+    /// `not_retryable` on `HoldNotFound`; `retryable` on transient I/O.
+    async fn finalize_hold(&self, hold_id: HoldId, tx_id: TxId) -> Result<(), StorageError>;
 
     /// Returns the persisted reservation row whose caller-supplied `request_id` matches,
     /// regardless of whether it is still active, finalized, or released.
@@ -910,10 +896,10 @@ pub trait WalletStorage: Send + Sync + 'static {
     /// to create a new row that would conflict.
     ///
     /// `not_retryable` on schema errors; `retryable` on transient I/O.
-    async fn find_dispense_reservation_by_request_id(
+    async fn find_hold_by_request_id(
         &self,
         request_id: &IdempotencyKey,
-    ) -> Result<Option<DispenseReservationRow>, StorageError>;
+    ) -> Result<Option<HoldRow>, StorageError>;
 
     /// Returns every active reservation row for `account_id`: rows with both
     /// `finalized_tx_id` and `released_at_ms` still `None`.
@@ -922,14 +908,11 @@ pub trait WalletStorage: Send + Sync + 'static {
     /// what the wallet has currently locked.
     ///
     /// `not_retryable` on schema errors; `retryable` on transient I/O.
-    async fn list_active_dispense_reservations(
-        &self,
-        account_id: AccountId,
-    ) -> Result<Vec<DispenseReservationRow>, StorageError>;
+    async fn list_active_holds(&self, account_id: AccountId) -> Result<Vec<HoldRow>, StorageError>;
 
     /// Returns the sum of `amount_zat` across every active reservation row for
     /// `account_id`. Equivalent to summing the rows from
-    /// [`Self::list_active_dispense_reservations`] but avoids the per-row decode cost
+    /// [`Self::list_active_holds`] but avoids the per-row decode cost
     /// for the steady-state spendable-balance read path.
     ///
     /// `not_retryable` on schema errors; `retryable` on transient I/O.

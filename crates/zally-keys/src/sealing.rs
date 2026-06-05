@@ -22,6 +22,29 @@ pub enum SealingKind {
     Custom,
 }
 
+/// The security posture the sealing implementation provides at runtime.
+///
+/// Orthogonal to [`SealingKind`]: a `SealingKind::AgeFile` impl is `Dev` posture for a
+/// developer-machine identity but `Kms`/`Hsm` posture when the identity itself is
+/// produced by a hosted KMS or hardware module. Returned by [`SeedSealing::posture`]
+/// so the wallet runtime can refuse to start with `Dev` posture in production deploys
+/// (D-13 of Proposal-0003).
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[non_exhaustive]
+pub enum SealingPosture {
+    /// Developer-machine posture. Acceptable for local dev and CI; the runtime must
+    /// refuse to serve production traffic in this posture without an explicit
+    /// operator override.
+    Dev,
+    /// Hardware-security-module-backed posture. Seed material never leaves the HSM
+    /// boundary in plaintext.
+    Hsm,
+    /// Cloud KMS-backed posture (AWS KMS, GCP KMS, `HashiCorp` Vault, etc.). Seed
+    /// material is unwrapped within the KMS boundary on demand.
+    Kms,
+}
+
 /// Trait for at-rest seed encryption.
 ///
 /// Implementations hold the sealed seed and expose [`SeedSealing::seal_seed`] /
@@ -37,6 +60,16 @@ pub trait SeedSealing: Send + Sync + 'static {
     /// [`SealingKind::Custom`]; first-party implementations override.
     fn kind(&self) -> SealingKind {
         SealingKind::Custom
+    }
+
+    /// Returns the security posture the sealing impl provides at runtime.
+    ///
+    /// The default is conservative: [`SealingPosture::Dev`]. First-party HSM and
+    /// KMS adapters override. The wallet runtime gates production startup on the
+    /// posture value (D-13 of Proposal-0003); a runtime that boots with `Dev`
+    /// posture without an explicit operator override is a configuration bug.
+    fn posture(&self) -> SealingPosture {
+        SealingPosture::Dev
     }
 
     /// Encrypts and persists `seed`. Idempotent: calling twice with the same seed replaces the

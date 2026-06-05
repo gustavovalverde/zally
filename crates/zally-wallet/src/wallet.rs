@@ -6,7 +6,7 @@ use std::sync::Arc;
 use parking_lot::Mutex;
 use tokio::sync::broadcast;
 use zally_chain::ChainSource;
-use zally_core::{AccountId, BlockHeight, IdempotencyKey, Network, ReservationId, TxId, Zatoshis};
+use zally_core::{AccountId, BlockHeight, HoldId, IdempotencyKey, Network, TxId, Zatoshis};
 use zally_keys::{Mnemonic, SealingError, SeedMaterial, SeedSealing};
 use zally_storage::WalletStorage;
 use zcash_keys::address::UnifiedAddress;
@@ -15,8 +15,8 @@ use crate::capabilities::{Capability, SealingCapability, StorageCapability, Wall
 use crate::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig, CircuitBreakerState};
 use crate::error::WalletError;
 use crate::event::{WalletEvent, WalletEventStream};
+use crate::hold::{Hold, LockedNotesSummary};
 use crate::options::WalletOptions;
-use crate::reservation::{DispenseReservation, LockedNotesSummary};
 use crate::retry::RetryPolicy;
 use crate::sync::fetch_prior_chain_state;
 
@@ -369,7 +369,7 @@ impl Wallet {
     pub async fn reserve_for_dispense(
         &self,
         plan: ReserveForDispensePlan,
-    ) -> Result<DispenseReservation, WalletError> {
+    ) -> Result<Hold, WalletError> {
         let ReserveForDispensePlan {
             account_id,
             amount_zat,
@@ -385,16 +385,16 @@ impl Wallet {
         if let Some(existing) = self
             .inner
             .storage
-            .find_dispense_reservation_by_request_id(&request_id)
+            .find_hold_by_request_id(&request_id)
             .await?
             && existing.is_active()
         {
             let available_after_release = self
                 .compute_available_after_release(account_id, existing.amount_zat)
                 .await?;
-            return Ok(DispenseReservation {
+            return Ok(Hold {
                 network: self.inner.network,
-                reservation_id: existing.reservation_id,
+                hold_id: existing.hold_id,
                 request_id: existing.request_id,
                 idempotency_key: existing.idempotency_key,
                 amount_zat: existing.amount_zat,
@@ -423,10 +423,10 @@ impl Wallet {
         }
 
         let locked_notes = select_locked_notes(&candidate_notes, amount_zat);
-        let reservation_id = ReservationId::new();
+        let hold_id = HoldId::new();
         let reserved_at_ms = current_unix_ms();
-        let record = zally_storage::DispenseReservationRecord {
-            reservation_id,
+        let record = zally_storage::HoldRecord {
+            hold_id,
             request_id: request_id.clone(),
             idempotency_key: idempotency_key.clone(),
             account_id,
@@ -437,14 +437,14 @@ impl Wallet {
         };
         self.inner
             .storage
-            .create_dispense_reservation(record)
+            .create_hold(record)
             .await
             .map_err(WalletError::from)?;
 
         let summary = summarize_locked_notes(&locked_notes);
-        Ok(DispenseReservation {
+        Ok(Hold {
             network: self.inner.network,
-            reservation_id,
+            hold_id,
             request_id,
             idempotency_key,
             amount_zat,
@@ -457,16 +457,13 @@ impl Wallet {
     ///
     /// Idempotent: a second call on the same identifier returns `Ok(())`. Fails with
     /// [`WalletError::Storage`] wrapping
-    /// [`zally_storage::StorageError::DispenseReservationNotFound`] when no row matches.
+    /// [`zally_storage::StorageError::HoldNotFound`] when no row matches.
     ///
     /// `not_retryable` on unknown reservation; `retryable` on transient storage I/O.
-    pub async fn release_dispense_reservation(
-        &self,
-        reservation_id: ReservationId,
-    ) -> Result<(), WalletError> {
+    pub async fn release_hold(&self, hold_id: HoldId) -> Result<(), WalletError> {
         self.inner
             .storage
-            .release_dispense_reservation(reservation_id, current_unix_ms())
+            .release_hold(hold_id, current_unix_ms())
             .await
             .map_err(WalletError::from)
     }
@@ -474,18 +471,14 @@ impl Wallet {
     /// Marks a previously-recorded reservation as consumed by `tx_id`.
     ///
     /// Idempotent: a second call returns `Ok(())`. Fails with [`WalletError::Storage`]
-    /// wrapping [`zally_storage::StorageError::DispenseReservationNotFound`] when no row
+    /// wrapping [`zally_storage::StorageError::HoldNotFound`] when no row
     /// matches.
     ///
     /// `not_retryable` on unknown reservation; `retryable` on transient storage I/O.
-    pub async fn finalize_dispense_reservation(
-        &self,
-        reservation_id: ReservationId,
-        tx_id: TxId,
-    ) -> Result<(), WalletError> {
+    pub async fn finalize_hold(&self, hold_id: HoldId, tx_id: TxId) -> Result<(), WalletError> {
         self.inner
             .storage
-            .finalize_dispense_reservation(reservation_id, tx_id)
+            .finalize_hold(hold_id, tx_id)
             .await
             .map_err(WalletError::from)
     }
@@ -783,7 +776,7 @@ impl ReserveForDispensePlan {
     }
 }
 
-fn summarize_locked_notes(notes: &[zally_storage::DispenseReservedNote]) -> LockedNotesSummary {
+fn summarize_locked_notes(notes: &[zally_storage::HeldNote]) -> LockedNotesSummary {
     let note_count = u32::try_from(notes.len()).unwrap_or(u32::MAX);
     let total = notes
         .iter()
@@ -802,7 +795,7 @@ fn summarize_locked_notes(notes: &[zally_storage::DispenseReservedNote]) -> Lock
 fn select_locked_notes(
     candidates: &[zally_storage::UnspentShieldedNoteRow],
     amount_zat: Zatoshis,
-) -> Vec<zally_storage::DispenseReservedNote> {
+) -> Vec<zally_storage::HeldNote> {
     let mut sorted: Vec<&zally_storage::UnspentShieldedNoteRow> = candidates.iter().collect();
     sorted.sort_by_key(|n| std::cmp::Reverse(n.value_zat));
     let mut taken = Vec::new();
@@ -812,7 +805,7 @@ fn select_locked_notes(
             break;
         }
         running = running.saturating_add(note.value_zat.as_u64());
-        taken.push(zally_storage::DispenseReservedNote::new(
+        taken.push(zally_storage::HeldNote::new(
             note.protocol,
             note.value_zat,
             note.tx_id,

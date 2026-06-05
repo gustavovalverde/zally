@@ -6,12 +6,12 @@ mod circuit_breaker;
 mod error;
 mod event;
 mod exposed_address;
+mod hold;
 mod metrics;
 mod options;
 mod pczt;
 mod pending_transparent_inputs;
 mod received_note;
-mod reservation;
 mod retry;
 mod spend;
 mod status;
@@ -25,11 +25,11 @@ pub use circuit_breaker::{CircuitBreaker, CircuitBreakerConfig, CircuitBreakerSt
 pub use error::WalletError;
 pub use event::{WalletEvent, WalletEventStream};
 pub use exposed_address::ExposedAddress;
+pub use hold::{Hold, LockedNotesSummary};
 pub use metrics::WalletMetrics;
 pub use options::WalletOptions;
 pub use pending_transparent_inputs::{PendingTransparentInput, PendingTransparentInputs};
 pub use received_note::ShieldedReceiveRecord;
-pub use reservation::{DispenseReservation, LockedNotesSummary};
 pub use retry::{HasFailurePosture, RetryPolicy, with_retry};
 pub use spend::{
     ParsedPayment, PaymentRequest, Proposal, ProposalPlan, SendOutcome, SendPaymentPlan,

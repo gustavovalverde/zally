@@ -2,7 +2,7 @@
 //!
 //! [`Wallet::reserve_for_dispense`]: crate::Wallet::reserve_for_dispense
 
-use zally_core::{IdempotencyKey, Network, ReservationId, Zatoshis};
+use zally_core::{HoldId, IdempotencyKey, Network, Zatoshis};
 
 /// Summary of what the wallet locked in one reservation call.
 ///
@@ -30,7 +30,7 @@ impl LockedNotesSummary {
 
 /// Outcome of a successful [`Wallet::reserve_for_dispense`] call.
 ///
-/// The wallet has persisted a reservation row keyed by `reservation_id` and bound
+/// The wallet has persisted a reservation row keyed by `hold_id` and bound
 /// it to the caller-supplied `request_id`. Any future call to
 /// [`Wallet::spendable_for_next_dispense`] subtracts `amount_zat` from the wallet's
 /// spendable balance until the reservation is finalized or released.
@@ -39,16 +39,16 @@ impl LockedNotesSummary {
 /// [`Wallet::spendable_for_next_dispense`]: crate::Wallet::spendable_for_next_dispense
 #[derive(Clone, Debug)]
 #[non_exhaustive]
-pub struct DispenseReservation {
+pub struct Hold {
     /// Network the wallet is bound to.
     pub network: Network,
     /// Wallet-issued identifier for this reservation. Consume it via
-    /// [`Wallet::finalize_dispense_reservation`] or
-    /// [`Wallet::release_dispense_reservation`].
+    /// [`Wallet::finalize_hold`] or
+    /// [`Wallet::release_hold`].
     ///
-    /// [`Wallet::finalize_dispense_reservation`]: crate::Wallet::finalize_dispense_reservation
-    /// [`Wallet::release_dispense_reservation`]: crate::Wallet::release_dispense_reservation
-    pub reservation_id: ReservationId,
+    /// [`Wallet::finalize_hold`]: crate::Wallet::finalize_hold
+    /// [`Wallet::release_hold`]: crate::Wallet::release_hold
+    pub hold_id: HoldId,
     /// Caller-supplied request identifier (idempotency anchor) the reservation is bound to.
     pub request_id: IdempotencyKey,
     /// Caller-supplied idempotency key for the eventual broadcast.

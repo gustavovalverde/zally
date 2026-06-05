@@ -723,8 +723,7 @@ impl Wallet {
         .await?;
         self.inner.storage.record_observed_tip(chain_tip).await?;
 
-        let Some((scan_start, scan_end, priority)) =
-            self.plan_scan_range(chain, chain_tip).await?
+        let Some((scan_start, scan_end, priority)) = self.plan_scan_range(chain, chain_tip).await?
         else {
             let transparent_utxo_count = self.sync_transparent_utxos(chain).await?;
             return Ok(self.emit_caught_up(chain_tip, transparent_utxo_count));
@@ -855,8 +854,14 @@ impl Wallet {
     /// index 0 each cycle and stops at the first short page.
     async fn backfill_subtree_roots(&self, chain: &dyn ChainSource) -> Result<(), WalletError> {
         for (pool, protocol) in [
-            (ShieldedPool::Sapling, zcash_protocol::ShieldedProtocol::Sapling),
-            (ShieldedPool::Orchard, zcash_protocol::ShieldedProtocol::Orchard),
+            (
+                ShieldedPool::Sapling,
+                zcash_protocol::ShieldedProtocol::Sapling,
+            ),
+            (
+                ShieldedPool::Orchard,
+                zcash_protocol::ShieldedProtocol::Orchard,
+            ),
         ] {
             let mut next_index = 0_u32;
             loop {
@@ -932,7 +937,11 @@ impl Wallet {
         })
     }
 
-    fn emit_caught_up(&self, target_height: BlockHeight, transparent_utxo_count: u64) -> SyncOutcome {
+    fn emit_caught_up(
+        &self,
+        target_height: BlockHeight,
+        transparent_utxo_count: u64,
+    ) -> SyncOutcome {
         self.publish_event(WalletEvent::ScanProgress {
             scanned_height: target_height,
             target_height,
@@ -1008,7 +1017,8 @@ impl Wallet {
 
         let transparent_utxo_count = self.sync_transparent_utxos(chain).await?;
 
-        self.verify_tree_roots(chain, outcome.scanned_to_height).await;
+        self.verify_tree_roots(chain, outcome.scanned_to_height)
+            .await;
 
         self.publish_event(WalletEvent::ScanProgress {
             scanned_height: outcome.scanned_to_height,
@@ -1246,4 +1256,3 @@ pub(crate) async fn fetch_prior_chain_state(
     )
     .await
 }
-

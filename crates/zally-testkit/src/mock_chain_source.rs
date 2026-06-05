@@ -100,7 +100,11 @@ impl MockChainSourceHandle {
 
     /// Reverts to `reorg_from_height - 1` and announces a reorg that re-commits up to
     /// `new_safe_chain_tip_height`.
-    pub fn trigger_reorg(&self, reorg_from_height: BlockHeight, new_safe_chain_tip_height: BlockHeight) {
+    pub fn trigger_reorg(
+        &self,
+        reorg_from_height: BlockHeight,
+        new_safe_chain_tip_height: BlockHeight,
+    ) {
         let prior_tip;
         {
             let mut guard = self.state.lock();
@@ -236,7 +240,9 @@ impl ChainSource for MockChainSource {
             Ok(event) => {
                 let new_safe_chain_tip_height = event_tip_height(&event);
                 Some(Ok(ChainEventEnvelope::new(
-                    ChainEventCursor::from_bytes(new_safe_chain_tip_height.as_u32().to_be_bytes().to_vec()),
+                    ChainEventCursor::from_bytes(
+                        new_safe_chain_tip_height.as_u32().to_be_bytes().to_vec(),
+                    ),
                     u64::from(new_safe_chain_tip_height.as_u32()),
                     new_safe_chain_tip_height,
                     event,
@@ -254,8 +260,14 @@ fn event_tip_height(event: &ChainEvent) -> BlockHeight {
         reason = "non_exhaustive chain events map unknown variants to the genesis cursor"
     )]
     match event {
-        ChainEvent::SafeChainTipAdvanced { new_safe_chain_tip_height, .. }
-        | ChainEvent::ChainReorged { new_safe_chain_tip_height, .. } => *new_safe_chain_tip_height,
+        ChainEvent::SafeChainTipAdvanced {
+            new_safe_chain_tip_height,
+            ..
+        }
+        | ChainEvent::ChainReorged {
+            new_safe_chain_tip_height,
+            ..
+        } => *new_safe_chain_tip_height,
         _ => BlockHeight::GENESIS,
     }
 }

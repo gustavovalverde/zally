@@ -1,11 +1,11 @@
 //! Persisted dispense-reservation row.
 //!
 //! Returned by
-//! [`WalletStorage::list_active_dispense_reservations`](crate::WalletStorage::list_active_dispense_reservations)
+//! [`WalletStorage::list_active_holds`](crate::WalletStorage::list_active_holds)
 //! and
-//! [`WalletStorage::find_dispense_reservation_by_request_id`](crate::WalletStorage::find_dispense_reservation_by_request_id).
+//! [`WalletStorage::find_hold_by_request_id`](crate::WalletStorage::find_hold_by_request_id).
 
-use zally_core::{AccountId, IdempotencyKey, ReservationId, TxId, Zatoshis};
+use zally_core::{AccountId, HoldId, IdempotencyKey, TxId, Zatoshis};
 
 /// A snapshot of one shielded note that contributed to a reservation at the moment
 /// the reservation was recorded.
@@ -16,7 +16,7 @@ use zally_core::{AccountId, IdempotencyKey, ReservationId, TxId, Zatoshis};
 /// layer round-trips the rows through a JSON-encoded blob in `locked_notes`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
-pub struct DispenseReservedNote {
+pub struct HeldNote {
     /// Pool the locked note lives on.
     pub protocol: zcash_protocol::ShieldedProtocol,
     /// Note value at reservation time.
@@ -28,7 +28,7 @@ pub struct DispenseReservedNote {
     pub output_index: u32,
 }
 
-impl DispenseReservedNote {
+impl HeldNote {
     /// Constructs a reserved-note record. New fields land as additive parameters on
     /// purpose-specific constructors rather than positional arguments here.
     #[must_use]
@@ -49,16 +49,16 @@ impl DispenseReservedNote {
 
 /// One persisted dispense reservation row.
 ///
-/// Rows live in the Zally-owned `ext_zally_dispense_reservations` table. A row is
+/// Rows live in the Zally-owned `ext_zally_holds` table. A row is
 /// considered **active** while both `finalized_tx_id` and `released_at_ms` are `None`.
 /// Releasing the reservation sets `released_at_ms`; finalizing sets `finalized_tx_id`.
 /// Active reservations subtract from the wallet's `spendable_for_next_dispense`
 /// snapshot.
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
-pub struct DispenseReservationRow {
+pub struct HoldRow {
     /// Wallet-issued identifier for this reservation.
-    pub reservation_id: ReservationId,
+    pub hold_id: HoldId,
     /// Caller-supplied request identifier (idempotency anchor) for the reservation.
     pub request_id: IdempotencyKey,
     /// Caller-supplied idempotency key for the eventual broadcast.
@@ -69,7 +69,7 @@ pub struct DispenseReservationRow {
     pub amount_zat: Zatoshis,
     /// Notes selected at reservation time. Informational; the enforcement contract
     /// is amount-based.
-    pub locked_notes: Vec<DispenseReservedNote>,
+    pub locked_notes: Vec<HeldNote>,
     /// Unix milliseconds when the reservation was recorded.
     pub reserved_at_ms: u64,
     /// If finalized, the broadcast transaction the reservation was consumed by.
@@ -78,7 +78,7 @@ pub struct DispenseReservationRow {
     pub released_at_ms: Option<u64>,
 }
 
-impl DispenseReservationRow {
+impl HoldRow {
     /// True when the reservation is neither finalized nor released and so still subtracts
     /// from `spendable_for_next_dispense`.
     #[must_use]

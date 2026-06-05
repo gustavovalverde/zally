@@ -7,18 +7,15 @@
 //! lifecycle methods which do not depend on a non-empty balance.
 
 use zally_core::{
-    AccountId, IdempotencyKey, IdempotencyKeyError, ReservationId, TxId, Zatoshis, ZatoshisError,
+    AccountId, HoldId, IdempotencyKey, IdempotencyKeyError, TxId, Zatoshis, ZatoshisError,
 };
-use zally_storage::{
-    DispenseReservationRecord, DispenseReservedNote, Sqlite, SqliteOptions, StorageError,
-    WalletStorage,
-};
+use zally_storage::{HeldNote, HoldRecord, Sqlite, SqliteOptions, StorageError, WalletStorage};
 use zally_wallet::{ReserveForDispensePlan, WalletError};
 
 use super::fixtures::{TestWalletFixture, create_test_wallet};
 
 #[tokio::test]
-async fn reserve_for_dispense_zero_amount_is_rejected() -> Result<(), TestError> {
+async fn reserve_hold_zero_amount_is_rejected() -> Result<(), TestError> {
     let TestWalletFixture {
         wallet,
         account_id,
@@ -39,7 +36,7 @@ async fn reserve_for_dispense_zero_amount_is_rejected() -> Result<(), TestError>
 }
 
 #[tokio::test]
-async fn reserve_for_dispense_returns_insufficient_when_amount_exceeds_spendable()
+async fn reserve_hold_returns_insufficient_when_amount_exceeds_spendable()
 -> Result<(), TestError> {
     let TestWalletFixture {
         wallet,
@@ -68,7 +65,7 @@ async fn reserve_for_dispense_returns_insufficient_when_amount_exceeds_spendable
 }
 
 #[tokio::test]
-async fn reserve_for_dispense_is_idempotent_on_active_request() -> Result<(), TestError> {
+async fn reserve_hold_is_idempotent_on_active_request() -> Result<(), TestError> {
     let TestWalletFixture {
         wallet,
         account_id,
@@ -82,17 +79,17 @@ async fn reserve_for_dispense_is_idempotent_on_active_request() -> Result<(), Te
     storage.open_or_create().await?;
     let request_id = IdempotencyKey::try_from("idempotent-request")?;
     let idempotency_key = IdempotencyKey::try_from("idempotent-broadcast")?;
-    let reservation_id = ReservationId::new();
+    let hold_id = HoldId::new();
     let amount = Zatoshis::try_from(42_u64)?;
     storage
-        .create_dispense_reservation(DispenseReservationRecord {
-            reservation_id,
+        .create_hold(HoldRecord {
+            hold_id,
             request_id: request_id.clone(),
             idempotency_key: idempotency_key.clone(),
             account_id,
             amount_zat: amount,
             spendable_for_check_zat: Zatoshis::try_from(1_000_000_u64)?,
-            locked_notes: vec![DispenseReservedNote::new(
+            locked_notes: vec![HeldNote::new(
                 zcash_protocol::ShieldedProtocol::Orchard,
                 amount,
                 TxId::from_bytes([0xAA; 32]),
@@ -110,7 +107,7 @@ async fn reserve_for_dispense_is_idempotent_on_active_request() -> Result<(), Te
     );
     let outcome = wallet.reserve_for_dispense(plan).await?;
     assert_eq!(
-        outcome.reservation_id, reservation_id,
+        outcome.hold_id, hold_id,
         "idempotent retry must return the prior reservation id"
     );
     assert_eq!(
@@ -125,7 +122,7 @@ async fn reserve_for_dispense_is_idempotent_on_active_request() -> Result<(), Te
 }
 
 #[tokio::test]
-async fn finalize_dispense_reservation_marks_row_consumed() -> Result<(), TestError> {
+async fn finalize_hold_marks_row_consumed() -> Result<(), TestError> {
     let TestWalletFixture {
         wallet,
         account_id,
@@ -135,10 +132,10 @@ async fn finalize_dispense_reservation_marks_row_consumed() -> Result<(), TestEr
     let storage = Sqlite::new(SqliteOptions::for_network(network, temp.db_path()));
     storage.open_or_create().await?;
 
-    let reservation_id = ReservationId::new();
+    let hold_id = HoldId::new();
     storage
-        .create_dispense_reservation(DispenseReservationRecord {
-            reservation_id,
+        .create_hold(HoldRecord {
+            hold_id,
             request_id: IdempotencyKey::try_from("finalize-request")?,
             idempotency_key: IdempotencyKey::try_from("finalize-broadcast")?,
             account_id,
@@ -150,30 +147,20 @@ async fn finalize_dispense_reservation_marks_row_consumed() -> Result<(), TestEr
         .await?;
 
     let tx_id = TxId::from_bytes([0xEE; 32]);
-    wallet
-        .finalize_dispense_reservation(reservation_id, tx_id)
-        .await?;
-    wallet
-        .finalize_dispense_reservation(reservation_id, tx_id)
-        .await?;
+    wallet.finalize_hold(hold_id, tx_id).await?;
+    wallet.finalize_hold(hold_id, tx_id).await?;
 
-    let active = storage
-        .list_active_dispense_reservations(account_id)
-        .await?;
+    let active = storage.list_active_holds(account_id).await?;
     assert!(
         active.is_empty(),
         "finalized reservations leave the active set"
     );
 
-    let unknown_outcome = wallet
-        .finalize_dispense_reservation(ReservationId::new(), tx_id)
-        .await;
+    let unknown_outcome = wallet.finalize_hold(HoldId::new(), tx_id).await;
     assert!(
         matches!(
             unknown_outcome,
-            Err(WalletError::Storage(
-                StorageError::DispenseReservationNotFound
-            ))
+            Err(WalletError::Storage(StorageError::HoldNotFound))
         ),
         "finalize for an unknown reservation must fail closed: {unknown_outcome:?}"
     );
@@ -181,7 +168,7 @@ async fn finalize_dispense_reservation_marks_row_consumed() -> Result<(), TestEr
 }
 
 #[tokio::test]
-async fn release_dispense_reservation_marks_row_released() -> Result<(), TestError> {
+async fn release_hold_marks_row_released() -> Result<(), TestError> {
     let TestWalletFixture {
         wallet,
         account_id,
@@ -191,10 +178,10 @@ async fn release_dispense_reservation_marks_row_released() -> Result<(), TestErr
     let storage = Sqlite::new(SqliteOptions::for_network(network, temp.db_path()));
     storage.open_or_create().await?;
 
-    let reservation_id = ReservationId::new();
+    let hold_id = HoldId::new();
     storage
-        .create_dispense_reservation(DispenseReservationRecord {
-            reservation_id,
+        .create_hold(HoldRecord {
+            hold_id,
             request_id: IdempotencyKey::try_from("release-request")?,
             idempotency_key: IdempotencyKey::try_from("release-broadcast")?,
             account_id,
@@ -205,25 +192,19 @@ async fn release_dispense_reservation_marks_row_released() -> Result<(), TestErr
         })
         .await?;
 
-    wallet.release_dispense_reservation(reservation_id).await?;
-    wallet.release_dispense_reservation(reservation_id).await?;
-    let active = storage
-        .list_active_dispense_reservations(account_id)
-        .await?;
+    wallet.release_hold(hold_id).await?;
+    wallet.release_hold(hold_id).await?;
+    let active = storage.list_active_holds(account_id).await?;
     assert!(
         active.is_empty(),
         "released reservations leave the active set"
     );
 
-    let unknown_outcome = wallet
-        .release_dispense_reservation(ReservationId::new())
-        .await;
+    let unknown_outcome = wallet.release_hold(HoldId::new()).await;
     assert!(
         matches!(
             unknown_outcome,
-            Err(WalletError::Storage(
-                StorageError::DispenseReservationNotFound
-            ))
+            Err(WalletError::Storage(StorageError::HoldNotFound))
         ),
         "release for an unknown reservation must fail closed: {unknown_outcome:?}"
     );
@@ -231,7 +212,7 @@ async fn release_dispense_reservation_marks_row_released() -> Result<(), TestErr
 }
 
 #[tokio::test]
-async fn spendable_for_next_dispense_subtracts_active_reservations() -> Result<(), TestError> {
+async fn spendable_for_next_dispense_subtracts_active_holds() -> Result<(), TestError> {
     let TestWalletFixture {
         wallet,
         account_id,
@@ -251,10 +232,10 @@ async fn spendable_for_next_dispense_subtracts_active_reservations() -> Result<(
     // The wallet stores reservations against a sqlite ledger that is shared with the
     // wallet handle's storage; once a reservation lives on disk it subtracts from
     // any subsequent spendable_for_next_dispense read on the wallet handle.
-    let reservation_id = ReservationId::new();
+    let hold_id = HoldId::new();
     storage
-        .create_dispense_reservation(DispenseReservationRecord {
-            reservation_id,
+        .create_hold(HoldRecord {
+            hold_id,
             request_id: IdempotencyKey::try_from("subtract-request")?,
             idempotency_key: IdempotencyKey::try_from("subtract-broadcast")?,
             account_id,
@@ -271,7 +252,7 @@ async fn spendable_for_next_dispense_subtracts_active_reservations() -> Result<(
 
     // After release, the active-sum should drop back to zero (still bounded at zero
     // because the wallet itself has nothing spendable to begin with).
-    wallet.release_dispense_reservation(reservation_id).await?;
+    wallet.release_hold(hold_id).await?;
     let restored = wallet.spendable_for_next_dispense(account_id).await?;
     assert_eq!(restored, baseline);
     Ok(())

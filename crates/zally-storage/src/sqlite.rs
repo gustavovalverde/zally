@@ -14,13 +14,15 @@ use std::num::NonZeroU32;
 use std::path::PathBuf;
 
 use async_trait::async_trait;
+use orchard::tree::MerkleHashOrchard;
 use rand::rngs::OsRng;
 use rusqlite::OptionalExtension as _;
+use sapling::Node as SaplingNode;
 use secrecy::{ExposeSecret as _, SecretVec};
 use tokio::sync::{mpsc, oneshot};
 use zally_core::{
-    AccountId, BlockHeight, FailurePosture, IdempotencyKey, Network, NetworkParameters,
-    ReservationId, TransparentGapLimit, TxId, Zatoshis,
+    AccountId, BlockHeight, FailurePosture, HoldId, IdempotencyKey, Network, NetworkParameters,
+    TransparentGapLimit, TxId, Zatoshis,
 };
 use zally_keys::{KeyDerivationError, SeedMaterial, derive_ufvk};
 use zcash_client_backend::data_api::chain::{ChainState, CommitmentTreeRoot};
@@ -40,8 +42,6 @@ use zcash_client_sqlite::wallet::init::WalletMigrator;
 use zcash_keys::address::UnifiedAddress;
 use zcash_keys::keys::UnifiedAddressRequest;
 use zcash_keys::keys::transparent::gap_limits::GapLimits;
-use orchard::tree::MerkleHashOrchard;
-use sapling::Node as SaplingNode;
 use zcash_protocol::ShieldedProtocol;
 use zcash_protocol::memo::Memo;
 use zcash_protocol::value::Zatoshis as UpstreamZatoshis;
@@ -319,8 +319,8 @@ fn open_wallet_db(options: &SqliteOptions) -> Result<WalletDbState, StorageError
              ); \
              CREATE INDEX IF NOT EXISTS idx_pending_broadcast_inputs_account_window \
                  ON ext_zally_pending_broadcast_inputs(account_id, broadcast_at_ms); \
-             CREATE TABLE IF NOT EXISTS ext_zally_dispense_reservations (\
-                 reservation_id BLOB PRIMARY KEY NOT NULL,\
+             CREATE TABLE IF NOT EXISTS ext_zally_holds (\
+                 hold_id BLOB PRIMARY KEY NOT NULL,\
                  request_id TEXT NOT NULL,\
                  idempotency_key TEXT NOT NULL,\
                  account_id BLOB NOT NULL,\
@@ -330,11 +330,11 @@ fn open_wallet_db(options: &SqliteOptions) -> Result<WalletDbState, StorageError
                  finalized_tx_id BLOB,\
                  released_at_ms INTEGER\
              ); \
-             CREATE UNIQUE INDEX IF NOT EXISTS idx_dispense_reservations_active_request \
-                 ON ext_zally_dispense_reservations(request_id) \
+             CREATE UNIQUE INDEX IF NOT EXISTS idx_holds_active_request \
+                 ON ext_zally_holds(request_id) \
                  WHERE finalized_tx_id IS NULL AND released_at_ms IS NULL; \
-             CREATE INDEX IF NOT EXISTS idx_dispense_reservations_account_active \
-                 ON ext_zally_dispense_reservations(account_id) \
+             CREATE INDEX IF NOT EXISTS idx_holds_account_active \
+                 ON ext_zally_holds(account_id) \
                  WHERE finalized_tx_id IS NULL AND released_at_ms IS NULL;",
         )
         .map_err(|e| StorageError::SqliteFailed {
@@ -560,12 +560,13 @@ impl WalletStorage for Sqlite {
                 let typed = roots
                     .into_iter()
                     .map(|(height, bytes)| {
-                        let node = SaplingNode::from_bytes(bytes).into_option().ok_or_else(|| {
-                            StorageError::SqliteFailed {
-                                reason: "invalid sapling subtree root hash".to_owned(),
-                                posture: FailurePosture::NotRetryable,
-                            }
-                        })?;
+                        let node =
+                            SaplingNode::from_bytes(bytes)
+                                .into_option()
+                                .ok_or_else(|| StorageError::SqliteFailed {
+                                    reason: "invalid sapling subtree root hash".to_owned(),
+                                    posture: FailurePosture::NotRetryable,
+                                })?;
                         let end = zcash_protocol::consensus::BlockHeight::from(height.as_u32());
                         Ok(CommitmentTreeRoot::from_parts(end, node))
                     })
@@ -580,12 +581,12 @@ impl WalletStorage for Sqlite {
                 let typed = roots
                     .into_iter()
                     .map(|(height, bytes)| {
-                        let node = MerkleHashOrchard::from_bytes(&bytes).into_option().ok_or_else(
-                            || StorageError::SqliteFailed {
+                        let node = MerkleHashOrchard::from_bytes(&bytes)
+                            .into_option()
+                            .ok_or_else(|| StorageError::SqliteFailed {
                                 reason: "invalid orchard subtree root hash".to_owned(),
                                 posture: FailurePosture::NotRetryable,
-                            },
-                        )?;
+                            })?;
                         let end = zcash_protocol::consensus::BlockHeight::from(height.as_u32());
                         Ok(CommitmentTreeRoot::from_parts(end, node))
                     })
@@ -600,10 +601,7 @@ impl WalletStorage for Sqlite {
         .await
     }
 
-    async fn truncate_to_chain_state(
-        &self,
-        chain_state: ChainState,
-    ) -> Result<(), StorageError> {
+    async fn truncate_to_chain_state(&self, chain_state: ChainState) -> Result<(), StorageError> {
         self.with_db_mut(move |db| {
             WalletWrite::truncate_to_chain_state(db, chain_state).map_err(|err| {
                 StorageError::SqliteFailed {
@@ -1662,12 +1660,9 @@ impl WalletStorage for Sqlite {
         .await
     }
 
-    async fn create_dispense_reservation(
-        &self,
-        record: crate::wallet::DispenseReservationRecord,
-    ) -> Result<(), StorageError> {
-        let crate::wallet::DispenseReservationRecord {
-            reservation_id,
+    async fn create_hold(&self, record: crate::wallet::HoldRecord) -> Result<(), StorageError> {
+        let crate::wallet::HoldRecord {
+            hold_id,
             request_id,
             idempotency_key,
             account_id,
@@ -1676,7 +1671,7 @@ impl WalletStorage for Sqlite {
             locked_notes,
             reserved_at_ms,
         } = record;
-        let reservation_uuid_bytes = reservation_id.as_uuid().as_bytes().to_vec();
+        let reservation_uuid_bytes = hold_id.as_uuid().as_bytes().to_vec();
         let request_id_str = request_id.as_str().to_owned();
         let idempotency_key_str = idempotency_key.as_str().to_owned();
         let account_uuid_bytes = account_id.as_uuid().as_bytes().to_vec();
@@ -1694,7 +1689,7 @@ impl WalletStorage for Sqlite {
                 })?;
 
             if find_active_reservation_id_by_request(&tx, &request_id_str)?.is_some() {
-                return Err(StorageError::DispenseReservationRequestConflict);
+                return Err(StorageError::HoldRequestConflict);
             }
 
             let active_sum = sum_active_reservations(&tx, &account_uuid_bytes)?;
@@ -1710,8 +1705,8 @@ impl WalletStorage for Sqlite {
             }
 
             tx.execute(
-                "INSERT INTO ext_zally_dispense_reservations \
-                     (reservation_id, request_id, idempotency_key, account_id, amount_zat, \
+                "INSERT INTO ext_zally_holds \
+                     (hold_id, request_id, idempotency_key, account_id, amount_zat, \
                       locked_notes, reserved_at_ms, finalized_tx_id, released_at_ms) \
                   VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, NULL)",
                 rusqlite::params![
@@ -1737,19 +1732,15 @@ impl WalletStorage for Sqlite {
         .await
     }
 
-    async fn release_dispense_reservation(
-        &self,
-        reservation_id: ReservationId,
-        released_at_ms: u64,
-    ) -> Result<(), StorageError> {
-        let reservation_uuid_bytes = reservation_id.as_uuid().as_bytes().to_vec();
+    async fn release_hold(&self, hold_id: HoldId, released_at_ms: u64) -> Result<(), StorageError> {
+        let reservation_uuid_bytes = hold_id.as_uuid().as_bytes().to_vec();
         let released_at_ms_i64 = clamp_unsigned_to_i64(released_at_ms);
         self.with_ledger(move |conn| {
             let exists = conn
                 .query_row(
                     "SELECT released_at_ms, finalized_tx_id \
-                     FROM ext_zally_dispense_reservations \
-                     WHERE reservation_id = ?1",
+                     FROM ext_zally_holds \
+                     WHERE hold_id = ?1",
                     [&reservation_uuid_bytes],
                     |row| {
                         let released: Option<i64> = row.get(0)?;
@@ -1763,15 +1754,15 @@ impl WalletStorage for Sqlite {
                     posture: FailurePosture::NotRetryable,
                 })?;
             let Some((released, _finalized)) = exists else {
-                return Err(StorageError::DispenseReservationNotFound);
+                return Err(StorageError::HoldNotFound);
             };
             if released.is_some() {
                 return Ok(());
             }
             conn.execute(
-                "UPDATE ext_zally_dispense_reservations \
+                "UPDATE ext_zally_holds \
                  SET released_at_ms = ?2 \
-                 WHERE reservation_id = ?1 AND released_at_ms IS NULL",
+                 WHERE hold_id = ?1 AND released_at_ms IS NULL",
                 rusqlite::params![&reservation_uuid_bytes, released_at_ms_i64],
             )
             .map_err(|err| StorageError::SqliteFailed {
@@ -1783,18 +1774,14 @@ impl WalletStorage for Sqlite {
         .await
     }
 
-    async fn finalize_dispense_reservation(
-        &self,
-        reservation_id: ReservationId,
-        tx_id: TxId,
-    ) -> Result<(), StorageError> {
-        let reservation_uuid_bytes = reservation_id.as_uuid().as_bytes().to_vec();
+    async fn finalize_hold(&self, hold_id: HoldId, tx_id: TxId) -> Result<(), StorageError> {
+        let reservation_uuid_bytes = hold_id.as_uuid().as_bytes().to_vec();
         let tx_bytes = tx_id.as_bytes().to_vec();
         self.with_ledger(move |conn| {
             let exists = conn
                 .query_row(
-                    "SELECT finalized_tx_id FROM ext_zally_dispense_reservations \
-                     WHERE reservation_id = ?1",
+                    "SELECT finalized_tx_id FROM ext_zally_holds \
+                     WHERE hold_id = ?1",
                     [&reservation_uuid_bytes],
                     |row| row.get::<_, Option<Vec<u8>>>(0),
                 )
@@ -1804,15 +1791,15 @@ impl WalletStorage for Sqlite {
                     posture: FailurePosture::NotRetryable,
                 })?;
             let Some(prior_finalized) = exists else {
-                return Err(StorageError::DispenseReservationNotFound);
+                return Err(StorageError::HoldNotFound);
             };
             if prior_finalized.is_some() {
                 return Ok(());
             }
             conn.execute(
-                "UPDATE ext_zally_dispense_reservations \
+                "UPDATE ext_zally_holds \
                  SET finalized_tx_id = ?2 \
-                 WHERE reservation_id = ?1 AND finalized_tx_id IS NULL",
+                 WHERE hold_id = ?1 AND finalized_tx_id IS NULL",
                 rusqlite::params![&reservation_uuid_bytes, &tx_bytes],
             )
             .map_err(|err| StorageError::SqliteFailed {
@@ -1824,17 +1811,17 @@ impl WalletStorage for Sqlite {
         .await
     }
 
-    async fn find_dispense_reservation_by_request_id(
+    async fn find_hold_by_request_id(
         &self,
         request_id: &IdempotencyKey,
-    ) -> Result<Option<crate::DispenseReservationRow>, StorageError> {
+    ) -> Result<Option<crate::HoldRow>, StorageError> {
         let request_id_str = request_id.as_str().to_owned();
         self.with_ledger(move |conn| {
             let mut stmt = conn
                 .prepare(
-                    "SELECT reservation_id, request_id, idempotency_key, account_id, amount_zat, \
+                    "SELECT hold_id, request_id, idempotency_key, account_id, amount_zat, \
                             locked_notes, reserved_at_ms, finalized_tx_id, released_at_ms \
-                     FROM ext_zally_dispense_reservations \
+                     FROM ext_zally_holds \
                      WHERE request_id = ?1 \
                      ORDER BY reserved_at_ms DESC LIMIT 1",
                 )
@@ -1854,28 +1841,26 @@ impl WalletStorage for Sqlite {
                 reason: format!("dispense reservation lookup-by-request row failed: {err}"),
                 posture: FailurePosture::NotRetryable,
             })?;
-            next.map_or(Ok(None), |row| {
-                decode_dispense_reservation_row(row).map(Some)
-            })
+            next.map_or(Ok(None), |row| decode_hold_row(row).map(Some))
         })
         .await
     }
 
-    async fn list_active_dispense_reservations(
+    async fn list_active_holds(
         &self,
         account_id: AccountId,
-    ) -> Result<Vec<crate::DispenseReservationRow>, StorageError> {
+    ) -> Result<Vec<crate::HoldRow>, StorageError> {
         let account_uuid_bytes = account_id.as_uuid().as_bytes().to_vec();
         self.with_ledger(move |conn| {
             let mut stmt = conn
                 .prepare(
-                    "SELECT reservation_id, request_id, idempotency_key, account_id, amount_zat, \
+                    "SELECT hold_id, request_id, idempotency_key, account_id, amount_zat, \
                             locked_notes, reserved_at_ms, finalized_tx_id, released_at_ms \
-                     FROM ext_zally_dispense_reservations \
+                     FROM ext_zally_holds \
                      WHERE account_id = ?1 \
                        AND finalized_tx_id IS NULL \
                        AND released_at_ms IS NULL \
-                     ORDER BY reserved_at_ms ASC, reservation_id ASC",
+                     ORDER BY reserved_at_ms ASC, hold_id ASC",
                 )
                 .map_err(|err| StorageError::SqliteFailed {
                     reason: format!("list active dispense reservations prepare failed: {err}"),
@@ -1892,7 +1877,7 @@ impl WalletStorage for Sqlite {
                 reason: format!("list active dispense reservations row failed: {err}"),
                 posture: FailurePosture::NotRetryable,
             })? {
-                out.push(decode_dispense_reservation_row(row)?);
+                out.push(decode_hold_row(row)?);
             }
             Ok(out)
         })
@@ -1907,7 +1892,7 @@ impl WalletStorage for Sqlite {
         self.with_ledger(move |conn| {
             let total_u64 = sum_active_reservations(conn, &account_uuid_bytes)?;
             Zatoshis::try_from(total_u64).map_err(|_| StorageError::RowValueOutOfRange {
-                column: "ext_zally_dispense_reservations.amount_zat (sum)",
+                column: "ext_zally_holds.amount_zat (sum)",
                 raw: total_u64.to_string(),
             })
         })
@@ -2364,8 +2349,7 @@ fn prepared_transactions_with_inputs<'a, FeeRuleT, NoteRefT>(
                 reason: format!("transaction serialize failed: {err}"),
                 posture: FailurePosture::NotRetryable,
             })?;
-        let tx_expiry_height =
-            BlockHeight::from(u32::from(stored.expiry_height()));
+        let tx_expiry_height = BlockHeight::from(u32::from(stored.expiry_height()));
         let transparent_inputs = steps
             .get(step_index)
             .map(|step| {
@@ -2562,12 +2546,12 @@ const LOCKED_NOTE_TAG_ORCHARD: u8 = 1;
 /// Byte size of one encoded reserved note (tag + value + `tx_id` + `output_index`).
 const LOCKED_NOTE_RECORD_BYTES: usize = 1 + 8 + 32 + 4;
 
-/// Encodes a list of [`DispenseReservedNote`] values into the compact byte layout
-/// stored in `ext_zally_dispense_reservations.locked_notes`.
+/// Encodes a list of [`HeldNote`] values into the compact byte layout
+/// stored in `ext_zally_holds.locked_notes`.
 ///
 /// Layout: `u32` BE note count, then per-note records of fixed size
 /// `[u8 protocol_tag][u64_be value_zat][32 bytes tx_id][u32_be output_index]`.
-fn encode_locked_notes(notes: &[crate::DispenseReservedNote]) -> Vec<u8> {
+fn encode_locked_notes(notes: &[crate::HeldNote]) -> Vec<u8> {
     let count = u32::try_from(notes.len()).unwrap_or(u32::MAX);
     let mut blob = Vec::with_capacity(
         4_usize.saturating_add(notes.len().saturating_mul(LOCKED_NOTE_RECORD_BYTES)),
@@ -2587,10 +2571,10 @@ fn encode_locked_notes(notes: &[crate::DispenseReservedNote]) -> Vec<u8> {
 }
 
 /// Reverses [`encode_locked_notes`].
-fn decode_locked_notes(blob: &[u8]) -> Result<Vec<crate::DispenseReservedNote>, StorageError> {
+fn decode_locked_notes(blob: &[u8]) -> Result<Vec<crate::HeldNote>, StorageError> {
     if blob.len() < 4 {
         return Err(StorageError::RowValueOutOfRange {
-            column: "ext_zally_dispense_reservations.locked_notes",
+            column: "ext_zally_holds.locked_notes",
             raw: format!("blob length {} below 4-byte header", blob.len()),
         });
     }
@@ -2598,7 +2582,7 @@ fn decode_locked_notes(blob: &[u8]) -> Result<Vec<crate::DispenseReservedNote>, 
         blob[0..4]
             .try_into()
             .map_err(|_| StorageError::RowValueOutOfRange {
-                column: "ext_zally_dispense_reservations.locked_notes",
+                column: "ext_zally_holds.locked_notes",
                 raw: "could not read count header".to_owned(),
             })?;
     let count = u32::from_be_bytes(header_bytes);
@@ -2606,7 +2590,7 @@ fn decode_locked_notes(blob: &[u8]) -> Result<Vec<crate::DispenseReservedNote>, 
         4_usize.saturating_add((count as usize).saturating_mul(LOCKED_NOTE_RECORD_BYTES));
     if blob.len() != expected_bytes {
         return Err(StorageError::RowValueOutOfRange {
-            column: "ext_zally_dispense_reservations.locked_notes",
+            column: "ext_zally_holds.locked_notes",
             raw: format!(
                 "blob length {} does not match header count {count} (expected {expected_bytes})",
                 blob.len()
@@ -2623,7 +2607,7 @@ fn decode_locked_notes(blob: &[u8]) -> Result<Vec<crate::DispenseReservedNote>, 
             LOCKED_NOTE_TAG_ORCHARD => ShieldedProtocol::Orchard,
             other => {
                 return Err(StorageError::RowValueOutOfRange {
-                    column: "ext_zally_dispense_reservations.locked_notes (protocol tag)",
+                    column: "ext_zally_holds.locked_notes (protocol tag)",
                     raw: other.to_string(),
                 });
             }
@@ -2632,31 +2616,31 @@ fn decode_locked_notes(blob: &[u8]) -> Result<Vec<crate::DispenseReservedNote>, 
             record[1..9]
                 .try_into()
                 .map_err(|_| StorageError::RowValueOutOfRange {
-                    column: "ext_zally_dispense_reservations.locked_notes (value_zat)",
+                    column: "ext_zally_holds.locked_notes (value_zat)",
                     raw: "could not read value bytes".to_owned(),
                 })?;
         let value_u64 = u64::from_be_bytes(value_bytes);
         let value_zat =
             Zatoshis::try_from(value_u64).map_err(|_| StorageError::RowValueOutOfRange {
-                column: "ext_zally_dispense_reservations.locked_notes (value_zat)",
+                column: "ext_zally_holds.locked_notes (value_zat)",
                 raw: value_u64.to_string(),
             })?;
         let tx_id_bytes: [u8; 32] =
             record[9..41]
                 .try_into()
                 .map_err(|_| StorageError::RowValueOutOfRange {
-                    column: "ext_zally_dispense_reservations.locked_notes (tx_id)",
+                    column: "ext_zally_holds.locked_notes (tx_id)",
                     raw: "could not read 32-byte tx_id".to_owned(),
                 })?;
         let output_index_bytes: [u8; 4] =
             record[41..45]
                 .try_into()
                 .map_err(|_| StorageError::RowValueOutOfRange {
-                    column: "ext_zally_dispense_reservations.locked_notes (output_index)",
+                    column: "ext_zally_holds.locked_notes (output_index)",
                     raw: "could not read output_index bytes".to_owned(),
                 })?;
         let output_index = u32::from_be_bytes(output_index_bytes);
-        notes.push(crate::DispenseReservedNote {
+        notes.push(crate::HeldNote {
             protocol,
             value_zat,
             tx_id: TxId::from_bytes(tx_id_bytes),
@@ -2672,7 +2656,7 @@ fn find_active_reservation_id_by_request(
     request_id: &str,
 ) -> Result<Option<Vec<u8>>, StorageError> {
     conn.query_row(
-        "SELECT reservation_id FROM ext_zally_dispense_reservations \
+        "SELECT hold_id FROM ext_zally_holds \
          WHERE request_id = ?1 \
            AND finalized_tx_id IS NULL \
            AND released_at_ms IS NULL",
@@ -2693,7 +2677,7 @@ fn sum_active_reservations(
     let sum_i64: i64 = conn
         .query_row(
             "SELECT COALESCE(SUM(amount_zat), 0) \
-             FROM ext_zally_dispense_reservations \
+             FROM ext_zally_holds \
              WHERE account_id = ?1 \
                AND finalized_tx_id IS NULL \
                AND released_at_ms IS NULL",
@@ -2705,14 +2689,12 @@ fn sum_active_reservations(
             posture: FailurePosture::NotRetryable,
         })?;
     u64::try_from(sum_i64).map_err(|_| StorageError::RowValueOutOfRange {
-        column: "ext_zally_dispense_reservations.amount_zat (sum)",
+        column: "ext_zally_holds.amount_zat (sum)",
         raw: sum_i64.to_string(),
     })
 }
 
-fn decode_dispense_reservation_row(
-    row: &rusqlite::Row<'_>,
-) -> Result<crate::DispenseReservationRow, StorageError> {
+fn decode_hold_row(row: &rusqlite::Row<'_>) -> Result<crate::HoldRow, StorageError> {
     let reservation_uuid_bytes: Vec<u8> = row.get(0).map_err(|e| map_row_decode_error(&e))?;
     let request_id_str: String = row.get(1).map_err(|e| map_row_decode_error(&e))?;
     let idempotency_key_str: String = row.get(2).map_err(|e| map_row_decode_error(&e))?;
@@ -2726,7 +2708,7 @@ fn decode_dispense_reservation_row(
     let reservation_uuid_array: [u8; 16] =
         reservation_uuid_bytes.try_into().map_err(|raw: Vec<u8>| {
             StorageError::RowValueOutOfRange {
-                column: "ext_zally_dispense_reservations.reservation_id",
+                column: "ext_zally_holds.hold_id",
                 raw: format!("uuid byte length {}", raw.len()),
             }
         })?;
@@ -2734,51 +2716,51 @@ fn decode_dispense_reservation_row(
         account_uuid_bytes
             .try_into()
             .map_err(|raw: Vec<u8>| StorageError::RowValueOutOfRange {
-                column: "ext_zally_dispense_reservations.account_id",
+                column: "ext_zally_holds.account_id",
                 raw: format!("uuid byte length {}", raw.len()),
             })?;
     let request_id = IdempotencyKey::try_from(request_id_str).map_err(|err| {
         StorageError::RowValueOutOfRange {
-            column: "ext_zally_dispense_reservations.request_id",
+            column: "ext_zally_holds.request_id",
             raw: format!("invalid idempotency key: {err}"),
         }
     })?;
     let idempotency_key = IdempotencyKey::try_from(idempotency_key_str).map_err(|err| {
         StorageError::RowValueOutOfRange {
-            column: "ext_zally_dispense_reservations.idempotency_key",
+            column: "ext_zally_holds.idempotency_key",
             raw: format!("invalid idempotency key: {err}"),
         }
     })?;
     let amount_u64 =
         u64::try_from(amount_zat_raw).map_err(|_| StorageError::RowValueOutOfRange {
-            column: "ext_zally_dispense_reservations.amount_zat",
+            column: "ext_zally_holds.amount_zat",
             raw: amount_zat_raw.to_string(),
         })?;
     let amount_zat =
         Zatoshis::try_from(amount_u64).map_err(|_| StorageError::RowValueOutOfRange {
-            column: "ext_zally_dispense_reservations.amount_zat",
+            column: "ext_zally_holds.amount_zat",
             raw: amount_u64.to_string(),
         })?;
     let reserved_at_ms =
         u64::try_from(reserved_at_ms_raw).map_err(|_| StorageError::RowValueOutOfRange {
-            column: "ext_zally_dispense_reservations.reserved_at_ms",
+            column: "ext_zally_holds.reserved_at_ms",
             raw: reserved_at_ms_raw.to_string(),
         })?;
     let finalized_tx_id = finalized_tx_bytes
-        .map(|bytes| decode_txid_bytes(bytes, "ext_zally_dispense_reservations.finalized_tx_id"))
+        .map(|bytes| decode_txid_bytes(bytes, "ext_zally_holds.finalized_tx_id"))
         .transpose()?;
     let released_at_ms = released_at_ms_raw
         .map(|raw| {
             u64::try_from(raw).map_err(|_| StorageError::RowValueOutOfRange {
-                column: "ext_zally_dispense_reservations.released_at_ms",
+                column: "ext_zally_holds.released_at_ms",
                 raw: raw.to_string(),
             })
         })
         .transpose()?;
     let locked_notes = decode_locked_notes(&locked_notes_blob)?;
 
-    Ok(crate::DispenseReservationRow {
-        reservation_id: ReservationId::from_uuid(uuid::Uuid::from_bytes(reservation_uuid_array)),
+    Ok(crate::HoldRow {
+        hold_id: HoldId::from_uuid(uuid::Uuid::from_bytes(reservation_uuid_array)),
         request_id,
         idempotency_key,
         account_id: AccountId::from_uuid(uuid::Uuid::from_bytes(account_uuid_array)),
