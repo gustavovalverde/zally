@@ -20,6 +20,7 @@ mod failure_posture;
 mod hash_hex;
 mod hold_id;
 mod idempotency_key;
+mod intent_hash;
 mod memo;
 mod network;
 mod outpoint;
@@ -40,6 +41,9 @@ pub use failure_posture::FailurePosture;
 pub use hash_hex::FromRpcHexError;
 pub use hold_id::HoldId;
 pub use idempotency_key::{IdempotencyKey, IdempotencyKeyError};
+pub use intent_hash::{
+    DOMAIN_SEPARATOR as INTENT_HASH_DOMAIN_SEPARATOR, IntentHash, IntentHashError, IntentInput,
+};
 pub use memo::{Memo, MemoBytes, MemoError};
 pub use network::{Network, NetworkParameters};
 pub use outpoint::OutPoint;
