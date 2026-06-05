@@ -96,8 +96,8 @@ async fn shielding_excludes_pending_broadcast_inputs() -> Result<(), TestError> 
                 reason: format!(
                     "expected the second immediate shield to be refused; it produced a duplicate \
                      broadcast (first shield tx_id bytes {:?}, second {:?})",
-                    first_shield.tx_id.as_bytes(),
-                    second_outcome.tx_id.as_bytes(),
+                    first_shield.tx_id().as_bytes(),
+                    second_outcome.tx_id().as_bytes(),
                 ),
             });
         }
@@ -200,7 +200,7 @@ impl FundedZinderRoundTrip {
             !receives.is_empty(),
             "funded live test expected Zally to observe its shielded self-send"
         );
-        Ok(shield_outcome.tx_id)
+        Ok(shield_outcome.tx_id())
     }
 
     async fn submit_shielded_payment(&mut self) -> Result<TxId, TestError> {
@@ -222,7 +222,7 @@ impl FundedZinderRoundTrip {
             .generate_blocks(SHIELDED_SPEND_CONFIRMATION_BLOCKS)?;
         let send_height = self.miner.safe_chain_tip_height()?;
         wait_until_at_tip_at_or_above(&mut self.sync_snapshots, send_height).await?;
-        Ok(send_outcome.tx_id)
+        Ok(send_outcome.tx_id())
     }
 
     async fn submit_pczt_payment(&mut self) -> Result<TxId, TestError> {
@@ -247,7 +247,7 @@ impl FundedZinderRoundTrip {
         self.miner.generate_blocks(1)?;
         let pczt_height = self.miner.safe_chain_tip_height()?;
         wait_until_at_tip_at_or_above(&mut self.sync_snapshots, pczt_height).await?;
-        Ok(pczt_outcome.tx_id)
+        Ok(pczt_outcome.tx_id())
     }
 
     // &mut self stays even though no field is mutated; the live test holds a

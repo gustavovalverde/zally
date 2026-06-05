@@ -42,7 +42,8 @@ async fn send_payment_short_circuits_on_known_idempotency_key() -> Result<(), Te
     let outcome = wallet.send_payment(plan).await?;
 
     assert_eq!(
-        outcome.tx_id, prior_tx_id,
+        outcome.tx_id(),
+        prior_tx_id,
         "ledger hit must return the previously-recorded tx_id"
     );
     assert_eq!(

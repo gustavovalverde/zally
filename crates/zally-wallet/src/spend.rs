@@ -241,17 +241,67 @@ impl Proposal {
     }
 }
 
-/// Result of a successful send.
+/// Result of building and signing a transaction without broadcast.
+///
+/// Produced by `Wallet::sign_pczt` and by the internal sign step inside
+/// `Wallet::send_payment`. The transaction is fully signed but has not yet
+/// been handed to a [`zally_chain::Submitter`]. `fee_zat` reflects the fee
+/// the proposal allocated; `tx_id` is the ZIP-244 identifier of the signed
+/// transaction. Phase 2d of Proposal-0003 fills the full PCZT path; this
+/// type lands in 2e ahead of that to lock the vocabulary.
+#[derive(Clone, Debug)]
+pub struct SignedPczt {
+    /// Transaction identifier of the signed transaction.
+    pub tx_id: TxId,
+    /// Fee allocated by the proposal builder, in zatoshis. Zero until the
+    /// 2d PCZT path threads the proposal-fee value through here.
+    pub fee_zat: zally_core::Zatoshis,
+    /// Block height at which Zcash consensus will reject this transaction
+    /// if it has not been mined.
+    pub tx_expiry_height: BlockHeight,
+}
+
+/// Result of a successful broadcast.
+///
+/// Produced by `Wallet::send_payment` after a [`zally_chain::Submitter::submit`]
+/// accept. Distinct from [`SignedPczt`] because the signing and broadcast
+/// phases of D-9 of Proposal-0003 live in two separate runtimes
+/// (`zspend-runtime` signs; `zpay-runtime` broadcasts). Inside the
+/// `send_payment` convenience method the two phases are still composed in
+/// one call; this type makes the post-broadcast facts visible separately.
+#[derive(Clone, Debug)]
+pub struct BroadcastOutcome {
+    /// Transaction identifier as confirmed by the broadcast plane.
+    pub tx_id: TxId,
+    /// Height at which the chain source observed the broadcast. Zero when
+    /// the chain source could not produce a tip snapshot at submit time.
+    pub broadcast_at_height: BlockHeight,
+}
+
+/// Composed result of `Wallet::send_payment`: signed + broadcast facts.
+///
+/// Field access for callers that previously read `outcome.tx_id`,
+/// `outcome.broadcast_at_height`, or `outcome.tx_expiry_height` migrates
+/// to `outcome.signed.tx_id`, `outcome.broadcast.broadcast_at_height`, and
+/// `outcome.signed.tx_expiry_height` respectively. The split is intentional
+/// (Proposal-0003 D-3): the two phases run in different services in
+/// production, even though the in-process `send_payment` helper still
+/// composes them.
 #[derive(Clone, Debug)]
 pub struct SendOutcome {
-    /// Transaction identifier.
-    pub tx_id: TxId,
-    /// Height at which the chain source confirmed the broadcast.
-    pub broadcast_at_height: BlockHeight,
-    /// Block height at which Zcash consensus will reject this transaction if it has
-    /// not been mined. Callers use this to bound the time they wait for confirmation
-    /// before classifying the broadcast as expired.
-    pub tx_expiry_height: BlockHeight,
+    /// Sign-phase facts.
+    pub signed: SignedPczt,
+    /// Broadcast-phase facts.
+    pub broadcast: BroadcastOutcome,
+}
+
+impl SendOutcome {
+    /// Convenience accessor for the transaction id common to both phases.
+    /// Equal to `self.signed.tx_id` and `self.broadcast.tx_id`.
+    #[must_use]
+    pub const fn tx_id(&self) -> TxId {
+        self.signed.tx_id
+    }
 }
 
 impl Wallet {
@@ -294,6 +344,10 @@ impl Wallet {
     ///
     /// `not_retryable` on validation failure, insufficient balance, or missing prover
     /// params; `retryable` on transient submitter failures.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "send_payment is the single composed flow; splitting it further would scatter the (sign, idempotency, broadcast) transaction across helpers"
+    )]
     pub async fn send_payment(
         &self,
         plan: SendPaymentPlan<'_>,
@@ -314,10 +368,17 @@ impl Wallet {
             .find_idempotent_submission(&plan.idempotency)
             .await?
         {
+            let broadcast_at_height = self.observed_tip_or_zero().await?;
             return Ok(SendOutcome {
-                tx_id: prior_tx_id,
-                broadcast_at_height: self.observed_tip_or_zero().await?,
-                tx_expiry_height: BlockHeight::from(0),
+                signed: SignedPczt {
+                    tx_id: prior_tx_id,
+                    fee_zat: zally_core::Zatoshis::zero(),
+                    tx_expiry_height: BlockHeight::from(0),
+                },
+                broadcast: BroadcastOutcome {
+                    tx_id: prior_tx_id,
+                    broadcast_at_height,
+                },
             });
         }
 
@@ -366,9 +427,15 @@ impl Wallet {
             .await?;
 
         Ok(SendOutcome {
-            tx_id: result_tx_id,
-            broadcast_at_height: observed_tip.unwrap_or_else(|| BlockHeight::from(0)),
-            tx_expiry_height,
+            signed: SignedPczt {
+                tx_id: result_tx_id,
+                fee_zat: zally_core::Zatoshis::zero(),
+                tx_expiry_height,
+            },
+            broadcast: BroadcastOutcome {
+                tx_id: result_tx_id,
+                broadcast_at_height: observed_tip.unwrap_or_else(|| BlockHeight::from(0)),
+            },
         })
     }
 
@@ -400,10 +467,17 @@ impl Wallet {
             .find_idempotent_submission(&plan.idempotency)
             .await?
         {
+            let broadcast_at_height = self.observed_tip_or_zero().await?;
             return Ok(SendOutcome {
-                tx_id: prior_tx_id,
-                broadcast_at_height: self.observed_tip_or_zero().await?,
-                tx_expiry_height: BlockHeight::from(0),
+                signed: SignedPczt {
+                    tx_id: prior_tx_id,
+                    fee_zat: zally_core::Zatoshis::zero(),
+                    tx_expiry_height: BlockHeight::from(0),
+                },
+                broadcast: BroadcastOutcome {
+                    tx_id: prior_tx_id,
+                    broadcast_at_height,
+                },
             });
         }
 
@@ -448,9 +522,15 @@ impl Wallet {
             .await?;
 
         Ok(SendOutcome {
-            tx_id: result_tx_id,
-            broadcast_at_height: observed_tip.unwrap_or_else(|| BlockHeight::from(0)),
-            tx_expiry_height,
+            signed: SignedPczt {
+                tx_id: result_tx_id,
+                fee_zat: zally_core::Zatoshis::zero(),
+                tx_expiry_height,
+            },
+            broadcast: BroadcastOutcome {
+                tx_id: result_tx_id,
+                broadcast_at_height: observed_tip.unwrap_or_else(|| BlockHeight::from(0)),
+            },
         })
     }
 

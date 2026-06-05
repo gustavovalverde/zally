@@ -32,8 +32,8 @@ pub use pending_transparent_inputs::{PendingTransparentInput, PendingTransparent
 pub use received_note::ShieldedReceiveRecord;
 pub use retry::{HasFailurePosture, RetryPolicy, with_retry};
 pub use spend::{
-    ParsedPayment, PaymentRequest, Proposal, ProposalPlan, SendOutcome, SendPaymentPlan,
-    ShieldTransparentPlan,
+    BroadcastOutcome, ParsedPayment, PaymentRequest, Proposal, ProposalPlan, SendOutcome,
+    SendPaymentPlan, ShieldTransparentPlan, SignedPczt,
 };
 pub use status::{SyncStatus, WalletStatus};
 pub use sync::{
