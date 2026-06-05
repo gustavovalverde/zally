@@ -11,6 +11,8 @@
 //! `BranchId` plus the regtest `LocalNetwork` carried inside [`Network::Regtest`].
 
 mod account_id;
+#[cfg(feature = "serde")]
+pub(crate) mod base64_bytes;
 mod block_hash;
 mod block_height;
 mod branch_id;
@@ -23,11 +25,14 @@ mod network;
 mod outpoint;
 mod payment_recipient;
 mod receiver_purpose;
+mod signed_payload;
 mod transparent_gap;
 mod txid;
 mod zatoshis;
 
 pub use account_id::AccountId;
+#[cfg(feature = "serde")]
+pub(crate) use base64_bytes::is_empty_metadata;
 pub use block_hash::BlockHash;
 pub use block_height::BlockHeight;
 pub use branch_id::BranchId;
@@ -40,6 +45,7 @@ pub use network::{Network, NetworkParameters};
 pub use outpoint::OutPoint;
 pub use payment_recipient::PaymentRecipient;
 pub use receiver_purpose::ReceiverPurpose;
+pub use signed_payload::{Amount, AmountUnit, ExpiresAt, SignedPayload, SignedPayloadFormat};
 pub use transparent_gap::TransparentGapLimit;
 pub use txid::TxId;
 pub use zatoshis::{Zatoshis, ZatoshisError};

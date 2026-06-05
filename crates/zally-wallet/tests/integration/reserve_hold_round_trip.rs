@@ -36,8 +36,8 @@ async fn reserve_hold_zero_amount_is_rejected() -> Result<(), TestError> {
 }
 
 #[tokio::test]
-async fn reserve_hold_returns_insufficient_when_amount_exceeds_spendable()
--> Result<(), TestError> {
+async fn reserve_hold_returns_insufficient_when_amount_exceeds_spendable() -> Result<(), TestError>
+{
     let TestWalletFixture {
         wallet,
         account_id,
