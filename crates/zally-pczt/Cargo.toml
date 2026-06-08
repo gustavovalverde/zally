@@ -17,8 +17,10 @@ serde = ["zally-core/serde"]
 [dependencies]
 orchard.workspace = true
 pczt.workspace = true
+postcard.workspace = true
 sapling.workspace = true
 secp256k1.workspace = true
+serde = { workspace = true }
 thiserror.workspace = true
 zally-core = { path = "../zally-core", version = "0.1" }
 zally-keys = { path = "../zally-keys", version = "0.1" }

@@ -5203,8 +5203,10 @@ version = "0.1.0"
 dependencies = [
  "orchard",
  "pczt",
+ "postcard",
  "sapling-crypto",
  "secp256k1",
+ "serde",
  "thiserror 2.0.18",
  "tokio",
  "zally-core",

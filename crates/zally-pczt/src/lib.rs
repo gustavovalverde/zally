@@ -11,6 +11,7 @@ mod error;
 mod extractor;
 mod prover;
 mod signer;
+mod updater;
 
 pub use bytes::PcztBytes;
 pub use combiner::Combiner;
@@ -19,3 +20,4 @@ pub use error::PcztError;
 pub use extractor::{ExtractedTransaction, Extractor};
 pub use prover::Prover;
 pub use signer::Signer;
+pub use updater::Updater;
