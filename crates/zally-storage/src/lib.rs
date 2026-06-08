@@ -7,6 +7,7 @@ mod filtered_wallet_db;
 mod hold_row;
 mod pending_broadcast_input_row;
 mod sqlite;
+mod v5_parse;
 mod wallet;
 
 pub use account_balance_row::AccountBalanceRow;
@@ -15,6 +16,7 @@ pub use exposed_address_row::ExposedAddressRow;
 pub use hold_row::{HeldNote, HoldRow};
 pub use pending_broadcast_input_row::PendingBroadcastInputRow;
 pub use sqlite::{Sqlite, SqliteOptions};
+pub use v5_parse::{V5ParseError, parse_v5_expiry_height};
 pub use wallet::{
     CommitmentTreeRoots, HoldRecord, PendingBroadcastRecord, PreparedTransaction,
     ProposalPaymentRequest, ProposalSummary, ReceivedShieldedNoteRow, ScanRequest, ScanResult,
