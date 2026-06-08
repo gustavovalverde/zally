@@ -19,24 +19,34 @@ impl Wallet {
     ///
     /// Validates the same recipient/memo/fee guards as [`Wallet::propose`], then composes
     /// `propose_standard_transfer_to_address` and `create_pczt_from_proposal` inside the
-    /// storage layer. The returned bytes carry the wallet's network and must be proven and
+    /// storage layer. When `target_expiry_height` is set, the caller-supplied value lands
+    /// on `Global::expiry_height` before the upstream IO Finalizer runs, which is the only
+    /// stage that can pin a value without invalidating the dummy spends the finalizer
+    /// signs. The returned bytes carry the wallet's network and must be proven and
     /// authorized via [`Wallet::prove_pczt`] and [`Wallet::sign_pczt`] before submission.
     ///
     /// `not_retryable` on validation failure or insufficient balance; `retryable` on
     /// transient I/O against the wallet database.
-    pub async fn propose_pczt(&self, plan: ProposalPlan) -> Result<PcztBytes, WalletError> {
+    pub async fn propose_pczt(
+        &self,
+        plan: ProposalPlan,
+        target_expiry_height: Option<BlockHeight>,
+    ) -> Result<PcztBytes, WalletError> {
         validate_proposal_plan(&plan, self.network())?;
         let recipient_encoded = plan.recipient.encoded().to_owned();
         let memo_bytes = plan.memo.as_ref().map(memo_to_wire_bytes);
         let raw = self
             .inner
             .storage
-            .create_pczt(zally_storage::ProposalPaymentRequest::new(
-                plan.account_id,
-                recipient_encoded,
-                plan.amount_zat,
-                memo_bytes,
-            ))
+            .create_pczt(
+                zally_storage::ProposalPaymentRequest::new(
+                    plan.account_id,
+                    recipient_encoded,
+                    plan.amount_zat,
+                    memo_bytes,
+                ),
+                target_expiry_height,
+            )
             .await
             .map_err(WalletError::from)?;
         Ok(PcztBytes::from_serialized(raw, self.network()))

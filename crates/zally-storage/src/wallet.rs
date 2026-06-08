@@ -590,12 +590,24 @@ pub trait WalletStorage: Send + Sync + 'static {
     /// `propose_standard_transfer_to_address` and
     /// `zcash_client_backend::data_api::wallet::create_pczt_from_proposal`.
     ///
+    /// When `target_expiry_height` is set, the caller-supplied value lands on
+    /// `Global::expiry_height` before the upstream IO Finalizer step. The IO
+    /// Finalizer signs every dummy orchard action with its `dummy_sk` against
+    /// the shielded sighash computed from that global and then consumes
+    /// `dummy_sk`. Setting expiry post-finalization (via a wire-format Updater)
+    /// would invalidate those dummy signatures with no recovery path, so this
+    /// is the only stage at which the caller can pin a value.
+    ///
     /// The returned bytes are not yet authorized; the wallet layer wraps them as
     /// `zally_pczt::PcztBytes` and routes through the `Signer` role before extraction.
     ///
     /// `not_retryable` on insufficient balance or invalid recipient; `retryable` on transient
     /// I/O.
-    async fn create_pczt(&self, request: ProposalPaymentRequest) -> Result<Vec<u8>, StorageError>;
+    async fn create_pczt(
+        &self,
+        request: ProposalPaymentRequest,
+        target_expiry_height: Option<BlockHeight>,
+    ) -> Result<Vec<u8>, StorageError>;
 
     /// Extracts a finalised PCZT, persists the resulting transaction in the wallet DB, and
     /// returns its raw bytes plus `tx_id`.

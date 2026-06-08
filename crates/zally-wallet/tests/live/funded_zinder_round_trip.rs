@@ -231,12 +231,10 @@ impl FundedZinderRoundTrip {
             derive_unified_recipient(&self.wallet, self.account_id, self.network).await?;
         let pczt = self
             .wallet
-            .propose_pczt(ProposalPlan::conventional(
-                self.account_id,
-                pczt_recipient,
-                send_zat,
+            .propose_pczt(
+                ProposalPlan::conventional(self.account_id, pczt_recipient, send_zat, None),
                 None,
-            ))
+            )
             .await?;
         let proven_pczt = self.wallet.prove_pczt(pczt).await?;
         let signed_pczt = self.wallet.sign_pczt(proven_pczt).await?;

@@ -176,7 +176,7 @@ async fn probe_live_pczt_cycle(
         recipient_ua = %encoded,
         "Wallet::propose_pczt driving create_pczt_from_proposal against the freshly-scanned WalletDb"
     );
-    match wallet.propose_pczt(plan).await {
+    match wallet.propose_pczt(plan, None).await {
         Ok(pczt) => info!(
             target: "zally::example",
             event = "live_zinder_propose_pczt_success",

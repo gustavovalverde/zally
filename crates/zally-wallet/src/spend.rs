@@ -469,12 +469,8 @@ impl Wallet {
             plan.amount_zat,
             plan.memo.clone(),
         );
-        let proposed = self.propose_pczt(proposal_plan).await?;
-        let target_u32 = u32::from(target);
-        let updated = zally_pczt::Updater::new(proposed)
-            .with_global_expiry_height(target_u32)
-            .finish()?;
-        let proven = self.prove_pczt(updated).await?;
+        let proposed = self.propose_pczt(proposal_plan, Some(target)).await?;
+        let proven = self.prove_pczt(proposed).await?;
         let signed = self.sign_pczt(proven).await?;
 
         let prepared = self
@@ -484,7 +480,7 @@ impl Wallet {
             .await
             .map_err(WalletError::from)?;
         let signed_height = prepared.tx_expiry_height;
-        if u32::from(signed_height) != target_u32 {
+        if u32::from(signed_height) != u32::from(target) {
             return Err(WalletError::TargetExpiryMismatch {
                 target,
                 signed: signed_height,

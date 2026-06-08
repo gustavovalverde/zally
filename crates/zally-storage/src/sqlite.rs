@@ -865,6 +865,7 @@ impl WalletStorage for Sqlite {
     async fn create_pczt(
         &self,
         request: crate::wallet::ProposalPaymentRequest,
+        target_expiry_height: Option<BlockHeight>,
     ) -> Result<Vec<u8>, StorageError> {
         let params = self.options.network.to_parameters();
         let account_uuid = zally_to_account_uuid(request.account_id);
@@ -875,6 +876,8 @@ impl WalletStorage for Sqlite {
             posture: FailurePosture::NotRetryable,
         })?;
         let memo_bytes = decode_memo_bytes(request.memo.as_deref())?;
+        let upstream_target_expiry_height = target_expiry_height
+            .map(|height| zcash_protocol::consensus::BlockHeight::from(u32::from(height)));
 
         self.with_db_mut(move |db| {
             let proposal = propose_payment_proposal(
@@ -899,6 +902,7 @@ impl WalletStorage for Sqlite {
                 account_uuid,
                 zcash_client_backend::wallet::OvkPolicy::Sender,
                 &proposal,
+                upstream_target_expiry_height,
             )
             .map_err(|err| classify_proposal_build_error(&err))?;
 
