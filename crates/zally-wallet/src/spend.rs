@@ -382,32 +382,35 @@ impl Wallet {
             });
         }
 
-        let seed = self
-            .inner
-            .sealing
-            .unseal_seed()
-            .await
-            .map_err(WalletError::from)?;
-        let recipient_encoded = plan.recipient.encoded().to_owned();
-        let memo_bytes = plan.memo.as_ref().map(memo_to_wire_bytes);
-        let excluded_outpoints = self
-            .collect_pending_broadcast_outpoints(plan.account_id)
-            .await?;
-        let prepared = self
-            .inner
-            .storage
-            .prepare_payment(
-                zally_storage::ProposalPaymentRequest::new(
-                    plan.account_id,
-                    recipient_encoded,
-                    plan.amount_zat,
-                    memo_bytes,
-                ),
-                excluded_outpoints,
-                &seed,
-            )
-            .await
-            .map_err(WalletError::from)?;
+        let prepared = if let Some(target) = plan.target_expiry_height {
+            self.prepare_send_with_target_expiry(&plan, target).await?
+        } else {
+            let seed = self
+                .inner
+                .sealing
+                .unseal_seed()
+                .await
+                .map_err(WalletError::from)?;
+            let recipient_encoded = plan.recipient.encoded().to_owned();
+            let memo_bytes = plan.memo.as_ref().map(memo_to_wire_bytes);
+            let excluded_outpoints = self
+                .collect_pending_broadcast_outpoints(plan.account_id)
+                .await?;
+            self.inner
+                .storage
+                .prepare_payment(
+                    zally_storage::ProposalPaymentRequest::new(
+                        plan.account_id,
+                        recipient_encoded,
+                        plan.amount_zat,
+                        memo_bytes,
+                    ),
+                    excluded_outpoints,
+                    &seed,
+                )
+                .await
+                .map_err(WalletError::from)?
+        };
         let observed_tip = self.inner.storage.find_observed_tip().await?;
         let (result_tx_id, tx_expiry_height) = self
             .submit_and_record_pending(
@@ -437,6 +440,58 @@ impl Wallet {
                 broadcast_at_height: observed_tip.unwrap_or_else(|| BlockHeight::from(0)),
             },
         })
+    }
+
+    /// Routes a `SendPaymentPlan` with `target_expiry_height` through the PCZT path.
+    ///
+    /// Composes propose -> Updater(expiry_height) -> prove -> sign -> extract, then
+    /// validates the signed expiry against the caller's target before handing the
+    /// prepared transaction back to `send_payment` for submission.
+    ///
+    /// Rejects targets at or below the wallet's observed chain tip with
+    /// [`WalletError::TargetExpiryStale`]: any signed bytes carrying such an expiry
+    /// would already be unmineable. Rejects a signed expiry that diverges from the
+    /// target with [`WalletError::TargetExpiryMismatch`], which catches bugs in the
+    /// Updater mutation at the wallet boundary rather than at the caller.
+    async fn prepare_send_with_target_expiry(
+        &self,
+        plan: &SendPaymentPlan<'_>,
+        target: BlockHeight,
+    ) -> Result<Vec<zally_storage::PreparedTransaction>, WalletError> {
+        let chain_tip = self.observed_tip_or_zero().await?;
+        if u32::from(target) <= u32::from(chain_tip) {
+            return Err(WalletError::TargetExpiryStale { target, chain_tip });
+        }
+
+        let proposal_plan = ProposalPlan::conventional(
+            plan.account_id,
+            plan.recipient.clone(),
+            plan.amount_zat,
+            plan.memo.clone(),
+        );
+        let proposed = self.propose_pczt(proposal_plan).await?;
+        let target_u32 = u32::from(target);
+        let updated = zally_pczt::Updater::new(proposed)
+            .with_global_expiry_height(target_u32)
+            .finish()?;
+        let proven = self.prove_pczt(updated).await?;
+        let signed = self.sign_pczt(proven).await?;
+
+        let prepared = self
+            .inner
+            .storage
+            .extract_and_store_pczt(signed.into_bytes())
+            .await
+            .map_err(WalletError::from)?;
+        let signed_height = prepared.tx_expiry_height;
+        if u32::from(signed_height) != target_u32 {
+            return Err(WalletError::TargetExpiryMismatch {
+                target,
+                signed: signed_height,
+            });
+        }
+
+        Ok(vec![prepared])
     }
 
     /// Shields wallet-owned transparent UTXOs into the account's internal shielded receiver,
@@ -732,6 +787,11 @@ impl ProposalPlan {
 }
 
 /// Inputs to [`Wallet::send_payment`].
+///
+/// Naming convention: fields prefixed with `target_` are caller-controlled wallet
+/// parameters that the wallet honours rather than derives. For example,
+/// `target_expiry_height` lets the caller commit to a specific expiry instead of
+/// letting the wallet derive one from its observed chain tip.
 #[non_exhaustive]
 pub struct SendPaymentPlan<'submitter> {
     /// Account that funds the send.
@@ -744,6 +804,13 @@ pub struct SendPaymentPlan<'submitter> {
     pub amount_zat: Zatoshis,
     /// Optional memo (rejected for transparent recipients).
     pub memo: Option<Memo>,
+    /// Caller-supplied expiry height to commit to.
+    ///
+    /// When set, the wallet builds the transaction through the PCZT path and mutates
+    /// the `global.expiry_height` field via the [`zally_pczt::Updater`] role before
+    /// proving and signing. When `None`, the wallet uses its own chain-tip-derived
+    /// default.
+    pub target_expiry_height: Option<BlockHeight>,
     /// Submitter that delivers the signed transaction.
     pub submitter: &'submitter dyn Submitter,
 }
@@ -795,6 +862,7 @@ impl<'submitter> SendPaymentPlan<'submitter> {
             recipient,
             amount_zat,
             memo: None,
+            target_expiry_height: None,
             submitter,
         }
     }
@@ -803,6 +871,18 @@ impl<'submitter> SendPaymentPlan<'submitter> {
     #[must_use]
     pub fn with_memo(mut self, memo: Memo) -> Self {
         self.memo = Some(memo);
+        self
+    }
+
+    /// Returns the plan with `target_expiry_height` set.
+    ///
+    /// Routes the send through the PCZT path so the caller-supplied height can be
+    /// committed via the [`zally_pczt::Updater`] role before the Prover and Signer
+    /// run. Without this builder call the wallet picks its own expiry from the
+    /// chain tip.
+    #[must_use]
+    pub fn with_target_expiry_height(mut self, height: BlockHeight) -> Self {
+        self.target_expiry_height = Some(height);
         self
     }
 }
@@ -915,6 +995,30 @@ mod tests {
             validate_non_zero(Zatoshis::zero()),
             Err(WalletError::ProposalRejected { .. })
         ));
+    }
+
+    /// `SendPaymentPlan::conventional` starts with `target_expiry_height: None`, and
+    /// `with_target_expiry_height` is the only way to opt in to the PCZT routing path.
+    #[test]
+    fn send_payment_plan_target_expiry_height_defaults_to_none() {
+        let submitter = zally_testkit::MockSubmitter::accepting(regtest());
+        let plan = SendPaymentPlan::conventional(
+            zally_core::AccountId::from_uuid(uuid::Uuid::nil()),
+            zally_core::IdempotencyKey::try_from("inert-builder-key").expect("key"),
+            PaymentRecipient::UnifiedAddress {
+                encoded: "uregtest1example".into(),
+                network: regtest(),
+            },
+            Zatoshis::try_from(1_u64).expect("zatoshis"),
+            &submitter,
+        );
+        assert!(
+            plan.target_expiry_height.is_none(),
+            "conventional() must not commit to any target expiry"
+        );
+
+        let with_target = plan.with_target_expiry_height(BlockHeight::from(123));
+        assert_eq!(with_target.target_expiry_height, Some(BlockHeight::from(123)));
     }
 
     /// Mainnet Sapling address from the upstream `zcash_address` rustdoc example.

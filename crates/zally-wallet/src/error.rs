@@ -1,7 +1,7 @@
 //! Operator-facing wallet error.
 
 use zally_chain::{ChainSourceError, FailurePosture, SubmitterError};
-use zally_core::{Network, Zatoshis};
+use zally_core::{BlockHeight, Network, Zatoshis};
 use zally_keys::{KeyDerivationError, SealingError};
 use zally_pczt::PcztError;
 use zally_storage::StorageError;
@@ -134,6 +134,35 @@ pub enum WalletError {
         operation: &'static str,
     },
 
+    /// The caller-supplied `target_expiry_height` is at or below the wallet's observed chain
+    /// tip, so any signed transaction would already be past its allowed expiry window.
+    ///
+    /// Posture: [`FailurePosture::NotRetryable`] until the caller picks a fresh height
+    /// (typically after observing a new tip).
+    #[error("target_expiry_height={target:?} is at or below the wallet's observed tip={chain_tip:?}")]
+    TargetExpiryStale {
+        /// Height the caller asked the wallet to commit to.
+        target: BlockHeight,
+        /// Chain tip the wallet had observed at the time of the call.
+        chain_tip: BlockHeight,
+    },
+
+    /// The signed transaction's `expiry_height` does not match the caller-supplied
+    /// `target_expiry_height`.
+    ///
+    /// Posture: [`FailurePosture::RequiresOperator`]: indicates a bug in the PCZT Updater
+    /// step or an unexpected upstream mutation; the caller should not retry the same plan
+    /// blindly.
+    #[error(
+        "signed transaction expiry_height={signed:?} does not match target_expiry_height={target:?}"
+    )]
+    TargetExpiryMismatch {
+        /// Height the caller asked the wallet to commit to.
+        target: BlockHeight,
+        /// Height the wallet actually signed.
+        signed: BlockHeight,
+    },
+
     /// The sync-driver task failed outside the wallet sync operation itself.
     ///
     /// Posture carries the operator-facing classification. A runtime cancellation surfaces as
@@ -162,7 +191,9 @@ impl WalletError {
             Self::Submitter(e) => e.posture(),
             Self::SyncDriverFailed { posture, .. } => *posture,
             Self::CircuitBroken { .. } => FailurePosture::Retryable,
-            Self::NetworkMismatch { .. } => FailurePosture::RequiresOperator,
+            Self::NetworkMismatch { .. } | Self::TargetExpiryMismatch { .. } => {
+                FailurePosture::RequiresOperator
+            }
             Self::NoSealedSeed
             | Self::AccountAlreadyExists
             | Self::AccountNotFound
@@ -171,7 +202,8 @@ impl WalletError {
             | Self::InsufficientBalance { .. }
             | Self::PaymentRequestParseFailed { .. }
             | Self::ProposalRejected { .. }
-            | Self::SubmissionRejected { .. } => FailurePosture::NotRetryable,
+            | Self::SubmissionRejected { .. }
+            | Self::TargetExpiryStale { .. } => FailurePosture::NotRetryable,
         }
     }
 
@@ -251,6 +283,14 @@ mod tests {
             },
             WalletError::Pczt(PcztError::NoMatchingKeys),
             WalletError::CircuitBroken { operation: "test" },
+            WalletError::TargetExpiryStale {
+                target: BlockHeight::from(10),
+                chain_tip: BlockHeight::from(20),
+            },
+            WalletError::TargetExpiryMismatch {
+                target: BlockHeight::from(10),
+                signed: BlockHeight::from(11),
+            },
             WalletError::SyncDriverFailed {
                 reason: "x".into(),
                 posture: FailurePosture::Retryable,
