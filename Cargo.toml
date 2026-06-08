@@ -117,10 +117,10 @@ proptest = "1.5"
 tempfile = "3.13"
 
 
-# Pinned to a sibling-directory copy of `zcash_client_backend` 0.23.0 with the
+# Pinned to a standalone fork of `zcash_client_backend` 0.23.0 with the
 # `target_expiry_height` argument added (matches https://github.com/zcash/librustzcash/pull/2412).
-# The copy lives outside the librustzcash workspace so cargo resolves transitive
-# deps from crates.io and not from sibling path-deps. Drop once upstream merges
-# and a `zcash_client_backend` release ships the patch on crates.io.
+# The fork is single-crate (not the librustzcash workspace) so cargo resolves
+# transitive deps from crates.io. Drop once upstream merges and a
+# `zcash_client_backend` release ships the patch on crates.io.
 [patch.crates-io]
-zcash_client_backend = { path = "../zcash_client_backend-debug" }
+zcash_client_backend = { git = "https://github.com/gustavovalverde/zcash_client_backend-target-expiry.git", tag = "v0.23.1-target-expiry" }
