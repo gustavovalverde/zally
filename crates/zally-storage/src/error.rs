@@ -113,6 +113,19 @@ pub enum StorageError {
         at_height: BlockHeight,
     },
 
+    /// The scanner computed a note-commitment subtree root that disagrees with a root
+    /// already stored in the wallet tree: the wallet's derived chain state no longer
+    /// matches the chain, and re-issuing the same scan fails deterministically until the
+    /// stale tree state is discarded.
+    ///
+    /// Posture: [`FailurePosture::NotRetryable`] for the issuing call; the sync driver
+    /// treats this as its cue to rewind deeper or rebuild derived state from the birthday.
+    #[error("note commitment tree conflict: {reason}")]
+    CommitmentTreeConflict {
+        /// Underlying error description.
+        reason: String,
+    },
+
     /// The transparent output script could not be mapped to a wallet-supported transparent
     /// address kind.
     ///
@@ -203,6 +216,7 @@ impl StorageError {
             | Self::AccountAlreadyExists
             | Self::KeyDerivationFailed { .. }
             | Self::IdempotencyKeyConflict
+            | Self::CommitmentTreeConflict { .. }
             | Self::TransparentOutputNotRecognized { .. }
             | Self::TransparentOutputValueOutOfRange { .. }
             | Self::InsufficientFunds { .. }
@@ -249,6 +263,7 @@ mod tests {
             StorageError::ChainReorgDetected {
                 at_height: BlockHeight::from(1),
             },
+            StorageError::CommitmentTreeConflict { reason: "x".into() },
             StorageError::TransparentOutputNotRecognized {
                 tx_id: zally_core::TxId::from_bytes([0_u8; 32]),
                 output_index: 0,

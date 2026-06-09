@@ -1,6 +1,6 @@
 //! Storage-level integration: `WalletStorage::list_shielded_receives_for_account` against
-//! an empty wallet returns `Ok(vec![])` and accepts both a freshly-created account and an
-//! unknown account UUID without panicking.
+//! an empty wallet returns `Ok(vec![])` for a freshly-created account and fails closed
+//! with `AccountNotFound` for an account id that does not name the wallet's account.
 //!
 //! This test intentionally covers the empty-account branch only. Inserting synthetic
 //! rows directly into the per-pool received-notes tables would bypass upstream
@@ -39,7 +39,7 @@ async fn list_shielded_receives_round_trip_empty_account() -> Result<(), TestErr
 }
 
 #[tokio::test]
-async fn list_shielded_receives_returns_empty_for_unknown_account() -> Result<(), TestError> {
+async fn list_shielded_receives_fails_closed_for_unknown_account() -> Result<(), TestError> {
     let temp = TempDir::new()?;
     let storage = Sqlite::new(SqliteOptions::for_network(
         zally_core::Network::regtest(),
@@ -47,13 +47,19 @@ async fn list_shielded_receives_returns_empty_for_unknown_account() -> Result<()
     ));
     storage.open_or_create().await?;
 
-    let unknown_account = AccountId::from_uuid(uuid::Uuid::new_v4());
-    let rows = storage
-        .list_shielded_receives_for_account(unknown_account)
+    let mnemonic = Mnemonic::generate();
+    let seed = SeedMaterial::from_mnemonic(&mnemonic, "");
+    storage
+        .create_account_for_seed(&seed, ChainState::empty(0.into(), BlockHash([0u8; 32])))
         .await?;
+
+    let unknown_account = AccountId::from_uuid(uuid::Uuid::new_v4());
+    let outcome = storage
+        .list_shielded_receives_for_account(unknown_account)
+        .await;
     assert!(
-        rows.is_empty(),
-        "unknown account must yield no rows, got {rows:?}"
+        matches!(outcome, Err(StorageError::AccountNotFound)),
+        "an id that does not name the wallet's account must fail closed: {outcome:?}"
     );
     Ok(())
 }

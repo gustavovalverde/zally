@@ -11,7 +11,7 @@
 //! channel sender; the actor lives until every clone is dropped.
 
 use std::num::NonZeroU32;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
 use orchard::tree::MerkleHashOrchard;
@@ -19,7 +19,9 @@ use rand::rngs::OsRng;
 use rusqlite::OptionalExtension as _;
 use sapling::Node as SaplingNode;
 use secrecy::{ExposeSecret as _, SecretVec};
+use shardtree::error::{InsertionError, ShardTreeError};
 use tokio::sync::{mpsc, oneshot};
+use uuid::Uuid;
 use zally_core::{
     AccountId, BlockHeight, FailurePosture, HoldId, IdempotencyKey, Network, NetworkParameters,
     TransparentGapLimit, TxId, Zatoshis,
@@ -37,11 +39,12 @@ use zcash_client_backend::fees::{DustOutputPolicy, StandardFeeRule, standard};
 use zcash_client_backend::wallet::{NoteId, WalletTransparentOutput};
 use zcash_client_sqlite::AccountUuid;
 use zcash_client_sqlite::WalletDb;
+use zcash_client_sqlite::error::SqliteClientError;
 use zcash_client_sqlite::util::SystemClock;
 use zcash_client_sqlite::wallet::init::WalletMigrator;
 use zcash_keys::address::UnifiedAddress;
-use zcash_keys::keys::UnifiedAddressRequest;
 use zcash_keys::keys::transparent::gap_limits::GapLimits;
+use zcash_keys::keys::{UnifiedAddressRequest, UnifiedFullViewingKey};
 use zcash_protocol::ShieldedProtocol;
 use zcash_protocol::memo::Memo;
 use zcash_protocol::value::Zatoshis as UpstreamZatoshis;
@@ -55,6 +58,13 @@ use crate::wallet::WalletStorage;
 type Db = WalletDb<rusqlite::Connection, NetworkParameters, SystemClock, OsRng>;
 
 const DEFAULT_ACCOUNT_NAME: &str = "primary";
+
+/// Namespace for key-derived account identity.
+///
+/// A zally [`AccountId`] is the UUID v5 of the account's UFVK (encoded for the wallet's
+/// network) under this namespace: the same key material yields the same identity across
+/// database rebuilds, machines, and resets.
+const ZALLY_ACCOUNT_NAMESPACE: Uuid = uuid::uuid!("665caaaf-8caa-4556-aa6d-92e76b0863b2");
 
 /// Bounded capacity of the wallet-db actor's request queue.
 ///
@@ -264,9 +274,13 @@ fn run_wallet_db_actor(options: &SqliteOptions, mut request_rx: mpsc::Receiver<D
 }
 
 /// Opens (or creates on first run) the underlying `WalletDb` and the Zally
-/// ledger connection backing the `ext_zally_*` tables. Runs on the actor
+/// ledger connection backing the `ext_zally_*` tables.
+///
+/// Both live in the same `SQLite` file at `options.db_path`. Runs on the actor
 /// thread; the file I/O and the schema migration happen here.
-fn open_wallet_db(options: &SqliteOptions) -> Result<WalletDbState, StorageError> {
+fn open_wallet_db(
+    options: &SqliteOptions,
+) -> Result<(Box<Db>, Box<rusqlite::Connection>), StorageError> {
     if let Some(parent) = options.db_path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| StorageError::SqliteFailed {
             reason: format!("could not create database directory: {e}"),
@@ -342,10 +356,31 @@ fn open_wallet_db(options: &SqliteOptions) -> Result<WalletDbState, StorageError
             posture: FailurePosture::NotRetryable,
         })?;
 
-    Ok(WalletDbState::Opened {
-        db: Box::new(db),
-        ledger: Box::new(ledger),
-    })
+    Ok((Box::new(db), Box::new(ledger)))
+}
+
+/// Removes the wallet database file plus its `-wal` and `-shm` siblings. The zally
+/// ledger tables live in the same file, so this discards them as well.
+fn remove_wallet_db_files(db_path: &Path) -> Result<(), StorageError> {
+    for suffix in ["", "-wal", "-shm"] {
+        let mut os_path = db_path.as_os_str().to_owned();
+        os_path.push(suffix);
+        let path = PathBuf::from(os_path);
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(StorageError::SqliteFailed {
+                    reason: format!(
+                        "could not delete wallet database file '{}': {err}",
+                        path.display()
+                    ),
+                    posture: FailurePosture::Retryable,
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 #[allow(
@@ -359,8 +394,8 @@ impl WalletStorage for Sqlite {
             if matches!(state, WalletDbState::Opened { .. }) {
                 return Ok(());
             }
-            let opened = open_wallet_db(options)?;
-            *state = opened;
+            let (db, ledger) = open_wallet_db(options)?;
+            *state = WalletDbState::Opened { db, ledger };
             Ok(())
         })
         .await
@@ -371,25 +406,43 @@ impl WalletStorage for Sqlite {
         seed: &SeedMaterial,
         prior_chain_state: ChainState,
     ) -> Result<AccountId, StorageError> {
+        let network = self.options.network;
         let account_name = self.options.account_name.clone();
-        let seed_bytes = seed.expose_secret().to_vec();
-        let secret = SecretVec::new(seed_bytes);
+        let secret = SecretVec::new(seed.expose_secret().to_vec());
 
         self.with_db_mut(move |db| {
-            let birthday_height = prior_chain_state.block_height() + 1;
-            let account_birthday = AccountBirthday::from_parts(prior_chain_state, None);
-            let (account, _usk) = db
-                .import_account_hd(
-                    &account_name,
-                    &secret,
-                    zip32::AccountId::ZERO,
-                    &account_birthday,
-                    None,
-                )
-                .map_err(|e| map_sqlite_error(&e))?;
-            db.update_chain_tip(birthday_height)
-                .map_err(|e| map_sqlite_error(&e))?;
-            Ok(account_uuid_to_zally(account.id()))
+            create_account_on(db, network, &account_name, &secret, prior_chain_state)
+        })
+        .await
+    }
+
+    async fn recreate_with_account(
+        &self,
+        seed: &SeedMaterial,
+        prior_chain_state: ChainState,
+    ) -> Result<AccountId, StorageError> {
+        let network = self.options.network;
+        let secret = SecretVec::new(seed.expose_secret().to_vec());
+
+        self.dispatch(move |state, options| {
+            *state = WalletDbState::NotOpened;
+            remove_wallet_db_files(&options.db_path)?;
+            let (mut db, ledger) = open_wallet_db(options)?;
+            let account_id = create_account_on(
+                &mut db,
+                network,
+                &options.account_name,
+                &secret,
+                prior_chain_state,
+            )?;
+            *state = WalletDbState::Opened { db, ledger };
+            tracing::warn!(
+                target: "zally::storage",
+                event = "wallet_db_recreated",
+                account_id = %account_id.as_uuid(),
+                "wallet database deleted and rebuilt with a fresh account"
+            );
+            Ok(account_id)
         })
         .await
     }
@@ -406,7 +459,9 @@ impl WalletStorage for Sqlite {
             let account = db
                 .get_account_for_ufvk(&ufvk)
                 .map_err(|e| map_sqlite_error(&e))?;
-            Ok(account.map(|a| account_uuid_to_zally(a.id())))
+            account
+                .map(|a| deterministic_account_id(network, &a))
+                .transpose()
         })
         .await
     }
@@ -415,7 +470,7 @@ impl WalletStorage for Sqlite {
         &self,
         account_id: AccountId,
     ) -> Result<UnifiedAddress, StorageError> {
-        let sqlite_uuid = zally_to_account_uuid(account_id);
+        let network = self.options.network;
 
         // `SHIELDED` returns a Unified Address with Orchard + Sapling receivers and skips
         // transparent entirely; this keeps the call free of the transparent gap-limit
@@ -424,6 +479,7 @@ impl WalletStorage for Sqlite {
         // [`Self::derive_next_address_with_transparent`] instead and accept the gap-limit
         // constraint that comes with it.
         self.with_db_mut(move |db| {
+            let sqlite_uuid = resolve_account_uuid(db, network, account_id)?;
             let outcome = db
                 .get_next_available_address(sqlite_uuid, UnifiedAddressRequest::SHIELDED)
                 .map_err(|e| map_sqlite_error(&e))?;
@@ -437,7 +493,7 @@ impl WalletStorage for Sqlite {
         &self,
         account_id: AccountId,
     ) -> Result<UnifiedAddress, StorageError> {
-        let sqlite_uuid = zally_to_account_uuid(account_id);
+        let network = self.options.network;
 
         // `AllAvailableKeys` resolves the request against the actual UFVK. P2PKH becomes
         // `Require` for Zally UFVKs with a transparent component, which routes upstream
@@ -446,6 +502,7 @@ impl WalletStorage for Sqlite {
         // fail with the gap-limit error until an on-chain transaction credits one of the
         // reserved transparent addresses.
         self.with_db_mut(move |db| {
+            let sqlite_uuid = resolve_account_uuid(db, network, account_id)?;
             let outcome = db
                 .get_next_available_address(sqlite_uuid, UnifiedAddressRequest::AllAvailableKeys)
                 .map_err(|e| map_sqlite_error(&e))?;
@@ -458,20 +515,21 @@ impl WalletStorage for Sqlite {
     async fn list_transparent_receivers(
         &self,
     ) -> Result<Vec<crate::wallet::TransparentReceiverRow>, StorageError> {
+        let network = self.options.network;
         self.with_db(move |db| {
             let accounts = db
                 .get_unified_full_viewing_keys()
                 .map_err(|e| map_sqlite_error(&e))?;
             let mut receivers = Vec::new();
-            for account_uuid in accounts.keys().copied() {
+            for (account_uuid, ufvk) in &accounts {
+                let account_id = account_id_from_ufvk(network, ufvk);
                 let transparent_addresses = db
-                    .get_transparent_receivers(account_uuid, true, true)
+                    .get_transparent_receivers(*account_uuid, true, true)
                     .map_err(|e| map_sqlite_error(&e))?;
                 for address in transparent_addresses.into_keys() {
                     let script = Script::from(address.script());
                     receivers.push(crate::wallet::TransparentReceiverRow::new(
-                        account_uuid_to_zally(account_uuid),
-                        script.0.0,
+                        account_id, script.0.0,
                     ));
                 }
             }
@@ -661,11 +719,13 @@ impl WalletStorage for Sqlite {
         .await
     }
 
-    async fn wallet_birthday(&self) -> Result<Option<BlockHeight>, StorageError> {
+    async fn account_birthday(&self) -> Result<BlockHeight, StorageError> {
         self.with_db(move |db| {
             let height = zcash_client_backend::data_api::WalletRead::get_wallet_birthday(db)
                 .map_err(|e| map_sqlite_error(&e))?;
-            Ok(height.map(|h| BlockHeight::from(u32::from(h))))
+            height
+                .map(|h| BlockHeight::from(u32::from(h)))
+                .ok_or(StorageError::AccountNotFound)
         })
         .await
     }
@@ -674,8 +734,8 @@ impl WalletStorage for Sqlite {
         &self,
         request: crate::wallet::ProposalPaymentRequest,
     ) -> Result<crate::wallet::ProposalSummary, StorageError> {
-        let params = self.options.network.to_parameters();
-        let account_uuid = zally_to_account_uuid(request.account_id);
+        let network = self.options.network;
+        let params = network.to_parameters();
         let amount = zally_to_upstream_zatoshis(request.amount_zat);
         let recipient = zcash_keys::address::Address::decode(&params, &request.recipient_encoded)
             .ok_or_else(|| StorageError::SqliteFailed {
@@ -683,8 +743,10 @@ impl WalletStorage for Sqlite {
             posture: FailurePosture::NotRetryable,
         })?;
         let memo_bytes = decode_memo_bytes(request.memo.as_deref())?;
+        let account_id = request.account_id;
 
         self.with_db_mut(move |db| {
+            let account_uuid = resolve_account_uuid(db, network, account_id)?;
             let proposal = propose_payment_proposal(
                 db,
                 &params,
@@ -716,7 +778,6 @@ impl WalletStorage for Sqlite {
         seed: &SeedMaterial,
     ) -> Result<Vec<crate::wallet::PreparedTransaction>, StorageError> {
         let params = self.options.network.to_parameters();
-        let account_uuid = zally_to_account_uuid(request.account_id);
         let amount = zally_to_upstream_zatoshis(request.amount_zat);
         let recipient = zcash_keys::address::Address::decode(&params, &request.recipient_encoded)
             .ok_or_else(|| StorageError::SqliteFailed {
@@ -731,6 +792,7 @@ impl WalletStorage for Sqlite {
         let account_id = request.account_id;
 
         self.with_db_mut(move |db| {
+            let account_uuid = resolve_account_uuid(db, network, account_id)?;
             let usk = derive_unified_spending_key(&params, &seed_bytes)?;
             let spending_keys = SpendingKeys::from_unified_spending_key(usk);
 
@@ -786,7 +848,6 @@ impl WalletStorage for Sqlite {
         seed: &SeedMaterial,
     ) -> Result<Vec<crate::wallet::PreparedTransaction>, StorageError> {
         let params = self.options.network.to_parameters();
-        let account_uuid = zally_to_account_uuid(request.account_id);
         let shielding_threshold = zally_to_upstream_zatoshis(request.shielding_threshold_zat);
         let prover = zcash_proofs::prover::LocalTxProver::with_default_location()
             .ok_or(StorageError::ProverUnavailable)?;
@@ -795,6 +856,7 @@ impl WalletStorage for Sqlite {
         let account_id = request.account_id;
 
         self.with_db_mut(move |db| {
+            let account_uuid = resolve_account_uuid(db, network, account_id)?;
             let usk = derive_unified_spending_key(&params, &seed_bytes)?;
             let spending_keys = SpendingKeys::from_unified_spending_key(usk);
             let from_addrs: Vec<_> = db
@@ -867,8 +929,8 @@ impl WalletStorage for Sqlite {
         request: crate::wallet::ProposalPaymentRequest,
         target_expiry_height: Option<BlockHeight>,
     ) -> Result<Vec<u8>, StorageError> {
-        let params = self.options.network.to_parameters();
-        let account_uuid = zally_to_account_uuid(request.account_id);
+        let network = self.options.network;
+        let params = network.to_parameters();
         let amount = zally_to_upstream_zatoshis(request.amount_zat);
         let recipient = zcash_keys::address::Address::decode(&params, &request.recipient_encoded)
             .ok_or_else(|| StorageError::SqliteFailed {
@@ -878,8 +940,10 @@ impl WalletStorage for Sqlite {
         let memo_bytes = decode_memo_bytes(request.memo.as_deref())?;
         let upstream_target_expiry_height = target_expiry_height
             .map(|height| zcash_protocol::consensus::BlockHeight::from(u32::from(height)));
+        let account_id = request.account_id;
 
         self.with_db_mut(move |db| {
+            let account_uuid = resolve_account_uuid(db, network, account_id)?;
             let proposal = propose_payment_proposal(
                 db,
                 &params,
@@ -1377,17 +1441,12 @@ impl WalletStorage for Sqlite {
         &self,
         account_id: AccountId,
     ) -> Result<Vec<crate::ExposedAddressRow>, StorageError> {
-        let account_uuid = zally_to_account_uuid(account_id);
-        let account_uuid_bytes = account_id.as_uuid().as_bytes().to_vec();
-        let params = self.options.network.to_parameters();
+        let network = self.options.network;
+        let params = network.to_parameters();
 
         self.with_db_and_ledger(move |db, ledger| {
-            if WalletRead::get_account(db, account_uuid)
-                .map_err(|e| map_sqlite_error(&e))?
-                .is_none()
-            {
-                return Err(StorageError::AccountNotFound);
-            }
+            let account_uuid = resolve_account_uuid(db, network, account_id)?;
+            let account_uuid_bytes = account_uuid.expose_uuid().as_bytes().to_vec();
 
             let mut stmt = ledger.prepare(EXPOSED_ADDRESSES_SQL).map_err(|err| {
                 StorageError::SqliteFailed {
@@ -1452,16 +1511,11 @@ impl WalletStorage for Sqlite {
         &self,
         account_id: AccountId,
     ) -> Result<crate::AccountBalanceRow, StorageError> {
-        let account_uuid = zally_to_account_uuid(account_id);
-        let account_uuid_bytes = account_id.as_uuid().as_bytes().to_vec();
+        let network = self.options.network;
 
         self.with_db_and_ledger(move |db, ledger| {
-            if WalletRead::get_account(db, account_uuid)
-                .map_err(|e| map_sqlite_error(&e))?
-                .is_none()
-            {
-                return Err(StorageError::AccountNotFound);
-            }
+            let account_uuid = resolve_account_uuid(db, network, account_id)?;
+            let account_uuid_bytes = account_uuid.expose_uuid().as_bytes().to_vec();
 
             let summary = db
                 .get_wallet_summary(ConfirmationsPolicy::default())
@@ -1521,11 +1575,12 @@ impl WalletStorage for Sqlite {
         account_id: AccountId,
         target_height: BlockHeight,
     ) -> Result<Vec<crate::wallet::UnspentShieldedNoteRow>, StorageError> {
-        let account_uuid = zally_to_account_uuid(account_id);
+        let network = self.options.network;
         let target = zcash_client_backend::data_api::wallet::TargetHeight::from(
             zcash_protocol::consensus::BlockHeight::from(target_height.as_u32()),
         );
         self.with_db(move |db| {
+            let account_uuid = resolve_account_uuid(db, network, account_id)?;
             let received = zcash_client_backend::data_api::InputSource::select_unspent_notes(
                 db,
                 account_uuid,
@@ -1588,9 +1643,11 @@ impl WalletStorage for Sqlite {
         from_height: BlockHeight,
         to_height: BlockHeight,
     ) -> Result<Vec<crate::wallet::ReceivedShieldedNoteRow>, StorageError> {
+        let network = self.options.network;
         let from_h = i64::from(from_height.as_u32());
         let to_h = i64::from(to_height.as_u32());
-        self.with_ledger(move |conn| {
+        self.with_db_and_ledger(move |db, conn| {
+            let (account_id, account_uuid) = resolve_account(db, network)?;
             let mut stmt = conn
                 .prepare(RECEIVED_SHIELDED_NOTES_IN_RANGE_SQL)
                 .map_err(|err| StorageError::SqliteFailed {
@@ -1603,7 +1660,7 @@ impl WalletStorage for Sqlite {
                     reason: format!("received_shielded_notes query failed: {err}"),
                     posture: FailurePosture::NotRetryable,
                 })?;
-            collect_received_shielded_note_rows(mapped)
+            collect_received_shielded_note_rows(mapped, account_uuid, account_id)
         })
         .await
     }
@@ -1612,8 +1669,10 @@ impl WalletStorage for Sqlite {
         &self,
         account_id: AccountId,
     ) -> Result<Vec<crate::wallet::ReceivedShieldedNoteRow>, StorageError> {
-        let account_uuid_bytes = account_id.as_uuid().as_bytes().to_vec();
-        self.with_ledger(move |conn| {
+        let network = self.options.network;
+        self.with_db_and_ledger(move |db, conn| {
+            let account_uuid = resolve_account_uuid(db, network, account_id)?;
+            let account_uuid_bytes = account_uuid.expose_uuid().as_bytes().to_vec();
             let mut stmt = conn
                 .prepare(RECEIVED_SHIELDED_NOTES_FOR_ACCOUNT_SQL)
                 .map_err(|err| StorageError::SqliteFailed {
@@ -1626,7 +1685,7 @@ impl WalletStorage for Sqlite {
                     reason: format!("list_shielded_receives query failed: {err}"),
                     posture: FailurePosture::NotRetryable,
                 })?;
-            collect_received_shielded_note_rows(mapped)
+            collect_received_shielded_note_rows(mapped, account_uuid, account_id)
         })
         .await
     }
@@ -2055,11 +2114,18 @@ fn decode_received_shielded_note_row(
     ))
 }
 
+/// Decodes received-note rows, stamping each with the wallet's deterministic
+/// [`AccountId`].
+///
+/// Every row must belong to `account_uuid`: zally holds one account per wallet, so a
+/// row keyed to any other account uuid means the database violates that invariant.
 fn collect_received_shielded_note_rows(
     mapped: rusqlite::MappedRows<
         '_,
         impl FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<ReceivedShieldedNoteRowRaw>,
     >,
+    account_uuid: AccountUuid,
+    account_id: AccountId,
 ) -> Result<Vec<crate::wallet::ReceivedShieldedNoteRow>, StorageError> {
     let mut rows = Vec::new();
     for raw in mapped {
@@ -2091,7 +2157,13 @@ fn collect_received_shielded_note_rows(
                     reason: format!("accounts.uuid had wrong byte length: {}", raw.len()),
                     posture: FailurePosture::NotRetryable,
                 })?;
-        let account_uuid = uuid::Uuid::from_bytes(account_uuid_array);
+        let row_uuid = Uuid::from_bytes(account_uuid_array);
+        if row_uuid != account_uuid.expose_uuid() {
+            return Err(StorageError::SqliteFailed {
+                reason: format!("received note row belongs to unknown account {row_uuid}"),
+                posture: FailurePosture::RequiresOperator,
+            });
+        }
         let output_index = u32::try_from(output_index).map_err(|_| StorageError::SqliteFailed {
             reason: format!("received note output_index out of u32 range: {output_index}"),
             posture: FailurePosture::NotRetryable,
@@ -2116,7 +2188,7 @@ fn collect_received_shielded_note_rows(
             .and_then(|raw| u64::try_from(raw).ok())
             .unwrap_or(0);
         rows.push(crate::wallet::ReceivedShieldedNoteRow {
-            account_id: AccountId::from_uuid(account_uuid),
+            account_id,
             protocol,
             value_zat,
             tx_id: zally_core::TxId::from_bytes(txid_array),
@@ -2176,12 +2248,14 @@ impl zcash_client_backend::data_api::chain::BlockSource for InMemoryBlockSource 
 ///
 /// `ScanError::PrevHashMismatch` (and other continuity errors) mean the chain rolled back
 /// between the wallet's last successful scan and this call; the caller must roll the
-/// wallet back to before `at_height` and retry. Everything else is opaque sqlite failure.
-fn map_scan_error<DbErr, BlockSourceErr>(
-    err: &zcash_client_backend::data_api::chain::error::Error<DbErr, BlockSourceErr>,
+/// wallet back to before `at_height` and retry. A shard-tree insertion conflict means the
+/// wallet's stored commitment tree disagrees with the chain, so re-issuing the same scan
+/// fails deterministically until the stale tree state is discarded. Everything else is
+/// opaque sqlite failure.
+fn map_scan_error<BlockSourceErr>(
+    err: &zcash_client_backend::data_api::chain::error::Error<SqliteClientError, BlockSourceErr>,
 ) -> StorageError
 where
-    DbErr: std::fmt::Display,
     BlockSourceErr: std::fmt::Display,
 {
     use zcash_client_backend::data_api::chain::error::Error as ChainError;
@@ -2192,14 +2266,103 @@ where
             at_height: BlockHeight::from(u32::from(scan.at_height())),
         };
     }
+    if let ChainError::Wallet(SqliteClientError::CommitmentTree(ShardTreeError::Insert(
+        InsertionError::Conflict(_),
+    ))) = err
+    {
+        return StorageError::CommitmentTreeConflict {
+            reason: err.to_string(),
+        };
+    }
     StorageError::SqliteFailed {
         reason: format!("scan_cached_blocks failed: {err}"),
         posture: FailurePosture::NotRetryable,
     }
 }
 
-fn account_uuid_to_zally(uuid: AccountUuid) -> AccountId {
-    AccountId::from_uuid(uuid.expose_uuid())
+/// Computes the deterministic [`AccountId`] for a UFVK.
+///
+/// The id is the UUID v5 of the network-encoded UFVK under
+/// [`ZALLY_ACCOUNT_NAMESPACE`]. Account identity is key identity, so the id is stable
+/// across database rebuilds, machines, and resets.
+fn account_id_from_ufvk(network: Network, ufvk: &UnifiedFullViewingKey) -> AccountId {
+    let encoded = ufvk.encode(&network.to_parameters());
+    AccountId::from_uuid(Uuid::new_v5(&ZALLY_ACCOUNT_NAMESPACE, encoded.as_bytes()))
+}
+
+/// Computes the deterministic [`AccountId`] for a stored account via its UFVK.
+fn deterministic_account_id<A: Account>(
+    network: Network,
+    account: &A,
+) -> Result<AccountId, StorageError> {
+    let ufvk = account
+        .ufvk()
+        .ok_or_else(|| StorageError::KeyDerivationFailed {
+            reason: "account has no unified full viewing key to derive its identity from"
+                .to_owned(),
+        })?;
+    Ok(account_id_from_ufvk(network, ufvk))
+}
+
+/// Resolves the wallet's single account to its deterministic [`AccountId`] and the
+/// backing sqlite [`AccountUuid`].
+///
+/// Zally holds one account per wallet; a wallet with no account yields
+/// [`StorageError::AccountNotFound`].
+fn resolve_account(db: &Db, network: Network) -> Result<(AccountId, AccountUuid), StorageError> {
+    let account_uuid = db
+        .get_account_ids()
+        .map_err(|e| map_sqlite_error(&e))?
+        .into_iter()
+        .next()
+        .ok_or(StorageError::AccountNotFound)?;
+    let account = WalletRead::get_account(db, account_uuid)
+        .map_err(|e| map_sqlite_error(&e))?
+        .ok_or(StorageError::AccountNotFound)?;
+    Ok((deterministic_account_id(network, &account)?, account_uuid))
+}
+
+/// Resolves `requested` to the backing sqlite [`AccountUuid`], failing with
+/// [`StorageError::AccountNotFound`] when it does not name the wallet's account.
+fn resolve_account_uuid(
+    db: &Db,
+    network: Network,
+    requested: AccountId,
+) -> Result<AccountUuid, StorageError> {
+    let (account_id, account_uuid) = resolve_account(db, network)?;
+    if account_id == requested {
+        Ok(account_uuid)
+    } else {
+        Err(StorageError::AccountNotFound)
+    }
+}
+
+/// Imports the wallet's single account, anchored at `prior_chain_state`.
+///
+/// Returns the account's deterministic [`AccountId`]. Shared by
+/// `create_account_for_seed` and `recreate_with_account` so both create the account
+/// identically.
+fn create_account_on(
+    db: &mut Db,
+    network: Network,
+    account_name: &str,
+    secret: &SecretVec<u8>,
+    prior_chain_state: ChainState,
+) -> Result<AccountId, StorageError> {
+    let birthday_height = prior_chain_state.block_height() + 1;
+    let account_birthday = AccountBirthday::from_parts(prior_chain_state, None);
+    let (account, _usk) = db
+        .import_account_hd(
+            account_name,
+            secret,
+            zip32::AccountId::ZERO,
+            &account_birthday,
+            None,
+        )
+        .map_err(|e| map_sqlite_error(&e))?;
+    db.update_chain_tip(birthday_height)
+        .map_err(|e| map_sqlite_error(&e))?;
+    deterministic_account_id(network, &account)
 }
 
 /// Shared proposal builder for `prepare_payment`, `propose_payment`, and `create_pczt`.
@@ -2501,10 +2664,6 @@ fn decode_diversifier_index_be(
     Ok(zip32::DiversifierIndex::from(di_be))
 }
 
-fn zally_to_account_uuid(id: AccountId) -> AccountUuid {
-    AccountUuid::from_uuid(id.as_uuid())
-}
-
 fn transparent_utxo_row_to_output(
     row: crate::wallet::TransparentUtxoRow,
 ) -> Result<WalletTransparentOutput, StorageError> {
@@ -2786,16 +2945,58 @@ fn map_row_decode_error(err: &rusqlite::Error) -> StorageError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use uuid::Uuid;
+    use zally_keys::Mnemonic;
+
+    type TestChainError = zcash_client_backend::data_api::chain::error::Error<
+        SqliteClientError,
+        std::convert::Infallible,
+    >;
 
     #[test]
-    fn account_id_translation_is_identity() {
-        let uuid = Uuid::new_v4();
-        let zally_id = AccountId::from_uuid(uuid);
-        let sqlite_uuid = zally_to_account_uuid(zally_id);
-        let back = account_uuid_to_zally(sqlite_uuid);
-        assert_eq!(zally_id, back);
-        assert_eq!(uuid, back.as_uuid());
+    fn account_id_is_deterministic_for_key_material() -> Result<(), KeyDerivationError> {
+        let mnemonic = Mnemonic::generate();
+        let seed = SeedMaterial::from_mnemonic(&mnemonic, "");
+        let regtest = Network::regtest();
+
+        let ufvk = derive_ufvk(regtest, &seed, zip32::AccountId::ZERO)?;
+        let first = account_id_from_ufvk(regtest, &ufvk);
+        let second = account_id_from_ufvk(regtest, &ufvk);
+        assert_eq!(first, second, "same key material must yield the same id");
+
+        let mainnet_ufvk = derive_ufvk(Network::Mainnet, &seed, zip32::AccountId::ZERO)?;
+        let mainnet = account_id_from_ufvk(Network::Mainnet, &mainnet_ufvk);
+        assert_ne!(
+            first, mainnet,
+            "a different network encoding must yield a different identity"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn map_scan_error_classifies_commitment_tree_conflict() {
+        let address = incrementalmerkletree::Address::from_parts(0.into(), 0);
+        let err: TestChainError = zcash_client_backend::data_api::chain::error::Error::Wallet(
+            SqliteClientError::CommitmentTree(ShardTreeError::Insert(InsertionError::Conflict(
+                address,
+            ))),
+        );
+        let mapped = map_scan_error(&err);
+        assert!(
+            matches!(&mapped, StorageError::CommitmentTreeConflict { .. }),
+            "a shard-tree insertion conflict must map to CommitmentTreeConflict: {mapped:?}"
+        );
+        assert_eq!(mapped.posture(), FailurePosture::NotRetryable);
+    }
+
+    #[test]
+    fn map_scan_error_leaves_other_insertion_errors_opaque() {
+        let err: TestChainError = zcash_client_backend::data_api::chain::error::Error::Wallet(
+            SqliteClientError::CommitmentTree(ShardTreeError::Insert(InsertionError::TreeFull)),
+        );
+        assert!(
+            matches!(map_scan_error(&err), StorageError::SqliteFailed { .. }),
+            "non-conflict insertion errors must stay opaque sqlite failures"
+        );
     }
 
     #[test]

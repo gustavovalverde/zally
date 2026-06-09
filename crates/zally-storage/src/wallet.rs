@@ -409,6 +409,29 @@ pub trait WalletStorage: Send + Sync + 'static {
         prior_chain_state: ChainState,
     ) -> Result<AccountId, StorageError>;
 
+    /// Deletes the wallet database and recreates it with a fresh account for `seed`,
+    /// anchored at `prior_chain_state`, in one atomic storage operation.
+    ///
+    /// The deepest rung of the sync driver's repair ladder: wallet chain state is
+    /// disposable derived state, so when it can no longer be reconciled with the chain
+    /// (for example a note commitment tree conflict that a bounded rewind cannot clear)
+    /// the repair is to rebuild from the birthday.
+    ///
+    /// This discards ALL wallet-local state, including the zally ledger: send idempotency
+    /// records, holds, and pending broadcasts are gone. Derived chain state is rebuilt by
+    /// rescan; the ledger is not. Hosts that need cross-rebuild idempotency must keep
+    /// their own ledger.
+    ///
+    /// The returned [`AccountId`] equals the one the discarded database held for the same
+    /// seed: account identity is key identity, not database identity.
+    ///
+    /// `requires_operator` on migration failure. `retryable` on transient I/O.
+    async fn recreate_with_account(
+        &self,
+        seed: &SeedMaterial,
+        prior_chain_state: ChainState,
+    ) -> Result<AccountId, StorageError>;
+
     /// Looks up the [`AccountId`] for the account whose UFVK matches the seed.
     ///
     /// Returns `Ok(None)` if no account matches.
@@ -521,13 +544,15 @@ pub trait WalletStorage: Send + Sync + 'static {
     /// tree correctly; a mismatch means a corrupt tree and a bad spend anchor.
     async fn commitment_tree_roots(&self) -> Result<CommitmentTreeRoots, StorageError>;
 
-    /// Returns the wallet's birthday height, the earliest block the operator-configured
+    /// Returns the account's birthday height, the earliest block the operator-configured
     /// account expects to receive funds at. `Wallet::sync` starts from this height on a
     /// fresh wallet (rather than genesis) to keep cold sync proportional to the operator's
-    /// real receive window.
+    /// real receive window, and a full rebuild of derived state rescans from it.
     ///
-    /// Returns `Ok(None)` for a wallet with no initialised account.
-    async fn wallet_birthday(&self) -> Result<Option<BlockHeight>, StorageError>;
+    /// Wraps `WalletRead::get_wallet_birthday`.
+    ///
+    /// `not_retryable` on missing account; `retryable` on transient I/O.
+    async fn account_birthday(&self) -> Result<BlockHeight, StorageError>;
 
     /// Builds a ZIP-317 conventional-fee proposal for `request`, creates the signed
     /// transactions via `zcash_client_backend::data_api::wallet::create_proposed_transactions`,
@@ -815,7 +840,7 @@ pub trait WalletStorage: Send + Sync + 'static {
     /// so consumers see every receive that ever happened in the range, suitable for
     /// donation indexing and historical aggregation.
     ///
-    /// `not_retryable` on schema errors; `retryable` on transient I/O.
+    /// `not_retryable` on missing account or schema errors; `retryable` on transient I/O.
     async fn received_shielded_notes_mined_in_range(
         &self,
         from_height: BlockHeight,

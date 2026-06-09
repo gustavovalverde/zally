@@ -1,6 +1,7 @@
 //! Storage-level integration: `WalletStorage::list_unspent_shielded_notes` against an empty
-//! wallet returns `Ok(vec![])` and propagates the configured target height into the
-//! upstream query without panicking.
+//! wallet returns `Ok(vec![])`, fails closed with `AccountNotFound` for an account id that
+//! does not name the wallet's account, and propagates the configured target height into
+//! the upstream query without panicking.
 //!
 //! This test intentionally covers the empty-account branch only. Inserting synthetic
 //! rows directly into `sapling_received_notes` / `orchard_received_notes` would bypass
@@ -39,7 +40,7 @@ async fn list_unspent_shielded_notes_round_trip_empty_account() -> Result<(), Te
 }
 
 #[tokio::test]
-async fn list_unspent_shielded_notes_returns_empty_for_unknown_account() -> Result<(), TestError> {
+async fn list_unspent_shielded_notes_fails_closed_for_unknown_account() -> Result<(), TestError> {
     let temp = TempDir::new()?;
     let storage = Sqlite::new(SqliteOptions::for_network(
         zally_core::Network::regtest(),
@@ -47,11 +48,20 @@ async fn list_unspent_shielded_notes_returns_empty_for_unknown_account() -> Resu
     ));
     storage.open_or_create().await?;
 
-    let unknown = AccountId::from_uuid(uuid::Uuid::nil());
-    let rows = storage
-        .list_unspent_shielded_notes(unknown, BlockHeight::from(100))
+    let mnemonic = Mnemonic::generate();
+    let seed = SeedMaterial::from_mnemonic(&mnemonic, "");
+    storage
+        .create_account_for_seed(&seed, ChainState::empty(0.into(), BlockHash([0u8; 32])))
         .await?;
-    assert!(rows.is_empty());
+
+    let unknown = AccountId::from_uuid(uuid::Uuid::nil());
+    let outcome = storage
+        .list_unspent_shielded_notes(unknown, BlockHeight::from(100))
+        .await;
+    assert!(
+        matches!(outcome, Err(StorageError::AccountNotFound)),
+        "an id that does not name the wallet's account must fail closed: {outcome:?}"
+    );
     Ok(())
 }
 

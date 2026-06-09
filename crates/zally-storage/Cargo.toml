@@ -28,6 +28,7 @@ zally-keys = { path = "../zally-keys", version = "0.1" }
 pczt = { workspace = true }
 orchard.workspace = true
 sapling.workspace = true
+shardtree.workspace = true
 zcash_client_backend = { workspace = true, features = ["orchard", "transparent-inputs", "pczt"] }
 zcash_client_sqlite = { workspace = true, features = ["orchard", "transparent-inputs", "serde"] }
 zcash_keys = { workspace = true, features = ["orchard", "sapling", "transparent-inputs", "unstable"] }
@@ -37,9 +38,10 @@ zcash_protocol.workspace = true
 zcash_script.workspace = true
 zcash_transparent.workspace = true
 zip32.workspace = true
-uuid.workspace = true
+uuid = { workspace = true, features = ["v5"] }
 
 [dev-dependencies]
+incrementalmerkletree.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
 
