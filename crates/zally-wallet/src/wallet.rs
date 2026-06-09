@@ -120,7 +120,8 @@ impl Wallet {
     /// account id does not change across the rebuild; handles holding the prior id keep
     /// working.
     ///
-    /// `not_retryable` when no sealed seed or account exists; `retryable` on transient I/O.
+    /// `requires_operator` when no sealed seed or account exists; `retryable` on transient
+    /// I/O.
     pub async fn reset_to_birthday(&self, chain: &dyn ChainSource) -> Result<(), WalletError> {
         let birthday = self.inner.storage.account_birthday().await?;
         let seed = match self.inner.sealing.unseal_seed().await {
@@ -143,7 +144,7 @@ impl Wallet {
     /// forward through diversifier indices per ZIP-316. Free of the BIP-44 transparent
     /// gap-limit; suitable as the default receive-address allocator.
     ///
-    /// `not_retryable` on unknown account. `retryable` on transient I/O.
+    /// `requires_operator` on unknown account. `retryable` on transient I/O.
     pub async fn derive_next_address(
         &self,
         account_id: AccountId,
@@ -162,7 +163,8 @@ impl Wallet {
     /// must credit a reserved transparent address. Use [`Wallet::derive_next_address`] for
     /// the unbounded shielded-only stream.
     ///
-    /// `not_retryable` on gap-limit exhaustion or unknown account; `retryable` on transient I/O.
+    /// `not_retryable` on gap-limit exhaustion; `requires_operator` on unknown account;
+    /// `retryable` on transient I/O.
     pub async fn derive_next_address_with_transparent(
         &self,
         account_id: AccountId,
@@ -183,7 +185,7 @@ impl Wallet {
     /// When the wallet has not yet observed a tip (no prior `sync`), `confirmations` is set
     /// to `0` and `mined_height` carries the note's actual mined height.
     ///
-    /// `not_retryable` on unknown account; `retryable` on transient storage I/O.
+    /// `requires_operator` on unknown account; `retryable` on transient storage I/O.
     pub async fn list_unspent_shielded_notes(
         &self,
         account_id: AccountId,
@@ -215,7 +217,7 @@ impl Wallet {
     /// broadcast eventually frees its locked outpoints from the read view as well as the
     /// spend filter.
     ///
-    /// `not_retryable` on unknown account; `retryable` on transient storage I/O.
+    /// `requires_operator` on unknown account; `retryable` on transient storage I/O.
     pub async fn get_pending_transparent_inputs(
         &self,
         account_id: AccountId,
@@ -256,7 +258,7 @@ impl Wallet {
     /// a diversifier index and never burns a BIP-44 transparent gap-limit slot, so it is
     /// safe to call on every diagnostics poll.
     ///
-    /// `not_retryable` on unknown account; `retryable` on transient storage I/O.
+    /// `requires_operator` on unknown account; `retryable` on transient storage I/O.
     pub async fn list_exposed_addresses(
         &self,
         account_id: AccountId,
@@ -286,7 +288,7 @@ impl Wallet {
     /// snapshot's `as_of_height` (the wallet's last observed tip). The mature half is what
     /// [`Wallet::shield_transparent_funds`] is allowed to consume right now.
     ///
-    /// `not_retryable` on unknown account; `retryable` on transient storage I/O.
+    /// `requires_operator` on unknown account; `retryable` on transient storage I/O.
     pub async fn get_account_balance(
         &self,
         account_id: AccountId,
@@ -309,7 +311,7 @@ impl Wallet {
     /// truth without coupling to the wallet's event stream. Idempotent on the upstream
     /// side: callers should deduplicate by `(tx_id, output_index, pool)`.
     ///
-    /// `not_retryable` on unknown account; `retryable` on transient storage I/O.
+    /// `requires_operator` on unknown account; `retryable` on transient storage I/O.
     pub async fn list_shielded_receives(
         &self,
         account_id: AccountId,
@@ -355,7 +357,7 @@ impl Wallet {
     /// they need no extra subtraction here. The result is what the next call to
     /// [`Wallet::reserve_for_dispense`] is allowed to lock.
     ///
-    /// `not_retryable` on unknown account; `retryable` on transient storage I/O.
+    /// `requires_operator` on unknown account; `retryable` on transient storage I/O.
     pub async fn spendable_for_next_dispense(
         &self,
         account_id: AccountId,
@@ -397,8 +399,8 @@ impl Wallet {
     /// Fails with [`WalletError::InsufficientBalance`] when `amount_zat` exceeds the
     /// current `spendable_for_next_dispense` view.
     ///
-    /// `not_retryable` on `InsufficientBalance` or `AccountNotFound`; `retryable` on
-    /// transient storage I/O.
+    /// `not_retryable` on `InsufficientBalance`; `requires_operator` on `AccountNotFound`;
+    /// `retryable` on transient storage I/O.
     pub async fn reserve_for_dispense(
         &self,
         plan: ReserveForDispensePlan,

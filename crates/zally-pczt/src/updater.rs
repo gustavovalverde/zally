@@ -115,11 +115,10 @@ impl Updater {
 
         let mut rebuilt = Vec::with_capacity(raw.len());
         rebuilt.extend_from_slice(header);
-        rebuilt = postcard::to_extend(&global, rebuilt).map_err(|err| {
-            PcztError::SerializeFailed {
+        rebuilt =
+            postcard::to_extend(&global, rebuilt).map_err(|err| PcztError::SerializeFailed {
                 reason: format!("PCZT global section encode failed: {err}"),
-            }
-        })?;
+            })?;
         rebuilt.extend_from_slice(tail);
 
         Ok(PcztBytes::from_serialized(rebuilt, network))

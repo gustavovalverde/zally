@@ -3,13 +3,16 @@
 //! Every T1 test sets up the same wallet shape: a temp directory holding an age-sealed seed
 //! and a sqlite wallet store, a regtest mock chain source, and a fresh wallet rooted at
 //! birthday height 1. `create_test_wallet` lifts this boilerplate out of every test so the
-//! tests focus on the behaviour they assert.
+//! tests focus on the behaviour they assert. `wait_for_snapshot` lifts the driver-snapshot
+//! polling shared by the sync-driver tests.
+
+use std::time::Duration;
 
 use zally_core::{BlockHeight, Network};
 use zally_keys::{AgeFileSealing, AgeFileSealingOptions};
 use zally_storage::{Sqlite, SqliteOptions};
 use zally_testkit::{MockChainSource, TempWalletPath};
-use zally_wallet::{Wallet, WalletError, WalletOptions};
+use zally_wallet::{SyncSnapshot, SyncSnapshotStream, Wallet, WalletError, WalletOptions};
 
 /// Result of a [`create_test_wallet`] fixture.
 ///
@@ -55,4 +58,33 @@ pub(crate) enum TestWalletError {
     Io(#[from] std::io::Error),
     #[error("wallet error: {0}")]
     Wallet(#[from] WalletError),
+}
+
+/// Longest any test waits for a sync-driver snapshot before failing.
+const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Waits for the first snapshot satisfying `predicate`, bounded by [`SNAPSHOT_TIMEOUT`].
+pub(crate) async fn wait_for_snapshot(
+    snapshots: &mut SyncSnapshotStream,
+    mut predicate: impl FnMut(&SyncSnapshot) -> bool,
+) -> Result<SyncSnapshot, SnapshotWaitError> {
+    tokio::time::timeout(SNAPSHOT_TIMEOUT, async {
+        while let Some(snapshot) = snapshots.next().await {
+            if predicate(&snapshot) {
+                return Ok(snapshot);
+            }
+        }
+        Err(SnapshotWaitError::StreamClosed)
+    })
+    .await
+    .map_err(|_elapsed| SnapshotWaitError::Timeout)?
+}
+
+/// Error returned by [`wait_for_snapshot`].
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum SnapshotWaitError {
+    #[error("sync snapshot stream closed")]
+    StreamClosed,
+    #[error("timed out waiting for sync snapshot")]
+    Timeout,
 }

@@ -24,8 +24,8 @@ pub enum WalletError {
 
     /// `Wallet::open` was called but no sealed seed exists.
     ///
-    /// Posture: [`FailurePosture::NotRetryable`]: switch to `Wallet::create` for first-time
-    /// bootstrap.
+    /// Posture: [`FailurePosture::RequiresOperator`]: a human provisions the seed (or runs
+    /// `Wallet::create` for first-time bootstrap); no retry conjures one.
     #[error("no sealed seed found for wallet")]
     NoSealedSeed,
 
@@ -37,7 +37,8 @@ pub enum WalletError {
 
     /// The unsealed seed does not match any account in storage.
     ///
-    /// Posture: [`FailurePosture::NotRetryable`].
+    /// Posture: [`FailurePosture::RequiresOperator`]: a seed and storage mismatch needs
+    /// investigation before any call can succeed.
     #[error("no account in storage matches the unsealed seed")]
     AccountNotFound,
 
@@ -204,11 +205,11 @@ impl WalletError {
             Self::Submitter(e) => e.posture(),
             Self::CircuitBroken { .. } => FailurePosture::Retryable,
             Self::NetworkMismatch { .. }
+            | Self::NoSealedSeed
+            | Self::AccountNotFound
             | Self::TargetExpiryMismatch { .. }
             | Self::SyncDriverFailed { .. } => FailurePosture::RequiresOperator,
-            Self::NoSealedSeed
-            | Self::AccountAlreadyExists
-            | Self::AccountNotFound
+            Self::AccountAlreadyExists
             | Self::MemoOnTransparentRecipient
             | Self::ShieldedInputsOnTexRecipient
             | Self::InsufficientBalance { .. }
@@ -323,6 +324,14 @@ mod tests {
         };
         assert_eq!(err.posture(), FailurePosture::RequiresOperator);
         assert!(!err.is_retryable());
+    }
+
+    #[test]
+    fn provisioning_dead_ends_require_operator() {
+        for err in [WalletError::NoSealedSeed, WalletError::AccountNotFound] {
+            assert_eq!(err.posture(), FailurePosture::RequiresOperator);
+            assert!(!err.is_retryable());
+        }
     }
 
     #[test]

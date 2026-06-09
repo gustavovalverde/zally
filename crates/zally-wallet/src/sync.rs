@@ -420,7 +420,7 @@ pub struct SyncDriver {
 impl SyncDriver {
     /// Constructs a driver for `wallet` and `chain`.
     ///
-    /// Fails closed on network mismatch. `not_retryable` on mismatch.
+    /// Fails closed on network mismatch. `requires_operator` on mismatch.
     pub fn new(
         wallet: Wallet,
         chain: Arc<dyn ChainSource>,
@@ -555,7 +555,6 @@ enum SyncRunAttempt {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SyncWakeupExit {
     Waiting,
-    Parked,
     CloseRequested,
 }
 
@@ -702,7 +701,7 @@ async fn run_sync_wakeup(
         if let Some(recovery) = &state.recovery {
             if recovery.rung == SyncRepair::Park {
                 enter_park(ctx, state).await;
-                return SyncWakeupExit::Parked;
+                return SyncWakeupExit::Waiting;
             }
             let backoff_ms = recovery.backoff_ms;
             tokio::select! {
@@ -880,42 +879,32 @@ const fn backoff_for(policy: SyncRecoveryPolicy, consecutive_faults: u32) -> u64
     }
 }
 
-const fn rewind_depth_blocks(index: usize) -> u32 {
-    if index < REWIND_LADDER_BLOCKS.len() {
-        REWIND_LADDER_BLOCKS[index]
-    } else {
-        REWIND_LADDER_BLOCKS[REWIND_LADDER_BLOCKS.len() - 1]
-    }
-}
-
 /// Classifies a fault onto the repair ladder.
 ///
-/// Commitment-tree conflicts, scan-time reorg divergences, and proven tree-root divergence
-/// rewind; identity and configuration dead ends park; transient faults retry. Everything
-/// else (opaque storage failures, malformed chain payloads) defaults to a rewind: the
-/// ladder escalates to a rebuild when rewinding does not cure, which is the self-healing
-/// default for unknown corruption.
+/// The named arms pin the cures the posture cannot express: commitment-tree conflicts,
+/// scan-time reorg divergences, and proven tree-root divergence rewind below the
+/// divergence. Every other error derives its repair from [`WalletError::posture`]:
+/// transient faults retry, operator dead ends park (the literal
+/// [`FailurePosture::RequiresOperator`] definition), and the rest rewind: the ladder
+/// escalates to a rebuild when rewinding does not cure, which is the self-healing default
+/// for unknown corruption.
 fn repair_for(error: &WalletError) -> SyncRepair {
     #[allow(
         clippy::wildcard_enum_match_arm,
-        reason = "the named arms pin the repairs that must not drift; every other error \
-                  falls through to its posture, keeping the classification total"
+        reason = "the named arms pin the cures that posture cannot express; every other \
+                  error derives its repair from its posture, keeping the classification \
+                  total"
     )]
     match error {
         WalletError::Storage(
             StorageError::CommitmentTreeConflict { .. } | StorageError::ChainReorgDetected { .. },
         )
         | WalletError::TreeRootsDiverged { .. } => SyncRepair::Rewind,
-        WalletError::NetworkMismatch { .. }
-        | WalletError::NoSealedSeed
-        | WalletError::AccountNotFound => SyncRepair::Park,
-        other => {
-            if other.posture() == FailurePosture::Retryable {
-                SyncRepair::Retry
-            } else {
-                SyncRepair::Rewind
-            }
-        }
+        other => match other.posture() {
+            FailurePosture::Retryable => SyncRepair::Retry,
+            FailurePosture::RequiresOperator => SyncRepair::Park,
+            _ => SyncRepair::Rewind,
+        },
     }
 }
 
@@ -931,23 +920,28 @@ async fn apply_repair(ctx: &DriverContext<'_>, state: &mut DriverState) -> Resul
     let repair = recovery.rung;
     let attempt = recovery.attempts_at_rung;
     let backoff_ms = recovery.backoff_ms;
-    let rewind_depth = rewind_depth_blocks(recovery.rewind_depth_index);
+    let rewind_depth = REWIND_LADDER_BLOCKS[recovery.rewind_depth_index];
 
-    let rewind_to_height = if repair == SyncRepair::Rewind {
-        ctx.wallet
-            .status_snapshot()
-            .await?
-            .scanned_height
-            .map(|scanned| BlockHeight::from(scanned.as_u32().saturating_sub(rewind_depth)))
-    } else {
-        None
-    };
     let phase = SyncDriverPhase::Recovering {
         repair,
         attempt,
         next_attempt_at_ms: current_unix_ms(),
     };
-    let snapshot = build_snapshot(ctx, phase, state).await;
+    let (snapshot, rewind_to_height) = if repair == SyncRepair::Rewind {
+        let wallet_status = ctx.wallet.status_snapshot().await?;
+        let rewind_to_height = wallet_status
+            .scanned_height
+            .map(|scanned| BlockHeight::from(scanned.as_u32().saturating_sub(rewind_depth)));
+        let snapshot = SyncSnapshot::from_wallet_status(
+            phase,
+            &wallet_status,
+            state.last_outcome,
+            state.last_fault.clone(),
+        );
+        (snapshot, rewind_to_height)
+    } else {
+        (build_snapshot(ctx, phase, state).await, None)
+    };
     publish_transition(
         ctx.status_tx,
         snapshot,
@@ -1212,7 +1206,8 @@ impl Wallet {
     /// Fails closed on network mismatch. Emits `ScanProgress` events at the start and end of
     /// the run; per-block events are emitted by the storage scanner.
     ///
-    /// `not_retryable` on network mismatch. `retryable` on transient chain-source failures.
+    /// `requires_operator` on network mismatch. `retryable` on transient chain-source
+    /// failures.
     pub async fn sync(&self, chain: &dyn ChainSource) -> Result<SyncOutcome, WalletError> {
         let outcome = self.sync_inner(chain).await?;
         self.retire_expired_pending_broadcasts().await?;
@@ -1776,4 +1771,60 @@ pub(crate) async fn fetch_prior_chain_state(
         BlockHeight::from(at_height.as_u32().saturating_sub(1)),
     )
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn named_cures_rewind_regardless_of_posture() {
+        let faults = [
+            WalletError::Storage(StorageError::CommitmentTreeConflict {
+                reason: "subtree root mismatch".into(),
+            }),
+            WalletError::Storage(StorageError::ChainReorgDetected {
+                at_height: BlockHeight::from(10),
+            }),
+            WalletError::TreeRootsDiverged {
+                height: BlockHeight::from(10),
+            },
+        ];
+        for fault in faults {
+            assert_eq!(repair_for(&fault), SyncRepair::Rewind);
+        }
+    }
+
+    #[test]
+    fn retryable_faults_retry() {
+        let fault = WalletError::CircuitBroken { operation: "test" };
+        assert_eq!(fault.posture(), FailurePosture::Retryable);
+        assert_eq!(repair_for(&fault), SyncRepair::Retry);
+    }
+
+    #[test]
+    fn requires_operator_faults_park() {
+        let faults = [
+            WalletError::NetworkMismatch {
+                storage: Network::Mainnet,
+                requested: Network::Testnet,
+            },
+            WalletError::NoSealedSeed,
+            WalletError::AccountNotFound,
+            WalletError::SyncDriverFailed {
+                reason: "panicked".into(),
+            },
+        ];
+        for fault in faults {
+            assert_eq!(fault.posture(), FailurePosture::RequiresOperator);
+            assert_eq!(repair_for(&fault), SyncRepair::Park);
+        }
+    }
+
+    #[test]
+    fn not_retryable_faults_rewind() {
+        let fault = WalletError::MemoOnTransparentRecipient;
+        assert_eq!(fault.posture(), FailurePosture::NotRetryable);
+        assert_eq!(repair_for(&fault), SyncRepair::Rewind);
+    }
 }

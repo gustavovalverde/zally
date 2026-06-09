@@ -15,12 +15,14 @@ use zally_chain::{
 use zally_core::{BlockHeight, Network, TxId};
 use zally_testkit::MockChainSource;
 use zally_wallet::{
-    SyncDriver, SyncDriverOptions, SyncDriverPhase, SyncRecoveryPolicy, SyncRepair, SyncSnapshot,
-    SyncSnapshotStream, WalletError, WalletEvent,
+    SyncDriver, SyncDriverOptions, SyncDriverPhase, SyncRecoveryPolicy, SyncRepair, WalletError,
+    WalletEvent,
 };
 use zcash_client_backend::proto::service::TreeState;
 
-use super::fixtures::{TestWalletError, TestWalletFixture, create_test_wallet};
+use super::fixtures::{
+    SnapshotWaitError, TestWalletError, TestWalletFixture, create_test_wallet, wait_for_snapshot,
+};
 
 fn fast_recovery_policy() -> SyncRecoveryPolicy {
     SyncRecoveryPolicy::default()
@@ -44,9 +46,9 @@ async fn fault_ladder_escalates_through_rewind_to_rescan_then_recovers() -> Resu
     let chain = Arc::new(MockChainSource::new(network));
     let chain_handle = chain.handle();
     chain_handle.advance_tip(BlockHeight::from(40));
-    chain_handle.fail_chain_tip_next(3, || ChainSourceError::MalformedCompactBlock {
-        block_height: BlockHeight::from(10),
-        reason: "synthetic derived-state corruption".into(),
+    chain_handle.fail_chain_tip_next(3, || ChainSourceError::BlockHeightBelowFloor {
+        requested_height: BlockHeight::from(10),
+        earliest_height: BlockHeight::from(20),
     });
 
     let chain_source: Arc<dyn ChainSource> = chain;
@@ -236,8 +238,7 @@ async fn close_returns_promptly_during_fault_backoff() -> Result<(), TestError> 
     let chain = Arc::new(MockChainSource::new(network));
     let chain_handle = chain.handle();
     chain_handle.advance_tip(BlockHeight::from(10));
-    chain_handle.fail_chain_tip_next(10, || ChainSourceError::MalformedCompactBlock {
-        block_height: BlockHeight::from(5),
+    chain_handle.fail_chain_tip_next(10, || ChainSourceError::Unavailable {
         reason: "synthetic fault for backoff".into(),
     });
 
@@ -265,22 +266,6 @@ async fn close_returns_promptly_during_fault_backoff() -> Result<(), TestError> 
         .map_err(|_elapsed| TestError::CloseTimedOut)??;
 
     Ok(())
-}
-
-async fn wait_for_snapshot(
-    snapshots: &mut SyncSnapshotStream,
-    mut predicate: impl FnMut(&SyncSnapshot) -> bool,
-) -> Result<SyncSnapshot, TestError> {
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while let Some(snapshot) = snapshots.next().await {
-            if predicate(&snapshot) {
-                return Ok(snapshot);
-            }
-        }
-        Err(TestError::SnapshotStreamClosed)
-    })
-    .await
-    .map_err(|_| TestError::SnapshotTimeout)?
 }
 
 /// `ChainSource` whose reported network can be shifted after construction.
@@ -367,10 +352,8 @@ enum TestError {
     Fixture(#[from] TestWalletError),
     #[error("wallet error: {0}")]
     Wallet(#[from] WalletError),
-    #[error("sync snapshot stream closed")]
-    SnapshotStreamClosed,
-    #[error("timed out waiting for sync snapshot")]
-    SnapshotTimeout,
+    #[error("snapshot wait failed: {0}")]
+    SnapshotWait(#[from] SnapshotWaitError),
     #[error("timed out waiting for wallet event")]
     EventTimeout,
     #[error("snapshot carried an unexpected phase")]
