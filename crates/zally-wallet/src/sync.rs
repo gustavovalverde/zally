@@ -8,6 +8,12 @@
 //! Each call re-scans from the wallet's last fully-scanned height up to the current chain
 //! tip. The `ChainState` is rebuilt from the embedded genesis frontier on every call: correct,
 //! linear-in-tip-height.
+//!
+//! The long-lived [`SyncDriver`] wraps the loop in a self-healing lifecycle. Wallet chain
+//! state is disposable derived state: every fault is classified onto an escalating repair
+//! ladder ([`SyncRepair`]) that retries, rewinds below the divergence, rebuilds from the
+//! seed and birthday, or parks when no software action cures it. The driver task is
+//! infallible while its handle is alive; it exits only through [`SyncHandle::close`].
 
 use std::collections::HashMap;
 use std::pin::Pin;
@@ -17,21 +23,21 @@ use std::time::Duration;
 use futures_util::{Stream, StreamExt as _, future};
 use tokio::sync::{oneshot, watch};
 use tokio::task::JoinHandle;
-use tokio::time::{MissedTickBehavior, interval, timeout};
+use tokio::time::{MissedTickBehavior, interval, sleep, timeout};
 use tokio_stream::wrappers::WatchStream;
 use zally_chain::{
     BlockHeightRange, ChainEventCursor, ChainEventEnvelope, ChainEventEnvelopeStream, ChainSource,
     ChainSourceError, ChainState, FailurePosture, ShieldedPool, SubtreeIndex,
 };
 use zally_core::{BlockHeight, Network};
-use zally_storage::{ScanRequest, TransparentUtxoRow};
+use zally_storage::{ScanRequest, StorageError, TransparentUtxoRow};
 use zcash_client_backend::data_api::scanning::ScanPriority;
 
 use crate::error::WalletError;
 use crate::event::WalletEvent;
 use crate::retry::with_breaker_and_retry;
 use crate::status::{SyncStatus, WalletStatus};
-use crate::wallet::Wallet;
+use crate::wallet::{Wallet, current_unix_ms};
 
 /// Maximum compact blocks scanned in one `Wallet::sync` call. A suggested range larger than
 /// this is scanned across successive calls; the driver loops until the scan queue drains.
@@ -40,14 +46,13 @@ const MAX_BLOCKS_PER_SYNC: u32 = 1_000;
 /// Subtree-root page size for the per-cycle backfill. Zinder clamps to its own page cap.
 const SUBTREE_ROOT_PAGE: u32 = 128;
 
-/// Blocks to rewind below a scan-time continuity error before re-planning.
+/// Rewind depths the repair ladder walks before escalating to a rebuild.
 ///
-/// A `PrevHashMismatch` at height `H` means the wallet's block at `H - 1` is orphaned, so the
-/// rewind must drop it; a margin lets a multi-block reorg re-converge in one pass.
-/// [`WalletStorage::truncate_to_chain_state`] lands the wallet at exactly the rewind height
-/// (unlike a checkpoint-snapping truncation, which lands below the target and spirals), so the
-/// margin is a reorg-depth heuristic, not a correctness crutch.
-const REORG_REWIND_BLOCKS: u32 = 10;
+/// The deepest rung rewinds 100 blocks: nodes never apply a reorg deeper than coinbase
+/// maturity minus one (both zcashd and zebra enforce the cap), so a 100-block rewind clears
+/// any divergence the chain can serve. Deeper rewinds are pointless; the next rung is a
+/// rebuild from the birthday.
+const REWIND_LADDER_BLOCKS: [u32; 2] = [10, 100];
 
 struct ScanContext {
     blocks: Vec<zcash_client_backend::proto::compact_formats::CompactBlock>,
@@ -69,8 +74,98 @@ pub struct SyncOutcome {
     pub block_count: u64,
     /// Number of transparent UTXOs refreshed during this run.
     pub transparent_utxo_count: u64,
-    /// Number of reorgs observed during this run.
-    pub reorgs_observed: u32,
+    /// Unix milliseconds when this run completed.
+    pub completed_at_ms: u64,
+}
+
+/// Self-healing policy for the [`SyncDriver`] repair ladder.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[non_exhaustive]
+pub struct SyncRecoveryPolicy {
+    /// Consecutive faults at one ladder rung before the driver escalates to the next rung.
+    /// Within [`SyncRepair::Rewind`] the same counter walks the rewind depth ladder.
+    pub escalate_after_faults: u32,
+    /// Rebuilds from the birthday attempted before the driver parks.
+    pub max_rescan_attempts: u32,
+    /// Backoff before the first faulted re-attempt, in milliseconds. Doubles per
+    /// consecutive fault.
+    pub fault_backoff_initial_ms: u64,
+    /// Cap on the fault backoff, in milliseconds.
+    pub fault_backoff_cap_ms: u64,
+    /// How long a parked driver holds before re-arming the full ladder, in milliseconds.
+    /// `None` parks forever; the driver keeps republishing its reason either way.
+    pub park_reprobe_ms: Option<u64>,
+}
+
+impl SyncRecoveryPolicy {
+    /// Returns the policy with `escalate_after_faults` replaced.
+    #[must_use]
+    pub const fn with_escalate_after_faults(self, escalate_after_faults: u32) -> Self {
+        Self {
+            escalate_after_faults,
+            ..self
+        }
+    }
+
+    /// Returns the policy with `max_rescan_attempts` replaced.
+    #[must_use]
+    pub const fn with_max_rescan_attempts(self, max_rescan_attempts: u32) -> Self {
+        Self {
+            max_rescan_attempts,
+            ..self
+        }
+    }
+
+    /// Returns the policy with `fault_backoff_initial_ms` replaced.
+    #[must_use]
+    pub const fn with_fault_backoff_initial_ms(self, fault_backoff_initial_ms: u64) -> Self {
+        Self {
+            fault_backoff_initial_ms,
+            ..self
+        }
+    }
+
+    /// Returns the policy with `fault_backoff_cap_ms` replaced.
+    #[must_use]
+    pub const fn with_fault_backoff_cap_ms(self, fault_backoff_cap_ms: u64) -> Self {
+        Self {
+            fault_backoff_cap_ms,
+            ..self
+        }
+    }
+
+    /// Returns the policy with `park_reprobe_ms` replaced.
+    #[must_use]
+    pub const fn with_park_reprobe_ms(self, park_reprobe_ms: Option<u64>) -> Self {
+        Self {
+            park_reprobe_ms,
+            ..self
+        }
+    }
+
+    fn normalized(self) -> Self {
+        let fault_backoff_initial_ms = self.fault_backoff_initial_ms.max(1);
+        Self {
+            escalate_after_faults: self.escalate_after_faults.max(1),
+            max_rescan_attempts: self.max_rescan_attempts.max(1),
+            fault_backoff_initial_ms,
+            fault_backoff_cap_ms: self.fault_backoff_cap_ms.max(fault_backoff_initial_ms),
+            park_reprobe_ms: self.park_reprobe_ms.map(|hold_ms| hold_ms.max(1)),
+        }
+    }
+}
+
+impl Default for SyncRecoveryPolicy {
+    fn default() -> Self {
+        Self {
+            escalate_after_faults: 3,
+            max_rescan_attempts: 2,
+            fault_backoff_initial_ms: 1_000,
+            fault_backoff_cap_ms: 60_000,
+            park_reprobe_ms: Some(900_000),
+        }
+    }
 }
 
 /// Policy for a long-lived [`SyncDriver`].
@@ -84,6 +179,8 @@ pub struct SyncDriverOptions {
     pub max_sync_iterations_per_wake_count: u32,
     /// Maximum seconds one [`Wallet::sync`] call may run before the driver retries later.
     pub sync_timeout_seconds: u64,
+    /// Self-healing policy for the driver's repair ladder.
+    pub recovery: SyncRecoveryPolicy,
 }
 
 impl SyncDriverOptions {
@@ -117,11 +214,18 @@ impl SyncDriverOptions {
         }
     }
 
+    /// Returns options with `recovery` replaced.
+    #[must_use]
+    pub const fn with_recovery_policy(self, recovery: SyncRecoveryPolicy) -> Self {
+        Self { recovery, ..self }
+    }
+
     fn normalized(self) -> Self {
         Self {
             poll_interval_ms: self.poll_interval_ms.max(1),
             max_sync_iterations_per_wake_count: self.max_sync_iterations_per_wake_count.max(1),
             sync_timeout_seconds: self.sync_timeout_seconds.max(1),
+            recovery: self.recovery.normalized(),
         }
     }
 }
@@ -132,41 +236,91 @@ impl Default for SyncDriverOptions {
             poll_interval_ms: 5_000,
             max_sync_iterations_per_wake_count: 1_000,
             sync_timeout_seconds: 120,
+            recovery: SyncRecoveryPolicy::default(),
         }
     }
 }
 
-/// Lifecycle state of a running [`SyncDriver`].
+/// Repair rung the sync driver applies before its next sync attempt.
+///
+/// Ordered by severity; the ladder only ever escalates from a lower rung to a higher one.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[non_exhaustive]
+pub enum SyncRepair {
+    /// Transient fault; the same state may succeed on the next attempt.
+    Retry,
+    /// The wallet's view diverged from the chain; truncate below the divergence.
+    Rewind,
+    /// Derived state is untrustworthy; rebuild it from the seed and the account birthday.
+    RescanFromBirthday,
+    /// No software action cures this; hold and keep republishing the reason.
+    Park,
+}
+
+impl SyncRepair {
+    /// Stable `snake_case` label for logs and metrics.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Retry => "retry",
+            Self::Rewind => "rewind",
+            Self::RescanFromBirthday => "rescan_from_birthday",
+            Self::Park => "park",
+        }
+    }
+}
+
+/// Cloneable fault record carried by [`SyncSnapshot`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[non_exhaustive]
+pub struct SyncFault {
+    /// Fault description safe for logs and status pages.
+    pub reason: String,
+    /// Repair rung the driver applies (or holds at) for this fault.
+    pub repair: SyncRepair,
+    /// Unix milliseconds when the fault was observed.
+    pub occurred_at_ms: u64,
+    /// Consecutive ladder faults up to and including this one. `0` when the fault did not
+    /// enter the ladder (chain-event stream interruptions; polling keeps sync healthy).
+    pub consecutive_faults: u32,
+}
+
+/// Lifecycle phase of a running [`SyncDriver`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[non_exhaustive]
-pub enum SyncDriverStatus {
+pub enum SyncDriverPhase {
     /// The driver task has been created and is opening its chain-event stream.
     Starting,
     /// The driver is running one or more [`Wallet::sync`] iterations.
     Syncing,
-    /// The driver is waiting for a chain event or the next polling wakeup.
+    /// Healthy idle: the last sync completed and the driver is waiting for a chain event or
+    /// the next polling wakeup.
     Waiting,
+    /// Degraded and self-healing: the driver observed a fault and applies `repair` before
+    /// the next sync attempt.
+    Recovering {
+        /// Repair rung the driver applies before the next attempt.
+        repair: SyncRepair,
+        /// 1-based attempt number at the current rung.
+        attempt: u32,
+        /// Unix milliseconds when the next attempt is due.
+        next_attempt_at_ms: u64,
+    },
+    /// Dead end: no software action cures the recorded fault. The driver holds, keeps
+    /// republishing its reason, and re-arms the ladder at `reprobe_at_ms` when set.
+    Parked {
+        /// Unix milliseconds when the driver parked.
+        since_ms: u64,
+        /// Unix milliseconds when the driver re-arms the ladder, if reprobing is enabled.
+        reprobe_at_ms: Option<u64>,
+    },
     /// The driver is closing after the caller requested shutdown.
     Closing,
     /// The driver closed cleanly.
     Closed,
-    /// The driver stopped after a terminal error.
-    Failed {
-        /// Operator-facing posture for the terminal failure.
-        posture: FailurePosture,
-    },
-}
-
-/// Cloneable error summary carried by [`SyncSnapshot`].
-#[derive(Clone, Debug, Eq, PartialEq)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-#[non_exhaustive]
-pub struct SyncErrorSnapshot {
-    /// Error description safe for logs and status pages.
-    pub reason: String,
-    /// Operator-facing posture for this failure.
-    pub posture: FailurePosture,
 }
 
 /// Current observable state of a [`SyncDriver`].
@@ -176,8 +330,8 @@ pub struct SyncErrorSnapshot {
 pub struct SyncSnapshot {
     /// Network this driver is bound to.
     pub network: Network,
-    /// Driver lifecycle status.
-    pub driver_status: SyncDriverStatus,
+    /// Driver lifecycle phase.
+    pub phase: SyncDriverPhase,
     /// Wallet scan status derived from persisted progress.
     pub sync_status: SyncStatus,
     /// Highest block height the wallet has scanned, if any.
@@ -186,41 +340,45 @@ pub struct SyncSnapshot {
     pub safe_chain_tip_height: Option<BlockHeight>,
     /// Number of blocks between `scanned_height` and `safe_chain_tip_height`, if known.
     pub lag_blocks: Option<u32>,
-    /// Most recent [`Wallet::sync`] run summary.
-    pub last_sync_outcome: Option<SyncOutcome>,
-    /// Most recent retryable error, or the terminal error if the driver failed.
-    pub last_error: Option<SyncErrorSnapshot>,
+    /// Most recent completed [`Wallet::sync`] run summary.
+    pub last_outcome: Option<SyncOutcome>,
+    /// Most recent fault; `None` while healthy.
+    pub last_fault: Option<SyncFault>,
+    /// Unix milliseconds when this snapshot was published.
+    pub published_at_ms: u64,
 }
 
 impl SyncSnapshot {
     fn starting(network: Network) -> Self {
         Self {
             network,
-            driver_status: SyncDriverStatus::Starting,
+            phase: SyncDriverPhase::Starting,
             sync_status: SyncStatus::NotStarted,
             scanned_height: None,
             safe_chain_tip_height: None,
             lag_blocks: None,
-            last_sync_outcome: None,
-            last_error: None,
+            last_outcome: None,
+            last_fault: None,
+            published_at_ms: current_unix_ms(),
         }
     }
 
     fn from_wallet_status(
-        driver_status: SyncDriverStatus,
+        phase: SyncDriverPhase,
         wallet_status: &WalletStatus,
-        last_sync_outcome: Option<SyncOutcome>,
-        last_error: Option<SyncErrorSnapshot>,
+        last_outcome: Option<SyncOutcome>,
+        last_fault: Option<SyncFault>,
     ) -> Self {
         Self {
             network: wallet_status.network,
-            driver_status,
+            phase,
             sync_status: wallet_status.sync_status,
             scanned_height: wallet_status.scanned_height,
             safe_chain_tip_height: wallet_status.safe_chain_tip_height,
             lag_blocks: wallet_status.lag_blocks,
-            last_sync_outcome,
-            last_error,
+            last_outcome,
+            last_fault,
+            published_at_ms: current_unix_ms(),
         }
     }
 }
@@ -249,6 +407,10 @@ impl SyncSnapshotStream {
 /// wallet catch-up loop: it listens for [`ChainSource::chain_event_envelopes`] when available,
 /// falls back to polling, repeatedly calls [`Wallet::sync`] until the observed tip is
 /// reached, and publishes [`SyncSnapshot`] values.
+///
+/// The driver task is infallible while its handle is alive. Faults engage the escalating
+/// repair ladder ([`SyncRepair`]) instead of killing the task; the task exits only through
+/// [`SyncHandle::close`].
 pub struct SyncDriver {
     wallet: Wallet,
     chain: Arc<dyn ChainSource>,
@@ -300,7 +462,7 @@ impl SyncDriver {
 /// Handle returned by [`SyncDriver::sync_continuously`].
 pub struct SyncHandle {
     close_tx: Option<oneshot::Sender<()>>,
-    join: JoinHandle<Result<(), WalletError>>,
+    join: JoinHandle<()>,
     status_rx: watch::Receiver<SyncSnapshot>,
 }
 
@@ -318,46 +480,112 @@ impl SyncHandle {
     }
 
     /// Requests shutdown and waits for the driver task to close.
+    ///
+    /// The driver task never fails on its own, so the only close-time error is
+    /// [`WalletError::SyncDriverFailed`] from a panic inside the driver task.
     pub async fn close(mut self) -> Result<(), WalletError> {
         if let Some(close_tx) = self.close_tx.take() {
             let _ = close_tx.send(());
         }
         match self.join.await {
-            Ok(join_outcome) => join_outcome,
-            Err(join_error) => {
-                let posture = if join_error.is_panic() {
-                    FailurePosture::RequiresOperator
-                } else {
-                    FailurePosture::Retryable
-                };
-                Err(WalletError::SyncDriverFailed {
-                    reason: join_error.to_string(),
-                    posture,
-                })
-            }
+            Ok(()) => Ok(()),
+            Err(join_error) if join_error.is_panic() => Err(WalletError::SyncDriverFailed {
+                reason: join_error.to_string(),
+            }),
+            Err(_cancelled) => Ok(()),
         }
     }
 }
 
+struct DriverContext<'a> {
+    wallet: &'a Wallet,
+    chain: &'a dyn ChainSource,
+    options: SyncDriverOptions,
+    status_tx: &'a watch::Sender<SyncSnapshot>,
+}
+
 #[derive(Default)]
-struct SyncRunState {
-    last_sync_outcome: Option<SyncOutcome>,
-    last_error: Option<SyncErrorSnapshot>,
+struct DriverState {
+    last_outcome: Option<SyncOutcome>,
+    last_fault: Option<SyncFault>,
+    recovery: Option<RecoveryState>,
+}
+
+impl DriverState {
+    fn parked(&self) -> Option<ParkedAt> {
+        self.recovery.as_ref().and_then(|recovery| recovery.parked)
+    }
+}
+
+struct RecoveryState {
+    rung: SyncRepair,
+    attempts_at_rung: u32,
+    rewind_depth_index: usize,
+    consecutive_faults: u32,
+    backoff_ms: u64,
+    degraded_since_ms: u64,
+    parked: Option<ParkedAt>,
+}
+
+impl RecoveryState {
+    const fn entering(rung: SyncRepair, now_ms: u64) -> Self {
+        Self {
+            rung,
+            attempts_at_rung: 0,
+            rewind_depth_index: 0,
+            consecutive_faults: 0,
+            backoff_ms: 0,
+            degraded_since_ms: now_ms,
+            parked: None,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ParkedAt {
+    since_ms: u64,
+    reprobe_at_ms: Option<u64>,
 }
 
 enum SyncRunAttempt {
     Completed(SyncOutcome),
-    RetryableError(SyncErrorSnapshot),
-    FatalError {
-        error: WalletError,
-        snapshot: SyncErrorSnapshot,
-    },
+    Faulted { reason: String, repair: SyncRepair },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SyncWakeupExit {
     Waiting,
+    Parked,
     CloseRequested,
+}
+
+enum DriverTransition<'a> {
+    DriverStarted,
+    Fault {
+        fault: &'a SyncFault,
+    },
+    RepairStarted {
+        repair: SyncRepair,
+        attempt: u32,
+        rewind_to_height: Option<BlockHeight>,
+        backoff_ms: u64,
+    },
+    RepairSucceeded {
+        repair: SyncRepair,
+        total_faults: u32,
+        degraded_for_ms: u64,
+    },
+    RepairEscalated {
+        from_repair: SyncRepair,
+        to_repair: SyncRepair,
+    },
+    Parked {
+        reason: &'a str,
+        reprobe_at_ms: Option<u64>,
+    },
+    ParkReprobe,
+    Closing,
+    Closed,
 }
 
 async fn run_sync_driver(
@@ -366,71 +594,57 @@ async fn run_sync_driver(
     options: SyncDriverOptions,
     mut close_rx: oneshot::Receiver<()>,
     status_tx: watch::Sender<SyncSnapshot>,
-) -> Result<(), WalletError> {
+) {
+    let ctx = DriverContext {
+        wallet: &wallet,
+        chain: chain.as_ref(),
+        options,
+        status_tx: &status_tx,
+    };
+    let started = ctx.status_tx.borrow().clone();
+    publish_transition(ctx.status_tx, started, &DriverTransition::DriverStarted);
+
     let mut poll = interval(Duration::from_millis(options.poll_interval_ms));
     poll.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let mut state = DriverState::default();
     let mut chain_event_cursor: Option<ChainEventCursor> = None;
-    let mut chain_events = open_chain_events(
-        chain.as_ref(),
-        &status_tx,
-        wallet.network(),
-        chain_event_cursor.clone(),
-    )
-    .await;
-    let mut run_state = SyncRunState::default();
+    let mut chain_events = open_chain_events(&ctx, &mut state, chain_event_cursor.clone()).await;
     let mut should_sync = true;
 
     loop {
-        if should_sync {
-            let mut wakeup_scope = SyncWakeupScope {
-                wallet: &wallet,
-                chain: chain.as_ref(),
-                options,
-                status_tx: &status_tx,
-                close_rx: &mut close_rx,
-            };
-            if run_sync_wakeup(&mut wakeup_scope, &mut run_state).await?
+        if should_sync && state.parked().is_none() {
+            if run_sync_wakeup(&ctx, &mut close_rx, &mut state).await
                 == SyncWakeupExit::CloseRequested
             {
-                return close_sync_driver(&wallet, &status_tx, run_state).await;
+                return close_sync_driver(&ctx, &state).await;
             }
             should_sync = false;
         }
 
         tokio::select! {
             _ = &mut close_rx => {
-                return close_sync_driver(&wallet, &status_tx, run_state).await;
+                return close_sync_driver(&ctx, &state).await;
             }
             _ = poll.tick() => {
-                if chain_events.is_none() {
-                    chain_events = open_chain_events(
-                        chain.as_ref(),
-                        &status_tx,
-                        wallet.network(),
-                        chain_event_cursor.clone(),
-                    )
-                    .await;
-                }
-                should_sync = true;
+                should_sync = handle_poll_tick(
+                    &ctx,
+                    &mut state,
+                    &mut chain_events,
+                    chain_event_cursor.clone(),
+                )
+                .await;
             }
             chain_event = next_chain_event_envelope(&mut chain_events) => {
                 match chain_event {
                     Some(Ok(envelope)) => {
                         chain_event_cursor = Some(envelope.cursor);
-                        should_sync = true;
+                        should_sync = state.parked().is_none();
                     }
                     Some(Err(err)) => {
-                        run_state.last_error = Some(SyncErrorSnapshot {
-                            reason: err.to_string(),
-                            posture: err.posture(),
-                        });
                         chain_events = None;
-                        publish_fallback_snapshot(
-                            wallet.network(),
-                            &status_tx,
-                            run_state.last_sync_outcome,
-                            run_state.last_error.clone(),
-                        );
+                        if state.parked().is_none() {
+                            record_stream_fault(&ctx, &mut state, &err);
+                        }
                     }
                     None => {
                         chain_events = None;
@@ -441,117 +655,356 @@ async fn run_sync_driver(
     }
 }
 
-struct SyncWakeupScope<'a> {
-    wallet: &'a Wallet,
-    chain: &'a dyn ChainSource,
-    options: SyncDriverOptions,
-    status_tx: &'a watch::Sender<SyncSnapshot>,
-    close_rx: &'a mut oneshot::Receiver<()>,
+/// Handles one polling wakeup; returns whether the driver should sync.
+///
+/// While parked this republishes the current snapshot (refreshed `published_at_ms`) so
+/// observers keep receiving the parked reason, and re-arms the full ladder once the reprobe
+/// deadline passes.
+async fn handle_poll_tick(
+    ctx: &DriverContext<'_>,
+    state: &mut DriverState,
+    chain_events: &mut Option<ChainEventEnvelopeStream>,
+    from_cursor: Option<ChainEventCursor>,
+) -> bool {
+    if let Some(parked) = state.parked() {
+        if parked
+            .reprobe_at_ms
+            .is_some_and(|reprobe_at_ms| current_unix_ms() >= reprobe_at_ms)
+        {
+            state.recovery = None;
+            let snapshot = build_snapshot(ctx, SyncDriverPhase::Waiting, state).await;
+            publish_transition(ctx.status_tx, snapshot, &DriverTransition::ParkReprobe);
+            return true;
+        }
+        let refreshed = ctx.status_tx.borrow().clone();
+        publish_snapshot(ctx.status_tx, refreshed);
+        return false;
+    }
+    if chain_events.is_none() {
+        *chain_events = open_chain_events(ctx, state, from_cursor).await;
+    }
+    true
 }
 
-async fn close_sync_driver(
-    wallet: &Wallet,
-    status_tx: &watch::Sender<SyncSnapshot>,
-    run_state: SyncRunState,
-) -> Result<(), WalletError> {
-    publish_driver_snapshot(
-        wallet,
-        status_tx,
-        SyncDriverStatus::Closing,
-        run_state.last_sync_outcome,
-        run_state.last_error.clone(),
-    )
-    .await?;
-    publish_driver_snapshot(
-        wallet,
-        status_tx,
-        SyncDriverStatus::Closed,
-        run_state.last_sync_outcome,
-        run_state.last_error,
-    )
-    .await
+async fn close_sync_driver(ctx: &DriverContext<'_>, state: &DriverState) {
+    let closing = build_snapshot(ctx, SyncDriverPhase::Closing, state).await;
+    publish_transition(ctx.status_tx, closing, &DriverTransition::Closing);
+    let closed = build_snapshot(ctx, SyncDriverPhase::Closed, state).await;
+    publish_transition(ctx.status_tx, closed, &DriverTransition::Closed);
 }
 
 async fn run_sync_wakeup(
-    scope: &mut SyncWakeupScope<'_>,
-    run_state: &mut SyncRunState,
-) -> Result<SyncWakeupExit, WalletError> {
-    for _ in 0..scope.options.max_sync_iterations_per_wake_count {
-        tokio::select! {
-            biased;
-            _ = &mut *scope.close_rx => {
-                return Ok(SyncWakeupExit::CloseRequested);
+    ctx: &DriverContext<'_>,
+    close_rx: &mut oneshot::Receiver<()>,
+    state: &mut DriverState,
+) -> SyncWakeupExit {
+    for _ in 0..ctx.options.max_sync_iterations_per_wake_count {
+        if let Some(recovery) = &state.recovery {
+            if recovery.rung == SyncRepair::Park {
+                enter_park(ctx, state).await;
+                return SyncWakeupExit::Parked;
             }
-            publish_outcome = publish_driver_snapshot(
-                scope.wallet,
-                scope.status_tx,
-                SyncDriverStatus::Syncing,
-                run_state.last_sync_outcome,
-                run_state.last_error.clone(),
-            ) => {
-                publish_outcome?;
+            let backoff_ms = recovery.backoff_ms;
+            tokio::select! {
+                biased;
+                _ = &mut *close_rx => return SyncWakeupExit::CloseRequested,
+                () = sleep(Duration::from_millis(backoff_ms)) => {}
+            }
+            if let Err(repair_error) = apply_repair(ctx, state).await {
+                let repair = repair_for(&repair_error);
+                record_fault(ctx, state, repair_error.to_string(), repair).await;
+                continue;
             }
         }
-        let sync_attempt = tokio::select! {
+        tokio::select! {
             biased;
-            _ = &mut *scope.close_rx => {
-                return Ok(SyncWakeupExit::CloseRequested);
+            _ = &mut *close_rx => return SyncWakeupExit::CloseRequested,
+            snapshot = build_snapshot(ctx, SyncDriverPhase::Syncing, state) => {
+                publish_snapshot(ctx.status_tx, snapshot);
             }
-            sync_attempt = run_one_sync(scope.wallet, scope.chain, scope.options) => sync_attempt,
+        }
+        let attempt = tokio::select! {
+            biased;
+            _ = &mut *close_rx => return SyncWakeupExit::CloseRequested,
+            attempt = run_one_sync(ctx.wallet, ctx.chain, ctx.options) => attempt,
         };
-        match sync_attempt {
+        match attempt {
             SyncRunAttempt::Completed(outcome) => {
-                run_state.last_sync_outcome = Some(outcome);
-                run_state.last_error = None;
-                let wallet_status = scope.wallet.status_snapshot().await?;
-                let should_continue = should_continue_syncing(outcome);
-                publish_snapshot(
-                    scope.status_tx,
-                    SyncSnapshot::from_wallet_status(
-                        if should_continue {
-                            SyncDriverStatus::Syncing
-                        } else {
-                            SyncDriverStatus::Waiting
-                        },
-                        &wallet_status,
-                        run_state.last_sync_outcome,
-                        None,
-                    ),
-                );
-                if !should_continue {
-                    return Ok(SyncWakeupExit::Waiting);
+                if !complete_sync(ctx, state, outcome).await {
+                    return SyncWakeupExit::Waiting;
                 }
             }
-            SyncRunAttempt::RetryableError(snapshot) => {
-                run_state.last_error = Some(snapshot);
-                publish_driver_snapshot(
-                    scope.wallet,
-                    scope.status_tx,
-                    SyncDriverStatus::Waiting,
-                    run_state.last_sync_outcome,
-                    run_state.last_error.clone(),
-                )
-                .await?;
-                return Ok(SyncWakeupExit::Waiting);
-            }
-            SyncRunAttempt::FatalError { error, snapshot } => {
-                let driver_posture = error.posture();
-                run_state.last_error = Some(snapshot);
-                publish_driver_snapshot(
-                    scope.wallet,
-                    scope.status_tx,
-                    SyncDriverStatus::Failed {
-                        posture: driver_posture,
-                    },
-                    run_state.last_sync_outcome,
-                    run_state.last_error.clone(),
-                )
-                .await?;
-                return Err(error);
+            SyncRunAttempt::Faulted { reason, repair } => {
+                record_fault(ctx, state, reason, repair).await;
             }
         }
     }
-    Ok(SyncWakeupExit::Waiting)
+    SyncWakeupExit::Waiting
+}
+
+/// Publishes the outcome of a completed sync run; returns whether the wakeup should run
+/// another iteration. Clears any active recovery and announces the repair success.
+async fn complete_sync(
+    ctx: &DriverContext<'_>,
+    state: &mut DriverState,
+    outcome: SyncOutcome,
+) -> bool {
+    let recovered = state.recovery.take();
+    state.last_outcome = Some(outcome);
+    state.last_fault = None;
+    let should_continue = should_continue_syncing(outcome);
+    let phase = if should_continue {
+        SyncDriverPhase::Syncing
+    } else {
+        SyncDriverPhase::Waiting
+    };
+    let snapshot = build_snapshot(ctx, phase, state).await;
+    if let Some(recovery) = recovered {
+        let degraded_for_ms = current_unix_ms().saturating_sub(recovery.degraded_since_ms);
+        publish_transition(
+            ctx.status_tx,
+            snapshot,
+            &DriverTransition::RepairSucceeded {
+                repair: recovery.rung,
+                total_faults: recovery.consecutive_faults,
+                degraded_for_ms,
+            },
+        );
+    } else {
+        publish_snapshot(ctx.status_tx, snapshot);
+    }
+    should_continue
+}
+
+/// Folds a fault into the recovery ladder and publishes the resulting transition.
+///
+/// The entry rung is the maximum of the current rung and the fault's classification; the
+/// ladder never de-escalates within one degraded episode. Once the current rung has been
+/// applied [`SyncRecoveryPolicy::escalate_after_faults`] times without a completed sync
+/// (rebuilds use [`SyncRecoveryPolicy::max_rescan_attempts`]), the next fault escalates one
+/// rung.
+async fn record_fault(
+    ctx: &DriverContext<'_>,
+    state: &mut DriverState,
+    reason: String,
+    classified: SyncRepair,
+) {
+    let now = current_unix_ms();
+    let policy = ctx.options.recovery;
+    let recovery = state
+        .recovery
+        .get_or_insert_with(|| RecoveryState::entering(classified, now));
+    let escalation = if classified > recovery.rung {
+        recovery.rung = classified;
+        recovery.attempts_at_rung = 0;
+        if classified == SyncRepair::Rewind {
+            recovery.rewind_depth_index = 0;
+        }
+        None
+    } else if recovery.attempts_at_rung >= escalation_threshold(recovery.rung, policy) {
+        let from_repair = recovery.rung;
+        escalate(recovery);
+        Some((from_repair, recovery.rung))
+    } else {
+        None
+    };
+    recovery.consecutive_faults = recovery.consecutive_faults.saturating_add(1);
+    recovery.backoff_ms = backoff_for(policy, recovery.consecutive_faults);
+    let fault = SyncFault {
+        reason,
+        repair: recovery.rung,
+        occurred_at_ms: now,
+        consecutive_faults: recovery.consecutive_faults,
+    };
+    let phase = SyncDriverPhase::Recovering {
+        repair: recovery.rung,
+        attempt: recovery.attempts_at_rung.saturating_add(1),
+        next_attempt_at_ms: now.saturating_add(recovery.backoff_ms),
+    };
+    state.last_fault = Some(fault.clone());
+    let snapshot = build_snapshot(ctx, phase, state).await;
+    publish_transition(
+        ctx.status_tx,
+        snapshot,
+        &DriverTransition::Fault { fault: &fault },
+    );
+    if let Some((from_repair, to_repair)) = escalation {
+        let snapshot = ctx.status_tx.borrow().clone();
+        publish_transition(
+            ctx.status_tx,
+            snapshot,
+            &DriverTransition::RepairEscalated {
+                from_repair,
+                to_repair,
+            },
+        );
+    }
+}
+
+fn escalate(recovery: &mut RecoveryState) {
+    match recovery.rung {
+        SyncRepair::Retry => {
+            recovery.rung = SyncRepair::Rewind;
+            recovery.rewind_depth_index = 0;
+        }
+        SyncRepair::Rewind => {
+            if recovery.rewind_depth_index + 1 < REWIND_LADDER_BLOCKS.len() {
+                recovery.rewind_depth_index += 1;
+            } else {
+                recovery.rung = SyncRepair::RescanFromBirthday;
+            }
+        }
+        SyncRepair::RescanFromBirthday => recovery.rung = SyncRepair::Park,
+        SyncRepair::Park => {}
+    }
+    recovery.attempts_at_rung = 0;
+}
+
+const fn escalation_threshold(rung: SyncRepair, policy: SyncRecoveryPolicy) -> u32 {
+    match rung {
+        SyncRepair::RescanFromBirthday => policy.max_rescan_attempts,
+        SyncRepair::Retry | SyncRepair::Rewind | SyncRepair::Park => policy.escalate_after_faults,
+    }
+}
+
+const fn backoff_for(policy: SyncRecoveryPolicy, consecutive_faults: u32) -> u64 {
+    let exponent = consecutive_faults.saturating_sub(1);
+    let exponent = if exponent > 31 { 31 } else { exponent };
+    let scaled = policy
+        .fault_backoff_initial_ms
+        .saturating_mul(1_u64 << exponent);
+    if scaled > policy.fault_backoff_cap_ms {
+        policy.fault_backoff_cap_ms
+    } else {
+        scaled
+    }
+}
+
+const fn rewind_depth_blocks(index: usize) -> u32 {
+    if index < REWIND_LADDER_BLOCKS.len() {
+        REWIND_LADDER_BLOCKS[index]
+    } else {
+        REWIND_LADDER_BLOCKS[REWIND_LADDER_BLOCKS.len() - 1]
+    }
+}
+
+/// Classifies a fault onto the repair ladder.
+///
+/// Commitment-tree conflicts, scan-time reorg divergences, and proven tree-root divergence
+/// rewind; identity and configuration dead ends park; transient faults retry. Everything
+/// else (opaque storage failures, malformed chain payloads) defaults to a rewind: the
+/// ladder escalates to a rebuild when rewinding does not cure, which is the self-healing
+/// default for unknown corruption.
+fn repair_for(error: &WalletError) -> SyncRepair {
+    #[allow(
+        clippy::wildcard_enum_match_arm,
+        reason = "the named arms pin the repairs that must not drift; every other error \
+                  falls through to its posture, keeping the classification total"
+    )]
+    match error {
+        WalletError::Storage(
+            StorageError::CommitmentTreeConflict { .. } | StorageError::ChainReorgDetected { .. },
+        )
+        | WalletError::TreeRootsDiverged { .. } => SyncRepair::Rewind,
+        WalletError::NetworkMismatch { .. }
+        | WalletError::NoSealedSeed
+        | WalletError::AccountNotFound => SyncRepair::Park,
+        other => {
+            if other.posture() == FailurePosture::Retryable {
+                SyncRepair::Retry
+            } else {
+                SyncRepair::Rewind
+            }
+        }
+    }
+}
+
+/// Applies the current repair rung before the next sync attempt.
+///
+/// A failed repair is itself a fault: the caller records it and the ladder escalates
+/// naturally.
+async fn apply_repair(ctx: &DriverContext<'_>, state: &mut DriverState) -> Result<(), WalletError> {
+    let Some(recovery) = state.recovery.as_mut() else {
+        return Ok(());
+    };
+    recovery.attempts_at_rung = recovery.attempts_at_rung.saturating_add(1);
+    let repair = recovery.rung;
+    let attempt = recovery.attempts_at_rung;
+    let backoff_ms = recovery.backoff_ms;
+    let rewind_depth = rewind_depth_blocks(recovery.rewind_depth_index);
+
+    let rewind_to_height = if repair == SyncRepair::Rewind {
+        ctx.wallet
+            .status_snapshot()
+            .await?
+            .scanned_height
+            .map(|scanned| BlockHeight::from(scanned.as_u32().saturating_sub(rewind_depth)))
+    } else {
+        None
+    };
+    let phase = SyncDriverPhase::Recovering {
+        repair,
+        attempt,
+        next_attempt_at_ms: current_unix_ms(),
+    };
+    let snapshot = build_snapshot(ctx, phase, state).await;
+    publish_transition(
+        ctx.status_tx,
+        snapshot,
+        &DriverTransition::RepairStarted {
+            repair,
+            attempt,
+            rewind_to_height,
+            backoff_ms,
+        },
+    );
+    match repair {
+        SyncRepair::Retry | SyncRepair::Park => Ok(()),
+        SyncRepair::Rewind => {
+            if let Some(rewind_to) = rewind_to_height {
+                ctx.wallet.rewind_to_height(ctx.chain, rewind_to).await?;
+            }
+            Ok(())
+        }
+        SyncRepair::RescanFromBirthday => ctx.wallet.reset_to_birthday(ctx.chain).await,
+    }
+}
+
+async fn enter_park(ctx: &DriverContext<'_>, state: &mut DriverState) {
+    let now = current_unix_ms();
+    let reprobe_at_ms = ctx
+        .options
+        .recovery
+        .park_reprobe_ms
+        .map(|hold_ms| now.saturating_add(hold_ms));
+    let parked = ParkedAt {
+        since_ms: now,
+        reprobe_at_ms,
+    };
+    if let Some(recovery) = state.recovery.as_mut() {
+        recovery.parked = Some(parked);
+    }
+    let reason = state
+        .last_fault
+        .as_ref()
+        .map_or_else(String::new, |fault| fault.reason.clone());
+    let snapshot = build_snapshot(
+        ctx,
+        SyncDriverPhase::Parked {
+            since_ms: parked.since_ms,
+            reprobe_at_ms,
+        },
+        state,
+    )
+    .await;
+    publish_transition(
+        ctx.status_tx,
+        snapshot,
+        &DriverTransition::Parked {
+            reason: &reason,
+            reprobe_at_ms,
+        },
+    );
 }
 
 async fn run_one_sync(
@@ -566,98 +1019,169 @@ async fn run_one_sync(
     .await
     {
         Ok(Ok(outcome)) => SyncRunAttempt::Completed(outcome),
-        Ok(Err(error)) => {
-            let posture = error.posture();
-            let snapshot = SyncErrorSnapshot {
-                reason: error.to_string(),
-                posture,
-            };
-            if posture.allows_retry() {
-                SyncRunAttempt::RetryableError(snapshot)
-            } else {
-                SyncRunAttempt::FatalError { error, snapshot }
-            }
-        }
-        Err(_elapsed) => SyncRunAttempt::RetryableError(SyncErrorSnapshot {
+        Ok(Err(error)) => SyncRunAttempt::Faulted {
+            reason: error.to_string(),
+            repair: repair_for(&error),
+        },
+        Err(_elapsed) => SyncRunAttempt::Faulted {
             reason: format!("sync exceeded {} seconds", options.sync_timeout_seconds),
-            posture: FailurePosture::Retryable,
-        }),
+            repair: SyncRepair::Retry,
+        },
     }
 }
 
 /// Whether the driver should run another sync iteration in this wakeup.
 ///
-/// A cycle that scanned a chunk (`block_count > 0`) or rewound a reorg
-/// (`reorgs_observed > 0`) leaves more scan-queue work; a caught-up cycle reports neither and
-/// stops the loop until the next chain event or poll.
-fn should_continue_syncing(outcome: SyncOutcome) -> bool {
-    outcome.block_count > 0 || outcome.reorgs_observed > 0
+/// A cycle that scanned a chunk (`block_count > 0`) leaves more scan-queue work; a
+/// caught-up cycle reports none and stops the loop until the next chain event or poll.
+const fn should_continue_syncing(outcome: SyncOutcome) -> bool {
+    outcome.block_count > 0
 }
 
-async fn publish_driver_snapshot(
-    wallet: &Wallet,
-    status_tx: &watch::Sender<SyncSnapshot>,
-    driver_status: SyncDriverStatus,
-    last_sync_outcome: Option<SyncOutcome>,
-    last_error: Option<SyncErrorSnapshot>,
-) -> Result<(), WalletError> {
-    let wallet_status = wallet.status_snapshot().await?;
-    publish_snapshot(
-        status_tx,
-        SyncSnapshot::from_wallet_status(
-            driver_status,
+/// Builds a snapshot from the live wallet status, falling back to the previously published
+/// snapshot when the status read fails (the driver must keep publishing regardless).
+async fn build_snapshot(
+    ctx: &DriverContext<'_>,
+    phase: SyncDriverPhase,
+    state: &DriverState,
+) -> SyncSnapshot {
+    match ctx.wallet.status_snapshot().await {
+        Ok(wallet_status) => SyncSnapshot::from_wallet_status(
+            phase,
             &wallet_status,
-            last_sync_outcome,
-            last_error,
+            state.last_outcome,
+            state.last_fault.clone(),
         ),
-    );
-    Ok(())
+        Err(_status_unavailable) => {
+            let mut snapshot = ctx.status_tx.borrow().clone();
+            snapshot.phase = phase;
+            snapshot.last_outcome = state.last_outcome;
+            snapshot.last_fault.clone_from(&state.last_fault);
+            snapshot
+        }
+    }
 }
 
-fn publish_fallback_snapshot(
-    network: Network,
+/// Records a chain-event stream interruption without engaging the repair ladder: polling
+/// keeps sync healthy while the stream reopens on the next tick.
+fn record_stream_fault(ctx: &DriverContext<'_>, state: &mut DriverState, error: &ChainSourceError) {
+    state.last_fault = Some(SyncFault {
+        reason: error.to_string(),
+        repair: SyncRepair::Retry,
+        occurred_at_ms: current_unix_ms(),
+        consecutive_faults: 0,
+    });
+    let mut snapshot = ctx.status_tx.borrow().clone();
+    snapshot.last_fault.clone_from(&state.last_fault);
+    publish_snapshot(ctx.status_tx, snapshot);
+}
+
+/// Single choke point for lifecycle transitions: emits the tracing event, then publishes
+/// the snapshot.
+fn publish_transition(
     status_tx: &watch::Sender<SyncSnapshot>,
-    last_sync_outcome: Option<SyncOutcome>,
-    last_error: Option<SyncErrorSnapshot>,
+    snapshot: SyncSnapshot,
+    transition: &DriverTransition<'_>,
 ) {
-    let prior = status_tx.borrow().clone();
-    publish_snapshot(
-        status_tx,
-        SyncSnapshot {
-            network,
-            driver_status: SyncDriverStatus::Waiting,
-            sync_status: prior.sync_status,
-            scanned_height: prior.scanned_height,
-            safe_chain_tip_height: prior.safe_chain_tip_height,
-            lag_blocks: prior.lag_blocks,
-            last_sync_outcome,
-            last_error,
-        },
-    );
+    emit_transition_event(&snapshot, transition);
+    publish_snapshot(status_tx, snapshot);
 }
 
-fn publish_snapshot(status_tx: &watch::Sender<SyncSnapshot>, snapshot: SyncSnapshot) {
+fn emit_transition_event(snapshot: &SyncSnapshot, transition: &DriverTransition<'_>) {
+    match transition {
+        DriverTransition::DriverStarted => tracing::info!(
+            target: "zally::sync",
+            event = "wallet_sync_driver_started",
+            network = ?snapshot.network,
+            "sync driver task started"
+        ),
+        DriverTransition::Fault { fault } => tracing::warn!(
+            target: "zally::sync",
+            event = "wallet_sync_fault",
+            reason = %fault.reason,
+            repair = fault.repair.label(),
+            consecutive_faults = fault.consecutive_faults,
+            scanned_height = snapshot.scanned_height.map(BlockHeight::as_u32),
+            "sync fault; repair ladder engaged"
+        ),
+        DriverTransition::RepairStarted {
+            repair,
+            attempt,
+            rewind_to_height,
+            backoff_ms,
+        } => tracing::warn!(
+            target: "zally::sync",
+            event = "wallet_sync_repair_started",
+            repair = repair.label(),
+            attempt,
+            rewind_to_height = rewind_to_height.map(BlockHeight::as_u32),
+            backoff_ms,
+            "applying repair before the next sync attempt"
+        ),
+        DriverTransition::RepairSucceeded {
+            repair,
+            total_faults,
+            degraded_for_ms,
+        } => tracing::info!(
+            target: "zally::sync",
+            event = "wallet_sync_repair_succeeded",
+            repair = repair.label(),
+            total_faults,
+            degraded_for_ms,
+            "sync completed after repair; driver healthy"
+        ),
+        DriverTransition::RepairEscalated {
+            from_repair,
+            to_repair,
+        } => tracing::error!(
+            target: "zally::sync",
+            event = "wallet_sync_repair_escalated",
+            from_repair = from_repair.label(),
+            to_repair = to_repair.label(),
+            "repair did not cure the fault; escalating to a deeper rung"
+        ),
+        DriverTransition::Parked {
+            reason,
+            reprobe_at_ms,
+        } => tracing::error!(
+            target: "zally::sync",
+            event = "wallet_sync_parked",
+            reason = %reason,
+            reprobe_at_ms,
+            "no software repair cures this fault; driver parked"
+        ),
+        DriverTransition::ParkReprobe => tracing::info!(
+            target: "zally::sync",
+            event = "wallet_sync_park_reprobe",
+            "park hold elapsed; repair ladder re-armed"
+        ),
+        DriverTransition::Closing => tracing::info!(
+            target: "zally::sync",
+            event = "wallet_sync_driver_closing",
+            "sync driver closing on request"
+        ),
+        DriverTransition::Closed => tracing::info!(
+            target: "zally::sync",
+            event = "wallet_sync_driver_closed",
+            "sync driver closed"
+        ),
+    }
+}
+
+fn publish_snapshot(status_tx: &watch::Sender<SyncSnapshot>, mut snapshot: SyncSnapshot) {
+    snapshot.published_at_ms = current_unix_ms();
     let _ = status_tx.send(snapshot);
 }
 
 async fn open_chain_events(
-    chain: &dyn ChainSource,
-    status_tx: &watch::Sender<SyncSnapshot>,
-    network: Network,
+    ctx: &DriverContext<'_>,
+    state: &mut DriverState,
     from_cursor: Option<ChainEventCursor>,
 ) -> Option<ChainEventEnvelopeStream> {
-    match chain.chain_event_envelopes(from_cursor).await {
+    match ctx.chain.chain_event_envelopes(from_cursor).await {
         Ok(stream) => Some(stream),
         Err(err) => {
-            publish_fallback_snapshot(
-                network,
-                status_tx,
-                None,
-                Some(SyncErrorSnapshot {
-                    reason: err.to_string(),
-                    posture: err.posture(),
-                }),
-            );
+            record_stream_fault(ctx, state, &err);
             None
         }
     }
@@ -677,13 +1201,13 @@ impl Wallet {
     ///
     /// Each call primes commitment-tree subtree roots, calls `update_chain_tip` with the live
     /// tip, then scans the highest-priority range `suggest_scan_ranges` returns (chunked to
-    /// [`MAX_BLOCKS_PER_SYNC`]). The `SyncDriver` loops until the scan queue drains. Subtree
+    /// `MAX_BLOCKS_PER_SYNC`). The `SyncDriver` loops until the scan queue drains. Subtree
     /// roots let the wallet witness a note from its subtree root without scanning every block,
     /// so spendability does not require a full linear scan; transaction expiry heights are
-    /// computed against the live tip. Reorg safety comes from the spend-time confirmation depth
-    /// (ZIP 315) and from in-loop recovery: a `ChainReorgDetected` triggers a precise rewind
-    /// via `truncate_to_chain_state` and a re-plan on the next tick. Divergences deeper than the
-    /// librustzcash 100-block rewind cap (`COINBASE_MATURITY`) surface as `RequiresOperator`.
+    /// computed against the live tip. Reorg safety comes from the spend-time confirmation
+    /// depth (ZIP 315); scan-time divergences (`ChainReorgDetected`,
+    /// `CommitmentTreeConflict`, [`WalletError::TreeRootsDiverged`]) surface as errors that
+    /// the [`SyncDriver`] repairs by rewinding or rebuilding derived state.
     ///
     /// Fails closed on network mismatch. Emits `ScanProgress` events at the start and end of
     /// the run; per-block events are emitted by the storage scanner.
@@ -696,8 +1220,8 @@ impl Wallet {
     }
 
     async fn retire_expired_pending_broadcasts(&self) -> Result<(), WalletError> {
-        let before_at_ms = crate::wallet::current_unix_ms()
-            .saturating_sub(self.inner.options.pending_broadcast_window_ms);
+        let before_at_ms =
+            current_unix_ms().saturating_sub(self.inner.options.pending_broadcast_window_ms);
         self.inner
             .storage
             .clear_expired_pending_broadcast_inputs(before_at_ms)
@@ -765,25 +1289,17 @@ impl Wallet {
             return Ok(self.emit_caught_up(chain_tip, transparent_utxo_count));
         }
 
-        match self
-            .scan_and_emit(
-                ScanContext {
-                    blocks,
-                    scanned_from: scan_start,
-                    target_height: chain_tip,
-                    block_count,
-                },
-                from_state,
-                chain,
-            )
-            .await
-        {
-            Ok(outcome) => Ok(outcome),
-            Err(WalletError::Storage(zally_storage::StorageError::ChainReorgDetected {
-                at_height,
-            })) => self.recover_from_reorg(chain, at_height).await,
-            Err(other) => Err(other),
-        }
+        self.scan_and_emit(
+            ScanContext {
+                blocks,
+                scanned_from: scan_start,
+                target_height: chain_tip,
+                block_count,
+            },
+            from_state,
+            chain,
+        )
+        .await
     }
 
     /// Resolves the next scan range, advancing the chain tip only when the queue is drained.
@@ -897,28 +1413,18 @@ impl Wallet {
         Ok(())
     }
 
-    /// Recovers from a scan-time chain divergence by rewinding to the exact prior chain state.
+    /// Rewinds the wallet's derived state to exactly `rewind_to` using the chain's tree
+    /// state at that height.
     ///
-    /// Fetches the chain state at `at_height - REORG_REWIND_BLOCKS` from the chain source and
-    /// truncates the wallet precisely to it (via [`WalletStorage::truncate_to_chain_state`]),
-    /// then returns an outcome that re-triggers a sync tick so `suggest_scan_ranges` re-plans
-    /// from the rewound frontier.
-    ///
-    /// `not_retryable` if the rewind target is below the librustzcash 100-block
-    /// `COINBASE_MATURITY` cap; the operator must reset the wallet.
-    async fn recover_from_reorg(
+    /// One rung of the sync driver's repair ladder: truncates below a divergence via
+    /// [`WalletStorage::truncate_to_chain_state`] (which lands the wallet at exactly the
+    /// target height) and publishes [`WalletEvent::ReorgDetected`] so hosts observe the
+    /// rollback. The next sync re-plans from the rewound frontier.
+    pub(crate) async fn rewind_to_height(
         &self,
         chain: &dyn ChainSource,
-        at_height: BlockHeight,
-    ) -> Result<SyncOutcome, WalletError> {
-        let rewind_to = BlockHeight::from(at_height.as_u32().saturating_sub(REORG_REWIND_BLOCKS));
-        tracing::warn!(
-            target: "zally::sync",
-            event = "wallet_sync_reorg_recover",
-            at_height = at_height.as_u32(),
-            rewind_to = rewind_to.as_u32(),
-            "scan-time reorg detected; rewinding to the exact prior chain state"
-        );
+        rewind_to: BlockHeight,
+    ) -> Result<(), WalletError> {
         let chain_state = chain_state_at(chain, rewind_to).await?;
         self.inner
             .storage
@@ -928,13 +1434,7 @@ impl Wallet {
             rolled_back_to_height: rewind_to,
             new_safe_chain_tip_height: rewind_to,
         });
-        Ok(SyncOutcome {
-            scanned_from_height: rewind_to,
-            scanned_to_height: rewind_to,
-            block_count: 0,
-            transparent_utxo_count: 0,
-            reorgs_observed: 1,
-        })
+        Ok(())
     }
 
     fn emit_caught_up(
@@ -951,7 +1451,7 @@ impl Wallet {
             scanned_to_height: target_height,
             block_count: 0,
             transparent_utxo_count,
-            reorgs_observed: 0,
+            completed_at_ms: current_unix_ms(),
         }
     }
 
@@ -1017,8 +1517,14 @@ impl Wallet {
 
         let transparent_utxo_count = self.sync_transparent_utxos(chain).await?;
 
-        self.verify_tree_roots(chain, outcome.scanned_to_height)
-            .await;
+        if let Some(diverged_height) = self
+            .verify_tree_roots(chain, outcome.scanned_to_height)
+            .await
+        {
+            return Err(WalletError::TreeRootsDiverged {
+                height: diverged_height,
+            });
+        }
 
         self.publish_event(WalletEvent::ScanProgress {
             scanned_height: outcome.scanned_to_height,
@@ -1029,20 +1535,25 @@ impl Wallet {
             scanned_to_height: outcome.scanned_to_height,
             block_count,
             transparent_utxo_count,
-            reorgs_observed: 0,
+            completed_at_ms: current_unix_ms(),
         })
     }
 
-    /// Diagnostic: checks the wallet's full note-commitment tree roots against the chain's tree
-    /// state at the just-scanned `height`.
+    /// Checks the wallet's full note-commitment tree roots against the chain's tree state at
+    /// the just-scanned `height`, returning `Some(height)` on a proven divergence.
     ///
-    /// A mismatch proves the wallet assembled a corrupt note-commitment tree, which the network
-    /// rejects at spend time as an invalid shielded proof; a match clears the tree as the
-    /// suspect and points at the proving inputs instead. The wallet roots cover every appended
-    /// leaf, so when the wallet is caught up they correspond to exactly `height`. Both sides
-    /// decode roots little-endian, so the comparison is exact. Best-effort: any read or fetch
-    /// failure is logged and swallowed so the check never fails a sync.
-    async fn verify_tree_roots(&self, chain: &dyn ChainSource, height: BlockHeight) {
+    /// A mismatch proves the wallet assembled a corrupt note-commitment tree, which the
+    /// network rejects at spend time as an invalid shielded proof; a match clears the tree as
+    /// the suspect and points at the proving inputs instead. The wallet roots cover every
+    /// appended leaf, so when the wallet is caught up they correspond to exactly `height`.
+    /// Both sides decode roots little-endian, so the comparison is exact. Skipped checks
+    /// (read or fetch failures, empty trees) are logged and return `None`; only a proven
+    /// mismatch faults the sync.
+    async fn verify_tree_roots(
+        &self,
+        chain: &dyn ChainSource,
+        height: BlockHeight,
+    ) -> Option<BlockHeight> {
         let wallet_roots = match self.inner.storage.commitment_tree_roots().await {
             Ok(roots) => roots,
             Err(err) => {
@@ -1053,7 +1564,7 @@ impl Wallet {
                     error = %err,
                     "could not read wallet commitment-tree roots"
                 );
-                return;
+                return None;
             }
         };
         let chain_state = match chain_state_at(chain, height).await {
@@ -1066,7 +1577,7 @@ impl Wallet {
                     error = %err,
                     "could not fetch chain tree state for root check"
                 );
-                return;
+                return None;
             }
         };
         let chain_sapling = chain_state.final_sapling_tree().root().to_bytes();
@@ -1075,34 +1586,43 @@ impl Wallet {
         let orchard_match = wallet_roots.orchard.map(|root| root == chain_orchard);
 
         match (sapling_match, orchard_match) {
-            (None, None) => tracing::warn!(
-                target: "zally::sync",
-                event = "wallet_tree_root_check_skipped",
-                height = height.as_u32(),
-                "wallet commitment trees are empty"
-            ),
-            _ if sapling_match != Some(false) && orchard_match != Some(false) => tracing::info!(
-                target: "zally::sync",
-                event = "wallet_tree_root_check",
-                height = height.as_u32(),
-                result = "match",
-                sapling_checked = sapling_match.is_some(),
-                orchard_checked = orchard_match.is_some(),
-                "wallet commitment-tree roots agree with the chain"
-            ),
-            _ => tracing::warn!(
-                target: "zally::sync",
-                event = "wallet_tree_root_check",
-                height = height.as_u32(),
-                result = "mismatch",
-                sapling_match = ?sapling_match,
-                orchard_match = ?orchard_match,
-                wallet_sapling = %wallet_roots.sapling.map_or_else(String::new, hex::encode),
-                chain_sapling = %hex::encode(chain_sapling),
-                wallet_orchard = %wallet_roots.orchard.map_or_else(String::new, hex::encode),
-                chain_orchard = %hex::encode(chain_orchard),
-                "wallet commitment-tree roots diverge from the chain; spends will be rejected"
-            ),
+            (None, None) => {
+                tracing::warn!(
+                    target: "zally::sync",
+                    event = "wallet_tree_root_check_skipped",
+                    height = height.as_u32(),
+                    "wallet commitment trees are empty"
+                );
+                None
+            }
+            _ if sapling_match != Some(false) && orchard_match != Some(false) => {
+                tracing::info!(
+                    target: "zally::sync",
+                    event = "wallet_tree_root_check",
+                    height = height.as_u32(),
+                    result = "match",
+                    sapling_checked = sapling_match.is_some(),
+                    orchard_checked = orchard_match.is_some(),
+                    "wallet commitment-tree roots agree with the chain"
+                );
+                None
+            }
+            _ => {
+                tracing::warn!(
+                    target: "zally::sync",
+                    event = "wallet_tree_root_check",
+                    height = height.as_u32(),
+                    result = "mismatch",
+                    sapling_match = ?sapling_match,
+                    orchard_match = ?orchard_match,
+                    wallet_sapling = %wallet_roots.sapling.map_or_else(String::new, hex::encode),
+                    chain_sapling = %hex::encode(chain_sapling),
+                    wallet_orchard = %wallet_roots.orchard.map_or_else(String::new, hex::encode),
+                    chain_orchard = %hex::encode(chain_orchard),
+                    "wallet commitment-tree roots diverge from the chain; spends will be rejected"
+                );
+                Some(height)
+            }
         }
     }
 
@@ -1244,8 +1764,9 @@ pub(crate) async fn chain_state_at(
 
 /// Fetches the `ChainState` anchor immediately below `at_height`.
 ///
-/// Shared by `sync_inner` (the `from_state` for a scan range) and the wallet builder (for
-/// birthday). The chain source serves the tree state at the exact prior height.
+/// Shared by `sync_inner` (the `from_state` for a scan range), the wallet builder, and
+/// [`Wallet::reset_to_birthday`] (the rebuild anchor below the birthday). The chain source
+/// serves the tree state at the exact prior height.
 pub(crate) async fn fetch_prior_chain_state(
     chain: &dyn ChainSource,
     at_height: BlockHeight,

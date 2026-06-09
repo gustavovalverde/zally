@@ -139,7 +139,9 @@ pub enum WalletError {
     ///
     /// Posture: [`FailurePosture::NotRetryable`] until the caller picks a fresh height
     /// (typically after observing a new tip).
-    #[error("target_expiry_height={target:?} is at or below the wallet's observed tip={chain_tip:?}")]
+    #[error(
+        "target_expiry_height={target:?} is at or below the wallet's observed tip={chain_tip:?}"
+    )]
     TargetExpiryStale {
         /// Height the caller asked the wallet to commit to.
         target: BlockHeight,
@@ -163,18 +165,29 @@ pub enum WalletError {
         signed: BlockHeight,
     },
 
-    /// The sync-driver task failed outside the wallet sync operation itself.
+    /// The wallet's full note-commitment tree root disagrees with the chain's tree state at
+    /// `height`: the wallet assembled a corrupt tree, and any spend anchored on it would be
+    /// rejected by the network. The sync driver treats this as its cue to rewind below the
+    /// divergence and ultimately rebuild derived state from the birthday.
     ///
-    /// Posture carries the operator-facing classification. A runtime cancellation surfaces as
-    /// [`FailurePosture::Retryable`]; a panic in the driver task surfaces as
-    /// [`FailurePosture::RequiresOperator`] (the panic indicates a Zally bug or upstream
-    /// invariant violation that needs investigation before a new driver is started).
-    #[error("sync driver failed: {reason}")]
+    /// Posture: [`FailurePosture::NotRetryable`]: re-issuing the same scan reproduces the
+    /// same corrupt tree.
+    #[error("wallet commitment-tree roots diverge from the chain at height {height:?}")]
+    TreeRootsDiverged {
+        /// Height whose chain tree state disagreed with the wallet's roots.
+        height: BlockHeight,
+    },
+
+    /// The sync-driver task panicked. Surfaced only by [`crate::SyncHandle::close`]; the
+    /// driver task never fails while its handle is alive.
+    ///
+    /// Posture: [`FailurePosture::RequiresOperator`]: a panic indicates a Zally bug or an
+    /// upstream invariant violation that needs investigation before a new driver is
+    /// started.
+    #[error("sync driver task panicked: {reason}")]
     SyncDriverFailed {
-        /// Underlying task failure description.
+        /// Underlying join-error description.
         reason: String,
-        /// Operator-facing posture for this failure.
-        posture: FailurePosture,
     },
 }
 
@@ -189,11 +202,10 @@ impl WalletError {
             Self::Pczt(e) => bool_to_posture(e.is_retryable()),
             Self::ChainSource(e) => e.posture(),
             Self::Submitter(e) => e.posture(),
-            Self::SyncDriverFailed { posture, .. } => *posture,
             Self::CircuitBroken { .. } => FailurePosture::Retryable,
-            Self::NetworkMismatch { .. } | Self::TargetExpiryMismatch { .. } => {
-                FailurePosture::RequiresOperator
-            }
+            Self::NetworkMismatch { .. }
+            | Self::TargetExpiryMismatch { .. }
+            | Self::SyncDriverFailed { .. } => FailurePosture::RequiresOperator,
             Self::NoSealedSeed
             | Self::AccountAlreadyExists
             | Self::AccountNotFound
@@ -203,7 +215,8 @@ impl WalletError {
             | Self::PaymentRequestParseFailed { .. }
             | Self::ProposalRejected { .. }
             | Self::SubmissionRejected { .. }
-            | Self::TargetExpiryStale { .. } => FailurePosture::NotRetryable,
+            | Self::TargetExpiryStale { .. }
+            | Self::TreeRootsDiverged { .. } => FailurePosture::NotRetryable,
         }
     }
 
@@ -291,10 +304,10 @@ mod tests {
                 target: BlockHeight::from(10),
                 signed: BlockHeight::from(11),
             },
-            WalletError::SyncDriverFailed {
-                reason: "x".into(),
-                posture: FailurePosture::Retryable,
+            WalletError::TreeRootsDiverged {
+                height: BlockHeight::from(12),
             },
+            WalletError::SyncDriverFailed { reason: "x".into() },
         ];
         for e in variants {
             let _ = e.posture();
@@ -322,12 +335,20 @@ mod tests {
     }
 
     #[test]
-    fn sync_driver_failed_posture_is_carried_through() {
+    fn sync_driver_failed_requires_operator() {
         let err = WalletError::SyncDriverFailed {
             reason: "panicked".into(),
-            posture: FailurePosture::RequiresOperator,
         };
         assert_eq!(err.posture(), FailurePosture::RequiresOperator);
+        assert!(!err.is_retryable());
+    }
+
+    #[test]
+    fn tree_roots_diverged_is_not_retryable() {
+        let err = WalletError::TreeRootsDiverged {
+            height: BlockHeight::from(7),
+        };
+        assert_eq!(err.posture(), FailurePosture::NotRetryable);
         assert!(!err.is_retryable());
     }
 }

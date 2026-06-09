@@ -14,6 +14,10 @@ use zally_wallet::{SendPaymentPlan, WalletError};
 use super::fixtures::{TestWalletFixture, create_test_wallet};
 
 #[tokio::test]
+#[allow(
+    clippy::panic,
+    reason = "the test asserts on the exact error shape; panic makes the failing variant readable"
+)]
 async fn send_payment_rejects_stale_target_expiry() -> Result<(), TestError> {
     let TestWalletFixture {
         temp: _temp,

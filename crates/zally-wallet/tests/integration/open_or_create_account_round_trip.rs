@@ -38,10 +38,10 @@ async fn open_or_create_account_recovers_account_on_fresh_storage() -> Result<()
     let (restored_wallet, restored_account_id) = Wallet::builder(network, sealing, storage)
         .open_or_create_account(&chain, BlockHeight::from(1))
         .await?;
-    assert_ne!(
+    assert_eq!(
         original_account_id, restored_account_id,
-        "AccountId is a fresh per-row UUID; restoring across separate storages must allocate \
-         a new one even though the seed material is the same"
+        "account identity is key identity: the same seed must yield the same AccountId \
+         across separate storages"
     );
 
     let ua = restored_wallet

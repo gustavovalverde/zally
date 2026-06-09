@@ -12,7 +12,7 @@ use zally_chain::{
 };
 use zally_core::{BlockHeight, Network, TxId};
 use zally_testkit::MockChainSource;
-use zally_wallet::{SyncDriver, SyncDriverOptions, SyncDriverStatus, SyncStatus, WalletError};
+use zally_wallet::{SyncDriver, SyncDriverOptions, SyncDriverPhase, SyncStatus, WalletError};
 use zcash_client_backend::proto::service::TreeState;
 
 use super::fixtures::{TestWalletFixture, create_test_wallet};
@@ -39,7 +39,7 @@ async fn sync_driver_wakes_from_chain_event() -> Result<(), TestError> {
     let handle = driver.sync_continuously();
     let mut snapshots = handle.observe_status();
 
-    wait_for_driver_status(&mut snapshots, SyncDriverStatus::Waiting).await?;
+    wait_for_driver_phase(&mut snapshots, SyncDriverPhase::Waiting).await?;
     chain_handle.advance_tip(BlockHeight::from(42));
     let observed = wait_for_chain_tip(&mut snapshots, BlockHeight::from(42)).await?;
 
@@ -50,7 +50,7 @@ async fn sync_driver_wakes_from_chain_event() -> Result<(), TestError> {
             target_height: BlockHeight::from(42)
         }
     );
-    assert_eq!(observed.last_error, None);
+    assert_eq!(observed.last_fault, None);
 
     handle.close().await?;
     Ok(())
@@ -76,7 +76,7 @@ async fn close_returns_while_sync_attempt_is_blocked() -> Result<(), TestError> 
     let handle = driver.sync_continuously();
     let mut snapshots = handle.observe_status();
 
-    wait_for_driver_status(&mut snapshots, SyncDriverStatus::Syncing).await?;
+    wait_for_driver_phase(&mut snapshots, SyncDriverPhase::Syncing).await?;
     tokio::time::timeout(Duration::from_millis(250), handle.close())
         .await
         .map_err(|_elapsed| TestError::CloseTimedOut)??;
@@ -84,13 +84,13 @@ async fn close_returns_while_sync_attempt_is_blocked() -> Result<(), TestError> 
     Ok(())
 }
 
-async fn wait_for_driver_status(
+async fn wait_for_driver_phase(
     snapshots: &mut zally_wallet::SyncSnapshotStream,
-    target_status: SyncDriverStatus,
+    target_phase: SyncDriverPhase,
 ) -> Result<(), TestError> {
     tokio::time::timeout(Duration::from_secs(2), async {
         while let Some(snapshot) = snapshots.next().await {
-            if snapshot.driver_status == target_status {
+            if snapshot.phase == target_phase {
                 return Ok(());
             }
         }

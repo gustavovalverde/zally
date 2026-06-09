@@ -37,8 +37,8 @@ pub use spend::{
 };
 pub use status::{SyncStatus, WalletStatus};
 pub use sync::{
-    SyncDriver, SyncDriverOptions, SyncDriverStatus, SyncErrorSnapshot, SyncHandle, SyncOutcome,
-    SyncSnapshot, SyncSnapshotStream,
+    SyncDriver, SyncDriverOptions, SyncDriverPhase, SyncFault, SyncHandle, SyncOutcome,
+    SyncRecoveryPolicy, SyncRepair, SyncSnapshot, SyncSnapshotStream,
 };
 pub use unspent_note::UnspentShieldedNote;
 pub use wallet::{ReserveForDispensePlan, Wallet, WalletBuilder};

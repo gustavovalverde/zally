@@ -13,7 +13,8 @@ use zally_core::{AccountId, BlockHeight, TxId};
 /// the run; [`WalletEvent::ReorgDetected`] when the upstream chain rolls back; one
 /// [`WalletEvent::TransactionConfirmed`] per newly confirmed wallet transaction; and one
 /// [`WalletEvent::ShieldedReceiveObserved`] per newly observed shielded note that the
-/// wallet owns. [`WalletEvent::Lagged`] is injected by the subscription stream when a
+/// wallet owns. [`WalletEvent::DerivedStateReset`] marks a wallet database rebuild from
+/// seed and birthday. [`WalletEvent::Lagged`] is injected by the subscription stream when a
 /// consumer drops events; the sync loop never emits it directly.
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -73,6 +74,14 @@ pub enum WalletEvent {
         /// The producing transaction spent at least one input owned by the receiving
         /// account, across Sapling, Orchard, or transparent pools.
         spent_our_inputs: bool,
+    },
+    /// The wallet discarded and recreated its database from the seed and the account
+    /// birthday. The ledger and holds were dropped with the database; chain state rebuilds
+    /// by rescan.
+    DerivedStateReset {
+        /// Account recreated in the fresh database. Equal to the prior id: account
+        /// identity is key identity, not database identity.
+        account_id: AccountId,
     },
     /// Consumer fell behind; `dropped_count` events were skipped before this notification.
     Lagged {

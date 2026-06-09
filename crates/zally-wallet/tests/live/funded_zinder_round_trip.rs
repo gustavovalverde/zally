@@ -362,7 +362,7 @@ async fn wait_until_transparent_utxo_at_tip(
                     if safe_chain_tip_height.as_u32() >= min_tip_height.as_u32()
             );
             let has_transparent_utxo = snapshot
-                .last_sync_outcome
+                .last_outcome
                 .is_some_and(|outcome| outcome.transparent_utxo_count > 0);
             if is_at_target_tip && has_transparent_utxo {
                 return Ok(());

@@ -105,6 +105,39 @@ impl Wallet {
         *self.inner.retry_policy.lock() = policy;
     }
 
+    /// Discards the wallet database and rebuilds it from the sealed seed at the account
+    /// birthday.
+    ///
+    /// The deepest repair rung of the sync driver: wallet chain state is disposable derived
+    /// state, so when it can no longer be reconciled with the chain the wallet rebuilds it
+    /// from first principles. Reads the birthday before any destructive step, then
+    /// recreates the database with a fresh account for the unsealed seed and publishes
+    /// [`WalletEvent::DerivedStateReset`] so hosts observe the rebuild. The ledger (send
+    /// idempotency records, holds, pending broadcasts) is dropped with the database; chain
+    /// state rebuilds by rescan.
+    ///
+    /// The storage layer derives the [`AccountId`] deterministically from the seed, so the
+    /// account id does not change across the rebuild; handles holding the prior id keep
+    /// working.
+    ///
+    /// `not_retryable` when no sealed seed or account exists; `retryable` on transient I/O.
+    pub async fn reset_to_birthday(&self, chain: &dyn ChainSource) -> Result<(), WalletError> {
+        let birthday = self.inner.storage.account_birthday().await?;
+        let seed = match self.inner.sealing.unseal_seed().await {
+            Ok(seed) => seed,
+            Err(SealingError::NoSealedSeed) => return Err(WalletError::NoSealedSeed),
+            Err(e) => return Err(WalletError::from(e)),
+        };
+        let prior_chain_state = fetch_prior_chain_state(chain, birthday).await?;
+        let account_id = self
+            .inner
+            .storage
+            .recreate_with_account(&seed, prior_chain_state)
+            .await?;
+        self.publish_event(WalletEvent::DerivedStateReset { account_id });
+        Ok(())
+    }
+
     /// Derives, persists, and marks-as-exposed the next available Unified Address for
     /// `account_id` with Sapling + Orchard receivers (no transparent). Each call walks
     /// forward through diversifier indices per ZIP-316. Free of the BIP-44 transparent

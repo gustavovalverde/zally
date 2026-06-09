@@ -19,6 +19,6 @@ async fn sync_catches_up_to_tip() -> Result<(), TestWalletError> {
 
     let outcome = wallet.sync(&chain).await?;
     assert_eq!(outcome.scanned_to_height, BlockHeight::from(42));
-    assert_eq!(outcome.reorgs_observed, 0);
+    assert!(outcome.completed_at_ms > 0);
     Ok(())
 }

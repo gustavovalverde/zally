@@ -444,7 +444,7 @@ impl Wallet {
 
     /// Routes a `SendPaymentPlan` with `target_expiry_height` through the PCZT path.
     ///
-    /// Composes propose -> Updater(expiry_height) -> prove -> sign -> extract, then
+    /// Composes propose -> `Updater(expiry_height)` -> prove -> sign -> extract, then
     /// validates the signed expiry against the caller's target before handing the
     /// prepared transaction back to `send_payment` for submission.
     ///
@@ -996,6 +996,10 @@ mod tests {
     /// `SendPaymentPlan::conventional` starts with `target_expiry_height: None`, and
     /// `with_target_expiry_height` is the only way to opt in to the PCZT routing path.
     #[test]
+    #[allow(
+        clippy::expect_used,
+        reason = "fixture literals are valid by construction; expect keeps the builder call readable"
+    )]
     fn send_payment_plan_target_expiry_height_defaults_to_none() {
         let submitter = zally_testkit::MockSubmitter::accepting(regtest());
         let plan = SendPaymentPlan::conventional(
@@ -1014,7 +1018,10 @@ mod tests {
         );
 
         let with_target = plan.with_target_expiry_height(BlockHeight::from(123));
-        assert_eq!(with_target.target_expiry_height, Some(BlockHeight::from(123)));
+        assert_eq!(
+            with_target.target_expiry_height,
+            Some(BlockHeight::from(123))
+        );
     }
 
     /// Mainnet Sapling address from the upstream `zcash_address` rustdoc example.
