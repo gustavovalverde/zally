@@ -103,10 +103,10 @@ impl Updater {
                 reason: "PCZT shorter than the 8-byte magic+version header".to_string(),
             });
         }
-        let (header, payload) = raw.split_at(PCZT_HEADER_LEN);
+        let (header, body) = raw.split_at(PCZT_HEADER_LEN);
 
         let (mut global, tail) =
-            postcard::take_from_bytes::<GlobalMirror>(payload).map_err(|err| {
+            postcard::take_from_bytes::<GlobalMirror>(body).map_err(|err| {
                 PcztError::ParseFailed {
                     reason: format!("PCZT global section decode failed: {err}"),
                 }
@@ -135,17 +135,16 @@ mod tests {
     /// Exercises the same `pczt::Pczt::serialize` codepath the Creator role calls so the
     /// mirror layout is validated against the upstream encoding, not against the mirror
     /// itself.
-    fn build_minimal_pczt(expiry: u32) -> Vec<u8> {
-        let pczt_struct: pczt::Pczt = postcard::from_bytes(&pczt_with_expiry(expiry))
-            .expect("minimal Pczt deserialises through upstream parser");
-        pczt_struct.serialize()
+    fn build_minimal_pczt(expiry: u32) -> Result<Vec<u8>, postcard::Error> {
+        let pczt_struct: pczt::Pczt = postcard::from_bytes(&pczt_with_expiry(expiry)?)?;
+        Ok(pczt_struct.serialize())
     }
 
     /// Hand-built minimal postcard payload for a `pczt::Pczt`.
     ///
     /// Used by `build_minimal_pczt` to obtain a real upstream `pczt::Pczt`, which is then
     /// re-serialised to produce a byte sequence the upstream parser accepts.
-    fn pczt_with_expiry(expiry: u32) -> Vec<u8> {
+    fn pczt_with_expiry(expiry: u32) -> Result<Vec<u8>, postcard::Error> {
         use serde::Serialize;
         #[derive(Serialize)]
         struct EmptyTransparent {
@@ -207,41 +206,37 @@ mod tests {
                 bsk: None,
             },
         };
-        postcard::to_allocvec(&mirror).expect("minimal Pczt mirror serialises")
+        postcard::to_allocvec(&mirror)
     }
 
     #[test]
-    fn finish_without_mutation_round_trips_bytes() {
-        let original = PcztBytes::from_serialized(build_minimal_pczt(100), Network::regtest());
-        let unchanged = Updater::new(original.clone())
-            .finish()
-            .expect("finish round-trip");
+    fn finish_without_mutation_round_trips_bytes() -> Result<(), Box<dyn std::error::Error>> {
+        let original = PcztBytes::from_serialized(build_minimal_pczt(100)?, Network::regtest());
+        let unchanged = Updater::new(original.clone()).finish()?;
         assert_eq!(unchanged.as_bytes(), original.as_bytes());
         assert_eq!(unchanged.network(), Network::regtest());
+        Ok(())
     }
 
     #[test]
-    fn with_global_expiry_height_mutates_only_expiry() {
-        let original = PcztBytes::from_serialized(build_minimal_pczt(100), Network::regtest());
+    fn with_global_expiry_height_mutates_only_expiry() -> Result<(), Box<dyn std::error::Error>> {
+        let original = PcztBytes::from_serialized(build_minimal_pczt(100)?, Network::regtest());
         let mutated = Updater::new(original)
             .with_global_expiry_height(4_321_098)
-            .finish()
-            .expect("finish applied mutation");
+            .finish()?;
 
         let parsed = pczt::Pczt::parse(mutated.as_bytes())
-            .expect("upstream Pczt parses mutated bytes");
+            .map_err(|err| format!("upstream Pczt rejected mutated bytes: {err:?}"))?;
         assert_eq!(*parsed.global().expiry_height(), 4_321_098);
         assert_eq!(*parsed.global().tx_version(), 5);
         assert_eq!(*parsed.global().consensus_branch_id(), 0xC2D6_D0B4);
+        Ok(())
     }
 
     #[test]
     fn finish_rejects_truncated_header() {
         let short = PcztBytes::from_serialized(vec![0_u8; 4], Network::regtest());
-        let err = Updater::new(short)
-            .with_global_expiry_height(1)
-            .finish()
-            .expect_err("truncated header must error");
-        assert!(matches!(err, PcztError::ParseFailed { .. }));
+        let outcome = Updater::new(short).with_global_expiry_height(1).finish();
+        assert!(matches!(outcome, Err(PcztError::ParseFailed { .. })));
     }
 }
