@@ -612,7 +612,7 @@ impl Wallet {
             )
             .await?;
 
-            let policy = self.retry_policy();
+            let policy = self.broadcast_retry_policy();
             let outcome = crate::retry::with_breaker_and_retry(
                 &self.inner.circuit_breaker,
                 policy,

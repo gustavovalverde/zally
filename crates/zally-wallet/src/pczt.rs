@@ -124,7 +124,7 @@ impl Wallet {
             .extract_and_store_pczt(pczt.into_bytes())
             .await
             .map_err(WalletError::from)?;
-        let policy = self.retry_policy();
+        let policy = self.broadcast_retry_policy();
         let outcome = crate::retry::with_breaker_and_retry(
             &self.inner.circuit_breaker,
             policy,

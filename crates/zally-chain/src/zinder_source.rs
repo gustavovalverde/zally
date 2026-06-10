@@ -20,9 +20,9 @@ use zally_core::{BlockHeight, Network, TxId};
 use zcash_client_backend::proto::compact_formats::CompactBlock;
 use zcash_client_backend::proto::service::TreeState;
 use zinder_client::{
-    AddressOutputIndexQuery, ChainEvent as ZinderChainEvent,
-    ChainEventCursor as ZinderChainEventCursor, ChainEventEnvelope as ZinderChainEventEnvelope,
-    ChainIndex, RemoteChainIndex, RemoteOpenOptions,
+    ChainEvent as ZinderChainEvent, ChainEventCursor as ZinderChainEventCursor,
+    ChainEventEnvelope as ZinderChainEventEnvelope, ChainIndex, RemoteChainIndex,
+    RemoteOpenOptions, TransparentAddressUnspentOutputsQuery,
 };
 use zinder_core::{
     BlockHeight as ZinderBlockHeight, BlockHeightRange as ZinderBlockHeightRange,
@@ -205,24 +205,26 @@ impl ChainSource for ZinderChainSource {
     ) -> Result<Vec<TransparentUtxo>, ChainSourceError> {
         let address_script_hash =
             TransparentAddressScriptHash::of_script_pub_key(script_pub_key_bytes);
-        let query = AddressOutputIndexQuery {
+        let query = TransparentAddressUnspentOutputsQuery {
             address_script_hash,
             start_height: ZinderBlockHeight::new(0),
-            max_entries: None,
-            from_cursor: None,
         };
-        let view = self.inner.address_output_index(query, None).await?;
-        Ok(view
-            .outputs
-            .into_iter()
-            .map(|artifact| TransparentUtxo {
-                tx_id: TxId::from_bytes(artifact.outpoint.transaction_id.as_bytes()),
-                output_index: artifact.outpoint.output_index,
-                value_zat: artifact.value_zat,
-                confirmed_at_height: BlockHeight::from(artifact.block_height.value()),
-                script_pub_key_bytes: artifact.script_pub_key,
-            })
-            .collect())
+        let mut stream = self
+            .inner
+            .transparent_address_unspent_outputs(query)
+            .await?;
+        let mut utxos = Vec::new();
+        while let Some(stream_item) = stream.next().await {
+            let output = stream_item?.output;
+            utxos.push(TransparentUtxo {
+                tx_id: TxId::from_bytes(output.outpoint.transaction_id.as_bytes()),
+                output_index: output.outpoint.output_index,
+                value_zat: output.value_zat,
+                confirmed_at_height: BlockHeight::from(output.block_height.value()),
+                script_pub_key_bytes: output.script_pub_key,
+            });
+        }
+        Ok(utxos)
     }
 
     async fn chain_event_envelopes(

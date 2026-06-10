@@ -98,6 +98,20 @@ impl Wallet {
         *self.inner.retry_policy.lock()
     }
 
+    /// Returns the wallet's [`RetryPolicy`] with the backoff zeroed, for transaction
+    /// broadcast only.
+    ///
+    /// Resubmission is idempotent: Zebra dedupes by txid and `AlreadyQueued` maps to a
+    /// success outcome, so a failed broadcast attempt retries immediately against the
+    /// submitter's own per-call timeout instead of sleeping between attempts.
+    pub(crate) fn broadcast_retry_policy(&self) -> RetryPolicy {
+        RetryPolicy {
+            initial_backoff_ms: 0,
+            max_backoff_ms: 0,
+            ..self.retry_policy()
+        }
+    }
+
     /// Replaces the wallet's [`RetryPolicy`]. Subsequent outbound calls (chain reads,
     /// submitter calls, sealed-seed reads, storage IO) use the new policy. Existing calls
     /// in flight finish under the prior policy.

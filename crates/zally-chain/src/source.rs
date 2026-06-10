@@ -272,7 +272,7 @@ pub trait ChainSource: Send + Sync + 'static {
     /// Looks up a transaction.
     async fn transaction_status(&self, tx_id: TxId) -> Result<TransactionStatus, ChainSourceError>;
 
-    /// Returns confirmed UTXOs for a transparent address at the source's current tip.
+    /// Returns the complete unspent set for a transparent address at one chain epoch.
     ///
     /// Takes the address as raw `scriptPubKey` bytes so implementations stay free of any
     /// particular address-encoding crate.
