@@ -1,21 +1,21 @@
-//! Live [`Submitter`] implementation backed by `zinder_client::ChainIndex::broadcast_transaction`.
+//! Live [`Submitter`] implementation backed by `zinder_client::EndpointBackedIndex::broadcast_transaction`.
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use zally_core::{Network, TxId};
-use zinder_client::ChainIndex;
+use zinder_client::EndpointBackedIndex;
 use zinder_core::{RawTransactionBytes, TransactionBroadcastResult};
 
 use crate::error::SubmitterError;
 use crate::submitter::{RejectionReason, SubmitOutcome, Submitter};
 
-/// Live `Submitter` backed by a [`zinder_client::ChainIndex`].
+/// Live `Submitter` backed by a [`zinder_client::EndpointBackedIndex`].
 ///
 /// `ZinderSubmitter` is `Clone`; cloning shares the underlying gRPC channel via `Arc`.
 #[derive(Clone)]
 pub struct ZinderSubmitter {
-    inner: Arc<dyn ChainIndex>,
+    inner: Arc<dyn EndpointBackedIndex>,
     network: Network,
 }
 
@@ -28,9 +28,9 @@ impl std::fmt::Debug for ZinderSubmitter {
 }
 
 impl ZinderSubmitter {
-    /// Wraps an already-constructed [`ChainIndex`] as a submitter for `network`.
+    /// Wraps an already-constructed [`EndpointBackedIndex`] as a submitter for `network`.
     #[must_use]
-    pub fn from_chain_index(inner: Arc<dyn ChainIndex>, network: Network) -> Self {
+    pub fn from_chain_index(inner: Arc<dyn EndpointBackedIndex>, network: Network) -> Self {
         Self { inner, network }
     }
 }

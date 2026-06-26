@@ -1,14 +1,14 @@
-//! Live [`ChainSource`] implementation backed by `zinder_client::ChainIndex`.
+//! Live [`ChainSource`] implementation backed by a [`zinder_client::EndpointBackedIndex`].
 //!
-//! `ZinderChainSource` wraps either a [`zinder_client::RemoteChainIndex`] (gRPC) or
-//! [`zinder_client::LocalChainIndex`] (colocated RocksDB-secondary) and exposes the
-//! Zally-vocabulary [`ChainSource`] surface that [`zally_wallet::Wallet`] consumes.
+//! `ZinderChainSource` wraps a [`zinder_client::RemoteChainIndex`] (gRPC) and exposes the
+//! Zally-vocabulary [`ChainSource`] surface that [`zally_wallet::Wallet`] consumes. The
+//! source streams chain events, so it needs an endpoint-backed handle; a canonical-only
+//! [`zinder_client::LocalChainIndex`] cannot back it.
 //!
 //! The wrapper is intentionally thin: every method translates Zally domain types into
-//! zinder-core/zinder-client domain types, calls the underlying [`ChainIndex`], and
-//! translates the result back. Network alignment is checked at construction; per-call
-//! re-validation is unnecessary because the underlying client pins the network at connect
-//! time.
+//! zinder-core/zinder-client domain types, calls the underlying handle, and translates the
+//! result back. Network alignment is checked at construction; per-call re-validation is
+//! unnecessary because the underlying client pins the network at connect time.
 
 use std::num::NonZeroU32;
 use std::sync::Arc;
@@ -21,7 +21,7 @@ use zcash_client_backend::proto::compact_formats::CompactBlock;
 use zcash_client_backend::proto::service::TreeState;
 use zinder_client::{
     ChainEvent as ZinderChainEvent, ChainEventCursor as ZinderChainEventCursor,
-    ChainEventEnvelope as ZinderChainEventEnvelope, ChainIndex, RemoteChainIndex,
+    ChainEventEnvelope as ZinderChainEventEnvelope, EndpointBackedIndex, RemoteChainIndex,
     RemoteOpenOptions, TransparentAddressUnspentOutputsQuery,
 };
 use zinder_core::{
@@ -49,13 +49,13 @@ pub struct ZinderRemoteOptions {
     pub network: Network,
 }
 
-/// Live `ChainSource` backed by a [`zinder_client::ChainIndex`].
+/// Live `ChainSource` backed by a [`zinder_client::EndpointBackedIndex`].
 ///
 /// `ZinderChainSource` is `Clone` via `Arc`; cloning is cheap and shares the underlying
 /// gRPC channel.
 #[derive(Clone)]
 pub struct ZinderChainSource {
-    inner: Arc<dyn ChainIndex>,
+    inner: Arc<dyn EndpointBackedIndex>,
     network: Network,
 }
 
@@ -86,12 +86,13 @@ impl ZinderChainSource {
         })
     }
 
-    /// Wraps an already-constructed [`ChainIndex`] (any implementation).
+    /// Wraps an already-constructed [`EndpointBackedIndex`].
     ///
-    /// Useful for tests that supply an in-memory fake, and for advanced operators that
-    /// open a `LocalChainIndex` against a colocated zinder-ingest `RocksDB` secondary.
+    /// Useful for tests that supply an in-memory fake. The source streams chain
+    /// events, so it needs an endpoint-backed handle; a canonical-only
+    /// `LocalChainIndex` cannot back it.
     #[must_use]
-    pub fn from_chain_index(inner: Arc<dyn ChainIndex>, network: Network) -> Self {
+    pub fn from_chain_index(inner: Arc<dyn EndpointBackedIndex>, network: Network) -> Self {
         Self { inner, network }
     }
 
@@ -208,6 +209,7 @@ impl ChainSource for ZinderChainSource {
         let query = TransparentAddressUnspentOutputsQuery {
             address_script_hash,
             start_height: ZinderBlockHeight::new(0),
+            at_epoch_id: None,
         };
         let mut stream = self
             .inner
