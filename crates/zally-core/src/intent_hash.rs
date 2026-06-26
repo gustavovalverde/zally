@@ -1,6 +1,6 @@
 //! Parsed-tuple intent binding for the OAuth `payment_authorization` RAR.
 //!
-//! Both the identity issuer (TypeScript at `apps/web/src/lib/agents/intent-hash.ts`
+//! Both the identity issuer (TypeScript at `packages/sdk/src/protocol/intent-hash.ts`
 //! in zentity) and the wallet runtime (Rust in `zspend-runtime`) compute the
 //! same SHA-256 over the same byte layout. Hashing the parsed tuple, not the
 //! URI text, eliminates canonicalization drift across language boundaries
@@ -210,7 +210,7 @@ mod tests {
 
     /// Conformance vector: minimal Zcash testnet input.
     ///
-    /// The TypeScript side at `apps/web/src/lib/agents/intent-hash.ts` MUST
+    /// The TypeScript side at `packages/sdk/src/protocol/intent-hash.ts` MUST
     /// produce the same digest for these inputs. Bumping either side without
     /// the other is a wire-shape break that this test catches at compile time.
     #[test]
@@ -315,7 +315,7 @@ mod tests {
         assert_eq!(
             hex::encode(hash.as_bytes()),
             expected_hex,
-            "intent_hash byte layout changed; update apps/web/src/lib/agents/intent-hash.ts to match"
+            "intent_hash byte layout changed; update packages/sdk/src/protocol/intent-hash.ts to match"
         );
     }
 }
