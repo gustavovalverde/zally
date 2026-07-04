@@ -22,8 +22,8 @@ use tokio_stream::StreamExt;
 use tokio_stream::wrappers::BroadcastStream;
 use zally_chain::{
     BlockHeightRange, ChainEvent, ChainEventCursor, ChainEventEnvelope, ChainEventEnvelopeStream,
-    ChainSource, ChainSourceError, CompactBlockStream, ShieldedPool, SubtreeIndex, SubtreeRoot,
-    TransactionStatus, TransparentUtxo,
+    ChainEventStreamStart, ChainSource, ChainSourceError, CompactBlockStream, ShieldedPool,
+    SubtreeIndex, SubtreeRoot, TransactionStatus, TransparentUtxo,
 };
 use zally_core::{BlockHeight, Network, TxId};
 use zcash_client_backend::proto::compact_formats::CompactBlock;
@@ -233,7 +233,7 @@ impl ChainSource for MockChainSource {
 
     async fn chain_event_envelopes(
         &self,
-        _from_cursor: Option<ChainEventCursor>,
+        _start: ChainEventStreamStart,
     ) -> Result<ChainEventEnvelopeStream, ChainSourceError> {
         let receiver = self.event_tx.subscribe();
         let stream = BroadcastStream::new(receiver).filter_map(|delivery| match delivery {
@@ -290,7 +290,9 @@ mod tests {
     #[tokio::test]
     async fn mock_emits_chain_tip_advanced_event() -> Result<(), ChainSourceError> {
         let mock = MockChainSource::new(Network::regtest());
-        let mut envelopes = mock.chain_event_envelopes(None).await?;
+        let mut envelopes = mock
+            .chain_event_envelopes(ChainEventStreamStart::EarliestRetained)
+            .await?;
         let handle = mock.handle();
         handle.advance_tip(BlockHeight::from(3));
         let first = _FuturesStreamExt::next(&mut envelopes).await;
@@ -309,7 +311,9 @@ mod tests {
         let mock = MockChainSource::new(Network::regtest());
         let handle = mock.handle();
         handle.advance_tip(BlockHeight::from(10));
-        let mut envelopes = mock.chain_event_envelopes(None).await?;
+        let mut envelopes = mock
+            .chain_event_envelopes(ChainEventStreamStart::EarliestRetained)
+            .await?;
         handle.trigger_reorg(BlockHeight::from(7), BlockHeight::from(11));
         let event = _FuturesStreamExt::next(&mut envelopes).await;
         assert!(matches!(

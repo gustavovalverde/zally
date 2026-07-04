@@ -77,9 +77,9 @@ incrementalmerkletree = "0.8"
 # Optional chain-plane backend. The `zinder` cargo feature on zally-chain pulls these
 # crates from a pinned git revision so the wallet integration tracks the zinder typed-
 # client surface directly.
-zinder-client = { git = "https://github.com/gustavovalverde/zinder", rev = "4f8445eaf00590c2e792ae855cd17084b80a227b" }
-zinder-core = { git = "https://github.com/gustavovalverde/zinder", rev = "4f8445eaf00590c2e792ae855cd17084b80a227b" }
-zinder-testkit = { git = "https://github.com/gustavovalverde/zinder", rev = "4f8445eaf00590c2e792ae855cd17084b80a227b" }
+zinder-client = { git = "https://github.com/gustavovalverde/zinder", rev = "f51ec77142e1dfd9907c60fdda81df91107002fc" }
+zinder-core = { git = "https://github.com/gustavovalverde/zinder", rev = "f51ec77142e1dfd9907c60fdda81df91107002fc" }
+zinder-testkit = { git = "https://github.com/gustavovalverde/zinder", rev = "f51ec77142e1dfd9907c60fdda81df91107002fc" }
 
 # Async runtime and concurrency.
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "fs", "io-util"] }

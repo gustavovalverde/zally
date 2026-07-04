@@ -26,8 +26,8 @@ use tokio::task::JoinHandle;
 use tokio::time::{MissedTickBehavior, interval, sleep, timeout};
 use tokio_stream::wrappers::WatchStream;
 use zally_chain::{
-    BlockHeightRange, ChainEventCursor, ChainEventEnvelope, ChainEventEnvelopeStream, ChainSource,
-    ChainSourceError, ChainState, FailurePosture, ShieldedPool, SubtreeIndex,
+    BlockHeightRange, ChainEventEnvelope, ChainEventEnvelopeStream, ChainEventStreamStart,
+    ChainSource, ChainSourceError, ChainState, FailurePosture, ShieldedPool, SubtreeIndex,
 };
 use zally_core::{BlockHeight, Network};
 use zally_storage::{ScanRequest, StorageError, TransparentUtxoRow};
@@ -606,8 +606,8 @@ async fn run_sync_driver(
     let mut poll = interval(Duration::from_millis(options.poll_interval_ms));
     poll.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut state = DriverState::default();
-    let mut chain_event_cursor: Option<ChainEventCursor> = None;
-    let mut chain_events = open_chain_events(&ctx, &mut state, chain_event_cursor.clone()).await;
+    let mut chain_events_start = ChainEventStreamStart::EarliestRetained;
+    let mut chain_events = open_chain_events(&ctx, &mut state, chain_events_start.clone()).await;
     let mut should_sync = true;
 
     loop {
@@ -629,14 +629,14 @@ async fn run_sync_driver(
                     &ctx,
                     &mut state,
                     &mut chain_events,
-                    chain_event_cursor.clone(),
+                    chain_events_start.clone(),
                 )
                 .await;
             }
             chain_event = next_chain_event_envelope(&mut chain_events) => {
                 match chain_event {
                     Some(Ok(envelope)) => {
-                        chain_event_cursor = Some(envelope.cursor);
+                        chain_events_start = ChainEventStreamStart::AfterCursor(envelope.cursor);
                         should_sync = state.parked().is_none();
                     }
                     Some(Err(err)) => {
@@ -663,7 +663,7 @@ async fn handle_poll_tick(
     ctx: &DriverContext<'_>,
     state: &mut DriverState,
     chain_events: &mut Option<ChainEventEnvelopeStream>,
-    from_cursor: Option<ChainEventCursor>,
+    start: ChainEventStreamStart,
 ) -> bool {
     if let Some(parked) = state.parked() {
         if parked
@@ -680,7 +680,7 @@ async fn handle_poll_tick(
         return false;
     }
     if chain_events.is_none() {
-        *chain_events = open_chain_events(ctx, state, from_cursor).await;
+        *chain_events = open_chain_events(ctx, state, start).await;
     }
     true
 }
@@ -1170,9 +1170,9 @@ fn publish_snapshot(status_tx: &watch::Sender<SyncSnapshot>, mut snapshot: SyncS
 async fn open_chain_events(
     ctx: &DriverContext<'_>,
     state: &mut DriverState,
-    from_cursor: Option<ChainEventCursor>,
+    start: ChainEventStreamStart,
 ) -> Option<ChainEventEnvelopeStream> {
-    match ctx.chain.chain_event_envelopes(from_cursor).await {
+    match ctx.chain.chain_event_envelopes(start).await {
         Ok(stream) => Some(stream),
         Err(err) => {
             record_stream_fault(ctx, state, &err);

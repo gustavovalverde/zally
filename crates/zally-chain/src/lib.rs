@@ -22,8 +22,8 @@ pub use zally_core::FailurePosture;
 
 pub use source::{
     BlockHeightRange, ChainEvent, ChainEventCursor, ChainEventEnvelope, ChainEventEnvelopeStream,
-    ChainEventStream, ChainSource, CompactBlockStream, ShieldedPool, SubtreeIndex, SubtreeRoot,
-    TransactionStatus, TransparentUtxo,
+    ChainEventStream, ChainEventStreamStart, ChainSource, CompactBlockStream, ShieldedPool,
+    SubtreeIndex, SubtreeRoot, TransactionStatus, TransparentUtxo,
 };
 pub use submitter::{RejectionReason, SubmitOutcome, Submitter};
 /// Re-export of `zcash_client_backend::data_api::chain::ChainState` so callers of the Zally

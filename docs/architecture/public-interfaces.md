@@ -109,6 +109,7 @@ A name must survive a change of its implementation.
 | `WalletStorage` | `zally-storage` | Trait abstraction over librustzcash's `WalletRead` + `WalletWrite`. |
 | `ChainSource` | `zally-chain` | Trait for compact-block reads, tree state, transparent UTXO lookups. |
 | `ChainEventCursor` | `zally-chain` | Opaque cursor for resuming chain-event streams without exposing backend internals. |
+| `ChainEventStreamStart` | `zally-chain` | Explicit chain-event subscription start position (`AfterCursor` \| `EarliestRetained` \| `LiveTail`). |
 | `ChainEventEnvelope` | `zally-chain` | Cursor-bound chain event consumed by sync drivers. |
 | `Submitter` | `zally-chain` | Trait for transaction broadcast. |
 | `SeedSealing` | `zally-keys` | Trait for at-rest seed encryption. |
@@ -240,6 +241,7 @@ The contract surface Zally publishes, grouped by domain. Each item is a guarante
 - **CHAIN-2**: `Submitter` trait with a single `submit(raw_tx) -> SubmitOutcome` method.
 - **CHAIN-3**: Reconnect, retry, and circuit-breaker logic at the wallet boundary, not duplicated in each embedding application.
 - **CHAIN-4**: `ChainEventCursor` is opaque Zally vocabulary. Backend cursor types never cross the public Zally API.
+- **CHAIN-5**: A chain-event subscription states its start position explicitly through `ChainEventStreamStart` (`AfterCursor` | `EarliestRetained` | `LiveTail`); there is no implicit empty-cursor default.
 
 ### Sync and scanning (SYNC)
 

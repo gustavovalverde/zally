@@ -37,8 +37,7 @@ The actor provides one storage serialization point and one queue-depth signal. C
 
 The driver:
 
-- listens to `ChainSource::chain_event_envelopes`;
-- resumes from the last in-process `ChainEventCursor` after a stream reconnect;
+- subscribes to `ChainSource::chain_event_envelopes` with an explicit `ChainEventStreamStart`: `EarliestRetained` until the first event is delivered, then `AfterCursor` so a stream reconnect resumes strictly after the last applied cursor;
 - falls back to polling with `poll_interval_ms`;
 - calls `Wallet::sync` repeatedly until the observed tip is reached or `max_sync_iterations_per_wake_count` is exhausted;
 - publishes `SyncSnapshot` values through `SyncHandle::observe_status`;

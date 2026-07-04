@@ -8,9 +8,9 @@ use std::time::Duration;
 use async_trait::async_trait;
 use parking_lot::Mutex;
 use zally_chain::{
-    BlockHeightRange, ChainEventCursor, ChainEventEnvelopeStream, ChainSource, ChainSourceError,
-    CompactBlockStream, ShieldedPool, SubtreeIndex, SubtreeRoot, TransactionStatus,
-    TransparentUtxo,
+    BlockHeightRange, ChainEventEnvelopeStream, ChainEventStreamStart, ChainSource,
+    ChainSourceError, CompactBlockStream, ShieldedPool, SubtreeIndex, SubtreeRoot,
+    TransactionStatus, TransparentUtxo,
 };
 use zally_core::{BlockHeight, Network, TxId};
 use zally_testkit::MockChainSource;
@@ -340,9 +340,9 @@ impl ChainSource for ShiftingNetworkChain {
 
     async fn chain_event_envelopes(
         &self,
-        from_cursor: Option<ChainEventCursor>,
+        start: ChainEventStreamStart,
     ) -> Result<ChainEventEnvelopeStream, ChainSourceError> {
-        self.inner.chain_event_envelopes(from_cursor).await
+        self.inner.chain_event_envelopes(start).await
     }
 }
 

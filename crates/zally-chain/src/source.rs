@@ -161,6 +161,26 @@ impl ChainEventCursor {
     }
 }
 
+/// Explicit start position for a chain-event subscription.
+///
+/// A subscriber states its intent rather than overloading an absent cursor.
+/// [`Self::AfterCursor`] resumes strictly after a durably applied cursor: the
+/// reconnect path once at least one event has been delivered.
+/// [`Self::EarliestRetained`] replays the source's retained window from its
+/// floor: the bootstrap path for a subscription that holds no cursor yet.
+/// [`Self::LiveTail`] resolves once at subscribe time to the current stream
+/// head and delivers only events applied afterwards.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum ChainEventStreamStart {
+    /// Resume strictly after this cursor.
+    AfterCursor(ChainEventCursor),
+    /// Replay from the source's earliest retained event.
+    EarliestRetained,
+    /// Start at the stream head resolved at subscribe time.
+    LiveTail,
+}
+
 /// Cursor-bound chain event returned to wallet consumers.
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -281,9 +301,9 @@ pub trait ChainSource: Send + Sync + 'static {
         script_pub_key_bytes: &[u8],
     ) -> Result<Vec<TransparentUtxo>, ChainSourceError>;
 
-    /// Subscribes to cursor-bound chain events.
+    /// Subscribes to cursor-bound chain events from an explicit `start`.
     async fn chain_event_envelopes(
         &self,
-        from_cursor: Option<ChainEventCursor>,
+        start: ChainEventStreamStart,
     ) -> Result<ChainEventEnvelopeStream, ChainSourceError>;
 }

@@ -21,8 +21,9 @@ use zcash_client_backend::proto::compact_formats::CompactBlock;
 use zcash_client_backend::proto::service::TreeState;
 use zinder_client::{
     ChainEvent as ZinderChainEvent, ChainEventCursor as ZinderChainEventCursor,
-    ChainEventEnvelope as ZinderChainEventEnvelope, EndpointBackedIndex, RemoteChainIndex,
-    RemoteOpenOptions, TransparentAddressUnspentOutputsQuery,
+    ChainEventEnvelope as ZinderChainEventEnvelope, EndpointBackedIndex,
+    EventStreamStart as ZinderEventStreamStart, RemoteChainIndex, RemoteOpenOptions,
+    TransparentAddressUnspentOutputsQuery,
 };
 use zinder_core::{
     BlockHeight as ZinderBlockHeight, BlockHeightRange as ZinderBlockHeightRange,
@@ -34,8 +35,8 @@ use zinder_core::{
 use crate::error::ChainSourceError;
 use crate::source::{
     BlockHeightRange, ChainEvent, ChainEventCursor, ChainEventEnvelope, ChainEventEnvelopeStream,
-    ChainSource, CompactBlockStream, ShieldedPool, SubtreeIndex, SubtreeRoot, TransactionStatus,
-    TransparentUtxo,
+    ChainEventStreamStart, ChainSource, CompactBlockStream, ShieldedPool, SubtreeIndex,
+    SubtreeRoot, TransactionStatus, TransparentUtxo,
 };
 
 const DEFAULT_SUBTREE_PAGE_SIZE: u32 = 256;
@@ -231,12 +232,17 @@ impl ChainSource for ZinderChainSource {
 
     async fn chain_event_envelopes(
         &self,
-        from_cursor: Option<ChainEventCursor>,
+        start: ChainEventStreamStart,
     ) -> Result<ChainEventEnvelopeStream, ChainSourceError> {
         let inner = self.inner.clone();
-        let zinder_cursor =
-            from_cursor.map(|cursor| ZinderChainEventCursor::from_bytes(cursor.into_bytes()));
-        let stream = inner.chain_events(zinder_cursor).await?;
+        let zinder_start = match start {
+            ChainEventStreamStart::AfterCursor(cursor) => ZinderEventStreamStart::AfterCursor(
+                ZinderChainEventCursor::from_bytes(cursor.into_bytes()),
+            ),
+            ChainEventStreamStart::EarliestRetained => ZinderEventStreamStart::EarliestRetained,
+            ChainEventStreamStart::LiveTail => ZinderEventStreamStart::LiveTail,
+        };
+        let stream = inner.chain_events(zinder_start).await?;
         let mapped = stream.map(|envelope_result| match envelope_result {
             Ok(envelope) => Ok(translate_chain_event_envelope(&envelope)),
             Err(err) => Err(ChainSourceError::from(err)),
