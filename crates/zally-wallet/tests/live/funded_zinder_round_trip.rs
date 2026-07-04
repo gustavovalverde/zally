@@ -38,7 +38,10 @@ const NODE_RPC_PASSWORD_ENV: &str = "ZALLY_TEST_NODE_RPC_PASSWORD";
 const SHIELDING_THRESHOLD_ZAT_ENV: &str = "ZALLY_TEST_SHIELDING_THRESHOLD_ZAT";
 const SEND_ZAT_ENV: &str = "ZALLY_TEST_SEND_ZAT";
 const BROADCAST_TEST_SEED: [u8; 32] = [0x42_u8; 32];
-const TRANSPARENT_FUNDING_CONFIRMATION_BLOCKS: u32 = 10;
+// The wallet's shielding policy treats every chain-ingested transparent input as
+// untrusted and requires COINBASE_MATURITY (100) confirmations, so the funding
+// output only becomes shieldable once this many blocks sit on top of it.
+const TRANSPARENT_FUNDING_CONFIRMATION_BLOCKS: u32 = 100;
 const SHIELDED_SPEND_CONFIRMATION_BLOCKS: u32 = 10;
 
 #[tokio::test]
@@ -354,7 +357,11 @@ async fn wait_until_transparent_utxo_at_tip(
     snapshots: &mut SyncSnapshotStream,
     min_tip_height: BlockHeight,
 ) -> Result<(), TestError> {
-    tokio::time::timeout(Duration::from_secs(30), async {
+    // Maturing the funding output to COINBASE_MATURITY means the wallet must scan
+    // that many freshly mined blocks, and the Zinder backend surfaces them to its
+    // secondary at roughly one regtest block per second, so this wait is sized well
+    // above the shorter at-tip waits.
+    tokio::time::timeout(Duration::from_mins(4), async {
         while let Some(snapshot) = snapshots.next().await {
             let is_at_target_tip = matches!(
                 snapshot.sync_status,
