@@ -1,9 +1,9 @@
-//! `Prover` role: creates Sapling and Orchard proofs for a PCZT.
+//! `Prover` role: creates Sapling, Orchard, and Ironwood proofs for a PCZT.
 //!
 //! Derives the account-zero ZIP-32 `UnifiedSpendingKey` from the supplied seed so Sapling
-//! proof-generation keys can be inserted before proving. Orchard proof creation does not
-//! require the spending key, but the same single-call surface keeps the in-process Zally
-//! wallet flow ergonomic.
+//! proof-generation keys can be inserted before proving. Orchard and Ironwood proof creation
+//! do not require the spending key, but the same single-call surface keeps the in-process
+//! Zally wallet flow ergonomic.
 
 use std::sync::OnceLock;
 
@@ -16,7 +16,10 @@ use zcash_proofs::prover::LocalTxProver;
 use crate::bytes::PcztBytes;
 use crate::error::PcztError;
 
-static ORCHARD_PROVING_KEY: OnceLock<orchard::circuit::ProvingKey> = OnceLock::new();
+static ORCHARD_PROVING_KEY_FIXED_POST_NU6_2: OnceLock<orchard::circuit::ProvingKey> =
+    OnceLock::new();
+static ORCHARD_PROVING_KEY_POST_NU6_3: OnceLock<orchard::circuit::ProvingKey> = OnceLock::new();
+static IRONWOOD_PROVING_KEY: OnceLock<orchard::circuit::ProvingKey> = OnceLock::new();
 
 /// Creates zero-knowledge proofs for a PCZT.
 #[derive(Debug)]
@@ -37,10 +40,10 @@ impl Prover {
         self.network
     }
 
-    /// Creates required Sapling and Orchard proofs using keys derived from `seed`.
+    /// Creates required Sapling, Orchard, and Ironwood proofs using keys derived from `seed`.
     ///
     /// The Sapling proving path needs both Sapling proving parameters and the account's
-    /// proof-generation key. Orchard proving uses a process-local proving-key cache.
+    /// proof-generation key. Orchard and Ironwood proving use process-local proving-key caches.
     ///
     /// `requires_operator` when Sapling parameters are unavailable; `not_retryable` when
     /// the PCZT is malformed or upstream proof creation rejects its contents.
@@ -64,12 +67,21 @@ impl Prover {
                 })?;
 
         let pczt = add_sapling_proof_generation_keys(pczt.parse()?, &usk)?;
+        let consensus_branch_id = *pczt.global().consensus_branch_id();
         let mut prover = UpstreamProver::new(pczt);
         if prover.requires_orchard_proof() {
             prover = prover
-                .create_orchard_proof(orchard_proving_key())
+                .create_orchard_proof(orchard_proving_key(consensus_branch_id)?)
                 .map_err(|err| PcztError::UpstreamFailed {
                     reason: format!("orchard proof creation failed: {err:?}"),
+                    is_retryable: false,
+                })?;
+        }
+        if prover.requires_ironwood_proof() {
+            prover = prover
+                .create_ironwood_proof(ironwood_proving_key())
+                .map_err(|err| PcztError::UpstreamFailed {
+                    reason: format!("ironwood proof creation failed: {err:?}"),
                     is_retryable: false,
                 })?;
         }
@@ -84,7 +96,7 @@ impl Prover {
                 })?;
         }
 
-        Ok(PcztBytes::from_pczt(&prover.finish(), self.network))
+        PcztBytes::from_pczt(prover.finish(), self.network)
     }
 }
 
@@ -120,8 +132,56 @@ fn add_sapling_proof_generation_keys(
         .map(Updater::finish)
 }
 
-fn orchard_proving_key() -> &'static orchard::circuit::ProvingKey {
-    ORCHARD_PROVING_KEY.get_or_init(orchard::circuit::ProvingKey::build)
+/// Builds (and caches) the Orchard proving key for the circuit version `consensus_branch_id`
+/// requires.
+///
+/// Orchard bundles built under different network upgrades require different, incompatible
+/// circuits: the fixed post-NU6.2 circuit and the post-NU6.3 circuit produce distinct
+/// proving/verifying keys, so a proof made with the wrong one is rejected by the upstream
+/// prover outright. Refuses to prove under the insecure pre-NU6.2 circuit, which upstream
+/// reserves for reconstructing historical verifying keys, never for creating new proofs.
+fn orchard_proving_key(
+    consensus_branch_id: u32,
+) -> Result<&'static orchard::circuit::ProvingKey, PcztError> {
+    use zcash_protocol::consensus::OrchardProtocolRevision;
+
+    let branch_id =
+        zcash_protocol::consensus::BranchId::try_from(consensus_branch_id).map_err(|reason| {
+            PcztError::UpstreamFailed {
+                reason: format!("unrecognized consensus branch id: {reason}"),
+                is_retryable: false,
+            }
+        })?;
+    let revision =
+        branch_id
+            .orchard_protocol_revision()
+            .ok_or_else(|| PcztError::UpstreamFailed {
+                reason: format!("consensus branch {branch_id:?} predates the Orchard protocol"),
+                is_retryable: false,
+            })?;
+
+    match revision {
+        OrchardProtocolRevision::InsecureV1 => Err(PcztError::UpstreamFailed {
+            reason: "refusing to create an Orchard proof under the insecure pre-NU6.2 circuit"
+                .into(),
+            is_retryable: false,
+        }),
+        OrchardProtocolRevision::V2 => Ok(ORCHARD_PROVING_KEY_FIXED_POST_NU6_2.get_or_init(|| {
+            orchard::circuit::ProvingKey::build(
+                orchard::circuit::OrchardCircuitVersion::FixedPostNu6_2,
+            )
+        })),
+        OrchardProtocolRevision::V3 => Ok(ORCHARD_PROVING_KEY_POST_NU6_3.get_or_init(|| {
+            orchard::circuit::ProvingKey::build(orchard::circuit::OrchardCircuitVersion::PostNu6_3)
+        })),
+    }
+}
+
+/// Builds (and caches) the Ironwood proving key for the post-NU6.3 circuit.
+fn ironwood_proving_key() -> &'static orchard::circuit::ProvingKey {
+    IRONWOOD_PROVING_KEY.get_or_init(|| {
+        orchard::circuit::ProvingKey::build(orchard::circuit::OrchardCircuitVersion::PostNu6_3)
+    })
 }
 
 fn validate_network(pczt: &PcztBytes, configured: Network) -> Result<(), PcztError> {

@@ -25,6 +25,7 @@ thiserror.workspace = true
 zally-core = { path = "../zally-core", version = "0.1" }
 zally-keys = { path = "../zally-keys", version = "0.1" }
 zcash_keys = { workspace = true, features = ["orchard", "sapling", "transparent-inputs"] }
+zcash_protocol.workspace = true
 zcash_proofs.workspace = true
 zcash_transparent.workspace = true
 zip32.workspace = true

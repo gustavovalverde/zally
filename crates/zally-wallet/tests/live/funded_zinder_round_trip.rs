@@ -696,6 +696,7 @@ fn zally_local_network_from_upgrades(upgrades: &[NodeUpgrade]) -> ZallyLocalNetw
         nu6: activation_height("NU6"),
         nu6_1: activation_height("NU6.1"),
         nu6_2: activation_height("NU6.2"),
+        nu6_3: activation_height("NU6.3"),
     }
 }
 

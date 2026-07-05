@@ -7,21 +7,50 @@ use crate::error::SubmitterError;
 
 /// Typed broadcast rejection reason.
 ///
-/// Re-exported from `zinder_core::BroadcastRejectionReason` so downstream
-/// callers (notably `zally-wallet` and its consumers) can dispatch on the
-/// typed value without depending on `zinder-core` directly. The upstream
-/// type is the source of truth; this re-export is a stability seam that
-/// keeps the chain-plane surface coherent.
-pub type RejectionReason = zinder_core::BroadcastRejectionReason;
+/// Mirrors `zinder_core::BroadcastRejectionReason` so callers (notably
+/// `zally-wallet`, `zally-testkit`, and their consumers) can dispatch on the
+/// typed value without requiring the `zinder` cargo feature.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum RejectionReason {
+    /// Node returned a rejection that did not match any known reason.
+    #[default]
+    Unknown,
+    /// Verifier rejected one or more transaction signatures.
+    InvalidSignature,
+    /// Transaction's `nExpiryHeight` is at or below the visible tip.
+    BadExpiryHeight,
+    /// Transaction's consensus branch id does not match the network upgrade.
+    BadConsensusBranch,
+    /// Mempool is at capacity and refused the transaction.
+    MempoolFull,
+}
+
+#[cfg(feature = "zinder")]
+#[allow(
+    clippy::wildcard_enum_match_arm,
+    reason = "non_exhaustive zinder_core::BroadcastRejectionReason maps unknown variants to Unknown"
+)]
+impl From<zinder_core::BroadcastRejectionReason> for RejectionReason {
+    fn from(reason: zinder_core::BroadcastRejectionReason) -> Self {
+        match reason {
+            zinder_core::BroadcastRejectionReason::InvalidSignature => Self::InvalidSignature,
+            zinder_core::BroadcastRejectionReason::BadExpiryHeight => Self::BadExpiryHeight,
+            zinder_core::BroadcastRejectionReason::BadConsensusBranch => Self::BadConsensusBranch,
+            zinder_core::BroadcastRejectionReason::MempoolFull => Self::MempoolFull,
+            _ => Self::Unknown,
+        }
+    }
+}
 
 /// Outcome of a transaction broadcast.
 ///
-/// Not `serde::Serialize` even with the `serde` feature, because the typed
-/// `RejectionReason` is non-exhaustive in `zinder-core` and does not derive
-/// serde. The outcome is an in-process value passed between the chain and
-/// wallet planes; persistence layers serialize the resulting `WalletError`
-/// variant (which carries `Debug` formatting of the typed reason) rather
-/// than the raw outcome.
+/// Not `serde::Serialize` even with the `serde` feature, because
+/// `RejectionReason` is `#[non_exhaustive]` and does not derive serde. The
+/// outcome is an in-process value passed between the chain and wallet
+/// planes; persistence layers serialize the resulting `WalletError` variant
+/// (which carries `Debug` formatting of the typed reason) rather than the
+/// raw outcome.
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum SubmitOutcome {

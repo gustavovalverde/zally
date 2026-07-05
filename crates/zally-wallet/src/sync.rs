@@ -1365,14 +1365,8 @@ impl Wallet {
     /// index 0 each cycle and stops at the first short page.
     async fn backfill_subtree_roots(&self, chain: &dyn ChainSource) -> Result<(), WalletError> {
         for (pool, protocol) in [
-            (
-                ShieldedPool::Sapling,
-                zcash_protocol::ShieldedProtocol::Sapling,
-            ),
-            (
-                ShieldedPool::Orchard,
-                zcash_protocol::ShieldedProtocol::Orchard,
-            ),
+            (ShieldedPool::Sapling, zcash_protocol::ShieldedPool::Sapling),
+            (ShieldedPool::Orchard, zcash_protocol::ShieldedPool::Orchard),
         ] {
             let mut next_index = 0_u32;
             loop {
@@ -1704,10 +1698,11 @@ fn block_timestamp_index(
         .collect()
 }
 
-const fn shielded_pool_for(protocol: zcash_protocol::ShieldedProtocol) -> ShieldedPool {
+const fn shielded_pool_for(protocol: zcash_protocol::ShieldedPool) -> ShieldedPool {
     match protocol {
-        zcash_protocol::ShieldedProtocol::Sapling => ShieldedPool::Sapling,
-        zcash_protocol::ShieldedProtocol::Orchard => ShieldedPool::Orchard,
+        zcash_protocol::ShieldedPool::Sapling => ShieldedPool::Sapling,
+        zcash_protocol::ShieldedPool::Orchard => ShieldedPool::Orchard,
+        zcash_protocol::ShieldedPool::Ironwood => ShieldedPool::Ironwood,
     }
 }
 

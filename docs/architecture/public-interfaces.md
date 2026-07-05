@@ -320,7 +320,7 @@ Which ZIPs Zally implements directly, which it inherits through librustzcash, an
 
 ### Reserved By Shape
 
-- **ZIP-230**: v6 transaction format (NU7, OrchardZSA). Transaction construction stays behind wallet/storage methods so a v6 path does not leak librustzcash internals.
+- **ZIP-230**: v6 transaction format. Activates at NU6.3 for the Ironwood pool, ahead of ZIP-230's own drafted NU7/OrchardZSA scope. Transaction construction stays behind wallet/storage methods so a v6 path does not leak librustzcash internals.
 - **ZIP-231**: Memo bundles. Memo API takes an opaque `Memo` value rather than exposing a Zally-owned memo enum.
 - **ZIP-312**: FROST spend authorisation. PCZT signing stays in `zally-pczt`, separate from wallet sync and storage.
 

@@ -39,7 +39,7 @@ impl Combiner {
             .map_err(|err| PcztError::CombineConflict {
                 reason: format!("{err:?}"),
             })?;
-        Ok(PcztBytes::from_pczt(&combined, network))
+        PcztBytes::from_pczt(combined, network)
     }
 }
 

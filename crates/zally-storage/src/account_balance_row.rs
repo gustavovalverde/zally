@@ -12,7 +12,7 @@ use zally_core::{BlockHeight, Zatoshis};
 /// One per-pool balance snapshot for a single account, anchored to the wallet's last
 /// observed chain tip.
 ///
-/// Sapling and Orchard values report the upstream spendable totals reported by
+/// Sapling, Orchard, and Ironwood values report the upstream spendable totals reported by
 /// `WalletRead::get_wallet_summary` (notes whose witnesses are computable and whose
 /// confirmation depth is met).
 ///
@@ -30,6 +30,8 @@ pub struct AccountBalanceRow {
     pub sapling_zat: Zatoshis,
     /// Spendable Orchard value.
     pub orchard_zat: Zatoshis,
+    /// Spendable Ironwood value.
+    pub ironwood_zat: Zatoshis,
     /// Transparent value past the ZIP-213 coinbase maturity gate at `as_of_height`.
     pub transparent_mature_zat: Zatoshis,
     /// Transparent value still inside the 100-block coinbase maturity window.

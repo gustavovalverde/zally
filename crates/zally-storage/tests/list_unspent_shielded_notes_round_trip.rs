@@ -4,7 +4,8 @@
 //! the upstream query without panicking.
 //!
 //! This test intentionally covers the empty-account branch only. Inserting synthetic
-//! rows directly into `sapling_received_notes` / `orchard_received_notes` would bypass
+//! rows directly into `sapling_received_notes`, `orchard_received_notes`, or
+//! `ironwood_received_notes` would bypass
 //! upstream account-membership invariants and produce false positives.
 
 use tempfile::TempDir;

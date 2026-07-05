@@ -41,7 +41,11 @@ impl BlockHeightRange {
     }
 }
 
-/// Shielded pool selector. Zally's vocabulary for `zcash_protocol::ShieldedProtocol`.
+/// Shielded pool selector. Zally's vocabulary for `zcash_protocol::ShieldedPool`.
+///
+/// `Ironwood` is not yet reachable through [`ChainSource::subtree_roots`]: the
+/// `zinder` backend has no query path for it and returns
+/// `ChainSourceError::ShieldedPoolUnsupported`.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[non_exhaustive]
@@ -50,6 +54,8 @@ pub enum ShieldedPool {
     Sapling,
     /// Orchard pool.
     Orchard,
+    /// Ironwood pool.
+    Ironwood,
 }
 
 /// Index of a subtree root in a pool's note commitment tree.

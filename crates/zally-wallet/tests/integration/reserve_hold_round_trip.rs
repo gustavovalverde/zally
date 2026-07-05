@@ -90,7 +90,7 @@ async fn reserve_hold_is_idempotent_on_active_request() -> Result<(), TestError>
             amount_zat: amount,
             spendable_for_check_zat: Zatoshis::try_from(1_000_000_u64)?,
             locked_notes: vec![HeldNote::new(
-                zcash_protocol::ShieldedProtocol::Orchard,
+                zcash_protocol::ShieldedPool::Orchard,
                 amount,
                 TxId::from_bytes([0xAA; 32]),
                 0,

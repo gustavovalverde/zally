@@ -190,7 +190,7 @@ impl Wallet {
             .map_err(WalletError::from)
     }
 
-    /// Returns every unspent Sapling and Orchard note owned by `account_id`.
+    /// Returns every unspent Sapling, Orchard, and Ironwood note owned by `account_id`.
     ///
     /// The wallet uses its persisted observed chain tip (the highest tip reported to it by
     /// [`Wallet::sync`]) to compute the `confirmations` field. Operators that need a fresh
@@ -316,7 +316,7 @@ impl Wallet {
         Ok(translate_account_balance(row, self.inner.network))
     }
 
-    /// Returns every Sapling and Orchard note ever received by `account_id`, spent or
+    /// Returns every Sapling, Orchard, and Ironwood note ever received by `account_id`, spent or
     /// unspent. Each record carries the provenance fields (`is_change`, `spent_our_inputs`)
     /// that let a downstream observer classify the receive identically to the matching
     /// [`WalletEvent::ShieldedReceiveObserved`] from the live event stream.
@@ -344,7 +344,7 @@ impl Wallet {
     /// Returns `Ok(Some(text))` only when the memo encodes a UTF-8 string per
     /// ZIP 302's text-memo case. Empty memos, arbitrary memos, future-reserved
     /// memos, and notes the wallet does not know all return `Ok(None)`. The
-    /// implementation resolves across Sapling and Orchard transparently.
+    /// implementation resolves across Sapling, Orchard, and Ironwood transparently.
     ///
     /// Callers that surface memos to a public audience should only project
     /// the text variant: the other variants are opaque by construction and
@@ -365,7 +365,7 @@ impl Wallet {
 
     /// Returns the wallet's spendable view for the next dispense.
     ///
-    /// Equal to the sum of the account's spendable Sapling and Orchard balances minus
+    /// Equal to the sum of the account's spendable Sapling, Orchard, and Ironwood balances minus
     /// every active dispense reservation persisted in storage. Locked transparent UTXOs
     /// are already excluded from the shielded balances at the librustzcash boundary, so
     /// they need no extra subtraction here. The result is what the next call to
@@ -391,7 +391,8 @@ impl Wallet {
         let shielded_spendable = balance_row
             .sapling_zat
             .as_u64()
-            .saturating_add(balance_row.orchard_zat.as_u64());
+            .saturating_add(balance_row.orchard_zat.as_u64())
+            .saturating_add(balance_row.ironwood_zat.as_u64());
         let remaining = shielded_spendable.saturating_sub(reserved.as_u64());
         Ok(Zatoshis::try_from(remaining).unwrap_or(Zatoshis::zero()))
     }
@@ -897,6 +898,7 @@ fn translate_account_balance(
         network,
         sapling_zat: row.sapling_zat,
         orchard_zat: row.orchard_zat,
+        ironwood_zat: row.ironwood_zat,
         transparent_mature_zat: row.transparent_mature_zat,
         transparent_immature_zat: row.transparent_immature_zat,
         as_of_height: row.as_of_height,
@@ -939,12 +941,11 @@ fn translate_unspent_note(
     }
 }
 
-const fn shielded_pool_for(
-    protocol: zcash_protocol::ShieldedProtocol,
-) -> zally_chain::ShieldedPool {
+const fn shielded_pool_for(protocol: zcash_protocol::ShieldedPool) -> zally_chain::ShieldedPool {
     match protocol {
-        zcash_protocol::ShieldedProtocol::Sapling => zally_chain::ShieldedPool::Sapling,
-        zcash_protocol::ShieldedProtocol::Orchard => zally_chain::ShieldedPool::Orchard,
+        zcash_protocol::ShieldedPool::Sapling => zally_chain::ShieldedPool::Sapling,
+        zcash_protocol::ShieldedPool::Orchard => zally_chain::ShieldedPool::Orchard,
+        zcash_protocol::ShieldedPool::Ironwood => zally_chain::ShieldedPool::Ironwood,
     }
 }
 

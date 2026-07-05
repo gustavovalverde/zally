@@ -48,12 +48,11 @@ impl PcztBytes {
     }
 
     /// Wraps a freshly built `pczt::Pczt` for the given network.
-    #[must_use]
-    pub fn from_pczt(pczt: &pczt::Pczt, network: Network) -> Self {
-        Self {
-            bytes: pczt.serialize(),
-            network,
-        }
+    pub fn from_pczt(pczt: pczt::Pczt, network: Network) -> Result<Self, PcztError> {
+        let bytes = pczt.serialize().map_err(|err| PcztError::SerializeFailed {
+            reason: format!("{err:?}"),
+        })?;
+        Ok(Self { bytes, network })
     }
 }
 

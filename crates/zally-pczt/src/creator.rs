@@ -32,8 +32,7 @@ impl Creator {
     ///
     /// Entry point for callers (typically `Wallet::propose_pczt`) that have constructed a
     /// `pczt::Pczt` via the upstream `pczt::roles::creator::Creator`.
-    #[must_use]
-    pub fn wrap(&self, pczt: &pczt::Pczt) -> PcztBytes {
+    pub fn wrap(&self, pczt: pczt::Pczt) -> Result<PcztBytes, PcztError> {
         PcztBytes::from_pczt(pczt, self.network)
     }
 }

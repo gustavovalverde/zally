@@ -163,7 +163,7 @@ impl ChainSource for ZinderChainSource {
         let bounded = max_count.clamp(1, DEFAULT_SUBTREE_PAGE_SIZE);
         let max_entries = NonZeroU32::new(bounded).unwrap_or(NonZeroU32::MIN);
         let range = ZinderSubtreeRootRange::new(
-            zally_pool_to_zinder(pool),
+            zally_pool_to_zinder(pool)?,
             ZinderSubtreeRootIndex::new(start_index.0),
             max_entries,
         );
@@ -305,10 +305,11 @@ fn zally_network_to_zinder(network: Network) -> Result<ZinderNetwork, ChainSourc
     }
 }
 
-const fn zally_pool_to_zinder(pool: ShieldedPool) -> ZinderShieldedProtocol {
+fn zally_pool_to_zinder(pool: ShieldedPool) -> Result<ZinderShieldedProtocol, ChainSourceError> {
     match pool {
-        ShieldedPool::Sapling => ZinderShieldedProtocol::Sapling,
-        ShieldedPool::Orchard => ZinderShieldedProtocol::Orchard,
+        ShieldedPool::Sapling => Ok(ZinderShieldedProtocol::Sapling),
+        ShieldedPool::Orchard => Ok(ZinderShieldedProtocol::Orchard),
+        ShieldedPool::Ironwood => Err(ChainSourceError::ShieldedPoolUnsupported { pool }),
     }
 }
 
@@ -380,6 +381,11 @@ fn decode_tree_state(
         .and_then(serde_json::Value::as_str)
         .unwrap_or_default()
         .to_owned();
+    let ironwood_tree = parsed
+        .pointer("/ironwood/commitments/finalState")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
 
     Ok(TreeState {
         network: lightwalletd_network_label(network).to_owned(),
@@ -388,6 +394,7 @@ fn decode_tree_state(
         time,
         sapling_tree,
         orchard_tree,
+        ironwood_tree,
     })
 }
 

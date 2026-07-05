@@ -58,16 +58,16 @@ redundant_pub_crate = "allow"
 # operators do not see these version numbers in Zally's public API.
 zcash_client_backend = "0.23"
 zcash_client_sqlite = "0.21"
-zcash_keys = "0.14"
-zcash_primitives = "0.28"
-zcash_protocol = { version = "0.9", features = ["local-consensus"] }
-zcash_address = "0.12"
-zcash_proofs = "0.28"
-zcash_transparent = { version = "0.8", default-features = false, features = ["transparent-inputs"] }
+zcash_keys = "0.15.0-pre.0"
+zcash_primitives = "0.29.0-pre.0"
+zcash_protocol = { version = "0.10.0-pre.0", features = ["local-consensus"] }
+zcash_address = "0.13.0-pre.0"
+zcash_proofs = "0.29.0-pre.0"
+zcash_transparent = { version = "0.9.0-pre.0", default-features = false, features = ["transparent-inputs"] }
 zcash_script = "0.4"
 pczt = { version = "0.7", features = ["orchard", "sapling", "transparent", "signer", "prover", "tx-extractor"] }
 secp256k1 = "0.29"
-orchard = "0.14"
+orchard = "0.15.0-pre.1"
 sapling = { package = "sapling-crypto", version = "0.7" }
 zip321 = "0.8"
 zip32 = "0.2"
@@ -77,9 +77,9 @@ incrementalmerkletree = "0.8"
 # Optional chain-plane backend. The `zinder` cargo feature on zally-chain pulls these
 # crates from a pinned git revision so the wallet integration tracks the zinder typed-
 # client surface directly.
-zinder-client = { git = "https://github.com/gustavovalverde/zinder", rev = "f51ec77142e1dfd9907c60fdda81df91107002fc" }
-zinder-core = { git = "https://github.com/gustavovalverde/zinder", rev = "f51ec77142e1dfd9907c60fdda81df91107002fc" }
-zinder-testkit = { git = "https://github.com/gustavovalverde/zinder", rev = "f51ec77142e1dfd9907c60fdda81df91107002fc" }
+zinder-client = { git = "https://github.com/gustavovalverde/zinder", rev = "429db6adc13269023f7b7cc2bf7a332c686e916a" }
+zinder-core = { git = "https://github.com/gustavovalverde/zinder", rev = "429db6adc13269023f7b7cc2bf7a332c686e916a" }
+zinder-testkit = { git = "https://github.com/gustavovalverde/zinder", rev = "429db6adc13269023f7b7cc2bf7a332c686e916a" }
 
 # Async runtime and concurrency.
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "fs", "io-util"] }
@@ -92,7 +92,7 @@ parking_lot = "0.12"
 thiserror = "2.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-postcard = { version = "1.1", features = ["use-std"] }
+postcard = { version = "1.1", default-features = false, features = ["use-std"] }
 
 # Identifiers and BIP-39 mnemonics.
 uuid = { version = "1", features = ["v4", "serde"] }
@@ -119,10 +119,27 @@ proptest = "1.5"
 tempfile = "3.13"
 
 
-# Pinned to a standalone fork of `zcash_client_backend` 0.23.0 with the
-# `target_expiry_height` argument added (matches https://github.com/zcash/librustzcash/pull/2412).
-# The fork is single-crate (not the librustzcash workspace) so cargo resolves
-# transitive deps from crates.io. Drop once upstream merges and a
-# `zcash_client_backend` release ships the patch on crates.io.
+# Pinned to a fork of the librustzcash workspace tracking the unreleased
+# Ironwood/NU6.3 dependency family, carrying two patches on top of upstream
+# main: the `target_expiry_height` argument added to `create_pczt_from_proposal`
+# (matches https://github.com/zcash/librustzcash/pull/2412) and wallet
+# scanning/storage support for the Ironwood shielded pool (matches
+# https://github.com/zcash/librustzcash/pull/2539, cherry-picked on top; that
+# PR is open and unmerged). Every librustzcash-internal crate Zally references
+# is patched from this same commit: they resolve each other by intra-workspace
+# path inside the fork's checkout, so patching a subset from a different
+# source would give Zally's crates and the fork's own internal crates
+# distinct, incompatible types for the same dependency. See ADR-0006. Drop
+# once upstream ships a stable `zcash_client_backend` release carrying both
+# patches.
 [patch.crates-io]
-zcash_client_backend = { git = "https://github.com/gustavovalverde/zcash_client_backend-target-expiry.git", tag = "v0.23.1-target-expiry" }
+zcash_client_backend = { git = "https://github.com/gustavovalverde/librustzcash.git", rev = "235d581f2c6eface19e857e69e9bfa4765c2d4bf" }
+zcash_client_sqlite = { git = "https://github.com/gustavovalverde/librustzcash.git", rev = "235d581f2c6eface19e857e69e9bfa4765c2d4bf" }
+pczt = { git = "https://github.com/gustavovalverde/librustzcash.git", rev = "235d581f2c6eface19e857e69e9bfa4765c2d4bf" }
+zcash_protocol = { git = "https://github.com/gustavovalverde/librustzcash.git", rev = "235d581f2c6eface19e857e69e9bfa4765c2d4bf" }
+zcash_primitives = { git = "https://github.com/gustavovalverde/librustzcash.git", rev = "235d581f2c6eface19e857e69e9bfa4765c2d4bf" }
+zcash_keys = { git = "https://github.com/gustavovalverde/librustzcash.git", rev = "235d581f2c6eface19e857e69e9bfa4765c2d4bf" }
+zcash_address = { git = "https://github.com/gustavovalverde/librustzcash.git", rev = "235d581f2c6eface19e857e69e9bfa4765c2d4bf" }
+zcash_transparent = { git = "https://github.com/gustavovalverde/librustzcash.git", rev = "235d581f2c6eface19e857e69e9bfa4765c2d4bf" }
+zcash_proofs = { git = "https://github.com/gustavovalverde/librustzcash.git", rev = "235d581f2c6eface19e857e69e9bfa4765c2d4bf" }
+zip321 = { git = "https://github.com/gustavovalverde/librustzcash.git", rev = "235d581f2c6eface19e857e69e9bfa4765c2d4bf" }

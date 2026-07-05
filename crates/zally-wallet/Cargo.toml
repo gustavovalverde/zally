@@ -42,7 +42,6 @@ zally-storage = { path = "../zally-storage", version = "0.1" }
 zcash_address.workspace = true
 zcash_client_backend = { workspace = true, features = ["orchard", "transparent-inputs"] }
 zcash_keys.workspace = true
-zcash_primitives.workspace = true
 zcash_protocol.workspace = true
 zcash_transparent.workspace = true
 zip32.workspace = true

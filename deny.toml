@@ -11,6 +11,10 @@ ignore = [
     # proc-macro-error unmaintained advisory; pulled transitively through age's i18n stack.
     # Not a vulnerability; tracking upstream replacement.
     "RUSTSEC-2024-0370",
+    # proc-macro-error2 unmaintained advisory; pulled transitively through
+    # orchard -> getset. Not a vulnerability; no getset release has dropped
+    # the dependency yet.
+    "RUSTSEC-2026-0173",
 ]
 
 [licenses]
@@ -58,4 +62,8 @@ allow-git = [
     # build Zally without a local checkout. Pin a specific commit rather than
     # tracking a branch.
     "https://github.com/gustavovalverde/zinder",
+    # Fork of the librustzcash workspace carrying the unreleased Ironwood/NU6.3
+    # dependency family plus the `target_expiry_height` patch on
+    # `create_pczt_from_proposal`. See ADR-0006.
+    "https://github.com/gustavovalverde/librustzcash.git",
 ]

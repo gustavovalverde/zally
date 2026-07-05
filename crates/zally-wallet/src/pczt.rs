@@ -74,7 +74,7 @@ impl Wallet {
         Ok(authorized)
     }
 
-    /// Creates Sapling and Orchard proofs for `pczt` using the sealed seed when needed.
+    /// Creates Sapling, Orchard, and Ironwood proofs for `pczt` using the sealed seed when needed.
     ///
     /// The returned PCZT remains unsigned unless it was already signed. For the local
     /// single-key path, call [`Wallet::prove_pczt`] and [`Wallet::sign_pczt`] before

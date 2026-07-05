@@ -45,7 +45,8 @@ use zcash_client_sqlite::wallet::init::WalletMigrator;
 use zcash_keys::address::UnifiedAddress;
 use zcash_keys::keys::transparent::gap_limits::GapLimits;
 use zcash_keys::keys::{UnifiedAddressRequest, UnifiedFullViewingKey};
-use zcash_protocol::ShieldedProtocol;
+use zcash_protocol::ShieldedPool;
+use zcash_protocol::consensus::{NetworkUpgrade, Parameters as _};
 use zcash_protocol::memo::Memo;
 use zcash_protocol::value::Zatoshis as UpstreamZatoshis;
 use zcash_transparent::address::Script;
@@ -609,12 +610,12 @@ impl WalletStorage for Sqlite {
 
     async fn put_subtree_roots(
         &self,
-        pool: ShieldedProtocol,
+        pool: ShieldedPool,
         start_index: u64,
         roots: Vec<(BlockHeight, [u8; 32])>,
     ) -> Result<(), StorageError> {
         self.with_db_mut(move |db| match pool {
-            ShieldedProtocol::Sapling => {
+            ShieldedPool::Sapling => {
                 let typed = roots
                     .into_iter()
                     .map(|(height, bytes)| {
@@ -635,7 +636,7 @@ impl WalletStorage for Sqlite {
                         posture: FailurePosture::NotRetryable,
                     })
             }
-            ShieldedProtocol::Orchard => {
+            ShieldedPool::Orchard => {
                 let typed = roots
                     .into_iter()
                     .map(|(height, bytes)| {
@@ -655,6 +656,7 @@ impl WalletStorage for Sqlite {
                         posture: FailurePosture::NotRetryable,
                     })
             }
+            ShieldedPool::Ironwood => Err(StorageError::ShieldedPoolUnsupported { pool }),
         })
         .await
     }
@@ -864,6 +866,10 @@ impl WalletStorage for Sqlite {
                 .map_err(|e| map_sqlite_error(&e))?
                 .into_keys()
                 .collect();
+            let change_pool = fallback_change_pool(
+                &params,
+                db.chain_height().map_err(|e| map_sqlite_error(&e))?,
+            );
 
             let proposal = {
                 let mut filtered = FilteredWalletDb {
@@ -877,7 +883,7 @@ impl WalletStorage for Sqlite {
                     standard::SingleOutputChangeStrategy::<FilteredWalletDb<'_>>::new(
                         StandardFeeRule::Zip317,
                         None,
-                        zcash_protocol::ShieldedProtocol::Orchard,
+                        change_pool,
                         DustOutputPolicy::default(),
                     );
 
@@ -896,7 +902,7 @@ impl WalletStorage for Sqlite {
                     &from_addrs,
                     account_uuid,
                     coinbase_safe_shielding_policy(),
-                    zcash_client_backend::data_api::TransparentOutputFilter::All,
+                    zcash_client_backend::data_api::CoinbaseFilter::AllTransparentOutputs,
                 )
                 .map_err(|err| classify_proposal_build_error(&err))?
             };
@@ -970,7 +976,11 @@ impl WalletStorage for Sqlite {
             )
             .map_err(|err| classify_proposal_build_error(&err))?;
 
-            Ok(pczt.serialize())
+            pczt.serialize()
+                .map_err(|err| StorageError::ProposalBuildFailed {
+                    reason: format!("pczt serialize failed: {err:?}"),
+                    posture: FailurePosture::NotRetryable,
+                })
         })
         .await
     }
@@ -1520,15 +1530,23 @@ impl WalletStorage for Sqlite {
             let summary = db
                 .get_wallet_summary(ConfirmationsPolicy::default())
                 .map_err(|e| map_sqlite_error(&e))?;
-            let (sapling_zat, orchard_zat, transparent_mature_zat) = summary
+            let (sapling_zat, orchard_zat, ironwood_zat, transparent_mature_zat) = summary
                 .as_ref()
                 .and_then(|s| s.account_balances().get(&account_uuid))
                 .map_or(
-                    (Zatoshis::zero(), Zatoshis::zero(), Zatoshis::zero()),
+                    (
+                        Zatoshis::zero(),
+                        Zatoshis::zero(),
+                        Zatoshis::zero(),
+                        Zatoshis::zero(),
+                    ),
                     |balance| {
                         (
                             upstream_to_zally_zatoshis(balance.sapling_balance().spendable_value()),
                             upstream_to_zally_zatoshis(balance.orchard_balance().spendable_value()),
+                            upstream_to_zally_zatoshis(
+                                balance.ironwood_balance().spendable_value(),
+                            ),
                             upstream_to_zally_zatoshis(
                                 balance.unshielded_balance().spendable_value(),
                             ),
@@ -1562,6 +1580,7 @@ impl WalletStorage for Sqlite {
             Ok(crate::AccountBalanceRow {
                 sapling_zat,
                 orchard_zat,
+                ironwood_zat,
                 transparent_mature_zat,
                 transparent_immature_zat,
                 as_of_height: observed_tip,
@@ -1585,8 +1604,9 @@ impl WalletStorage for Sqlite {
                 db,
                 account_uuid,
                 &[
-                    zcash_protocol::ShieldedProtocol::Sapling,
-                    zcash_protocol::ShieldedProtocol::Orchard,
+                    zcash_protocol::ShieldedPool::Sapling,
+                    zcash_protocol::ShieldedPool::Orchard,
+                    zcash_protocol::ShieldedPool::Ironwood,
                 ],
                 target,
                 &[],
@@ -1608,7 +1628,7 @@ impl WalletStorage for Sqlite {
                     }
                 })?;
                 rows.push(crate::wallet::UnspentShieldedNoteRow {
-                    protocol: zcash_protocol::ShieldedProtocol::Sapling,
+                    protocol: zcash_protocol::ShieldedPool::Sapling,
                     value_zat,
                     tx_id: zally_core::TxId::from_bytes(*note.txid().as_ref()),
                     output_index: u32::from(note.output_index()),
@@ -1626,7 +1646,25 @@ impl WalletStorage for Sqlite {
                     }
                 })?;
                 rows.push(crate::wallet::UnspentShieldedNoteRow {
-                    protocol: zcash_protocol::ShieldedProtocol::Orchard,
+                    protocol: zcash_protocol::ShieldedPool::Orchard,
+                    value_zat,
+                    tx_id: zally_core::TxId::from_bytes(*note.txid().as_ref()),
+                    output_index: u32::from(note.output_index()),
+                    mined_height: BlockHeight::from(u32::from(mined_height)),
+                });
+            }
+            for note in received.ironwood() {
+                let Some(mined_height) = note.mined_height() else {
+                    continue;
+                };
+                let value_zat = Zatoshis::try_from(note.note().value().inner()).map_err(|_| {
+                    StorageError::RowValueOutOfRange {
+                        column: "ironwood_received_notes.value",
+                        raw: note.note().value().inner().to_string(),
+                    }
+                })?;
+                rows.push(crate::wallet::UnspentShieldedNoteRow {
+                    protocol: zcash_protocol::ShieldedPool::Ironwood,
                     value_zat,
                     tx_id: zally_core::TxId::from_bytes(*note.txid().as_ref()),
                     output_index: u32::from(note.output_index()),
@@ -1698,12 +1736,16 @@ impl WalletStorage for Sqlite {
         let upstream_tx_id = zcash_protocol::TxId::from_bytes(*tx_id.as_bytes());
         self.with_db(move |db| {
             // Caller does not know which pool the note lives on; try Sapling
-            // first (the dominant pool for current donations), then Orchard.
-            // `get_memo` returns `Ok(None)` when the note is unknown to that
-            // pool, which lets the loop fall through. Once we find a memo on
-            // either pool we return immediately: a single (tx, output_index)
-            // pair belongs to at most one pool.
-            for protocol in [ShieldedProtocol::Sapling, ShieldedProtocol::Orchard] {
+            // first (the dominant pool for current donations), then Orchard,
+            // then Ironwood. `get_memo` returns `Ok(None)` when the note is
+            // unknown to that pool, which lets the loop fall through. Once we
+            // find a memo on any pool we return immediately: a single (tx,
+            // output_index) pair belongs to at most one pool.
+            for protocol in [
+                ShieldedPool::Sapling,
+                ShieldedPool::Orchard,
+                ShieldedPool::Ironwood,
+            ] {
                 let note_id = NoteId::new(upstream_tx_id, protocol, output_index);
                 let memo = db
                     .get_memo(note_id)
@@ -2054,7 +2096,7 @@ const RECEIVED_SHIELDED_NOTES_IN_RANGE_SQL: &str = "\
 
 /// Per-account full-history receive query.
 ///
-/// Returns every Sapling and Orchard receive ever observed for one account with the same
+/// Returns every Sapling, Orchard, and Ironwood receive ever observed for one account with the same
 /// provenance fields and block-header timestamp the in-range query carries. Powers
 /// historical replays that classify every receive at boot, independent of the wallet's
 /// event stream.
@@ -2064,6 +2106,7 @@ const RECEIVED_SHIELDED_NOTES_FOR_ACCOUNT_SQL: &str = "\
            srn.is_change, \
            CASE WHEN EXISTS (SELECT 1 FROM sapling_received_note_spends s WHERE s.transaction_id = t.id_tx) \
                   OR EXISTS (SELECT 1 FROM orchard_received_note_spends o WHERE o.transaction_id = t.id_tx) \
+                  OR EXISTS (SELECT 1 FROM ironwood_received_note_spends i WHERE i.transaction_id = t.id_tx) \
                   OR EXISTS (SELECT 1 FROM transparent_received_output_spends p WHERE p.transaction_id = t.id_tx) \
                 THEN 1 ELSE 0 END AS spent_our_inputs \
     FROM sapling_received_notes srn \
@@ -2077,11 +2120,26 @@ const RECEIVED_SHIELDED_NOTES_FOR_ACCOUNT_SQL: &str = "\
            orn.is_change, \
            CASE WHEN EXISTS (SELECT 1 FROM sapling_received_note_spends s WHERE s.transaction_id = t.id_tx) \
                   OR EXISTS (SELECT 1 FROM orchard_received_note_spends o WHERE o.transaction_id = t.id_tx) \
+                  OR EXISTS (SELECT 1 FROM ironwood_received_note_spends i WHERE i.transaction_id = t.id_tx) \
                   OR EXISTS (SELECT 1 FROM transparent_received_output_spends p WHERE p.transaction_id = t.id_tx) \
                 THEN 1 ELSE 0 END AS spent_our_inputs \
     FROM orchard_received_notes orn \
     JOIN transactions t ON orn.transaction_id = t.id_tx \
     JOIN accounts a ON orn.account_id = a.id \
+    LEFT JOIN blocks b ON b.height = t.mined_height \
+    WHERE a.uuid = ?1 AND t.mined_height IS NOT NULL \
+    UNION ALL \
+    SELECT a.uuid, t.txid, irn.action_index, irn.value, t.mined_height, 'ironwood' AS pool, \
+           b.time * 1000 AS block_timestamp_ms, \
+           irn.is_change, \
+           CASE WHEN EXISTS (SELECT 1 FROM sapling_received_note_spends s WHERE s.transaction_id = t.id_tx) \
+                  OR EXISTS (SELECT 1 FROM orchard_received_note_spends o WHERE o.transaction_id = t.id_tx) \
+                  OR EXISTS (SELECT 1 FROM ironwood_received_note_spends i WHERE i.transaction_id = t.id_tx) \
+                  OR EXISTS (SELECT 1 FROM transparent_received_output_spends p WHERE p.transaction_id = t.id_tx) \
+                THEN 1 ELSE 0 END AS spent_our_inputs \
+    FROM ironwood_received_notes irn \
+    JOIN transactions t ON irn.transaction_id = t.id_tx \
+    JOIN accounts a ON irn.account_id = a.id \
     LEFT JOIN blocks b ON b.height = t.mined_height \
     WHERE a.uuid = ?1 AND t.mined_height IS NOT NULL \
     ORDER BY mined_height ASC, txid ASC, output_index ASC, pool ASC";
@@ -2175,8 +2233,9 @@ fn collect_received_shielded_note_rows(
                 posture: FailurePosture::NotRetryable,
             })?;
         let protocol = match pool.as_str() {
-            "sapling" => zcash_protocol::ShieldedProtocol::Sapling,
-            "orchard" => zcash_protocol::ShieldedProtocol::Orchard,
+            "sapling" => zcash_protocol::ShieldedPool::Sapling,
+            "orchard" => zcash_protocol::ShieldedPool::Orchard,
+            "ironwood" => zcash_protocol::ShieldedPool::Ironwood,
             other => {
                 return Err(StorageError::SqliteFailed {
                     reason: format!("unknown pool tag: {other}"),
@@ -2266,9 +2325,13 @@ where
             at_height: BlockHeight::from(u32::from(scan.at_height())),
         };
     }
-    if let ChainError::Wallet(SqliteClientError::CommitmentTree(ShardTreeError::Insert(
-        InsertionError::Conflict(_),
-    ))) = err
+    if let ChainError::Wallet(
+        SqliteClientError::CommitmentTree(ShardTreeError::Insert(InsertionError::Conflict(_)))
+        | SqliteClientError::PutBlocksCommitmentTree {
+            error: ShardTreeError::Insert(InsertionError::Conflict(_)),
+            ..
+        },
+    ) = err
     {
         return StorageError::CommitmentTreeConflict {
             reason: err.to_string(),
@@ -2365,6 +2428,28 @@ fn create_account_on(
     deterministic_account_id(network, &account)
 }
 
+/// The shielded pool for new value with no matching spend to route into.
+///
+/// `zcash_client_backend`'s change-strategy layer only redirects a caller's `Orchard`
+/// preference into the Ironwood bundle when the proposal already carries some other
+/// Orchard or Ironwood flow; a proposal built entirely from transparent or Sapling inputs
+/// falls through to this caller-supplied fallback untouched. Once NU6.3 activates, Orchard's
+/// value balance may never go negative, so new value with no offsetting spend must be routed
+/// to Ironwood instead. `chain_tip + 1` matches `zcash_client_sqlite`'s own target-height
+/// derivation, so this reaches the same activation decision the proposal builder will.
+fn fallback_change_pool(
+    params: &NetworkParameters,
+    chain_tip: Option<zcash_protocol::consensus::BlockHeight>,
+) -> zcash_protocol::ShieldedPool {
+    let ironwood_active =
+        chain_tip.is_some_and(|tip| params.is_nu_active(NetworkUpgrade::Nu6_3, tip + 1));
+    if ironwood_active {
+        zcash_protocol::ShieldedPool::Ironwood
+    } else {
+        zcash_protocol::ShieldedPool::Orchard
+    }
+}
+
 /// Shared proposal builder for `prepare_payment`, `propose_payment`, and `create_pczt`.
 ///
 /// The three sites build the same `propose_standard_transfer_to_address` call with the
@@ -2397,6 +2482,9 @@ where
             Error = zcash_client_sqlite::error::SqliteClientError,
         >,
 {
+    let change_pool =
+        fallback_change_pool(params, db.chain_height().map_err(|e| map_sqlite_error(&e))?);
+
     zcash_client_backend::data_api::wallet::propose_standard_transfer_to_address::<
         _,
         _,
@@ -2411,7 +2499,7 @@ where
         amount,
         memo,
         None,
-        zcash_protocol::ShieldedProtocol::Orchard,
+        change_pool,
     )
     .map_err(|err| classify_proposal_build_error(&err))
 }
@@ -2666,19 +2754,18 @@ fn decode_diversifier_index_be(
 
 fn transparent_utxo_row_to_output(
     row: crate::wallet::TransparentUtxoRow,
-) -> Result<WalletTransparentOutput, StorageError> {
+) -> Result<WalletTransparentOutput<AccountUuid>, StorageError> {
     let outpoint = UpstreamOutPoint::new(*row.tx_id.as_bytes(), row.output_index);
     let txout = TxOut::new(
         zally_to_upstream_zatoshis(row.value_zat),
         Script(zcash_script::script::Code(row.script_pub_key_bytes)),
     );
     let mined_height = zcash_protocol::consensus::BlockHeight::from(row.mined_height.as_u32());
-    WalletTransparentOutput::from_parts(outpoint, txout, Some(mined_height)).ok_or(
-        StorageError::TransparentOutputNotRecognized {
+    WalletTransparentOutput::from_parts(outpoint, txout, Some(mined_height), None, None, None)
+        .ok_or(StorageError::TransparentOutputNotRecognized {
             tx_id: row.tx_id,
             output_index: row.output_index,
-        },
-    )
+        })
 }
 
 fn map_sqlite_error<E: std::fmt::Display>(err: &E) -> StorageError {
@@ -2701,10 +2788,11 @@ fn map_derivation_error(err: &KeyDerivationError) -> StorageError {
     }
 }
 
-/// Tag bytes for `ShieldedProtocol` in the `locked_notes` blob. Stable across releases;
+/// Tag bytes for `ShieldedPool` in the `locked_notes` blob. Stable across releases;
 /// changing them requires a migration step.
 const LOCKED_NOTE_TAG_SAPLING: u8 = 0;
 const LOCKED_NOTE_TAG_ORCHARD: u8 = 1;
+const LOCKED_NOTE_TAG_IRONWOOD: u8 = 2;
 
 /// Byte size of one encoded reserved note (tag + value + `tx_id` + `output_index`).
 const LOCKED_NOTE_RECORD_BYTES: usize = 1 + 8 + 32 + 4;
@@ -2722,8 +2810,9 @@ fn encode_locked_notes(notes: &[crate::HeldNote]) -> Vec<u8> {
     blob.extend_from_slice(&count.to_be_bytes());
     for note in notes {
         let tag = match note.protocol {
-            ShieldedProtocol::Sapling => LOCKED_NOTE_TAG_SAPLING,
-            ShieldedProtocol::Orchard => LOCKED_NOTE_TAG_ORCHARD,
+            ShieldedPool::Sapling => LOCKED_NOTE_TAG_SAPLING,
+            ShieldedPool::Orchard => LOCKED_NOTE_TAG_ORCHARD,
+            ShieldedPool::Ironwood => LOCKED_NOTE_TAG_IRONWOOD,
         };
         blob.push(tag);
         blob.extend_from_slice(&note.value_zat.as_u64().to_be_bytes());
@@ -2766,8 +2855,9 @@ fn decode_locked_notes(blob: &[u8]) -> Result<Vec<crate::HeldNote>, StorageError
         let record = &blob[cursor..cursor + LOCKED_NOTE_RECORD_BYTES];
         let tag = record[0];
         let protocol = match tag {
-            LOCKED_NOTE_TAG_SAPLING => ShieldedProtocol::Sapling,
-            LOCKED_NOTE_TAG_ORCHARD => ShieldedProtocol::Orchard,
+            LOCKED_NOTE_TAG_SAPLING => ShieldedPool::Sapling,
+            LOCKED_NOTE_TAG_ORCHARD => ShieldedPool::Orchard,
+            LOCKED_NOTE_TAG_IRONWOOD => ShieldedPool::Ironwood,
             other => {
                 return Err(StorageError::RowValueOutOfRange {
                     column: "ext_zally_holds.locked_notes (protocol tag)",
@@ -2984,6 +3074,26 @@ mod tests {
         assert!(
             matches!(&mapped, StorageError::CommitmentTreeConflict { .. }),
             "a shard-tree insertion conflict must map to CommitmentTreeConflict: {mapped:?}"
+        );
+        assert_eq!(mapped.posture(), FailurePosture::NotRetryable);
+    }
+
+    #[test]
+    fn map_scan_error_classifies_put_blocks_commitment_tree_conflict() {
+        let address = incrementalmerkletree::Address::from_parts(0.into(), 0);
+        let start = zcash_protocol::consensus::BlockHeight::from_u32(1);
+        let end = zcash_protocol::consensus::BlockHeight::from_u32(2);
+        let err: TestChainError = zcash_client_backend::data_api::chain::error::Error::Wallet(
+            SqliteClientError::PutBlocksCommitmentTree {
+                pool: zcash_protocol::ShieldedPool::Orchard,
+                block_range: start..end,
+                error: ShardTreeError::Insert(InsertionError::Conflict(address)),
+            },
+        );
+        let mapped = map_scan_error(&err);
+        assert!(
+            matches!(&mapped, StorageError::CommitmentTreeConflict { .. }),
+            "a put_blocks shard-tree insertion conflict must map to CommitmentTreeConflict: {mapped:?}"
         );
         assert_eq!(mapped.posture(), FailurePosture::NotRetryable);
     }

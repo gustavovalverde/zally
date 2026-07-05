@@ -23,7 +23,7 @@ use zcash_client_backend::data_api::chain::ChainState;
 use zcash_client_backend::data_api::scanning::ScanRange;
 use zcash_client_backend::proto::compact_formats::CompactBlock;
 use zcash_keys::address::UnifiedAddress;
-use zcash_protocol::ShieldedProtocol;
+use zcash_protocol::ShieldedPool;
 
 use crate::account_balance_row::AccountBalanceRow;
 use crate::error::StorageError;
@@ -190,14 +190,14 @@ impl PreparedTransaction {
 
 /// One unspent shielded note row returned by [`WalletStorage::list_unspent_shielded_notes`].
 ///
-/// Carries the upstream `zcash_protocol::ShieldedProtocol` directly so storage stays free of
+/// Carries the upstream `zcash_protocol::ShieldedPool` directly so storage stays free of
 /// chain-vocabulary deps. The wallet layer maps `protocol` onto its own `ShieldedPool`
 /// vocabulary before returning to operators.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub struct UnspentShieldedNoteRow {
     /// Pool this note lives on.
-    pub protocol: zcash_protocol::ShieldedProtocol,
+    pub protocol: zcash_protocol::ShieldedPool,
     /// Spendable value in this note.
     pub value_zat: Zatoshis,
     /// Transaction that created the note.
@@ -229,7 +229,7 @@ pub struct ReceivedShieldedNoteRow {
     /// Account that owns the note.
     pub account_id: AccountId,
     /// Pool this note lives on.
-    pub protocol: zcash_protocol::ShieldedProtocol,
+    pub protocol: zcash_protocol::ShieldedPool,
     /// Note value at the time of receipt.
     pub value_zat: Zatoshis,
     /// Transaction that created the note.
@@ -524,9 +524,12 @@ pub trait WalletStorage: Send + Sync + 'static {
     /// Wraps `WalletCommitmentTrees::put_{sapling,orchard}_subtree_roots`. Priming these is
     /// what lets the wallet witness notes in a subtree without scanning every block it spans,
     /// and is a prerequisite for `suggest_scan_ranges` to plan subtree-aligned work.
+    ///
+    /// `pool = ShieldedPool::Ironwood` returns `StorageError::ShieldedPoolUnsupported`; the
+    /// pinned `zcash_client_backend` has no Ironwood subtree-root write path yet.
     async fn put_subtree_roots(
         &self,
-        pool: ShieldedProtocol,
+        pool: ShieldedPool,
         start_index: u64,
         roots: Vec<(BlockHeight, [u8; 32])>,
     ) -> Result<(), StorageError>;
@@ -718,7 +721,7 @@ pub trait WalletStorage: Send + Sync + 'static {
     /// `not_retryable` on schema errors; `retryable` on transient I/O.
     async fn update_chain_tip(&self, tip_height: BlockHeight) -> Result<(), StorageError>;
 
-    /// Returns every unspent Sapling and Orchard note owned by `account_id` against
+    /// Returns every unspent Sapling, Orchard, and Ironwood note owned by `account_id` against
     /// `target_height` (typically the wallet's current chain tip). Spent notes, locked
     /// notes, and notes whose producing transaction has not yet mined are excluded.
     ///
@@ -804,7 +807,7 @@ pub trait WalletStorage: Send + Sync + 'static {
     /// Returns the per-pool balance snapshot for `account_id`, anchored to the wallet's last
     /// observed chain tip.
     ///
-    /// Sapling and Orchard values come from `WalletRead::get_wallet_summary`; the
+    /// Sapling, Orchard, and Ironwood values come from `WalletRead::get_wallet_summary`; the
     /// transparent mature/immature split applies ZIP-213 coinbase maturity directly against
     /// the `transparent_received_outputs` rows so the figure stays consistent with what
     /// `shield_transparent_funds` will accept as input. Unconfirmed wallet-owned spends are
@@ -847,7 +850,7 @@ pub trait WalletStorage: Send + Sync + 'static {
         to_height: BlockHeight,
     ) -> Result<Vec<ReceivedShieldedNoteRow>, StorageError>;
 
-    /// Returns every Sapling and Orchard note ever received by `account_id`, regardless
+    /// Returns every Sapling, Orchard, and Ironwood note ever received by `account_id`, regardless
     /// of current spent state and regardless of when the note was mined.
     ///
     /// Powers operator-side replays that rebuild a downstream observation table from
@@ -872,7 +875,7 @@ pub trait WalletStorage: Send + Sync + 'static {
     /// variants are opaque by construction and unsafe to render as strings.
     ///
     /// `tx_id` and `output_index` together identify the note; the implementation
-    /// resolves across Sapling and Orchard without requiring the caller to know
+    /// resolves across Sapling, Orchard, and Ironwood without requiring the caller to know
     /// which pool the note lives on.
     ///
     /// `not_retryable` on schema errors; `retryable` on transient I/O.

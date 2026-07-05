@@ -133,6 +133,16 @@ pub enum ChainSourceError {
         reason: String,
     },
 
+    /// The requested shielded pool has no subtree-root query path on this chain source.
+    ///
+    /// Posture: [`FailurePosture::RequiresOperator`]; upgrading to a chain-source backend
+    /// that supports the pool is the only way to query subtree roots for it.
+    #[error("shielded pool {pool:?} has no subtree-root query path on this chain source")]
+    ShieldedPoolUnsupported {
+        /// The pool the caller requested.
+        pool: crate::source::ShieldedPool,
+    },
+
     /// A zinder client call failed.
     ///
     /// Posture: derived from `IndexerError::retry_policy` via the crate-private
@@ -154,7 +164,8 @@ impl ChainSourceError {
             }
             Self::NetworkMismatch { .. }
             | Self::MalformedCompactBlock { .. }
-            | Self::TreeStateAnchorHeightMismatch { .. } => FailurePosture::RequiresOperator,
+            | Self::TreeStateAnchorHeightMismatch { .. }
+            | Self::ShieldedPoolUnsupported { .. } => FailurePosture::RequiresOperator,
             #[cfg(feature = "zinder")]
             Self::Indexer(err) => posture_for_indexer(err.retry_policy()),
         }
@@ -282,6 +293,12 @@ mod tests {
             (
                 ChainSourceError::BlockingTaskFailed { reason: "x".into() },
                 FailurePosture::Retryable,
+            ),
+            (
+                ChainSourceError::ShieldedPoolUnsupported {
+                    pool: crate::source::ShieldedPool::Ironwood,
+                },
+                FailurePosture::RequiresOperator,
             ),
         ];
         for (variant, expected) in cases {

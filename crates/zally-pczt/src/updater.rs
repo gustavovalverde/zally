@@ -8,7 +8,7 @@
 //! signatures.
 //!
 //! Wire-layer contract: the upstream `pczt::Pczt` is `#[derive(Serialize,
-//! Deserialize)]` with field order `global, transparent, sapling, orchard`, and
+//! Deserialize)]` with field order `global, transparent, sapling, orchard, ironwood`, and
 //! `common::Global` is `#[derive(Serialize, Deserialize)]` with field order
 //! `tx_version, version_group_id, consensus_branch_id, fallback_lock_time,
 //! expiry_height, coin_type, tx_modifiable, proprietary`. This module pins a
@@ -132,80 +132,20 @@ mod tests {
     /// Builds a minimal serialised `pczt::Pczt` whose `global.expiry_height` is `expiry`.
     ///
     /// Exercises the same `pczt::Pczt::serialize` codepath the Creator role calls so the
-    /// mirror layout is validated against the upstream encoding, not against the mirror
-    /// itself.
-    fn build_minimal_pczt(expiry: u32) -> Result<Vec<u8>, postcard::Error> {
-        let pczt_struct: pczt::Pczt = postcard::from_bytes(&pczt_with_expiry(expiry)?)?;
-        Ok(pczt_struct.serialize())
-    }
-
-    /// Hand-built minimal postcard payload for a `pczt::Pczt`.
-    ///
-    /// Used by `build_minimal_pczt` to obtain a real upstream `pczt::Pczt`, which is then
-    /// re-serialised to produce a byte sequence the upstream parser accepts.
-    fn pczt_with_expiry(expiry: u32) -> Result<Vec<u8>, postcard::Error> {
-        use serde::Serialize;
-        #[derive(Serialize)]
-        struct EmptyTransparent {
-            inputs: Vec<()>,
-            outputs: Vec<()>,
-        }
-        #[derive(Serialize)]
-        struct EmptyShielded {
-            spends: Vec<()>,
-            outputs: Vec<()>,
-            value_sum: (i64, i64),
-            anchor: [u8; 32],
-            bsk: Option<[u8; 32]>,
-        }
-        #[derive(Serialize)]
-        struct OrchardShielded {
-            actions: Vec<()>,
-            flags: u8,
-            value_sum: (i64, i64),
-            anchor: [u8; 32],
-            zkproof: Option<Vec<u8>>,
-            bsk: Option<[u8; 32]>,
-        }
-        #[derive(Serialize)]
-        struct PcztMirror {
-            global: GlobalMirror,
-            transparent: EmptyTransparent,
-            sapling: EmptyShielded,
-            orchard: OrchardShielded,
-        }
-        let mirror = PcztMirror {
-            global: GlobalMirror {
-                tx_version: 5,
-                version_group_id: 0x26A7_270A,
-                consensus_branch_id: 0xC2D6_D0B4,
-                fallback_lock_time: None,
-                expiry_height: expiry,
-                coin_type: 1,
-                tx_modifiable: 0,
-                proprietary: BTreeMap::new(),
-            },
-            transparent: EmptyTransparent {
-                inputs: vec![],
-                outputs: vec![],
-            },
-            sapling: EmptyShielded {
-                spends: vec![],
-                outputs: vec![],
-                value_sum: (0, 0),
-                anchor: [0_u8; 32],
-                bsk: None,
-            },
-            orchard: OrchardShielded {
-                actions: vec![],
-                flags: 0,
-                value_sum: (0, 0),
-                anchor: [0_u8; 32],
-                zkproof: None,
-                bsk: None,
-            },
-        };
-        postcard::to_allocvec(&mirror)
+    /// wire layout is validated against the upstream encoding, not against a hand-built
+    /// mirror. `0xC2D6_D0B4` is the NU5 consensus branch id, which builds a v5 PCZT.
+    fn build_minimal_pczt(expiry: u32) -> Result<Vec<u8>, PcztError> {
+        let pczt_struct =
+            pczt::roles::creator::Creator::new(0xC2D6_D0B4, expiry, 1, [0; 32], [0; 32])
+                .map_err(|err| PcztError::ParseFailed {
+                    reason: format!("test PCZT creation failed: {err:?}"),
+                })?
+                .build();
+        pczt_struct
+            .serialize()
+            .map_err(|err| PcztError::SerializeFailed {
+                reason: format!("{err:?}"),
+            })
     }
 
     #[test]

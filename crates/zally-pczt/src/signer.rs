@@ -1,4 +1,4 @@
-//! `Signer` role: applies Sapling, Orchard, and transparent signatures using a sealed seed.
+//! `Signer` role: applies Sapling, Orchard, Ironwood, and transparent signatures using a sealed seed.
 //!
 //! Derives the per-account ZIP-32 `UnifiedSpendingKey` from the supplied seed and uses the
 //! pczt 0.6 signer to apply each pool's spend authorization. Transparent inputs are matched
@@ -49,7 +49,7 @@ impl Signer {
 
     /// Signs `pczt` with keys derived from `seed` via the account-zero ZIP-32 spending key.
     ///
-    /// Applies Sapling and Orchard spend authorizations for every spend whose embedded
+    /// Applies Sapling, Orchard, and Ironwood spend authorizations for every spend whose embedded
     /// metadata aligns with the derived account's keys, and signs every transparent input
     /// whose `script_pubkey` matches a derived external- or internal-scope address within
     /// the gap limit. Returns [`PcztError::NoMatchingKeys`] when the seed cannot authorize
@@ -70,6 +70,7 @@ impl Signer {
         let parsed = pczt.parse()?;
         let sapling_count = parsed.sapling().spends().len();
         let orchard_count = parsed.orchard().actions().len();
+        let ironwood_count = parsed.ironwood().actions().len();
         let transparent_scripts: Vec<Vec<u8>> = parsed
             .transparent()
             .inputs()
@@ -94,14 +95,16 @@ impl Signer {
 
         let sapling_total = sign_sapling_spends(&mut upstream, &usk, sapling_count)?;
         let orchard_total = sign_orchard_spends(&mut upstream, &usk, orchard_count)?;
+        let ironwood_total = sign_ironwood_spends(&mut upstream, &usk, ironwood_count)?;
         let transparent_total =
             sign_transparent_spends(&mut upstream, usk.transparent(), &transparent_scripts)?;
-        if sapling_total == 0 && orchard_total == 0 && transparent_total == 0 {
+        if sapling_total == 0 && orchard_total == 0 && ironwood_total == 0 && transparent_total == 0
+        {
             return Err(PcztError::NoMatchingKeys);
         }
 
         let signed_pczt = upstream.finish();
-        Ok(PcztBytes::from_pczt(&signed_pczt, self.network))
+        PcztBytes::from_pczt(signed_pczt, self.network)
     }
 }
 
@@ -153,6 +156,38 @@ fn sign_orchard_spends(
             Err(err) => {
                 return Err(PcztError::UpstreamFailed {
                     reason: format!("orchard action {index} sign failed: {err:?}"),
+                    is_retryable: false,
+                });
+            }
+        }
+    }
+    Ok(authorized)
+}
+
+fn sign_ironwood_spends(
+    signer: &mut UpstreamSigner,
+    usk: &UnifiedSpendingKey,
+    spend_count: usize,
+) -> Result<usize, PcztError> {
+    let sk_bytes = *usk.orchard().to_bytes();
+    let spending_key =
+        Option::from(orchard::keys::SpendingKey::from_bytes(sk_bytes)).ok_or_else(|| {
+            PcztError::UpstreamFailed {
+                reason: "ironwood spending key bytes failed CtOption check".into(),
+                is_retryable: false,
+            }
+        })?;
+    let ask = orchard::keys::SpendAuthorizingKey::from(&spending_key);
+    let mut authorized = 0_usize;
+    for index in 0..spend_count {
+        match signer.sign_ironwood(index, &ask) {
+            Ok(()) => authorized += 1,
+            Err(UpstreamSignerError::IronwoodSign(
+                orchard::pczt::SignerError::WrongSpendAuthorizingKey,
+            )) => {}
+            Err(err) => {
+                return Err(PcztError::UpstreamFailed {
+                    reason: format!("ironwood action {index} sign failed: {err:?}"),
                     is_retryable: false,
                 });
             }

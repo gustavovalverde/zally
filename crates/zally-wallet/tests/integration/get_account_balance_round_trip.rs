@@ -2,7 +2,7 @@
 //! fresh wallet and tracks the observed tip after the first sync.
 //!
 //! The mock chain source returns no compact blocks, so the test cannot exercise an account
-//! with real Sapling, Orchard, and transparent UTXOs (that case lives under the T3 live
+//! with real Sapling, Orchard, Ironwood, and transparent UTXOs (that case lives under the T3 live
 //! profile). What is exercised here: the wrapping pattern, the network tag, the
 //! `as_of_height` lifecycle, the read-only invariant, and the unknown-account error.
 
@@ -28,6 +28,7 @@ async fn get_account_balance_returns_zeros_on_fresh_wallet() -> Result<(), TestE
     assert_eq!(balance.network, network);
     assert_eq!(balance.sapling_zat, Zatoshis::zero());
     assert_eq!(balance.orchard_zat, Zatoshis::zero());
+    assert_eq!(balance.ironwood_zat, Zatoshis::zero());
     assert_eq!(balance.transparent_mature_zat, Zatoshis::zero());
     assert_eq!(balance.transparent_immature_zat, Zatoshis::zero());
     assert!(

@@ -45,6 +45,7 @@ Every chain-source and wallet error exposes a `posture()` method returning a [`F
 | `NetworkMismatch` | `requires_operator` | The source serves a different network than the caller asked for. |
 | `MalformedCompactBlock` | `requires_operator` | The source returned bytes that did not decode; investigate the upstream version. |
 | `BlockingTaskFailed` | `retryable` | A `spawn_blocking` task panicked or was cancelled. |
+| `ShieldedPoolUnsupported` | `requires_operator` | The requested shielded pool has no subtree-root query path on this chain source. |
 | `Indexer(IndexerError)` | Mirrors `IndexerError::retry_policy` | Lossless pass-through of a `zinder-client` error. |
 
 ## SubmitterError
@@ -72,6 +73,7 @@ Every chain-source and wallet error exposes a `posture()` method returning a [`F
 | `ChainReorgDetected` | `retryable` | Scanner input diverged from persisted chain state and needs rollback. |
 | `TransparentOutputNotRecognized` | `not_retryable` | A chain source returned a transparent output script Zally cannot map. |
 | `TransparentOutputValueOutOfRange` | `not_retryable` | A chain source returned a transparent output value outside the zatoshis range. |
+| `ShieldedPoolUnsupported` | `requires_operator` | The requested shielded pool has no subtree-root write path in the pinned `zcash_client_backend` release. |
 
 ## PcztError
 

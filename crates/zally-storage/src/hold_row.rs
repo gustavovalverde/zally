@@ -18,7 +18,7 @@ use zally_core::{AccountId, HoldId, IdempotencyKey, TxId, Zatoshis};
 #[non_exhaustive]
 pub struct HeldNote {
     /// Pool the locked note lives on.
-    pub protocol: zcash_protocol::ShieldedProtocol,
+    pub protocol: zcash_protocol::ShieldedPool,
     /// Note value at reservation time.
     pub value_zat: Zatoshis,
     /// Transaction that produced the note.
@@ -33,7 +33,7 @@ impl HeldNote {
     /// purpose-specific constructors rather than positional arguments here.
     #[must_use]
     pub const fn new(
-        protocol: zcash_protocol::ShieldedProtocol,
+        protocol: zcash_protocol::ShieldedPool,
         value_zat: Zatoshis,
         tx_id: TxId,
         output_index: u32,

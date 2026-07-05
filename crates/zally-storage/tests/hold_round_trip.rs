@@ -60,7 +60,7 @@ fn make_record(fixture: HoldFixture) -> HoldRecord {
         amount_zat,
         spendable_for_check_zat,
         locked_notes: vec![HeldNote::new(
-            zcash_protocol::ShieldedProtocol::Orchard,
+            zcash_protocol::ShieldedPool::Orchard,
             amount_zat,
             TxId::from_bytes([0xAB; 32]),
             0,
@@ -100,7 +100,7 @@ async fn hold_round_trip_persists_active_row() -> Result<(), TestError> {
     assert!(active[0].is_active());
     assert_eq!(active[0].locked_notes.len(), 1);
     let locked = active[0].locked_notes[0];
-    assert_eq!(locked.protocol, zcash_protocol::ShieldedProtocol::Orchard);
+    assert_eq!(locked.protocol, zcash_protocol::ShieldedPool::Orchard);
     assert_eq!(locked.value_zat, amount);
     assert_eq!(locked.tx_id, TxId::from_bytes([0xAB; 32]));
 

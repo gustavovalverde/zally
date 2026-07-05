@@ -8,6 +8,16 @@
 //! `WalletDb`. The override removes outpoints already committed to a
 //! still-unconfirmed wallet-owned transaction so upstream proposal
 //! construction cannot select them a second time.
+//!
+//! `get_spendable_transparent_outputs_for_addresses` (the batched gather
+//! `propose_shielding` actually calls) is deliberately left unoverridden: the
+//! trait default fans out to `get_spendable_transparent_outputs` per address,
+//! which routes through this type's filtered override. Overriding it to
+//! delegate straight to `inner` would bypass the exclusion filter.
+//! `select_spendable_transparent_outputs` is left unoverridden too; it panics
+//! via the trait default, which is safe today because Zally only proposes
+//! `TransparentSpendPolicy::ShieldedOnly` transfers and that policy never
+//! reaches this gather.
 
 use std::collections::{HashMap, HashSet};
 use std::num::NonZeroU32;
@@ -20,12 +30,13 @@ use zcash_client_backend::data_api::error::FindAccountForAddressError;
 use zcash_client_backend::data_api::scanning::ScanRange;
 use zcash_client_backend::data_api::wallet::{ConfirmationsPolicy, TargetHeight};
 use zcash_client_backend::data_api::{
-    AccountMeta, AddressInfo, BlockMetadata, InputSource, NoteFilter, NullifierQuery,
-    ReceivedNotes, ReceivedTransactionOutput, SeedRelevance, TargetValue, TransactionDataRequest,
-    TransparentBalances, TransparentOutputFilter, WalletRead, WalletSummary, WalletUtxo,
-    Zip32Derivation,
+    AccountMeta, AddressInfo, BlockMetadata, CoinbaseFilter, InputSource, NoteFilter,
+    NullifierQuery, ReceivedNotes, ReceivedTransactionOutput, SeedRelevance, TargetValue,
+    TransactionDataRequest, TransparentBalances, WalletRead, WalletSummary, Zip32Derivation,
 };
-use zcash_client_backend::wallet::{Note, NoteId, ReceivedNote, TransparentAddressMetadata};
+use zcash_client_backend::wallet::{
+    Note, NoteId, ReceivedNote, TransparentAddressMetadata, WalletTransparentOutput,
+};
 use zcash_client_sqlite::WalletDb;
 use zcash_client_sqlite::util::SystemClock;
 use zcash_keys::address::{Address, UnifiedAddress};
@@ -34,7 +45,7 @@ use zcash_primitives::block::BlockHash;
 use zcash_primitives::transaction::Transaction;
 use zcash_protocol::consensus::{self, BlockHeight};
 use zcash_protocol::memo::Memo;
-use zcash_protocol::{ShieldedProtocol, TxId};
+use zcash_protocol::{ShieldedPool, TxId};
 use zcash_transparent::address::TransparentAddress;
 use zcash_transparent::bundle::OutPoint as UpstreamOutPoint;
 
@@ -60,7 +71,7 @@ impl InputSource for FilteredWalletDb<'_> {
     fn get_spendable_note(
         &self,
         txid: &TxId,
-        protocol: ShieldedProtocol,
+        protocol: ShieldedPool,
         index: u32,
         target_height: TargetHeight,
     ) -> Result<Option<ReceivedNote<Self::NoteRef, Note>>, Self::Error> {
@@ -71,7 +82,7 @@ impl InputSource for FilteredWalletDb<'_> {
         &self,
         account: Self::AccountId,
         target_value: TargetValue,
-        sources: &[ShieldedProtocol],
+        sources: &[ShieldedPool],
         target_height: TargetHeight,
         confirmations_policy: ConfirmationsPolicy,
         exclude: &[Self::NoteRef],
@@ -90,7 +101,7 @@ impl InputSource for FilteredWalletDb<'_> {
     fn select_unspent_notes(
         &self,
         account: Self::AccountId,
-        sources: &[ShieldedProtocol],
+        sources: &[ShieldedPool],
         target_height: TargetHeight,
         exclude: &[Self::NoteRef],
     ) -> Result<ReceivedNotes<Self::NoteRef>, Self::Error> {
@@ -123,7 +134,7 @@ impl InputSource for FilteredWalletDb<'_> {
         &self,
         outpoint: &UpstreamOutPoint,
         target_height: TargetHeight,
-    ) -> Result<Option<WalletUtxo>, Self::Error> {
+    ) -> Result<Option<WalletTransparentOutput<Self::AccountId>>, Self::Error> {
         <Db as InputSource>::get_unspent_transparent_output(self.inner, outpoint, target_height)
     }
 
@@ -132,8 +143,8 @@ impl InputSource for FilteredWalletDb<'_> {
         address: &TransparentAddress,
         target_height: TargetHeight,
         confirmations_policy: ConfirmationsPolicy,
-        output_filter: TransparentOutputFilter,
-    ) -> Result<Vec<WalletUtxo>, Self::Error> {
+        output_filter: CoinbaseFilter,
+    ) -> Result<Vec<WalletTransparentOutput<Self::AccountId>>, Self::Error> {
         let all = <Db as InputSource>::get_spendable_transparent_outputs(
             self.inner,
             address,
@@ -145,7 +156,7 @@ impl InputSource for FilteredWalletDb<'_> {
             return Ok(all);
         }
         let total_count = all.len();
-        let filtered: Vec<WalletUtxo> = all
+        let filtered: Vec<WalletTransparentOutput<Self::AccountId>> = all
             .into_iter()
             .filter(|utxo| {
                 let upstream = utxo.outpoint();

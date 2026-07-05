@@ -84,6 +84,17 @@ pub enum StorageError {
     )]
     ProverUnavailable,
 
+    /// The requested shielded pool has no commitment-tree write path in the pinned
+    /// `zcash_client_backend` release.
+    ///
+    /// Posture: [`FailurePosture::RequiresOperator`]; upgrading to a release that adds the
+    /// write path is the only way to record subtree roots for this pool.
+    #[error("shielded pool {pool:?} has no subtree-root write path in this release")]
+    ShieldedPoolUnsupported {
+        /// The pool the caller requested.
+        pool: zcash_protocol::ShieldedPool,
+    },
+
     /// The supplied `IdempotencyKey` already maps to a different `TxId` in the ledger.
     ///
     /// Posture: [`FailurePosture::NotRetryable`]; the wallet layer surfaces the prior `TxId`
@@ -224,6 +235,7 @@ impl StorageError {
             | Self::HoldRequestConflict => FailurePosture::NotRetryable,
             Self::MigrationFailed { .. }
             | Self::ProverUnavailable
+            | Self::ShieldedPoolUnsupported { .. }
             | Self::RowValueOutOfRange { .. } => FailurePosture::RequiresOperator,
             Self::ChainReorgDetected { .. } | Self::BlockingTaskFailed { .. } => {
                 FailurePosture::Retryable
@@ -285,6 +297,9 @@ mod tests {
             },
             StorageError::HoldNotFound,
             StorageError::HoldRequestConflict,
+            StorageError::ShieldedPoolUnsupported {
+                pool: zcash_protocol::ShieldedPool::Ironwood,
+            },
         ];
         for e in variants {
             let _ = e.posture();

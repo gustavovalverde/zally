@@ -76,7 +76,7 @@ fn translate_broadcast_outcome(outcome: TransactionBroadcastResult) -> SubmitOut
             detail: format!("invalid encoding: {}", invalid.message),
         },
         TransactionBroadcastResult::Rejected(rejected) => SubmitOutcome::Rejected {
-            reason: rejected.kind,
+            reason: rejected.kind.into(),
             detail: rejected.message,
         },
         TransactionBroadcastResult::Unknown(unknown) => SubmitOutcome::Rejected {
