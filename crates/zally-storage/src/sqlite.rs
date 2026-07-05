@@ -702,15 +702,18 @@ impl WalletStorage for Sqlite {
         &self,
     ) -> Result<crate::wallet::CommitmentTreeRoots, StorageError> {
         self.with_db_mut(move |db| {
+            // Depth 0 anchors each root at the latest checkpoint; a root over all nodes
+            // would include backfilled subtree caps that commit leaves beyond the scanned
+            // frontier.
             let sapling = db
-                .with_sapling_tree_mut(|tree| tree.root_at_checkpoint_depth(None))
+                .with_sapling_tree_mut(|tree| tree.root_at_checkpoint_depth(Some(0)))
                 .map_err(|err| StorageError::SqliteFailed {
                     reason: format!("sapling root_at_checkpoint_depth failed: {err}"),
                     posture: FailurePosture::NotRetryable,
                 })?
                 .map(|node| node.to_bytes());
             let orchard = db
-                .with_orchard_tree_mut(|tree| tree.root_at_checkpoint_depth(None))
+                .with_orchard_tree_mut(|tree| tree.root_at_checkpoint_depth(Some(0)))
                 .map_err(|err| StorageError::SqliteFailed {
                     reason: format!("orchard root_at_checkpoint_depth failed: {err}"),
                     posture: FailurePosture::NotRetryable,

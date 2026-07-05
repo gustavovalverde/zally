@@ -1623,16 +1623,16 @@ impl Wallet {
         })
     }
 
-    /// Checks the wallet's full note-commitment tree roots against the chain's tree state at
+    /// Checks the wallet's note-commitment tree roots against the chain's tree state at
     /// the just-scanned `height`, returning `Some(height)` on a proven divergence.
     ///
     /// A mismatch proves the wallet assembled a corrupt note-commitment tree, which the
     /// network rejects at spend time as an invalid shielded proof; a match clears the tree as
-    /// the suspect and points at the proving inputs instead. The wallet roots cover every
-    /// appended leaf, so when the wallet is caught up they correspond to exactly `height`.
-    /// Both sides decode roots little-endian, so the comparison is exact. Skipped checks
-    /// (read or fetch failures, empty trees) are logged and return `None`; only a proven
-    /// mismatch faults the sync.
+    /// the suspect and points at the proving inputs instead. The wallet roots are anchored at
+    /// the latest retained checkpoint, which each scan creates at its final block, so they
+    /// correspond to exactly `height`. Both sides decode roots little-endian, so the
+    /// comparison is exact. Skipped checks (read or fetch failures, empty trees) are logged
+    /// and return `None`; only a proven mismatch faults the sync.
     async fn verify_tree_roots(
         &self,
         chain: &dyn ChainSource,

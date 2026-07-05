@@ -5260,14 +5260,17 @@ name = "zally-storage"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "hex",
  "incrementalmerkletree",
  "orchard",
  "pczt",
+ "prost",
  "rand",
  "rusqlite",
  "sapling-crypto",
  "secrecy 0.8.0",
  "serde",
+ "serde_json",
  "shardtree",
  "tempfile",
  "thiserror 2.0.18",

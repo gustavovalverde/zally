@@ -72,18 +72,18 @@ pub struct ScanResult {
     pub block_count: u64,
 }
 
-/// Wallet note-commitment tree roots at a checkpoint height.
+/// Wallet note-commitment tree roots at the latest retained checkpoint.
 ///
-/// Each field is `None` when the wallet holds no checkpoint at the requested height (the
-/// scanner prunes old checkpoints). Compare these against the chain's tree-state root at the
-/// same height to detect commitment-tree corruption, which surfaces downstream as shielded
-/// proofs the network rejects.
+/// Each field is `None` when the wallet holds no retained checkpoint (nothing scanned yet).
+/// Compare these against the chain's tree-state root at the checkpoint height to detect
+/// commitment-tree corruption, which surfaces downstream as shielded proofs the network
+/// rejects.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub struct CommitmentTreeRoots {
-    /// Sapling note-commitment tree root, little-endian, or `None` if no checkpoint matches.
+    /// Sapling note-commitment tree root, little-endian, or `None` if no checkpoint exists.
     pub sapling: Option<[u8; 32]>,
-    /// Orchard note-commitment tree root, little-endian, or `None` if no checkpoint matches.
+    /// Orchard note-commitment tree root, little-endian, or `None` if no checkpoint exists.
     pub orchard: Option<[u8; 32]>,
 }
 
@@ -537,12 +537,13 @@ pub trait WalletStorage: Send + Sync + 'static {
     /// Returns the height the wallet has been fully scanned to, or `None` for a fresh wallet.
     async fn fully_scanned_height(&self) -> Result<Option<BlockHeight>, StorageError>;
 
-    /// Computes the wallet's current Sapling and Orchard note-commitment tree roots over every
-    /// leaf the wallet has appended.
+    /// Computes the wallet's Sapling and Orchard note-commitment tree roots at the latest
+    /// retained checkpoint.
     ///
     /// Wraps `WalletCommitmentTrees::with_{sapling,orchard}_tree_mut` plus
-    /// `ShardTree::root_at_checkpoint_depth(None)`, which needs no checkpoint (the scanner does
-    /// not retain a checkpoint at every height). After the wallet scans up to height `H`, these
+    /// `ShardTree::root_at_checkpoint_depth(Some(0))`. Anchoring at the checkpoint truncates
+    /// each root to the scanned leaves, so backfilled subtree roots that commit leaves beyond
+    /// the scan frontier do not contribute. After the wallet scans up to height `H`, these
     /// roots equal the chain's tree-state root at `H` if and only if the wallet assembled the
     /// tree correctly; a mismatch means a corrupt tree and a bad spend anchor.
     async fn commitment_tree_roots(&self) -> Result<CommitmentTreeRoots, StorageError>;
