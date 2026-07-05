@@ -5,7 +5,9 @@
 //! - set the visible chain tip via [`MockChainSourceHandle::advance_tip`],
 //! - emit a [`ChainEvent::ChainReorged`] via [`MockChainSourceHandle::trigger_reorg`],
 //! - stream empty compact blocks (the fixture covers sync orchestration; tests that need
-//!   real note decryption point `Wallet::sync` at a live `ChainSource` instead).
+//!   real note decryption point `Wallet::sync` at a live `ChainSource` instead),
+//! - serve scannable transactionless compact blocks via
+//!   [`MockChainSourceHandle::serve_compact_blocks`], so scan progress commits.
 //!
 //! The handle returned by [`MockChainSource::handle`] is `Clone` and shares state with the
 //! original mock; tests drive the mock through the handle while passing the mock itself to
@@ -26,7 +28,7 @@ use zally_chain::{
     SubtreeIndex, SubtreeRoot, TransactionStatus, TransparentUtxo,
 };
 use zally_core::{BlockHeight, Network, TxId};
-use zcash_client_backend::proto::compact_formats::CompactBlock;
+use zcash_client_backend::proto::compact_formats::{ChainMetadata, CompactBlock};
 use zcash_client_backend::proto::service::TreeState;
 
 const EVENT_CHANNEL_CAPACITY: usize = 256;
@@ -35,7 +37,9 @@ struct MockState {
     network: Network,
     tip_height: BlockHeight,
     chain_tip_failures: Vec<ChainSourceError>,
+    transparent_utxo_failures: Vec<ChainSourceError>,
     failures_consumed: u32,
+    is_serving_compact_blocks: bool,
 }
 
 /// In-memory `ChainSource` fixture.
@@ -54,7 +58,9 @@ impl MockChainSource {
                 network,
                 tip_height: BlockHeight::GENESIS,
                 chain_tip_failures: Vec::new(),
+                transparent_utxo_failures: Vec::new(),
                 failures_consumed: 0,
+                is_serving_compact_blocks: false,
             })),
             event_tx,
         }
@@ -147,10 +153,44 @@ impl MockChainSourceHandle {
         }
     }
 
+    /// Queues `count` consecutive failures for `transparent_utxos` calls. Mirrors
+    /// [`Self::fail_chain_tip_next`]: each call pops one failure off the queue; once empty,
+    /// calls succeed normally.
+    pub fn fail_transparent_utxos_next(
+        &self,
+        count: u32,
+        mut produce_error: impl FnMut() -> ChainSourceError,
+    ) {
+        let mut guard = self.state.lock();
+        for _ in 0..count {
+            guard.transparent_utxo_failures.push(produce_error());
+        }
+    }
+
+    /// Streams a transactionless compact block per requested height instead of an empty
+    /// stream, so `Wallet::sync` runs the real scanner and commits scan progress.
+    ///
+    /// Every block carries an all-zero hash and previous hash, matching the all-zero block
+    /// hash in the mock's `tree_state_at`, so the scanner's continuity checks pass.
+    pub fn serve_compact_blocks(&self) {
+        self.state.lock().is_serving_compact_blocks = true;
+    }
+
     /// Number of failures consumed since the mock was constructed.
     #[must_use]
     pub fn failures_consumed(&self) -> u32 {
         self.state.lock().failures_consumed
+    }
+}
+
+fn transactionless_compact_block(height: u32) -> CompactBlock {
+    CompactBlock {
+        height: u64::from(height),
+        hash: vec![0; 32],
+        prev_hash: vec![0; 32],
+        time: height,
+        chain_metadata: Some(ChainMetadata::default()),
+        ..CompactBlock::default()
     }
 }
 
@@ -178,20 +218,28 @@ impl ChainSource for MockChainSource {
         &self,
         block_range: BlockHeightRange,
     ) -> Result<CompactBlockStream, ChainSourceError> {
-        let tip = self.state.lock().tip_height;
+        let (tip, is_serving) = {
+            let guard = self.state.lock();
+            (guard.tip_height, guard.is_serving_compact_blocks)
+        };
         if block_range.end_height.as_u32() > tip.as_u32() {
             return Err(ChainSourceError::BlockHeightAboveSafeChainTip {
                 requested_height: block_range.end_height,
                 safe_chain_tip_height: tip,
             });
         }
-        // Mock returns an empty stream: tests cover sync orchestration. Tests that need
-        // the scan loop's note decryption point `Wallet::sync` at a live `ChainSource`.
-        let empty: Pin<Box<dyn Stream<Item = Result<CompactBlock, ChainSourceError>> + Send>> =
-            Box::pin(tokio_stream::iter(Vec::<
-                Result<CompactBlock, ChainSourceError>,
-            >::new()));
-        Ok(empty)
+        // The default empty stream covers sync orchestration. Tests that need the scan loop
+        // opt in via `serve_compact_blocks`; note decryption still needs a live `ChainSource`.
+        let blocks: Vec<Result<CompactBlock, ChainSourceError>> = if is_serving {
+            (block_range.start_height.as_u32()..=block_range.end_height.as_u32())
+                .map(|height| Ok(transactionless_compact_block(height)))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let stream: Pin<Box<dyn Stream<Item = Result<CompactBlock, ChainSourceError>> + Send>> =
+            Box::pin(tokio_stream::iter(blocks));
+        Ok(stream)
     }
 
     async fn tree_state_at(
@@ -229,6 +277,13 @@ impl ChainSource for MockChainSource {
         &self,
         _script_pub_key_bytes: &[u8],
     ) -> Result<Vec<TransparentUtxo>, ChainSourceError> {
+        let mut guard = self.state.lock();
+        if !guard.transparent_utxo_failures.is_empty() {
+            let injected = guard.transparent_utxo_failures.remove(0);
+            guard.failures_consumed = guard.failures_consumed.saturating_add(1);
+            drop(guard);
+            return Err(injected);
+        }
         Ok(Vec::new())
     }
 

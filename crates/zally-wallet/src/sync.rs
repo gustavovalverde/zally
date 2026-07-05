@@ -515,10 +515,16 @@ impl DriverState {
     fn parked(&self) -> Option<ParkedAt> {
         self.recovery.as_ref().and_then(|recovery| recovery.parked)
     }
+
+    fn clear_recovery(&mut self) {
+        self.recovery = None;
+        self.last_fault = None;
+    }
 }
 
 struct RecoveryState {
     rung: SyncRepair,
+    max_classified: SyncRepair,
     attempts_at_rung: u32,
     rewind_depth_index: usize,
     consecutive_faults: u32,
@@ -531,6 +537,7 @@ impl RecoveryState {
     const fn entering(rung: SyncRepair, now_ms: u64) -> Self {
         Self {
             rung,
+            max_classified: rung,
             attempts_at_rung: 0,
             rewind_depth_index: 0,
             consecutive_faults: 0,
@@ -538,6 +545,33 @@ impl RecoveryState {
             degraded_since_ms: now_ms,
             parked: None,
         }
+    }
+
+    /// Folds one classified fault into the ladder, escalating the rung when the current rung
+    /// has exhausted its attempts. Returns the rung transition when one occurred.
+    fn fold_fault(
+        &mut self,
+        classified: SyncRepair,
+        policy: SyncRecoveryPolicy,
+    ) -> Option<(SyncRepair, SyncRepair)> {
+        self.max_classified = self.max_classified.max(classified);
+        let escalation = if classified > self.rung {
+            self.rung = classified;
+            self.attempts_at_rung = 0;
+            if classified == SyncRepair::Rewind {
+                self.rewind_depth_index = 0;
+            }
+            None
+        } else if self.attempts_at_rung >= escalation_threshold(self.rung, policy) {
+            let from_repair = self.rung;
+            escalate(self);
+            Some((from_repair, self.rung))
+        } else {
+            None
+        };
+        self.consecutive_faults = self.consecutive_faults.saturating_add(1);
+        self.backoff_ms = backoff_for(policy, self.consecutive_faults);
+        escalation
     }
 }
 
@@ -562,6 +596,10 @@ enum DriverTransition<'a> {
     DriverStarted,
     Fault {
         fault: &'a SyncFault,
+    },
+    SlowProgress {
+        reason: &'a str,
+        blocks_advanced: u32,
     },
     RepairStarted {
         repair: SyncRepair,
@@ -715,13 +753,15 @@ async fn run_sync_wakeup(
                 continue;
             }
         }
-        tokio::select! {
+        let scanned_before = tokio::select! {
             biased;
             _ = &mut *close_rx => return SyncWakeupExit::CloseRequested,
             snapshot = build_snapshot(ctx, SyncDriverPhase::Syncing, state) => {
+                let scanned_before = snapshot.scanned_height;
                 publish_snapshot(ctx.status_tx, snapshot);
+                scanned_before
             }
-        }
+        };
         let attempt = tokio::select! {
             biased;
             _ = &mut *close_rx => return SyncWakeupExit::CloseRequested,
@@ -734,7 +774,18 @@ async fn run_sync_wakeup(
                 }
             }
             SyncRunAttempt::Faulted { reason, repair } => {
-                record_fault(ctx, state, reason, repair).await;
+                let scanned_after = ctx
+                    .wallet
+                    .status_snapshot()
+                    .await
+                    .ok()
+                    .and_then(|status| status.scanned_height);
+                let blocks_advanced = height_delta(scanned_before, scanned_after);
+                if is_slow_progress(repair, blocks_advanced) {
+                    note_slow_progress(ctx, state, reason, blocks_advanced).await;
+                } else {
+                    record_fault(ctx, state, reason, repair).await;
+                }
             }
         }
     }
@@ -775,6 +826,44 @@ async fn complete_sync(
     should_continue
 }
 
+/// Handles an environment fault whose iteration still advanced the wallet's scanned height:
+/// clears the ladder and presents the driver as healthy again without applying a repair or
+/// backoff.
+async fn note_slow_progress(
+    ctx: &DriverContext<'_>,
+    state: &mut DriverState,
+    reason: String,
+    blocks_advanced: u32,
+) {
+    state.clear_recovery();
+    let snapshot = build_snapshot(ctx, SyncDriverPhase::Syncing, state).await;
+    publish_transition(
+        ctx.status_tx,
+        snapshot,
+        &DriverTransition::SlowProgress {
+            reason: &reason,
+            blocks_advanced,
+        },
+    );
+}
+
+/// Blocks the wallet's scanned height advanced between two reads, treating an absent height
+/// as zero.
+fn height_delta(before: Option<BlockHeight>, after: Option<BlockHeight>) -> u32 {
+    let before = before.map_or(0, BlockHeight::as_u32);
+    let after = after.map_or(0, BlockHeight::as_u32);
+    after.saturating_sub(before)
+}
+
+/// Whether a faulted iteration counts as slow progress instead of a ladder strike.
+///
+/// Only environment faults (classified [`SyncRepair::Retry`]) are excused by forward
+/// progress. A state fault after a committed chunk still proves divergence; skipping its
+/// repair would scan the next chunk on top of the corrupt state.
+const fn is_slow_progress(repair: SyncRepair, blocks_advanced: u32) -> bool {
+    matches!(repair, SyncRepair::Retry) && blocks_advanced > 0
+}
+
 /// Folds a fault into the recovery ladder and publishes the resulting transition.
 ///
 /// The entry rung is the maximum of the current rung and the fault's classification; the
@@ -793,22 +882,7 @@ async fn record_fault(
     let recovery = state
         .recovery
         .get_or_insert_with(|| RecoveryState::entering(classified, now));
-    let escalation = if classified > recovery.rung {
-        recovery.rung = classified;
-        recovery.attempts_at_rung = 0;
-        if classified == SyncRepair::Rewind {
-            recovery.rewind_depth_index = 0;
-        }
-        None
-    } else if recovery.attempts_at_rung >= escalation_threshold(recovery.rung, policy) {
-        let from_repair = recovery.rung;
-        escalate(recovery);
-        Some((from_repair, recovery.rung))
-    } else {
-        None
-    };
-    recovery.consecutive_faults = recovery.consecutive_faults.saturating_add(1);
-    recovery.backoff_ms = backoff_for(policy, recovery.consecutive_faults);
+    let escalation = recovery.fold_fault(classified, policy);
     let fault = SyncFault {
         reason,
         repair: recovery.rung,
@@ -843,8 +917,14 @@ async fn record_fault(
 fn escalate(recovery: &mut RecoveryState) {
     match recovery.rung {
         SyncRepair::Retry => {
-            recovery.rung = SyncRepair::Rewind;
-            recovery.rewind_depth_index = 0;
+            // A slow or unreachable upstream is not cured by rewinding or rebuilding; only a
+            // classified state fault earns a state repair.
+            if recovery.max_classified >= SyncRepair::Rewind {
+                recovery.rung = SyncRepair::Rewind;
+                recovery.rewind_depth_index = 0;
+            } else {
+                recovery.rung = SyncRepair::Park;
+            }
         }
         SyncRepair::Rewind => {
             if recovery.rewind_depth_index + 1 < REWIND_LADDER_BLOCKS.len() {
@@ -1081,6 +1161,10 @@ fn publish_transition(
     publish_snapshot(status_tx, snapshot);
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "one flat arm per lifecycle transition; splitting would scatter the sync event vocabulary across helpers"
+)]
 fn emit_transition_event(snapshot: &SyncSnapshot, transition: &DriverTransition<'_>) {
     match transition {
         DriverTransition::DriverStarted => tracing::info!(
@@ -1097,6 +1181,17 @@ fn emit_transition_event(snapshot: &SyncSnapshot, transition: &DriverTransition<
             consecutive_faults = fault.consecutive_faults,
             scanned_height = snapshot.scanned_height.map(BlockHeight::as_u32),
             "sync fault; repair ladder engaged"
+        ),
+        DriverTransition::SlowProgress {
+            reason,
+            blocks_advanced,
+        } => tracing::warn!(
+            target: "zally::sync",
+            event = "wallet_sync_slow_progress",
+            reason = %reason,
+            blocks_advanced,
+            scanned_height = snapshot.scanned_height.map(BlockHeight::as_u32),
+            "sync faulted mid-chunk but advanced; ladder reset"
         ),
         DriverTransition::RepairStarted {
             repair,
@@ -1821,5 +1916,139 @@ mod tests {
         let fault = WalletError::MemoOnTransparentRecipient;
         assert_eq!(fault.posture(), FailurePosture::NotRetryable);
         assert_eq!(repair_for(&fault), SyncRepair::Rewind);
+    }
+
+    fn one_strike_policy() -> SyncRecoveryPolicy {
+        SyncRecoveryPolicy::default()
+            .with_escalate_after_faults(1)
+            .with_max_rescan_attempts(2)
+    }
+
+    /// Drives the recovery ladder through a stream of classified faults, mirroring the
+    /// driver's record-then-apply interleaving, and records the `(rung, rewind_depth_index)`
+    /// after each fault.
+    fn drive_ladder(
+        classifieds: impl IntoIterator<Item = SyncRepair>,
+        policy: SyncRecoveryPolicy,
+    ) -> Vec<(SyncRepair, usize)> {
+        let mut recovery: Option<RecoveryState> = None;
+        let mut ladder = Vec::new();
+        for classified in classifieds {
+            let recovery = recovery.get_or_insert_with(|| RecoveryState::entering(classified, 0));
+            recovery.fold_fault(classified, policy);
+            ladder.push((recovery.rung, recovery.rewind_depth_index));
+            recovery.attempts_at_rung = recovery.attempts_at_rung.saturating_add(1);
+        }
+        ladder
+    }
+
+    #[test]
+    fn faulted_iteration_with_progress_is_not_a_ladder_strike() {
+        assert_eq!(
+            height_delta(
+                Some(BlockHeight::from(73_000)),
+                Some(BlockHeight::from(74_000)),
+            ),
+            1_000
+        );
+        assert_eq!(height_delta(None, Some(BlockHeight::from(1_000))), 1_000);
+        assert_eq!(
+            height_delta(
+                Some(BlockHeight::from(74_000)),
+                Some(BlockHeight::from(74_000)),
+            ),
+            0
+        );
+        assert_eq!(height_delta(Some(BlockHeight::from(74_000)), None), 0);
+        assert!(is_slow_progress(SyncRepair::Retry, 1_000));
+        assert!(!is_slow_progress(SyncRepair::Retry, 0));
+    }
+
+    #[test]
+    fn state_fault_with_progress_still_strikes_the_ladder() {
+        assert!(!is_slow_progress(SyncRepair::Rewind, 1_000));
+        assert!(!is_slow_progress(SyncRepair::Park, 1_000));
+
+        let ladder = drive_ladder([SyncRepair::Rewind], one_strike_policy());
+        assert_eq!(ladder, vec![(SyncRepair::Rewind, 0)]);
+    }
+
+    #[test]
+    fn clearing_recovery_drops_the_ladder_and_last_fault() {
+        let mut state = DriverState {
+            recovery: Some(RecoveryState::entering(SyncRepair::Rewind, 0)),
+            last_fault: Some(SyncFault {
+                reason: "sync exceeded 120 seconds".into(),
+                repair: SyncRepair::Retry,
+                occurred_at_ms: 0,
+                consecutive_faults: 4,
+            }),
+            ..DriverState::default()
+        };
+        state.clear_recovery();
+        assert!(state.recovery.is_none());
+        assert!(state.last_fault.is_none());
+    }
+
+    #[test]
+    fn environment_fault_streak_escalates_retry_to_park() {
+        let ladder = drive_ladder([SyncRepair::Retry, SyncRepair::Retry], one_strike_policy());
+        assert_eq!(ladder, vec![(SyncRepair::Retry, 0), (SyncRepair::Park, 0)]);
+        assert!(
+            !ladder.iter().any(|(rung, _)| matches!(
+                rung,
+                SyncRepair::Rewind | SyncRepair::RescanFromBirthday
+            )),
+            "an environment streak must never reach a state-repair rung"
+        );
+    }
+
+    #[test]
+    fn escalate_from_retry_parks_unless_a_state_fault_was_seen() {
+        let mut environment = RecoveryState::entering(SyncRepair::Retry, 0);
+        escalate(&mut environment);
+        assert_eq!(environment.rung, SyncRepair::Park);
+
+        let mut with_state_fault = RecoveryState::entering(SyncRepair::Retry, 0);
+        with_state_fault.max_classified = SyncRepair::Rewind;
+        escalate(&mut with_state_fault);
+        assert_eq!(with_state_fault.rung, SyncRepair::Rewind);
+        assert_eq!(with_state_fault.rewind_depth_index, 0);
+    }
+
+    #[test]
+    fn state_fault_streak_walks_rewind_then_rescan_to_park() {
+        let ladder = drive_ladder([SyncRepair::Rewind; 5], one_strike_policy());
+        assert_eq!(ladder[0].0, SyncRepair::Rewind);
+        assert_eq!(REWIND_LADDER_BLOCKS[ladder[0].1], 10);
+        assert_eq!(ladder[1].0, SyncRepair::Rewind);
+        assert_eq!(REWIND_LADDER_BLOCKS[ladder[1].1], 100);
+        assert!(
+            ladder
+                .iter()
+                .any(|(rung, _)| *rung == SyncRepair::RescanFromBirthday)
+        );
+        assert_eq!(ladder.last().map(|(rung, _)| *rung), Some(SyncRepair::Park));
+    }
+
+    #[test]
+    fn mixed_streak_permits_rewind() {
+        let ladder = drive_ladder(
+            [
+                SyncRepair::Retry,
+                SyncRepair::Rewind,
+                SyncRepair::Rewind,
+                SyncRepair::Rewind,
+                SyncRepair::Rewind,
+                SyncRepair::Rewind,
+            ],
+            one_strike_policy(),
+        );
+        assert_eq!(ladder[0].0, SyncRepair::Retry);
+        assert!(
+            ladder.iter().any(|(rung, _)| *rung == SyncRepair::Rewind),
+            "a corruption fault in the streak must permit the rewind rung"
+        );
+        assert_eq!(ladder.last().map(|(rung, _)| *rung), Some(SyncRepair::Park));
     }
 }
