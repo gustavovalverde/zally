@@ -77,9 +77,9 @@ incrementalmerkletree = "0.8"
 # Optional chain-plane backend. The `zinder` cargo feature on zally-chain pulls these
 # crates from a pinned git revision so the wallet integration tracks the zinder typed-
 # client surface directly.
-zinder-client = { git = "https://github.com/gustavovalverde/zinder", rev = "429db6adc13269023f7b7cc2bf7a332c686e916a" }
-zinder-core = { git = "https://github.com/gustavovalverde/zinder", rev = "429db6adc13269023f7b7cc2bf7a332c686e916a" }
-zinder-testkit = { git = "https://github.com/gustavovalverde/zinder", rev = "429db6adc13269023f7b7cc2bf7a332c686e916a" }
+zinder-client = { git = "https://github.com/gustavovalverde/zinder", rev = "74abb4b8f708dfb511c5f301c3d59f2127a5e2ed" }
+zinder-core = { git = "https://github.com/gustavovalverde/zinder", rev = "74abb4b8f708dfb511c5f301c3d59f2127a5e2ed" }
+zinder-testkit = { git = "https://github.com/gustavovalverde/zinder", rev = "74abb4b8f708dfb511c5f301c3d59f2127a5e2ed" }
 
 # Async runtime and concurrency.
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "fs", "io-util"] }
@@ -125,12 +125,15 @@ tempfile = "3.13"
 # (matches https://github.com/zcash/librustzcash/pull/2412) and wallet
 # scanning/storage support for the Ironwood shielded pool (matches
 # https://github.com/zcash/librustzcash/pull/2539, cherry-picked on top; that
-# PR is open and unmerged). Every librustzcash-internal crate Zally references
-# is patched from this same commit: they resolve each other by intra-workspace
-# path inside the fork's checkout, so patching a subset from a different
-# source would give Zally's crates and the fork's own internal crates
-# distinct, incompatible types for the same dependency. See ADR-0006. Drop
-# once upstream ships a stable `zcash_client_backend` release carrying both
+# PR is open and unmerged). Every librustzcash-internal crate Zally
+# references, directly or transitively, is patched from this same commit:
+# they resolve each other by intra-workspace path inside the fork's checkout,
+# so patching a subset from a different source would give Zally's crates and
+# the fork's own internal crates distinct, incompatible types for the same
+# dependency. `zcash_encoding` and `equihash` are not zally-direct
+# dependencies but are patched for the same reason: `cargo tree -d` must show
+# zero duplicate sources across the whole family. See ADR-0006. Drop once
+# upstream ships a stable `zcash_client_backend` release carrying both
 # patches.
 [patch.crates-io]
 zcash_client_backend = { git = "https://github.com/gustavovalverde/librustzcash.git", rev = "235d581f2c6eface19e857e69e9bfa4765c2d4bf" }
@@ -143,3 +146,5 @@ zcash_address = { git = "https://github.com/gustavovalverde/librustzcash.git", r
 zcash_transparent = { git = "https://github.com/gustavovalverde/librustzcash.git", rev = "235d581f2c6eface19e857e69e9bfa4765c2d4bf" }
 zcash_proofs = { git = "https://github.com/gustavovalverde/librustzcash.git", rev = "235d581f2c6eface19e857e69e9bfa4765c2d4bf" }
 zip321 = { git = "https://github.com/gustavovalverde/librustzcash.git", rev = "235d581f2c6eface19e857e69e9bfa4765c2d4bf" }
+zcash_encoding = { git = "https://github.com/gustavovalverde/librustzcash.git", rev = "235d581f2c6eface19e857e69e9bfa4765c2d4bf" }
+equihash = { git = "https://github.com/gustavovalverde/librustzcash.git", rev = "235d581f2c6eface19e857e69e9bfa4765c2d4bf" }

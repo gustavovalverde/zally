@@ -11,10 +11,6 @@ ignore = [
     # proc-macro-error unmaintained advisory; pulled transitively through age's i18n stack.
     # Not a vulnerability; tracking upstream replacement.
     "RUSTSEC-2024-0370",
-    # proc-macro-error2 unmaintained advisory; pulled transitively through
-    # orchard -> getset. Not a vulnerability; no getset release has dropped
-    # the dependency yet.
-    "RUSTSEC-2026-0173",
 ]
 
 [licenses]
