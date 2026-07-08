@@ -1023,7 +1023,12 @@ fn repair_for(error: &WalletError) -> SyncRepair {
     )]
     match error {
         WalletError::Storage(
-            StorageError::CommitmentTreeConflict { .. } | StorageError::ChainReorgDetected { .. },
+            StorageError::CommitmentTreeConflict { .. }
+            | StorageError::ChainReorgDetected { .. }
+            // A dropped reply means the storage work panicked and unwound; a panic during
+            // scanning is state-shaped, and repeating the same call proves nothing. Rewind,
+            // and let the ladder escalate to a rebuild if the panic recurs.
+            | StorageError::BlockingTaskFailed { .. },
         )
         | WalletError::TreeRootsDiverged { .. } => SyncRepair::Rewind,
         other => match other.posture() {
