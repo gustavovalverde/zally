@@ -1712,11 +1712,13 @@ impl Wallet {
         };
         let chain_sapling = chain_state.final_sapling_tree().root().to_bytes();
         let chain_orchard = chain_state.final_orchard_tree().root().to_bytes();
+        let chain_ironwood = chain_state.final_ironwood_tree().root().to_bytes();
         let sapling_match = wallet_roots.sapling.map(|root| root == chain_sapling);
         let orchard_match = wallet_roots.orchard.map(|root| root == chain_orchard);
+        let ironwood_match = wallet_roots.ironwood.map(|root| root == chain_ironwood);
 
-        match (sapling_match, orchard_match) {
-            (None, None) => {
+        match (sapling_match, orchard_match, ironwood_match) {
+            (None, None, None) => {
                 tracing::warn!(
                     target: "zally::sync",
                     event = "wallet_tree_root_check_skipped",
@@ -1725,7 +1727,10 @@ impl Wallet {
                 );
                 None
             }
-            _ if sapling_match != Some(false) && orchard_match != Some(false) => {
+            _ if sapling_match != Some(false)
+                && orchard_match != Some(false)
+                && ironwood_match != Some(false) =>
+            {
                 tracing::info!(
                     target: "zally::sync",
                     event = "wallet_tree_root_check",
@@ -1733,6 +1738,7 @@ impl Wallet {
                     result = "match",
                     sapling_checked = sapling_match.is_some(),
                     orchard_checked = orchard_match.is_some(),
+                    ironwood_checked = ironwood_match.is_some(),
                     "wallet commitment-tree roots agree with the chain"
                 );
                 None
@@ -1745,10 +1751,13 @@ impl Wallet {
                     result = "mismatch",
                     sapling_match = ?sapling_match,
                     orchard_match = ?orchard_match,
+                    ironwood_match = ?ironwood_match,
                     wallet_sapling = %wallet_roots.sapling.map_or_else(String::new, hex::encode),
                     chain_sapling = %hex::encode(chain_sapling),
                     wallet_orchard = %wallet_roots.orchard.map_or_else(String::new, hex::encode),
                     chain_orchard = %hex::encode(chain_orchard),
+                    wallet_ironwood = %wallet_roots.ironwood.map_or_else(String::new, hex::encode),
+                    chain_ironwood = %hex::encode(chain_ironwood),
                     "wallet commitment-tree roots diverge from the chain; spends will be rejected"
                 );
                 Some(height)

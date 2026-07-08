@@ -168,6 +168,13 @@ async fn assert_roots_match_chain(storage: &Sqlite, height: u32) -> Result<(), T
         Some(chain.final_orchard_tree().root().to_bytes()),
         "wallet orchard root at the latest checkpoint must match the chain root at {height}",
     );
+    if let Some(ironwood) = wallet.ironwood {
+        assert_eq!(
+            ironwood,
+            chain.final_ironwood_tree().root().to_bytes(),
+            "wallet ironwood root at the latest checkpoint must match the chain root at {height}",
+        );
+    }
     Ok(())
 }
 

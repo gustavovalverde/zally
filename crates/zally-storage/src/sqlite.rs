@@ -656,7 +656,26 @@ impl WalletStorage for Sqlite {
                         posture: FailurePosture::NotRetryable,
                     })
             }
-            ShieldedPool::Ironwood => Err(StorageError::ShieldedPoolUnsupported { pool }),
+            ShieldedPool::Ironwood => {
+                let typed = roots
+                    .into_iter()
+                    .map(|(height, bytes)| {
+                        let node = MerkleHashOrchard::from_bytes(&bytes)
+                            .into_option()
+                            .ok_or_else(|| StorageError::SqliteFailed {
+                                reason: "invalid ironwood subtree root hash".to_owned(),
+                                posture: FailurePosture::NotRetryable,
+                            })?;
+                        let end = zcash_protocol::consensus::BlockHeight::from(height.as_u32());
+                        Ok(CommitmentTreeRoot::from_parts(end, node))
+                    })
+                    .collect::<Result<Vec<_>, StorageError>>()?;
+                db.put_ironwood_subtree_roots(start_index, &typed)
+                    .map_err(|err| StorageError::SqliteFailed {
+                        reason: format!("put_ironwood_subtree_roots failed: {err}"),
+                        posture: FailurePosture::NotRetryable,
+                    })
+            }
         })
         .await
     }
@@ -719,7 +738,19 @@ impl WalletStorage for Sqlite {
                     posture: FailurePosture::NotRetryable,
                 })?
                 .map(|node| node.to_bytes());
-            Ok(crate::wallet::CommitmentTreeRoots { sapling, orchard })
+            let ironwood = db
+                .with_ironwood_tree_mut(|tree| tree.root_at_checkpoint_depth(Some(0)))
+                .map_err(|err| StorageError::SqliteFailed {
+                    reason: format!("ironwood root_at_checkpoint_depth failed: {err}"),
+                    posture: FailurePosture::NotRetryable,
+                })?
+                .flatten()
+                .map(|node| node.to_bytes());
+            Ok(crate::wallet::CommitmentTreeRoots {
+                sapling,
+                orchard,
+                ironwood,
+            })
         })
         .await
     }

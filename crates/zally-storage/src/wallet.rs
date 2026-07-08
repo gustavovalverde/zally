@@ -85,6 +85,8 @@ pub struct CommitmentTreeRoots {
     pub sapling: Option<[u8; 32]>,
     /// Orchard note-commitment tree root, little-endian, or `None` if no checkpoint exists.
     pub orchard: Option<[u8; 32]>,
+    /// Ironwood note-commitment tree root, little-endian, or `None` if no checkpoint exists.
+    pub ironwood: Option<[u8; 32]>,
 }
 
 /// Request body for [`WalletStorage::propose_payment`].
