@@ -1958,7 +1958,7 @@ dependencies = [
 [[package]]
 name = "incrementalmerkletree"
 version = "0.8.2"
-source = "git+https://github.com/gustavovalverde/incrementalmerkletree?rev=034ab470160ed1d40e5ce02875a68a58f864e903#034ab470160ed1d40e5ce02875a68a58f864e903"
+source = "git+https://github.com/gustavovalverde/incrementalmerkletree?rev=7e79e55dedea24b4e56f3f3ad2afeed9fc88ab26#7e79e55dedea24b4e56f3f3ad2afeed9fc88ab26"
 dependencies = [
  "either",
  "proptest",
@@ -3828,7 +3828,7 @@ dependencies = [
 [[package]]
 name = "shardtree"
 version = "0.6.2"
-source = "git+https://github.com/gustavovalverde/incrementalmerkletree?rev=034ab470160ed1d40e5ce02875a68a58f864e903#034ab470160ed1d40e5ce02875a68a58f864e903"
+source = "git+https://github.com/gustavovalverde/incrementalmerkletree?rev=7e79e55dedea24b4e56f3f3ad2afeed9fc88ab26#7e79e55dedea24b4e56f3f3ad2afeed9fc88ab26"
 dependencies = [
  "bitflags",
  "either",

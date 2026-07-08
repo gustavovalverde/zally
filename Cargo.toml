@@ -151,5 +151,5 @@ equihash = { git = "https://github.com/gustavovalverde/librustzcash.git", rev = 
 # Mirrors the fork's own [patch.crates-io]: the anchor-retention shardtree APIs
 # exist only on this incrementalmerkletree line. Pinned to our fork, which adds
 # the two-pass checkpoint-prune flag clearing on top of upstream decefc46.
-shardtree = { git = "https://github.com/gustavovalverde/incrementalmerkletree", rev = "034ab470160ed1d40e5ce02875a68a58f864e903" }
-incrementalmerkletree = { git = "https://github.com/gustavovalverde/incrementalmerkletree", rev = "034ab470160ed1d40e5ce02875a68a58f864e903" }
+shardtree = { git = "https://github.com/gustavovalverde/incrementalmerkletree", rev = "7e79e55dedea24b4e56f3f3ad2afeed9fc88ab26" }
+incrementalmerkletree = { git = "https://github.com/gustavovalverde/incrementalmerkletree", rev = "7e79e55dedea24b4e56f3f3ad2afeed9fc88ab26" }
