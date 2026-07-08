@@ -163,7 +163,7 @@ impl ChainSource for ZinderChainSource {
         let bounded = max_count.clamp(1, DEFAULT_SUBTREE_PAGE_SIZE);
         let max_entries = NonZeroU32::new(bounded).unwrap_or(NonZeroU32::MIN);
         let range = ZinderSubtreeRootRange::new(
-            zally_pool_to_zinder(pool)?,
+            zally_pool_to_zinder(pool),
             ZinderSubtreeRootIndex::new(start_index.0),
             max_entries,
         );
@@ -305,11 +305,11 @@ fn zally_network_to_zinder(network: Network) -> Result<ZinderNetwork, ChainSourc
     }
 }
 
-fn zally_pool_to_zinder(pool: ShieldedPool) -> Result<ZinderShieldedProtocol, ChainSourceError> {
+const fn zally_pool_to_zinder(pool: ShieldedPool) -> ZinderShieldedProtocol {
     match pool {
-        ShieldedPool::Sapling => Ok(ZinderShieldedProtocol::Sapling),
-        ShieldedPool::Orchard => Ok(ZinderShieldedProtocol::Orchard),
-        ShieldedPool::Ironwood => Ok(ZinderShieldedProtocol::Ironwood),
+        ShieldedPool::Sapling => ZinderShieldedProtocol::Sapling,
+        ShieldedPool::Orchard => ZinderShieldedProtocol::Orchard,
+        ShieldedPool::Ironwood => ZinderShieldedProtocol::Ironwood,
     }
 }
 
