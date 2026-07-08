@@ -1503,10 +1503,11 @@ impl Wallet {
     /// Fetches and records every new subtree root for all shielded pools.
     ///
     /// Idempotent: re-recording a root the wallet already holds is a no-op, so this runs from
-    /// index 0 each cycle and stops at the first short page. An Ironwood request against a
-    /// chain source that predates Ironwood subtree roots skips that pool with a warning
-    /// instead of faulting: backfill is a fast-forward optimization, and scanning still
-    /// builds the Ironwood tree linearly.
+    /// index 0 each cycle and stops at the first short page. A pool whose roots the chain
+    /// source cannot serve (a server that predates Ironwood subtree roots, or a
+    /// checkpoint-bootstrapped store missing historical root artifacts) is skipped with a
+    /// warning instead of faulting: backfill is a fast-forward optimization, and scanning
+    /// still builds each tree linearly.
     async fn backfill_subtree_roots(&self, chain: &dyn ChainSource) -> Result<(), WalletError> {
         for (pool, protocol) in [
             (ShieldedPool::Sapling, zcash_protocol::ShieldedPool::Sapling),
@@ -1529,17 +1530,17 @@ impl Wallet {
                 .await;
                 let roots = match fetched {
                     Ok(roots) => roots,
-                    Err(err) if pool == ShieldedPool::Ironwood => {
+                    Err(err) => {
                         tracing::warn!(
                             target: "zally::sync",
                             event = "wallet_subtree_root_backfill_skipped",
-                            pool = "ironwood",
+                            pool = ?pool,
                             error = %err,
-                            "chain source cannot serve Ironwood subtree roots; the Ironwood                              tree will build from linear scanning"
+                            "chain source cannot serve subtree roots for this pool; its \
+                             tree will build from linear scanning"
                         );
                         break;
                     }
-                    Err(err) => return Err(err),
                 };
                 let (Some(first), Some(last)) = (roots.first(), roots.last()) else {
                     break;
