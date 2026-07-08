@@ -6,25 +6,38 @@
 //! must apply its exclusion filter along that batched path too, by inheriting the
 //! trait default (which fans out to the per-address override) rather than
 //! delegating the batched method straight to the inner `WalletDb`.
+//!
+//! The wallet must scan at least one block before any proposal can be built: proposals
+//! anchor at a note commitment tree checkpoint, and checkpoints exist only for scanned
+//! blocks. The fixture scans a slice of the vendored testnet compact blocks (see
+//! `commitment_tree_roots_regress.rs` for the fixture provenance) before shielding.
 
 use std::collections::HashSet;
+use std::fs;
+use std::path::{Path, PathBuf};
 
+use prost::Message as _;
 use tempfile::TempDir;
-use zally_core::{BlockHeight, OutPoint, TxId, Zatoshis};
+use zally_core::{BlockHeight, Network, OutPoint, TxId, Zatoshis};
 use zally_keys::{Mnemonic, SeedMaterial};
 use zally_storage::{
-    ShieldTransparentRequest, Sqlite, SqliteOptions, StorageError, TransparentUtxoRow,
+    ScanRequest, ShieldTransparentRequest, Sqlite, SqliteOptions, StorageError, TransparentUtxoRow,
     WalletStorage,
 };
 use zcash_client_backend::data_api::chain::ChainState;
-use zcash_primitives::block::BlockHash;
+use zcash_client_backend::proto::compact_formats::CompactBlock;
+use zcash_client_backend::proto::service::TreeState;
 use zcash_transparent::address::Script;
 
-#[tokio::test]
+const ANCHOR_HEIGHT: u32 = 4_009_899;
+const SCAN_START: u32 = 4_009_900;
+const SCAN_END: u32 = 4_009_999;
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn shielding_skips_excluded_outpoint_via_batched_gather() -> Result<(), TestError> {
     let temp = TempDir::new()?;
     let storage = Sqlite::new(SqliteOptions::for_network(
-        zally_core::Network::regtest(),
+        Network::Testnet,
         temp.path().join("wallet.db"),
     ));
     storage.open_or_create().await?;
@@ -32,7 +45,7 @@ async fn shielding_skips_excluded_outpoint_via_batched_gather() -> Result<(), Te
     let mnemonic = Mnemonic::generate();
     let seed = SeedMaterial::from_mnemonic(&mnemonic, "");
     let account_id = storage
-        .create_account_for_seed(&seed, ChainState::empty(0.into(), BlockHash([0u8; 32])))
+        .create_account_for_seed(&seed, chain_state_at(ANCHOR_HEIGHT)?)
         .await?;
     let ua = storage
         .derive_next_address_with_transparent(account_id)
@@ -43,9 +56,20 @@ async fn shielding_skips_excluded_outpoint_via_batched_gather() -> Result<(), Te
         .ok_or(TestError::TransparentReceiverMissing)?;
     let script_pub_key_bytes = Script::from(transparent.script()).0.0;
 
-    let mined_height = BlockHeight::from(2);
-    storage.update_chain_tip(BlockHeight::from(200)).await?;
+    storage
+        .update_chain_tip(BlockHeight::from(SCAN_END))
+        .await?;
+    storage
+        .scan_blocks(ScanRequest::new(
+            load_blocks(u64::from(SCAN_START), u64::from(SCAN_END))?,
+            BlockHeight::from(SCAN_START),
+            chain_state_at(ANCHOR_HEIGHT)?,
+        ))
+        .await?;
 
+    // The shielding policy requires 100 confirmations (coinbase maturity); mining at the
+    // range start gives the outputs exactly 100 at the post-scan target height.
+    let mined_height = BlockHeight::from(SCAN_START);
     let excluded_tx_id = TxId::from_bytes([0x11_u8; 32]);
     let kept_tx_id = TxId::from_bytes([0x22_u8; 32]);
     let utxo_amount = Zatoshis::try_from(1_000_000_u64).unwrap_or(Zatoshis::zero());
@@ -96,12 +120,84 @@ async fn shielding_skips_excluded_outpoint_via_batched_gather() -> Result<(), Te
     Ok(())
 }
 
+fn fixtures_dir() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")
+}
+
+fn chain_state_at(height: u32) -> Result<ChainState, TestError> {
+    let text = fs::read_to_string(fixtures_dir().join(format!("treestate_{height}.json")))?;
+    let json: serde_json::Value = serde_json::from_str(&text)?;
+    let rpc_result = &json["result"];
+    let tree_hex = |pool: &str| -> Result<String, TestError> {
+        rpc_result[pool]["commitments"]["finalState"]
+            .as_str()
+            .map(str::to_owned)
+            .ok_or_else(|| TestError::fixture(format!("missing {pool} finalState at {height}")))
+    };
+    let tree_state = TreeState {
+        network: "test".to_owned(),
+        height: rpc_result["height"]
+            .as_u64()
+            .ok_or_else(|| TestError::fixture(format!("missing height at {height}")))?,
+        hash: rpc_result["hash"]
+            .as_str()
+            .ok_or_else(|| TestError::fixture(format!("missing hash at {height}")))?
+            .to_owned(),
+        time: u32::try_from(
+            rpc_result["time"]
+                .as_u64()
+                .ok_or_else(|| TestError::fixture(format!("missing time at {height}")))?,
+        )
+        .map_err(|_| TestError::fixture(format!("time out of range at {height}")))?,
+        sapling_tree: tree_hex("sapling")?,
+        orchard_tree: tree_hex("orchard")?,
+        ironwood_tree: String::new(),
+    };
+    Ok(tree_state.to_chain_state()?)
+}
+
+fn load_blocks(from_height: u64, to_height: u64) -> Result<Vec<CompactBlock>, TestError> {
+    let framed = fs::read(fixtures_dir().join("compact_blocks_4009900_4009999.bin"))?;
+    let mut blocks = Vec::new();
+    let mut at = 0_usize;
+    while at < framed.len() {
+        let header: [u8; 4] = framed
+            .get(at..at + 4)
+            .and_then(|slice| slice.try_into().ok())
+            .ok_or_else(|| TestError::fixture("truncated block frame header"))?;
+        at += 4;
+        let frame_len = usize::try_from(u32::from_be_bytes(header))
+            .map_err(|_| TestError::fixture("block frame length overflows usize"))?;
+        let body = framed
+            .get(at..at + frame_len)
+            .ok_or_else(|| TestError::fixture("truncated block frame body"))?;
+        at += frame_len;
+        let block = CompactBlock::decode(body)?;
+        if (from_height..=to_height).contains(&block.height) {
+            blocks.push(block);
+        }
+    }
+    Ok(blocks)
+}
+
 #[derive(Debug, thiserror::Error)]
 enum TestError {
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
     #[error("storage error: {0}")]
     Storage(#[from] StorageError),
+    #[error("fixture json error: {0}")]
+    FixtureJson(#[from] serde_json::Error),
+    #[error("fixture proto decode error: {0}")]
+    FixtureProto(#[from] prost::DecodeError),
+    #[error("fixture error: {0}")]
+    Fixture(String),
     #[error("derived UA did not contain a transparent receiver")]
     TransparentReceiverMissing,
+}
+
+impl TestError {
+    fn fixture(message: impl Into<String>) -> Self {
+        Self::Fixture(message.into())
+    }
 }

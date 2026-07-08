@@ -135,12 +135,17 @@ mod tests {
     /// wire layout is validated against the upstream encoding, not against a hand-built
     /// mirror. `0xC2D6_D0B4` is the NU5 consensus branch id, which builds a v5 PCZT.
     fn build_minimal_pczt(expiry: u32) -> Result<Vec<u8>, PcztError> {
-        let pczt_struct =
-            pczt::roles::creator::Creator::new(0xC2D6_D0B4, expiry, 1, [0; 32], [0; 32])
-                .map_err(|err| PcztError::ParseFailed {
-                    reason: format!("test PCZT creation failed: {err:?}"),
-                })?
-                .build();
+        let pczt_struct = pczt::roles::creator::Creator::new(
+            0xC2D6_D0B4,
+            expiry,
+            1,
+            Some([0; 32]),
+            Some([0; 32]),
+        )
+        .map_err(|err| PcztError::ParseFailed {
+            reason: format!("test PCZT creation failed: {err:?}"),
+        })?
+        .build();
         pczt_struct
             .serialize()
             .map_err(|err| PcztError::SerializeFailed {

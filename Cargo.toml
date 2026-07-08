@@ -136,15 +136,19 @@ tempfile = "3.13"
 # upstream ships a stable `zcash_client_backend` release carrying both
 # patches.
 [patch.crates-io]
-zcash_client_backend = { git = "https://github.com/gustavovalverde/librustzcash.git", rev = "235d581f2c6eface19e857e69e9bfa4765c2d4bf" }
-zcash_client_sqlite = { git = "https://github.com/gustavovalverde/librustzcash.git", rev = "235d581f2c6eface19e857e69e9bfa4765c2d4bf" }
-pczt = { git = "https://github.com/gustavovalverde/librustzcash.git", rev = "235d581f2c6eface19e857e69e9bfa4765c2d4bf" }
-zcash_protocol = { git = "https://github.com/gustavovalverde/librustzcash.git", rev = "235d581f2c6eface19e857e69e9bfa4765c2d4bf" }
-zcash_primitives = { git = "https://github.com/gustavovalverde/librustzcash.git", rev = "235d581f2c6eface19e857e69e9bfa4765c2d4bf" }
-zcash_keys = { git = "https://github.com/gustavovalverde/librustzcash.git", rev = "235d581f2c6eface19e857e69e9bfa4765c2d4bf" }
-zcash_address = { git = "https://github.com/gustavovalverde/librustzcash.git", rev = "235d581f2c6eface19e857e69e9bfa4765c2d4bf" }
-zcash_transparent = { git = "https://github.com/gustavovalverde/librustzcash.git", rev = "235d581f2c6eface19e857e69e9bfa4765c2d4bf" }
-zcash_proofs = { git = "https://github.com/gustavovalverde/librustzcash.git", rev = "235d581f2c6eface19e857e69e9bfa4765c2d4bf" }
-zip321 = { git = "https://github.com/gustavovalverde/librustzcash.git", rev = "235d581f2c6eface19e857e69e9bfa4765c2d4bf" }
-zcash_encoding = { git = "https://github.com/gustavovalverde/librustzcash.git", rev = "235d581f2c6eface19e857e69e9bfa4765c2d4bf" }
-equihash = { git = "https://github.com/gustavovalverde/librustzcash.git", rev = "235d581f2c6eface19e857e69e9bfa4765c2d4bf" }
+zcash_client_backend = { git = "https://github.com/gustavovalverde/librustzcash.git", rev = "693338fea7a50313905ad00d2f08be1b9e4e7322" }
+zcash_client_sqlite = { git = "https://github.com/gustavovalverde/librustzcash.git", rev = "693338fea7a50313905ad00d2f08be1b9e4e7322" }
+pczt = { git = "https://github.com/gustavovalverde/librustzcash.git", rev = "693338fea7a50313905ad00d2f08be1b9e4e7322" }
+zcash_protocol = { git = "https://github.com/gustavovalverde/librustzcash.git", rev = "693338fea7a50313905ad00d2f08be1b9e4e7322" }
+zcash_primitives = { git = "https://github.com/gustavovalverde/librustzcash.git", rev = "693338fea7a50313905ad00d2f08be1b9e4e7322" }
+zcash_keys = { git = "https://github.com/gustavovalverde/librustzcash.git", rev = "693338fea7a50313905ad00d2f08be1b9e4e7322" }
+zcash_address = { git = "https://github.com/gustavovalverde/librustzcash.git", rev = "693338fea7a50313905ad00d2f08be1b9e4e7322" }
+zcash_transparent = { git = "https://github.com/gustavovalverde/librustzcash.git", rev = "693338fea7a50313905ad00d2f08be1b9e4e7322" }
+zcash_proofs = { git = "https://github.com/gustavovalverde/librustzcash.git", rev = "693338fea7a50313905ad00d2f08be1b9e4e7322" }
+zip321 = { git = "https://github.com/gustavovalverde/librustzcash.git", rev = "693338fea7a50313905ad00d2f08be1b9e4e7322" }
+zcash_encoding = { git = "https://github.com/gustavovalverde/librustzcash.git", rev = "693338fea7a50313905ad00d2f08be1b9e4e7322" }
+equihash = { git = "https://github.com/gustavovalverde/librustzcash.git", rev = "693338fea7a50313905ad00d2f08be1b9e4e7322" }
+# Mirrors the fork's own [patch.crates-io]: the anchor-retention shardtree APIs
+# it uses exist only at this incrementalmerkletree rev.
+shardtree = { git = "https://github.com/zcash/incrementalmerkletree", rev = "decefc469dbf1e686b20b7e7dcaa7cb4f122125b" }
+incrementalmerkletree = { git = "https://github.com/zcash/incrementalmerkletree", rev = "decefc469dbf1e686b20b7e7dcaa7cb4f122125b" }
