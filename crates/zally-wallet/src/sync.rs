@@ -1500,26 +1500,47 @@ impl Wallet {
         Ok(None)
     }
 
-    /// Fetches and records every new subtree root for both shielded pools.
+    /// Fetches and records every new subtree root for all shielded pools.
     ///
     /// Idempotent: re-recording a root the wallet already holds is a no-op, so this runs from
-    /// index 0 each cycle and stops at the first short page.
+    /// index 0 each cycle and stops at the first short page. An Ironwood request against a
+    /// chain source that predates Ironwood subtree roots skips that pool with a warning
+    /// instead of faulting: backfill is a fast-forward optimization, and scanning still
+    /// builds the Ironwood tree linearly.
     async fn backfill_subtree_roots(&self, chain: &dyn ChainSource) -> Result<(), WalletError> {
         for (pool, protocol) in [
             (ShieldedPool::Sapling, zcash_protocol::ShieldedPool::Sapling),
             (ShieldedPool::Orchard, zcash_protocol::ShieldedPool::Orchard),
+            (
+                ShieldedPool::Ironwood,
+                zcash_protocol::ShieldedPool::Ironwood,
+            ),
         ] {
             let mut next_index = 0_u32;
             loop {
                 let policy = self.retry_policy();
-                let roots = with_breaker_and_retry(
+                let fetched = with_breaker_and_retry(
                     &self.inner.circuit_breaker,
                     policy,
                     "sync.subtree_roots",
                     || chain.subtree_roots(pool, SubtreeIndex(next_index), SUBTREE_ROOT_PAGE),
                     WalletError::from,
                 )
-                .await?;
+                .await;
+                let roots = match fetched {
+                    Ok(roots) => roots,
+                    Err(err) if pool == ShieldedPool::Ironwood => {
+                        tracing::warn!(
+                            target: "zally::sync",
+                            event = "wallet_subtree_root_backfill_skipped",
+                            pool = "ironwood",
+                            error = %err,
+                            "chain source cannot serve Ironwood subtree roots; the Ironwood                              tree will build from linear scanning"
+                        );
+                        break;
+                    }
+                    Err(err) => return Err(err),
+                };
                 let (Some(first), Some(last)) = (roots.first(), roots.last()) else {
                     break;
                 };

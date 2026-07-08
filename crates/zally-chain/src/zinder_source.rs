@@ -309,7 +309,7 @@ fn zally_pool_to_zinder(pool: ShieldedPool) -> Result<ZinderShieldedProtocol, Ch
     match pool {
         ShieldedPool::Sapling => Ok(ZinderShieldedProtocol::Sapling),
         ShieldedPool::Orchard => Ok(ZinderShieldedProtocol::Orchard),
-        ShieldedPool::Ironwood => Err(ChainSourceError::ShieldedPoolUnsupported { pool }),
+        ShieldedPool::Ironwood => Ok(ZinderShieldedProtocol::Ironwood),
     }
 }
 
