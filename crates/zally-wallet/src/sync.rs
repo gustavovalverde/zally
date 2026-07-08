@@ -516,9 +516,27 @@ impl DriverState {
         self.recovery.as_ref().and_then(|recovery| recovery.parked)
     }
 
-    fn clear_recovery(&mut self) {
-        self.recovery = None;
-        self.last_fault = None;
+    /// Settles the active recovery after a completed or excused sync iteration.
+    ///
+    /// Returns the recovery when the scan passed the fault boundary (a genuine repair
+    /// success). When the boundary has not been passed, the ladder position is retained
+    /// dormant so that a recurring fault resumes the ladder where it left off instead of
+    /// restarting it at the first rung: a completed re-scan of already-known-good blocks
+    /// below the conflict proves nothing about the conflict itself (issue #5).
+    fn settle_recovery(&mut self, scanned_to: Option<BlockHeight>) -> Option<RecoveryState> {
+        let survives = self.recovery.as_ref().is_some_and(|recovery| {
+            recovery.fault_height.is_some_and(|fault_height| {
+                scanned_to.is_none_or(|scanned| scanned <= fault_height)
+            })
+        });
+        if survives {
+            if let Some(recovery) = self.recovery.as_mut() {
+                recovery.dormant = true;
+            }
+            None
+        } else {
+            self.recovery.take()
+        }
     }
 }
 
@@ -531,6 +549,13 @@ struct RecoveryState {
     backoff_ms: u64,
     degraded_since_ms: u64,
     parked: Option<ParkedAt>,
+    /// Highest wallet scanned height observed at fault time. Recovery is complete only
+    /// when a sync finishes strictly above this height; anything at or below it re-covers
+    /// known-good ground and must not clear the ladder.
+    fault_height: Option<BlockHeight>,
+    /// A dormant recovery no longer applies repairs or backoff; it survives completed
+    /// syncs below `fault_height` purely as ladder memory and is woken by the next fault.
+    dormant: bool,
 }
 
 impl RecoveryState {
@@ -544,6 +569,8 @@ impl RecoveryState {
             backoff_ms: 0,
             degraded_since_ms: now_ms,
             parked: None,
+            fault_height: None,
+            dormant: false,
         }
     }
 
@@ -736,7 +763,9 @@ async fn run_sync_wakeup(
     state: &mut DriverState,
 ) -> SyncWakeupExit {
     for _ in 0..ctx.options.max_sync_iterations_per_wake_count {
-        if let Some(recovery) = &state.recovery {
+        if let Some(recovery) = &state.recovery
+            && !recovery.dormant
+        {
             if recovery.rung == SyncRepair::Park {
                 enter_park(ctx, state).await;
                 return SyncWakeupExit::Waiting;
@@ -749,7 +778,7 @@ async fn run_sync_wakeup(
             }
             if let Err(repair_error) = apply_repair(ctx, state).await {
                 let repair = repair_for(&repair_error);
-                record_fault(ctx, state, repair_error.to_string(), repair).await;
+                record_fault(ctx, state, repair_error.to_string(), repair, None).await;
                 continue;
             }
         }
@@ -782,9 +811,9 @@ async fn run_sync_wakeup(
                     .and_then(|status| status.scanned_height);
                 let blocks_advanced = height_delta(scanned_before, scanned_after);
                 if is_slow_progress(repair, blocks_advanced) {
-                    note_slow_progress(ctx, state, reason, blocks_advanced).await;
+                    note_slow_progress(ctx, state, reason, blocks_advanced, scanned_after).await;
                 } else {
-                    record_fault(ctx, state, reason, repair).await;
+                    record_fault(ctx, state, reason, repair, scanned_after).await;
                 }
             }
         }
@@ -792,14 +821,17 @@ async fn run_sync_wakeup(
     SyncWakeupExit::Waiting
 }
 
-/// Publishes the outcome of a completed sync run; returns whether the wakeup should run
-/// another iteration. Clears any active recovery and announces the repair success.
+/// Publishes the outcome of a completed sync run.
+///
+/// Returns whether the wakeup should run another iteration. Announces a repair success
+/// only when the scan passed the recovery's fault boundary; a completed sync at or below
+/// it retains the ladder position dormant.
 async fn complete_sync(
     ctx: &DriverContext<'_>,
     state: &mut DriverState,
     outcome: SyncOutcome,
 ) -> bool {
-    let recovered = state.recovery.take();
+    let recovered = state.settle_recovery(Some(outcome.scanned_to_height));
     state.last_outcome = Some(outcome);
     state.last_fault = None;
     let should_continue = should_continue_syncing(outcome);
@@ -826,16 +858,19 @@ async fn complete_sync(
     should_continue
 }
 
-/// Handles an environment fault whose iteration still advanced the wallet's scanned height:
-/// clears the ladder and presents the driver as healthy again without applying a repair or
-/// backoff.
+/// Handles an environment fault whose iteration still advanced the wallet's scanned height.
+///
+/// Presents the driver as healthy again without applying a repair or backoff. Ladder
+/// memory survives dormant unless the advance passed the recovery's fault boundary.
 async fn note_slow_progress(
     ctx: &DriverContext<'_>,
     state: &mut DriverState,
     reason: String,
     blocks_advanced: u32,
+    scanned_after: Option<BlockHeight>,
 ) {
-    state.clear_recovery();
+    state.settle_recovery(scanned_after);
+    state.last_fault = None;
     let snapshot = build_snapshot(ctx, SyncDriverPhase::Syncing, state).await;
     publish_transition(
         ctx.status_tx,
@@ -876,12 +911,23 @@ async fn record_fault(
     state: &mut DriverState,
     reason: String,
     classified: SyncRepair,
+    fault_height: Option<BlockHeight>,
 ) {
     let now = current_unix_ms();
     let policy = ctx.options.recovery;
     let recovery = state
         .recovery
         .get_or_insert_with(|| RecoveryState::entering(classified, now));
+    recovery.dormant = false;
+    if let Some(height) = fault_height {
+        // Rewinds lower the scanned height, so a fault observed after one must not lower
+        // the recovery bar below the original conflict.
+        recovery.fault_height = Some(
+            recovery
+                .fault_height
+                .map_or(height, |prior| prior.max(height)),
+        );
+    }
     let escalation = recovery.fold_fault(classified, policy);
     let fault = SyncFault {
         reason,
@@ -1974,20 +2020,93 @@ mod tests {
     }
 
     #[test]
-    fn clearing_recovery_drops_the_ladder_and_last_fault() {
+    fn settling_past_the_fault_boundary_drops_the_ladder() {
+        let mut recovery = RecoveryState::entering(SyncRepair::Rewind, 0);
+        recovery.fault_height = Some(BlockHeight::from(4_148_826));
         let mut state = DriverState {
-            recovery: Some(RecoveryState::entering(SyncRepair::Rewind, 0)),
-            last_fault: Some(SyncFault {
-                reason: "sync exceeded 120 seconds".into(),
-                repair: SyncRepair::Retry,
-                occurred_at_ms: 0,
-                consecutive_faults: 4,
-            }),
+            recovery: Some(recovery),
             ..DriverState::default()
         };
-        state.clear_recovery();
+        let recovered = state.settle_recovery(Some(BlockHeight::from(4_148_827)));
+        assert!(recovered.is_some());
         assert!(state.recovery.is_none());
-        assert!(state.last_fault.is_none());
+    }
+
+    /// The production wedge (issue #5): each rewind re-covers a known-good range below the
+    /// conflict, the trivially-completed sync must not clear the ladder, and the recurring
+    /// fault must resume it so it eventually escalates past the rewind rungs.
+    #[test]
+    fn completed_sync_below_the_fault_boundary_keeps_ladder_memory() {
+        let fault_height = BlockHeight::from(4_148_826);
+        let policy = one_strike_policy();
+        let mut state = DriverState::default();
+
+        let mut rungs = Vec::new();
+        for _ in 0..6 {
+            // The recurring conflict at the same boundary.
+            let recovery = state
+                .recovery
+                .get_or_insert_with(|| RecoveryState::entering(SyncRepair::Rewind, 0));
+            recovery.dormant = false;
+            recovery.fault_height = Some(
+                recovery
+                    .fault_height
+                    .map_or(fault_height, |prior| prior.max(fault_height)),
+            );
+            recovery.fold_fault(SyncRepair::Rewind, policy);
+            recovery.attempts_at_rung = recovery.attempts_at_rung.saturating_add(1);
+            rungs.push((recovery.rung, recovery.rewind_depth_index));
+
+            // The post-rewind verify range completes below the boundary.
+            let recovered = state.settle_recovery(Some(BlockHeight::from(4_148_826)));
+            assert!(
+                recovered.is_none(),
+                "a completed sync at the fault boundary must not clear the ladder"
+            );
+            assert!(
+                state.recovery.as_ref().is_some_and(|r| r.dormant),
+                "the retained ladder must be dormant between faults"
+            );
+        }
+
+        assert!(
+            rungs
+                .iter()
+                .any(|(rung, _)| *rung == SyncRepair::RescanFromBirthday),
+            "the recurring conflict must escalate past the rewind rungs: {rungs:?}"
+        );
+    }
+
+    #[test]
+    fn a_fault_after_a_rewind_does_not_lower_the_recovery_bar() {
+        let mut state = DriverState::default();
+        let recovery = state
+            .recovery
+            .get_or_insert_with(|| RecoveryState::entering(SyncRepair::Rewind, 0));
+        recovery.fault_height = Some(BlockHeight::from(4_148_826));
+        // A fault observed at the rewound (lower) height keeps the original boundary.
+        let lower = BlockHeight::from(4_148_816);
+        recovery.fault_height = Some(
+            recovery
+                .fault_height
+                .map_or(lower, |prior| prior.max(lower)),
+        );
+        assert_eq!(recovery.fault_height, Some(BlockHeight::from(4_148_826)));
+
+        let recovered = state.settle_recovery(Some(BlockHeight::from(4_148_820)));
+        assert!(recovered.is_none());
+        assert!(state.recovery.is_some());
+    }
+
+    #[test]
+    fn recovery_without_a_fault_height_clears_on_any_completed_sync() {
+        let mut state = DriverState {
+            recovery: Some(RecoveryState::entering(SyncRepair::Retry, 0)),
+            ..DriverState::default()
+        };
+        let recovered = state.settle_recovery(Some(BlockHeight::from(1)));
+        assert!(recovered.is_some());
+        assert!(state.recovery.is_none());
     }
 
     #[test]
