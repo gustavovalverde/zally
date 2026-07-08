@@ -4,10 +4,10 @@
 //! (default 2000, spanning post-NU6.3 blocks on testnet), then runs the sync driver for
 //! `ZALLY_PROBE_SECONDS` (default 300) and reports every snapshot transition: sync
 //! outcomes, subtree-root backfill behavior, tree-root check results, reorg rewinds, and
-//! repair-ladder activity.
+//! repair-ladder activity. Fails unless the wallet reaches the chain tip.
 //!
 //! ```sh
-//! ZINDER_ENDPOINT=http://127.0.0.1:9101 \
+//! ZINDER_ENDPOINT=http://127.0.0.1:9301 \
 //!   ZALLY_NETWORK=testnet \
 //!   ZALLY_BIRTHDAY_DEPTH=2000 \
 //!   ZALLY_PROBE_SECONDS=300 \
@@ -26,7 +26,7 @@ use zally_chain::{ChainSource, ZinderChainSource, ZinderRemoteOptions};
 use zally_core::{BlockHeight, Network};
 use zally_keys::{AgeFileSealing, AgeFileSealingOptions};
 use zally_storage::{Sqlite, SqliteOptions, WalletStorage};
-use zally_wallet::{SyncDriverOptions, Wallet, WalletError};
+use zally_wallet::{SyncDriver, SyncDriverOptions, Wallet, WalletError};
 
 #[tokio::main]
 async fn main() -> Result<(), ProbeError> {
@@ -39,7 +39,7 @@ async fn main() -> Result<(), ProbeError> {
     let endpoint =
         env::var("ZINDER_ENDPOINT").map_err(|_| ProbeError::MissingEnv("ZINDER_ENDPOINT"))?;
     let network = match env::var("ZALLY_NETWORK").as_deref() {
-        Ok("testnet") => Network::testnet(),
+        Ok("testnet") => Network::Testnet,
         Ok("regtest") | Err(_) => Network::regtest(),
         Ok(other) => return Err(ProbeError::UnknownNetwork(other.to_owned())),
     };
@@ -82,42 +82,45 @@ async fn main() -> Result<(), ProbeError> {
         .create(&chain, birthday)
         .await?;
 
-    let chain: Arc<dyn ChainSource> = Arc::new(chain);
-    let driver = wallet
-        .clone()
-        .spawn_sync_driver(Arc::clone(&chain), SyncDriverOptions::default());
-    let mut status = driver.subscribe();
+    let chain_source: Arc<dyn ChainSource> = Arc::new(chain);
+    let driver = SyncDriver::new(
+        wallet.clone(),
+        chain_source,
+        SyncDriverOptions::default()
+            .with_poll_interval_ms(1_000)
+            .with_max_sync_iterations_per_wake_count(16),
+    )?;
+    let handle = driver.sync_continuously();
+    let mut snapshots = handle.observe_status();
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(probe_seconds);
     let mut reached_tip = false;
     loop {
         tokio::select! {
             () = tokio::time::sleep_until(deadline) => break,
-            changed = status.changed() => {
-                if changed.is_err() {
-                    break;
-                }
-                let snapshot = status.borrow().clone();
+            snapshot = snapshots.next() => {
+                let Some(snapshot) = snapshot else { break };
                 info!(
                     target: "zally::e2e",
                     event = "probe_snapshot",
                     phase = ?snapshot.phase,
                     scanned_height = snapshot.scanned_height.map(BlockHeight::as_u32),
-                    chain_tip = snapshot.chain_tip_height.map(BlockHeight::as_u32),
+                    safe_chain_tip = snapshot.safe_chain_tip_height.map(BlockHeight::as_u32),
+                    lag_blocks = snapshot.lag_blocks,
                     fault = snapshot.last_fault.as_ref().map(|fault| fault.reason.clone()),
                     "sync driver transition"
                 );
                 if !reached_tip
-                    && let (Some(scanned), Some(chain_tip)) =
-                        (snapshot.scanned_height, snapshot.chain_tip_height)
-                    && scanned >= chain_tip
+                    && let (Some(scanned), Some(safe_tip)) =
+                        (snapshot.scanned_height, snapshot.safe_chain_tip_height)
+                    && scanned >= safe_tip
                 {
                     reached_tip = true;
                     info!(
                         target: "zally::e2e",
                         event = "probe_reached_tip",
                         scanned_height = scanned.as_u32(),
-                        "wallet reached the chain tip; continuing to observe for reorgs"
+                        "wallet reached the safe chain tip; observing for reorgs"
                     );
                 }
             }
@@ -134,7 +137,7 @@ async fn main() -> Result<(), ProbeError> {
         "final wallet commitment-tree roots"
     );
 
-    driver.close().await;
+    handle.close().await?;
     if !reached_tip {
         return Err(ProbeError::Probe(
             "wallet never reached the chain tip within the probe window".to_owned(),
