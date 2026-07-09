@@ -9,6 +9,7 @@ mod buffered_source;
 mod error;
 mod source;
 mod submitter;
+mod transaction;
 #[cfg(feature = "zinder")]
 mod zinder_source;
 #[cfg(feature = "zinder")]
@@ -26,6 +27,7 @@ pub use source::{
     SubtreeIndex, SubtreeRoot, TransactionStatus, TransparentUtxo,
 };
 pub use submitter::{RejectionReason, SubmitOutcome, Submitter};
+pub use transaction::{TransactionParseError, parse_transaction_expiry_height};
 /// Re-export of `zcash_client_backend::data_api::chain::ChainState` so callers of the Zally
 /// scan API do not need to depend on `zcash_client_backend` directly.
 pub use zcash_client_backend::data_api::chain::ChainState;

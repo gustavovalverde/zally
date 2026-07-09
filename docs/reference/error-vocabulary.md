@@ -57,6 +57,12 @@ Every chain-source and wallet error exposes a `posture()` method returning a [`F
 | `BlockingTaskFailed` | `retryable` | A `spawn_blocking` task panicked or was cancelled. |
 | `Indexer(IndexerError)` | Mirrors `IndexerError::retry_policy` | Lossless pass-through of a `zinder-client` broadcast error. |
 
+## TransactionParseError
+
+| Variant | Posture | Meaning |
+|---------|---------|---------|
+| `Read` | `not_retryable` | Serialized transaction bytes could not be decoded. |
+
 ## StorageError
 
 | Variant | Posture | Meaning |

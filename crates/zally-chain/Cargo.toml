@@ -25,6 +25,7 @@ serde_json = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true }
 zally-core = { path = "../zally-core", version = "0.1" }
 zcash_client_backend = { workspace = true, features = ["orchard", "transparent-inputs"] }
+zcash_primitives.workspace = true
 zcash_protocol.workspace = true
 zinder-client = { workspace = true, optional = true }
 zinder-core = { workspace = true, optional = true }

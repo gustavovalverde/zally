@@ -114,6 +114,7 @@ A name must survive a change of its implementation.
 | `ChainEventStreamStart` | `zally-chain` | Explicit chain-event subscription start position (`AfterCursor` \| `EarliestRetained` \| `LiveTail`). |
 | `ChainEventEnvelope` | `zally-chain` | Cursor-bound chain event consumed by sync drivers. |
 | `Submitter` | `zally-chain` | Trait for transaction broadcast. |
+| `TransactionParseError` | `zally-chain` | Typed rejection of malformed serialized transaction bytes at the chain-plane boundary. |
 | `SeedSealing` | `zally-keys` | Trait for at-rest seed encryption. |
 | `WalletCapabilities` | `zally-wallet` | Runtime descriptor of supported features (ZIP coverage, PCZT version, sealing impl). |
 
@@ -244,6 +245,7 @@ The contract surface Zally publishes, grouped by domain. Each item is a guarante
 - **CHAIN-3**: Reconnect, retry, and circuit-breaker logic at the wallet boundary, not duplicated in each embedding application.
 - **CHAIN-4**: `ChainEventCursor` is opaque Zally vocabulary. Backend cursor types never cross the public Zally API.
 - **CHAIN-5**: A chain-event subscription states its start position explicitly through `ChainEventStreamStart` (`AfterCursor` | `EarliestRetained` | `LiveTail`); there is no implicit empty-cursor default.
+- **CHAIN-6**: `parse_transaction_expiry_height` parses a serialized transaction through the same librustzcash family as the chain plane and returns its `BlockHeight` without pulling a storage backend into the caller.
 
 ### Sync and scanning (SYNC)
 

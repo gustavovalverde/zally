@@ -4990,6 +4990,7 @@ dependencies = [
  "zally-core",
  "zally-testkit",
  "zcash_client_backend",
+ "zcash_primitives",
  "zcash_protocol",
  "zinder-client",
  "zinder-core",
