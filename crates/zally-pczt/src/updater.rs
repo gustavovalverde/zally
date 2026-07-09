@@ -145,7 +145,10 @@ mod tests {
         .map_err(|err| PcztError::ParseFailed {
             reason: format!("test PCZT creation failed: {err:?}"),
         })?
-        .build();
+        .build()
+        .map_err(|err| PcztError::ParseFailed {
+            reason: format!("test PCZT build failed: {err:?}"),
+        })?;
         pczt_struct
             .serialize()
             .map_err(|err| PcztError::SerializeFailed {

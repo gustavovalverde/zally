@@ -67,7 +67,7 @@ zcash_transparent = { version = "0.9.0-pre.0", default-features = false, feature
 zcash_script = "0.4"
 pczt = { version = "0.7", features = ["orchard", "sapling", "transparent", "signer", "prover", "tx-extractor"] }
 secp256k1 = "0.29"
-orchard = "0.15.0-pre.1"
+orchard = "0.15.0-pre.2"
 sapling = { package = "sapling-crypto", version = "0.7" }
 zip321 = "0.8"
 zip32 = "0.2"
@@ -77,9 +77,9 @@ incrementalmerkletree = "0.8"
 # Optional chain-plane backend. The `zinder` cargo feature on zally-chain pulls these
 # crates from a pinned git revision so the wallet integration tracks the zinder typed-
 # client surface directly.
-zinder-client = { git = "https://github.com/gustavovalverde/zinder", rev = "6d3d332f2f0343ce91b57053f32f7a87fed606c9" }
-zinder-core = { git = "https://github.com/gustavovalverde/zinder", rev = "6d3d332f2f0343ce91b57053f32f7a87fed606c9" }
-zinder-testkit = { git = "https://github.com/gustavovalverde/zinder", rev = "6d3d332f2f0343ce91b57053f32f7a87fed606c9" }
+zinder-client = { version = "0.1", git = "https://github.com/gustavovalverde/zinder", rev = "c604ac3d260b4e65219dbeb6062d01d213d65ea9" }
+zinder-core = { version = "0.1", git = "https://github.com/gustavovalverde/zinder", rev = "c604ac3d260b4e65219dbeb6062d01d213d65ea9" }
+zinder-testkit = { version = "0.1", git = "https://github.com/gustavovalverde/zinder", rev = "c604ac3d260b4e65219dbeb6062d01d213d65ea9" }
 
 # Async runtime and concurrency.
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "fs", "io-util"] }
@@ -119,37 +119,34 @@ proptest = "1.5"
 tempfile = "3.13"
 
 
-# Pinned to a fork of the librustzcash workspace tracking the unreleased
-# Ironwood/NU6.3 dependency family, carrying two patches on top of upstream
-# main: the `target_expiry_height` argument added to `create_pczt_from_proposal`
-# (matches https://github.com/zcash/librustzcash/pull/2412) and wallet
-# scanning/storage support for the Ironwood shielded pool (matches
-# https://github.com/zcash/librustzcash/pull/2539, cherry-picked on top; that
-# PR is open and unmerged). Every librustzcash-internal crate Zally
-# references, directly or transitively, is patched from this same commit:
-# they resolve each other by intra-workspace path inside the fork's checkout,
-# so patching a subset from a different source would give Zally's crates and
-# the fork's own internal crates distinct, incompatible types for the same
-# dependency. `zcash_encoding` and `equihash` are not zally-direct
-# dependencies but are patched for the same reason: `cargo tree -d` must show
-# zero duplicate sources across the whole family. See ADR-0006. Drop once
-# upstream ships a stable `zcash_client_backend` release carrying both
-# patches.
+# Pinned to an unreleased librustzcash commit that carries the Ironwood/NU6.3
+# dependency family, target-expiry PCZT construction, and Ironwood wallet
+# scanning/storage support. Every librustzcash-internal crate Zally references,
+# directly or transitively, is patched from this same commit: they resolve each
+# other by intra-workspace path inside the checkout, so patching a subset from a
+# different source would give Zally's crates and the upstream internal crates
+# distinct, incompatible types for the same dependency. `zcash_encoding` and
+# `equihash` are not zally-direct dependencies but are patched for the same
+# reason: `cargo tree -d` must show zero duplicate sources across the whole
+# family. See ADR-0006. Drop once upstream ships a stable
+# `zcash_client_backend` release carrying these APIs. The Orchard patch mirrors
+# librustzcash's own temporary patch for the bundle-type APIs required by the
+# pinned commit.
 [patch.crates-io]
-zcash_client_backend = { git = "https://github.com/gustavovalverde/librustzcash.git", rev = "693338fea7a50313905ad00d2f08be1b9e4e7322" }
-zcash_client_sqlite = { git = "https://github.com/gustavovalverde/librustzcash.git", rev = "693338fea7a50313905ad00d2f08be1b9e4e7322" }
-pczt = { git = "https://github.com/gustavovalverde/librustzcash.git", rev = "693338fea7a50313905ad00d2f08be1b9e4e7322" }
-zcash_protocol = { git = "https://github.com/gustavovalverde/librustzcash.git", rev = "693338fea7a50313905ad00d2f08be1b9e4e7322" }
-zcash_primitives = { git = "https://github.com/gustavovalverde/librustzcash.git", rev = "693338fea7a50313905ad00d2f08be1b9e4e7322" }
-zcash_keys = { git = "https://github.com/gustavovalverde/librustzcash.git", rev = "693338fea7a50313905ad00d2f08be1b9e4e7322" }
-zcash_address = { git = "https://github.com/gustavovalverde/librustzcash.git", rev = "693338fea7a50313905ad00d2f08be1b9e4e7322" }
-zcash_transparent = { git = "https://github.com/gustavovalverde/librustzcash.git", rev = "693338fea7a50313905ad00d2f08be1b9e4e7322" }
-zcash_proofs = { git = "https://github.com/gustavovalverde/librustzcash.git", rev = "693338fea7a50313905ad00d2f08be1b9e4e7322" }
-zip321 = { git = "https://github.com/gustavovalverde/librustzcash.git", rev = "693338fea7a50313905ad00d2f08be1b9e4e7322" }
-zcash_encoding = { git = "https://github.com/gustavovalverde/librustzcash.git", rev = "693338fea7a50313905ad00d2f08be1b9e4e7322" }
-equihash = { git = "https://github.com/gustavovalverde/librustzcash.git", rev = "693338fea7a50313905ad00d2f08be1b9e4e7322" }
-# Mirrors the fork's own [patch.crates-io]: the anchor-retention shardtree APIs
-# exist only on this incrementalmerkletree line. Pinned to our fork, which adds
-# the two-pass checkpoint-prune flag clearing on top of upstream decefc46.
-shardtree = { git = "https://github.com/gustavovalverde/incrementalmerkletree", rev = "7e79e55dedea24b4e56f3f3ad2afeed9fc88ab26" }
-incrementalmerkletree = { git = "https://github.com/gustavovalverde/incrementalmerkletree", rev = "7e79e55dedea24b4e56f3f3ad2afeed9fc88ab26" }
+orchard = { git = "https://github.com/zcash/orchard", rev = "475ef0ff77d45aebff93cb039d639250d82518a3" }
+zcash_client_backend = { git = "https://github.com/zcash/librustzcash.git", rev = "8e6864a3c67cab3c64a052dd20f83c553662e8b2" }
+zcash_client_sqlite = { git = "https://github.com/zcash/librustzcash.git", rev = "8e6864a3c67cab3c64a052dd20f83c553662e8b2" }
+pczt = { git = "https://github.com/zcash/librustzcash.git", rev = "8e6864a3c67cab3c64a052dd20f83c553662e8b2" }
+zcash_protocol = { git = "https://github.com/zcash/librustzcash.git", rev = "8e6864a3c67cab3c64a052dd20f83c553662e8b2" }
+zcash_primitives = { git = "https://github.com/zcash/librustzcash.git", rev = "8e6864a3c67cab3c64a052dd20f83c553662e8b2" }
+zcash_keys = { git = "https://github.com/zcash/librustzcash.git", rev = "8e6864a3c67cab3c64a052dd20f83c553662e8b2" }
+zcash_address = { git = "https://github.com/zcash/librustzcash.git", rev = "8e6864a3c67cab3c64a052dd20f83c553662e8b2" }
+zcash_transparent = { git = "https://github.com/zcash/librustzcash.git", rev = "8e6864a3c67cab3c64a052dd20f83c553662e8b2" }
+zcash_proofs = { git = "https://github.com/zcash/librustzcash.git", rev = "8e6864a3c67cab3c64a052dd20f83c553662e8b2" }
+zip321 = { git = "https://github.com/zcash/librustzcash.git", rev = "8e6864a3c67cab3c64a052dd20f83c553662e8b2" }
+zcash_encoding = { git = "https://github.com/zcash/librustzcash.git", rev = "8e6864a3c67cab3c64a052dd20f83c553662e8b2" }
+equihash = { git = "https://github.com/zcash/librustzcash.git", rev = "8e6864a3c67cab3c64a052dd20f83c553662e8b2" }
+# Carries the anchor-retention shardtree APIs, retained-checkpoint pruning fix,
+# and exact checkpoint truncation fix until those fixes are released upstream.
+shardtree = { git = "https://github.com/gustavovalverde/incrementalmerkletree", rev = "48b5297872f9c321e7d7e65b803132362035c4ee" }
+incrementalmerkletree = { git = "https://github.com/gustavovalverde/incrementalmerkletree", rev = "48b5297872f9c321e7d7e65b803132362035c4ee" }

@@ -16,9 +16,9 @@ use serde::{Deserialize, Serialize};
 
 /// Chain-neutral envelope around a signed payment transaction.
 ///
-/// The Zcash adapter sets [`Self::format`] to [`SignedPayloadFormat::PcztV1`]
-/// and writes a ZIP-48 v1 PCZT into [`Self::bytes`]. Future formats (raw Solana
-/// transaction, raw EVM transaction, etc.) plug in by adding variants to
+/// The Zcash adapter sets [`Self::format`] to a PCZT format and writes ZIP-374
+/// PCZT bytes into [`Self::bytes`]. Future formats (raw Solana transaction,
+/// raw EVM transaction, etc.) plug in by adding variants to
 /// [`SignedPayloadFormat`] without touching the surrounding shape.
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
@@ -61,15 +61,17 @@ pub struct SignedPayload {
 
 /// Wire format of [`SignedPayload::bytes`].
 ///
-/// `#[non_exhaustive]` so new formats land as additive changes. The Zcash v1
-/// adapter only constructs and accepts [`Self::PcztV1`].
+/// `#[non_exhaustive]` so new formats land as additive changes.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[cfg_attr(feature = "serde", serde(rename_all = "kebab-case"))]
 #[non_exhaustive]
 pub enum SignedPayloadFormat {
-    /// Partially Created Zcash Transaction, ZIP-48 v1, extractor-ready.
+    /// Partially Created Zcash Transaction v1, extractor-ready.
     PcztV1,
+    /// Partially Created Zcash Transaction v2, extractor-ready for the Zcash
+    /// x402 exact binding.
+    PcztV2Extractable,
 }
 
 /// Chain-neutral amount: a decimal-string `value` in `currency`'s `unit`.
@@ -166,6 +168,28 @@ mod tests {
         // expires_at is tagged
         assert_eq!(wire["expires_at"]["kind"].as_str(), Some("block_height"));
         assert_eq!(wire["expires_at"]["value"].as_u64(), Some(4_047_100));
+        Ok(())
+    }
+
+    #[test]
+    fn pczt_v2_extractable_round_trips_through_json() -> Result<(), serde_json::Error> {
+        let payload = SignedPayload {
+            format: SignedPayloadFormat::PcztV2Extractable,
+            bytes: vec![0xca, 0xfe],
+            tx_id: "abcd1234".to_owned(),
+            fee: Amount {
+                currency: "ZEC".to_owned(),
+                value: "1000".to_owned(),
+                unit: AmountUnit::Base,
+            },
+            expires_at: ExpiresAt::BlockHeight(4_047_100),
+            metadata: json!({ "zcash.x402": true }),
+        };
+
+        let wire = serde_json::to_value(&payload)?;
+        let back: SignedPayload = serde_json::from_value(wire.clone())?;
+        assert_eq!(payload, back);
+        assert_eq!(wire["format"].as_str(), Some("pczt-v2-extractable"));
         Ok(())
     }
 

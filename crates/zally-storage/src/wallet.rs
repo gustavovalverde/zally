@@ -249,8 +249,8 @@ pub struct ReceivedShieldedNoteRow {
     /// transaction and the note is internally-scoped.
     pub is_change: bool,
     /// True when the producing transaction's input set includes any UTXO or shielded
-    /// note owned by the receiving account, across the Sapling, Orchard, and
-    /// transparent pools. False for third-party transfers.
+    /// note owned by the receiving account, across the Sapling, Orchard, Ironwood,
+    /// and transparent pools. False for third-party transfers.
     pub spent_our_inputs: bool,
 }
 
@@ -394,8 +394,8 @@ pub trait WalletStorage: Send + Sync + 'static {
     /// Creates the wallet's first account for `seed`, anchored at `prior_chain_state`.
     ///
     /// `prior_chain_state` is the note commitment tree state at the block immediately before
-    /// the operator-chosen birthday height. It carries the real Sapling and Orchard frontiers
-    /// fetched from the chain source; passing empty frontiers at a non-genesis birthday
+    /// the operator-chosen birthday height. It carries the real Sapling, Orchard, and Ironwood
+    /// frontiers fetched from the chain source; passing empty frontiers at a non-genesis birthday
     /// makes the first call to [`WalletStorage::scan_blocks`] fail closed with
     /// `NonSequentialBlocks` because the wallet's commitment tree progression no longer
     /// matches the chain.
@@ -523,12 +523,9 @@ pub trait WalletStorage: Send + Sync + 'static {
     /// Records commitment-tree subtree roots for `pool`, starting at subtree index
     /// `start_index`. Each entry is `(subtree_end_height, 32-byte root hash)`.
     ///
-    /// Wraps `WalletCommitmentTrees::put_{sapling,orchard}_subtree_roots`. Priming these is
+    /// Wraps `WalletCommitmentTrees::put_{sapling,orchard,ironwood}_subtree_roots`. Priming these is
     /// what lets the wallet witness notes in a subtree without scanning every block it spans,
     /// and is a prerequisite for `suggest_scan_ranges` to plan subtree-aligned work.
-    ///
-    /// `pool = ShieldedPool::Ironwood` returns `StorageError::ShieldedPoolUnsupported`; the
-    /// pinned `zcash_client_backend` has no Ironwood subtree-root write path yet.
     async fn put_subtree_roots(
         &self,
         pool: ShieldedPool,
@@ -539,10 +536,10 @@ pub trait WalletStorage: Send + Sync + 'static {
     /// Returns the height the wallet has been fully scanned to, or `None` for a fresh wallet.
     async fn fully_scanned_height(&self) -> Result<Option<BlockHeight>, StorageError>;
 
-    /// Computes the wallet's Sapling and Orchard note-commitment tree roots at the latest
+    /// Computes the wallet's Sapling, Orchard, and Ironwood note-commitment tree roots at the latest
     /// retained checkpoint.
     ///
-    /// Wraps `WalletCommitmentTrees::with_{sapling,orchard}_tree_mut` plus
+    /// Wraps `WalletCommitmentTrees::with_{sapling,orchard,ironwood}_tree_mut` plus
     /// `ShardTree::root_at_checkpoint_depth(Some(0))`. Anchoring at the checkpoint truncates
     /// each root to the scanned leaves, so backfilled subtree roots that commit leaves beyond
     /// the scan frontier do not contribute. After the wallet scans up to height `H`, these
@@ -837,7 +834,7 @@ pub trait WalletStorage: Send + Sync + 'static {
     /// `not_retryable` on schema errors; `retryable` on transient I/O.
     async fn truncate_to_chain_state(&self, chain_state: ChainState) -> Result<(), StorageError>;
 
-    /// Returns every Sapling and Orchard note received in the inclusive height range
+    /// Returns every Sapling, Orchard, and Ironwood note received in the inclusive height range
     /// `[from_height, to_height]`, regardless of current spent state.
     ///
     /// Powers the wallet's event stream: after a successful `scan_blocks` call the wallet

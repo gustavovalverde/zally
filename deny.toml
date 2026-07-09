@@ -58,8 +58,13 @@ allow-git = [
     # build Zally without a local checkout. Pin a specific commit rather than
     # tracking a branch.
     "https://github.com/gustavovalverde/zinder",
-    # Fork of the librustzcash workspace carrying the unreleased Ironwood/NU6.3
-    # dependency family plus the `target_expiry_height` patch on
-    # `create_pczt_from_proposal`. See ADR-0006.
-    "https://github.com/gustavovalverde/librustzcash.git",
+    # Upstream librustzcash commit carrying the unreleased Ironwood/NU6.3
+    # dependency family plus the target-expiry PCZT API. See ADR-0006.
+    "https://github.com/zcash/librustzcash.git",
+    # Temporary Orchard patch required by the pinned librustzcash commit's
+    # bundle-type APIs.
+    "https://github.com/zcash/orchard",
+    # Temporary incrementalmerkletree fork carrying retained-checkpoint and exact
+    # checkpoint truncation fixes until they are released upstream.
+    "https://github.com/gustavovalverde/incrementalmerkletree",
 ]

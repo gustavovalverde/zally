@@ -1007,6 +1007,7 @@ impl WalletStorage for Sqlite {
                 zcash_client_backend::wallet::OvkPolicy::Sender,
                 &proposal,
                 upstream_target_expiry_height,
+                orchard::builder::BundleType::DEFAULT,
             )
             .map_err(|err| classify_proposal_build_error(&err))?;
 
@@ -2106,6 +2107,7 @@ const RECEIVED_SHIELDED_NOTES_IN_RANGE_SQL: &str = "\
            srn.is_change, \
            CASE WHEN EXISTS (SELECT 1 FROM sapling_received_note_spends s WHERE s.transaction_id = t.id_tx) \
                   OR EXISTS (SELECT 1 FROM orchard_received_note_spends o WHERE o.transaction_id = t.id_tx) \
+                  OR EXISTS (SELECT 1 FROM ironwood_received_note_spends i WHERE i.transaction_id = t.id_tx) \
                   OR EXISTS (SELECT 1 FROM transparent_received_output_spends p WHERE p.transaction_id = t.id_tx) \
                 THEN 1 ELSE 0 END AS spent_our_inputs \
     FROM sapling_received_notes srn \
@@ -2119,11 +2121,26 @@ const RECEIVED_SHIELDED_NOTES_IN_RANGE_SQL: &str = "\
            orn.is_change, \
            CASE WHEN EXISTS (SELECT 1 FROM sapling_received_note_spends s WHERE s.transaction_id = t.id_tx) \
                   OR EXISTS (SELECT 1 FROM orchard_received_note_spends o WHERE o.transaction_id = t.id_tx) \
+                  OR EXISTS (SELECT 1 FROM ironwood_received_note_spends i WHERE i.transaction_id = t.id_tx) \
                   OR EXISTS (SELECT 1 FROM transparent_received_output_spends p WHERE p.transaction_id = t.id_tx) \
                 THEN 1 ELSE 0 END AS spent_our_inputs \
     FROM orchard_received_notes orn \
     JOIN transactions t ON orn.transaction_id = t.id_tx \
     JOIN accounts a ON orn.account_id = a.id \
+    LEFT JOIN blocks b ON b.height = t.mined_height \
+    WHERE t.mined_height BETWEEN ?1 AND ?2 \
+    UNION ALL \
+    SELECT a.uuid, t.txid, irn.action_index, irn.value, t.mined_height, 'ironwood' AS pool, \
+           b.time * 1000 AS block_timestamp_ms, \
+           irn.is_change, \
+           CASE WHEN EXISTS (SELECT 1 FROM sapling_received_note_spends s WHERE s.transaction_id = t.id_tx) \
+                  OR EXISTS (SELECT 1 FROM orchard_received_note_spends o WHERE o.transaction_id = t.id_tx) \
+                  OR EXISTS (SELECT 1 FROM ironwood_received_note_spends i WHERE i.transaction_id = t.id_tx) \
+                  OR EXISTS (SELECT 1 FROM transparent_received_output_spends p WHERE p.transaction_id = t.id_tx) \
+                THEN 1 ELSE 0 END AS spent_our_inputs \
+    FROM ironwood_received_notes irn \
+    JOIN transactions t ON irn.transaction_id = t.id_tx \
+    JOIN accounts a ON irn.account_id = a.id \
     LEFT JOIN blocks b ON b.height = t.mined_height \
     WHERE t.mined_height BETWEEN ?1 AND ?2 \
     ORDER BY mined_height ASC, txid ASC, output_index ASC, pool ASC";
@@ -2534,6 +2551,7 @@ where
         memo,
         None,
         change_pool,
+        None,
     )
     .map_err(|err| classify_proposal_build_error(&err))
 }
@@ -3075,6 +3093,24 @@ mod tests {
         SqliteClientError,
         std::convert::Infallible,
     >;
+
+    #[test]
+    fn mined_range_receive_query_covers_all_shielded_pools() {
+        for pool_tag in [
+            "'sapling' AS pool",
+            "'orchard' AS pool",
+            "'ironwood' AS pool",
+        ] {
+            assert!(
+                RECEIVED_SHIELDED_NOTES_IN_RANGE_SQL.contains(pool_tag),
+                "mined-range receive query must include {pool_tag}"
+            );
+        }
+        assert!(
+            RECEIVED_SHIELDED_NOTES_IN_RANGE_SQL.contains("ironwood_received_note_spends"),
+            "mined-range receive provenance must include Ironwood spends"
+        );
+    }
 
     #[test]
     fn account_id_is_deterministic_for_key_material() -> Result<(), KeyDerivationError> {

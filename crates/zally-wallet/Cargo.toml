@@ -84,5 +84,15 @@ name = "live-zinder-probe"
 path = "examples/live-zinder-probe/main.rs"
 required-features = ["zinder"]
 
+[[example]]
+name = "e2e-ironwood-probe"
+path = "examples/e2e-ironwood-probe/main.rs"
+required-features = ["zinder"]
+
+[[example]]
+name = "e2e-seeded-probe"
+path = "examples/e2e-seeded-probe/main.rs"
+required-features = ["zinder"]
+
 [lints]
 workspace = true

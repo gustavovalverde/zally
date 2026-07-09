@@ -73,7 +73,7 @@ Every chain-source and wallet error exposes a `posture()` method returning a [`F
 | `ChainReorgDetected` | `retryable` | Scanner input diverged from persisted chain state and needs rollback. |
 | `TransparentOutputNotRecognized` | `not_retryable` | A chain source returned a transparent output script Zally cannot map. |
 | `TransparentOutputValueOutOfRange` | `not_retryable` | A chain source returned a transparent output value outside the zatoshis range. |
-| `ShieldedPoolUnsupported` | `requires_operator` | The requested shielded pool has no subtree-root write path in the pinned `zcash_client_backend` release. |
+| `ShieldedPoolUnsupported` | `requires_operator` | The requested shielded pool has no subtree-root write path in this storage backend. |
 
 ## PcztError
 

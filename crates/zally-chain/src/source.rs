@@ -42,10 +42,6 @@ impl BlockHeightRange {
 }
 
 /// Shielded pool selector. Zally's vocabulary for `zcash_protocol::ShieldedPool`.
-///
-/// `Ironwood` is not yet reachable through [`ChainSource::subtree_roots`]: the
-/// `zinder` backend has no query path for it and returns
-/// `ChainSourceError::ShieldedPoolUnsupported`.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[non_exhaustive]

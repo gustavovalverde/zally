@@ -15,9 +15,9 @@
 //! which routes through this type's filtered override. Overriding it to
 //! delegate straight to `inner` would bypass the exclusion filter.
 //! `select_spendable_transparent_outputs` is left unoverridden too; it panics
-//! via the trait default, which is safe today because Zally only proposes
-//! `TransparentSpendPolicy::ShieldedOnly` transfers and that policy never
-//! reaches this gather.
+//! via the trait default, which is safe today because Zally's standard-transfer
+//! proposals do not enable transparent input selection, while transparent
+//! shielding reaches the batched gather above.
 
 use std::collections::{HashMap, HashSet};
 use std::num::NonZeroU32;
@@ -328,6 +328,13 @@ impl WalletRead for FilteredWalletDb<'_> {
         query: NullifierQuery,
     ) -> Result<Vec<(Self::AccountId, orchard::note::Nullifier)>, Self::Error> {
         <Db as WalletRead>::get_orchard_nullifiers(self.inner, query)
+    }
+
+    fn get_ironwood_nullifiers(
+        &self,
+        query: NullifierQuery,
+    ) -> Result<Vec<(Self::AccountId, orchard::note::Nullifier)>, Self::Error> {
+        <Db as WalletRead>::get_ironwood_nullifiers(self.inner, query)
     }
 
     fn get_transparent_receivers(

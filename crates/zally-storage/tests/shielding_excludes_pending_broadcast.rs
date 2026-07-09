@@ -31,7 +31,8 @@ use zcash_transparent::address::Script;
 
 const ANCHOR_HEIGHT: u32 = 4_009_899;
 const SCAN_START: u32 = 4_009_900;
-const SCAN_END: u32 = 4_009_999;
+const SCAN_END: u32 = 4_009_997;
+const TRANSPARENT_MINED_HEIGHT: u32 = ANCHOR_HEIGHT - 1;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn shielding_skips_excluded_outpoint_via_batched_gather() -> Result<(), TestError> {
@@ -67,9 +68,11 @@ async fn shielding_skips_excluded_outpoint_via_batched_gather() -> Result<(), Te
         ))
         .await?;
 
-    // The shielding policy requires 100 confirmations (coinbase maturity); mining at the
-    // range start gives the outputs exactly 100 at the post-scan target height.
-    let mined_height = BlockHeight::from(SCAN_START);
+    // The shielding policy requires 100 confirmations for transparent inputs and 3
+    // confirmations for the shielded anchor. The synthetic transparent height leaves the
+    // outputs mature at the target height while the shielded anchor lands on the latest
+    // retained checkpoint in this scanned slice.
+    let mined_height = BlockHeight::from(TRANSPARENT_MINED_HEIGHT);
     let excluded_tx_id = TxId::from_bytes([0x11_u8; 32]);
     let kept_tx_id = TxId::from_bytes([0x22_u8; 32]);
     let utxo_amount = Zatoshis::try_from(1_000_000_u64).unwrap_or(Zatoshis::zero());

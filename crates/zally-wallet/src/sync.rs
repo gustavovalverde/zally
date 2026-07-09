@@ -2068,9 +2068,11 @@ mod tests {
         assert!(state.recovery.is_none());
     }
 
-    /// The production wedge (issue #5): each rewind re-covers a known-good range below the
-    /// conflict, the trivially-completed sync must not clear the ladder, and the recurring
-    /// fault must resume it so it eventually escalates past the rewind rungs.
+    /// Reproduces the production wedge from issue #5.
+    ///
+    /// Each rewind re-covers a known-good range below the conflict, the trivially-completed
+    /// sync must not clear the ladder, and the recurring fault must resume it so it
+    /// eventually escalates past the rewind rungs.
     #[test]
     fn completed_sync_below_the_fault_boundary_keeps_ladder_memory() {
         let fault_height = BlockHeight::from(4_148_826);

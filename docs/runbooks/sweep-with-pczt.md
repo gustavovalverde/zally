@@ -22,7 +22,7 @@ Move every spendable note out of a Zally wallet to one operator-controlled recei
    - Transport the bytes to the cold signer (USB stick, QR, hardware wallet bridge: your choice).
 3. **Cold: prove**
    - On the cold signer, instantiate `Prover::new(network)` and call `prove_with_seed(pczt, &seed)`.
-   - The prover validates the embedded network before touching the seed and creates required Sapling and Orchard proofs.
+   - The prover validates the embedded network before touching the seed and creates required Sapling, Orchard, and Ironwood proofs.
 4. **Cold: sign**
    - On the cold signer, instantiate `Signer::new(network)` and call `sign_with_seed(pczt, &seed)`.
    - The signer validates the embedded network *before* touching the seed. A mismatched PCZT routes to `PcztError::NetworkMismatch` with no key derivation.

@@ -84,8 +84,7 @@ pub enum StorageError {
     )]
     ProverUnavailable,
 
-    /// The requested shielded pool has no commitment-tree write path in the pinned
-    /// `zcash_client_backend` release.
+    /// The requested shielded pool has no commitment-tree write path in this storage backend.
     ///
     /// Posture: [`FailurePosture::RequiresOperator`]; upgrading to a release that adds the
     /// write path is the only way to record subtree roots for this pool.

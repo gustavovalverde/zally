@@ -72,7 +72,7 @@ pub enum WalletEvent {
         /// `zcash_client_sqlite` marked this note as change for the receiving account.
         is_change: bool,
         /// The producing transaction spent at least one input owned by the receiving
-        /// account, across Sapling, Orchard, or transparent pools.
+        /// account, across Sapling, Orchard, Ironwood, or transparent pools.
         spent_our_inputs: bool,
     },
     /// The wallet discarded and recreated its database from the seed and the account

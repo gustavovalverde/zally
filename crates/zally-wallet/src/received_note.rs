@@ -3,7 +3,7 @@
 use zally_chain::ShieldedPool;
 use zally_core::{BlockHeight, TxId, Zatoshis};
 
-/// One Sapling or Orchard note ever observed for an account.
+/// One Sapling, Orchard, or Ironwood note ever observed for an account.
 ///
 /// Returned by [`crate::Wallet::list_shielded_receives`]. Distinguishes itself from
 /// [`crate::UnspentShieldedNote`] by including notes that have already been spent: the
@@ -27,7 +27,7 @@ pub struct ShieldedReceiveRecord {
     /// Transaction that produced this note.
     pub tx_id: TxId,
     /// Output index within the producing transaction (Sapling output index or Orchard
-    /// action index, depending on `pool`).
+    /// or Ironwood action index, depending on `pool`).
     pub output_index: u32,
     /// Block height at which the producing transaction was mined.
     pub mined_height: BlockHeight,
@@ -38,6 +38,6 @@ pub struct ShieldedReceiveRecord {
     /// `zcash_client_sqlite` marked this note as change for the receiving account.
     pub is_change: bool,
     /// The producing transaction spent at least one input owned by the receiving account,
-    /// across Sapling, Orchard, or transparent pools.
+    /// across Sapling, Orchard, Ironwood, or transparent pools.
     pub spent_our_inputs: bool,
 }

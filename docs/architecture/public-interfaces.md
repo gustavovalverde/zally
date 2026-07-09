@@ -101,6 +101,8 @@ A name must survive a change of its implementation.
 | `DispenseReservation` | `zally-wallet` | Amount lock returned by `Wallet::reserve_for_dispense`. Carries the wallet-issued `ReservationId`, the caller-supplied `request_id` and `idempotency_key`, `amount_zat`, `locked_notes_summary`, and `available_after_release_zat`. |
 | `LockedNotesSummary` | `zally-wallet` | Count and total value of the shielded notes the wallet considered locked at reservation time. Informational; reservations enforce by amount, not by note identity. |
 | `ReserveForDispensePlan` | `zally-wallet` | Inputs to `Wallet::reserve_for_dispense`: `account_id`, `amount_zat`, `request_id`, `idempotency_key`. |
+| `SignedPayload` | `zally-core` | Chain-neutral envelope returned by wallet-runtime signers and consumed by facilitators. `bytes` carry the opaque signed artifact, `format` names how to extract or broadcast it, and chain-specific amounts stay in the `Amount` decimal-string shape. |
+| `SignedPayloadFormat` | `zally-core` | Wire discriminant for `SignedPayload::bytes`. Zcash x402 exact uses `pczt-v2-extractable`; older PCZT v1 integrations use `pczt-v1`. |
 | `WalletOptions` | `zally-wallet` | Open-time wallet configuration; currently carries the pending-broadcast inflight window. |
 | `OutPoint` | `zally-core` | Transparent transaction outpoint (`tx_id` + `output_index`). Zally-owned so the public surface composes only Zally domain types; inside `zally-storage` the upstream `zcash_transparent::bundle::OutPoint` is imported as `UpstreamOutPoint` to avoid the same-name collision. |
 | `WalletStatus` | `zally-wallet` | Operator readiness snapshot derived from persisted wallet progress. |
@@ -264,7 +266,7 @@ The contract surface Zally publishes, grouped by domain. Each item is a guarante
 - **SPEND-5**: `nExpiryHeight` set per ZIP-203.
 - **SPEND-6**: ZIP-321 payment URI parsing through `PaymentRequest::from_uri`.
 - **SPEND-7**: `Wallet::shield_transparent_funds(ShieldTransparentPlan) -> SendOutcome` explicitly shields wallet-owned transparent UTXOs before shielded spending. Transparent outpoints locked by a still-unconfirmed wallet-owned broadcast are excluded from input selection at the `InputSource::get_spendable_transparent_outputs` seam (see `WalletOptions::pending_broadcast_window_ms`). When the filter removes every eligible input the spend fails closed with `WalletError::InsufficientBalance`, not a generic proposal-rejected error.
-- **SPEND-8**: `Wallet::get_account_balance(account_id) -> AccountBalance` returns a per-pool balance snapshot (Sapling, Orchard, transparent-mature, transparent-immature) anchored to the wallet's last observed chain tip. Read-only; composes the persisted wallet rows that drive `Wallet::sync` and `Wallet::list_unspent_shielded_notes`. Transparent values split by ZIP-213 coinbase maturity (100 confirmations) computed against `as_of_height + 1`, matching `zcash_client_backend`'s `chain_tip + 1` convention.
+- **SPEND-8**: `Wallet::get_account_balance(account_id) -> AccountBalance` returns a per-pool balance snapshot (Sapling, Orchard, Ironwood, transparent-mature, transparent-immature) anchored to the wallet's last observed chain tip. Read-only; composes the persisted wallet rows that drive `Wallet::sync` and `Wallet::list_unspent_shielded_notes`. Transparent values split by ZIP-213 coinbase maturity (100 confirmations) computed against `as_of_height + 1`, matching `zcash_client_backend`'s `chain_tip + 1` convention.
 - **SPEND-9**: `Wallet::get_pending_transparent_inputs(account_id) -> PendingTransparentInputs` returns the transparent outpoints currently locked by wallet-owned broadcasts not yet observed mined. The snapshot honours `WalletOptions::pending_broadcast_window_ms`: rows whose broadcast timestamp falls outside the window are excluded so a permanently-dropped broadcast eventually frees its outpoints.
 - **SPEND-10**: `Wallet::send_payment` excludes the same pending-broadcast outpoints as SPEND-7 from transparent input selection via the same `InputSource` override; no path-specific filter exists. Records its broadcast inputs to storage *before* calling `Submitter::submit`, so a crash window between submit and persistence does not leave an in-flight broadcast unrecorded.
 - **SPEND-11**: `Wallet::reserve_for_dispense(ReserveForDispensePlan) -> DispenseReservation` atomically locks `amount_zat` of the account's shielded balance against the caller-supplied `request_id`. The reservation persists in storage so it survives a process restart; concurrent reservations whose amounts sum above spendable cannot both pass (one returns `InsufficientBalance`). The wallet plane exposes `Wallet::release_dispense_reservation`, `Wallet::finalize_dispense_reservation`, and `Wallet::spendable_for_next_dispense` to complete the lifecycle; the latter subtracts every active reservation from the wallet's shielded view. See [ADR-0003](../adrs/0003-dispense-reservations.md).
@@ -273,10 +275,11 @@ The contract surface Zally publishes, grouped by domain. Each item is a guarante
 
 - **PCZT-1**: `Wallet::propose_pczt(plan) -> PcztBytes`: build an unsigned PCZT without holding spending keys.
 - **PCZT-2**: PCZT serialization to bytes for export to HSM, FROST coordinator, air-gapped signer.
-- **PCZT-3**: `Wallet::prove_pczt(pczt) -> PcztBytes`: create required Sapling and Orchard proofs for the in-process path.
+- **PCZT-3**: `Wallet::prove_pczt(pczt) -> PcztBytes`: create required Sapling, Orchard, and Ironwood proofs for the in-process path.
 - **PCZT-4**: `Wallet::sign_pczt(pczt) -> PcztBytes`: sign in-process (uses USK).
 - **PCZT-5**: `Wallet::extract_and_submit_pczt(final, submitter) -> SendOutcome`: extract the transaction from a fully-authorized PCZT and submit.
-- **PCZT-6**: PCZT support covers transparent, Sapling, and Orchard bundles.
+- **PCZT-6**: PCZT support covers transparent, Sapling, Orchard, and Ironwood bundles.
+- **PCZT-7**: Wallet runtimes that return `SignedPayload` for Zcash x402 exact set `format = pczt-v2-extractable` and put extractor-ready ZIP-374 PCZT bytes in `bytes`; facilitators never need wallet private keys to verify, extract, and broadcast.
 
 ### Observability (OBS)
 
