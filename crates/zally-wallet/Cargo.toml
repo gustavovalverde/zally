@@ -49,6 +49,9 @@ zip321.workspace = true
 
 [dev-dependencies]
 async-trait.workspace = true
+orchard.workspace = true
+rand.workspace = true
+secp256k1.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
 thiserror.workspace = true
@@ -56,8 +59,7 @@ tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "time
 tracing-subscriber.workspace = true
 uuid.workspace = true
 zally-testkit = { path = "../zally-testkit", version = "0.1" }
-zinder-core.workspace = true
-zinder-testkit.workspace = true
+zcash_primitives = { workspace = true, features = ["circuits", "test-dependencies"] }
 
 [[example]]
 name = "open-wallet"

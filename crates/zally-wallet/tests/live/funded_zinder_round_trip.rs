@@ -5,6 +5,8 @@ use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
 
+use rand::rngs::OsRng;
+use secp256k1::{PublicKey, Secp256k1};
 use serde_json::{Value, json};
 use zally_chain::{
     ChainSource, SubmitOutcome, Submitter, ZinderChainSource, ZinderRemoteOptions, ZinderSubmitter,
@@ -21,23 +23,27 @@ use zally_wallet::{
     ProposalPlan, SendPaymentPlan, ShieldTransparentPlan, SyncDriver, SyncDriverOptions,
     SyncHandle, SyncSnapshotStream, SyncStatus, Wallet, WalletError,
 };
+use zcash_primitives::transaction::builder::{BuildConfig, Builder};
 use zcash_protocol::{
-    consensus::BlockHeight as ConsensusBlockHeight,
+    consensus::{BlockHeight as ConsensusBlockHeight, NetworkType},
     local_consensus::LocalNetwork as ZallyLocalNetwork,
+    value::Zatoshis as UpstreamZatoshis,
 };
-use zcash_transparent::address::TransparentAddress as ZallyTransparentAddress;
-use zinder_core::{ConsensusBranchId, NetworkUpgradeActivation, NetworkUpgradeActivations};
-use zinder_testkit::{
-    LocalNetwork as FundingLocalNetwork, P2pkhSpendArgs, TransparentAddress, TransparentTestKey,
-    ZIP317_FEE_ONE_IN_ONE_OUT_ZATS, local_network_from_activations,
+use zcash_transparent::{
+    address::TransparentAddress as ZallyTransparentAddress,
+    builder::TransparentSigningSet,
+    bundle::{OutPoint, TxOut},
+    keys::{AccountPrivKey, NonHardenedChildIndex},
 };
+use zip32::AccountId as TransparentAccountId;
 
 const NODE_JSON_RPC_ADDR_ENV: &str = "ZALLY_TEST_NODE_JSON_RPC_ADDR";
 const NODE_RPC_USER_ENV: &str = "ZALLY_TEST_NODE_RPC_USER";
 const NODE_RPC_PASSWORD_ENV: &str = "ZALLY_TEST_NODE_RPC_PASSWORD";
 const SHIELDING_THRESHOLD_ZAT_ENV: &str = "ZALLY_TEST_SHIELDING_THRESHOLD_ZAT";
 const SEND_ZAT_ENV: &str = "ZALLY_TEST_SEND_ZAT";
-const BROADCAST_TEST_SEED: [u8; 32] = [0x42_u8; 32];
+const TRANSPARENT_FUNDING_TEST_SEED: [u8; 32] = [0x42_u8; 32];
+const ZIP317_FEE_ONE_IN_ONE_OUT_ZAT: u64 = 10_000;
 // The wallet's shielding policy treats every chain-ingested transparent input as
 // untrusted and requires COINBASE_MATURITY (100) confirmations, so the funding
 // output only becomes shieldable once this many blocks sit on top of it.
@@ -119,7 +125,7 @@ struct FundedZinderRoundTrip {
     submitter: ZinderSubmitter,
     sync_handle: SyncHandle,
     sync_snapshots: SyncSnapshotStream,
-    funding_local_network: FundingLocalNetwork,
+    funding_local_network: ZallyLocalNetwork,
 }
 
 impl FundedZinderRoundTrip {
@@ -167,7 +173,6 @@ impl FundedZinderRoundTrip {
         let receive_transparent = receive_ua
             .transparent()
             .copied()
-            .map(zally_transparent_to_funding_transparent)
             .ok_or(TestError::TransparentReceiverMissing)?;
         let funding_tx = build_regtest_funding_transaction(
             &self.miner,
@@ -383,32 +388,84 @@ async fn wait_until_transparent_utxo_at_tip(
 
 fn build_regtest_funding_transaction(
     miner: &JsonRpcClient,
-    recipient: &TransparentAddress,
-    funding_local_network: FundingLocalNetwork,
+    recipient: &ZallyTransparentAddress,
+    funding_local_network: ZallyLocalNetwork,
 ) -> Result<Vec<u8>, TestError> {
-    let test_key = TransparentTestKey::from_seed_with_local_network(
-        &BROADCAST_TEST_SEED,
-        funding_local_network,
-    )?;
-    let coinbase = miner.locate_spendable_coinbase(&test_key.address_base58())?;
-    test_key
-        .build_p2pkh_spend(&P2pkhSpendArgs {
-            coinbase_txid_be: coinbase.txid_be,
-            coinbase_vout: coinbase.vout,
-            coinbase_value_zats: coinbase.value_zats,
-            recipient,
-            target_height: coinbase.target_height,
-        })
-        .map_err(TestError::from)
-}
-
-fn zally_transparent_to_funding_transparent(
-    address: ZallyTransparentAddress,
-) -> TransparentAddress {
-    match address {
-        ZallyTransparentAddress::PublicKeyHash(hash) => TransparentAddress::PublicKeyHash(hash),
-        ZallyTransparentAddress::ScriptHash(hash) => TransparentAddress::ScriptHash(hash),
+    let account_key = AccountPrivKey::from_seed(
+        &funding_local_network,
+        &TRANSPARENT_FUNDING_TEST_SEED,
+        TransparentAccountId::ZERO,
+    )
+    .map_err(|error| TestError::TransparentFunding {
+        reason: format!("could not derive funding account key: {error}"),
+    })?;
+    let secret_key = account_key
+        .derive_external_secret_key(NonHardenedChildIndex::ZERO)
+        .map_err(|error| TestError::TransparentFunding {
+            reason: format!("could not derive funding secret key: {error}"),
+        })?;
+    let secp = Secp256k1::new();
+    let public_key = PublicKey::from_secret_key(&secp, &secret_key);
+    let funding_address = ZallyTransparentAddress::from_pubkey(&public_key)
+        .to_zcash_address(NetworkType::Regtest)
+        .encode();
+    let coinbase = miner.locate_spendable_coinbase(&funding_address)?;
+    if coinbase.value_zats <= ZIP317_FEE_ONE_IN_ONE_OUT_ZAT {
+        return Err(TestError::TransparentFunding {
+            reason: format!(
+                "coinbase value {} does not exceed the ZIP-317 fee {ZIP317_FEE_ONE_IN_ONE_OUT_ZAT}",
+                coinbase.value_zats
+            ),
+        });
     }
+    let coinbase_amount = UpstreamZatoshis::from_u64(coinbase.value_zats).map_err(|error| {
+        TestError::TransparentFunding {
+            reason: format!("coinbase value was invalid: {error}"),
+        }
+    })?;
+    let send_amount = UpstreamZatoshis::from_u64(
+        coinbase.value_zats - ZIP317_FEE_ONE_IN_ONE_OUT_ZAT,
+    )
+    .map_err(|error| TestError::TransparentFunding {
+        reason: format!("funding output value was invalid: {error}"),
+    })?;
+    let mut signing_set = TransparentSigningSet::new();
+    let signing_public_key = signing_set.add_key(secret_key);
+    let coin = TxOut::new(
+        coinbase_amount,
+        ZallyTransparentAddress::from_pubkey(&signing_public_key)
+            .script()
+            .into(),
+    );
+    let outpoint = OutPoint::new(coinbase.txid_be, coinbase.vout);
+    let mut builder = Builder::new(
+        funding_local_network,
+        ConsensusBlockHeight::from_u32(coinbase.target_height),
+        BuildConfig::Standard {
+            sapling_anchor: None,
+            orchard_anchor: None,
+            ironwood_anchor: None,
+            orchard_pool_bundle_type: orchard::builder::BundleType::DEFAULT,
+        },
+    );
+    builder
+        .add_transparent_p2pkh_input(signing_public_key, outpoint, coin)
+        .map_err(|error| TestError::TransparentFunding {
+            reason: format!("could not add funding input: {error}"),
+        })?;
+    builder
+        .add_transparent_output(recipient, send_amount)
+        .map_err(|error| TestError::TransparentFunding {
+            reason: format!("could not add funding output: {error}"),
+        })?;
+    let built = builder
+        .mock_build(&signing_set, &[], &[], OsRng)
+        .map_err(|error| TestError::TransparentFunding {
+            reason: format!("could not build funding transaction: {error}"),
+        })?;
+    let mut bytes = Vec::new();
+    built.transaction().write(&mut bytes)?;
+    Ok(bytes)
 }
 
 #[allow(
@@ -475,7 +532,6 @@ struct AddressUtxo {
 }
 
 struct NodeUpgrade {
-    branch_id: u32,
     activation_height: u32,
     name: String,
 }
@@ -520,27 +576,10 @@ impl JsonRpcClient {
         Ok(BlockHeight::from(height))
     }
 
-    fn regtest_networks_from_node(&self) -> Result<(Network, FundingLocalNetwork), TestError> {
+    fn regtest_networks_from_node(&self) -> Result<(Network, ZallyLocalNetwork), TestError> {
         let node_upgrades = self.node_upgrade_activations()?;
-        let zally_network = Network::Regtest(zally_local_network_from_upgrades(&node_upgrades));
-        let zinder_activations = NetworkUpgradeActivations::new(
-            zinder_core::Network::ZcashRegtest,
-            node_upgrades
-                .iter()
-                .map(|upgrade| NetworkUpgradeActivation {
-                    branch_id: ConsensusBranchId::new(upgrade.branch_id),
-                    activation_height: zinder_core::BlockHeight::new(upgrade.activation_height),
-                    name: upgrade.name.clone(),
-                })
-                .collect(),
-        )
-        .map_err(|err| TestError::ActivationTable {
-            reason: err.to_string(),
-        })?;
-        Ok((
-            zally_network,
-            local_network_from_activations(&zinder_activations),
-        ))
+        let local_network = zally_local_network_from_upgrades(&node_upgrades);
+        Ok((Network::Regtest(local_network), local_network))
     }
 
     fn node_upgrade_activations(&self) -> Result<Vec<NodeUpgrade>, TestError> {
@@ -569,7 +608,7 @@ impl JsonRpcClient {
 
         for utxo in utxos {
             if utxo.height <= maturity_cutoff
-                && utxo.satoshis > ZIP317_FEE_ONE_IN_ONE_OUT_ZATS
+                && utxo.satoshis > ZIP317_FEE_ONE_IN_ONE_OUT_ZAT
                 && self.address_utxo_is_unspent(&utxo)?
             {
                 return Ok(TestCoinbase {
@@ -704,10 +743,6 @@ fn node_upgrade_from_json(
     branch_id_hex: &str,
     upgrade_json: &Value,
 ) -> Result<NodeUpgrade, TestError> {
-    let branch_id = u32::from_str_radix(branch_id_hex, 16).map_err(|err| TestError::RpcShape {
-        method: "getblockchaininfo",
-        reason: format!("upgrade branch id {branch_id_hex} was not hex u32: {err}"),
-    })?;
     let name = upgrade_json
         .get("name")
         .and_then(Value::as_str)
@@ -729,7 +764,6 @@ fn node_upgrade_from_json(
             reason: format!("upgrade {name} activationheight did not fit u32: {err}"),
         })?;
     Ok(NodeUpgrade {
-        branch_id,
         activation_height,
         name,
     })
@@ -823,8 +857,8 @@ enum TestError {
     Chain(#[from] zally_chain::ChainSourceError),
     #[error("submitter error: {0}")]
     Submitter(#[from] zally_chain::SubmitterError),
-    #[error("transparent funding signer error: {0}")]
-    TransparentSigner(#[from] zinder_testkit::TransparentSignerError),
+    #[error("transparent funding transaction could not be built: {reason}")]
+    TransparentFunding { reason: String },
     #[error("idempotency key error: {0}")]
     IdempotencyKey(#[from] zally_core::IdempotencyKeyError),
     #[error("funded live test requires ZALLY_NETWORK=regtest")]
@@ -853,8 +887,6 @@ enum TestError {
         method: &'static str,
         reason: String,
     },
-    #[error("node upgrade activation table was invalid: {reason}")]
-    ActivationTable { reason: String },
     #[error("sync snapshot stream closed")]
     SyncStreamClosed,
     #[error("timed out waiting for sync to reach tip")]

@@ -29,14 +29,32 @@ That packaging choice does not survive the family bump. `zcash_client_sqlite` an
 
 6. **Downstream consumers move in lockstep.** Any consumer building on top of a zally commit that carries this ADR (notably fauzec) must bump its own `zcash_*`/`pczt` pins and its own copy of the `target_expiry_height` patch to the same librustzcash commit zally pins. Picking up zally's API changes without the matching dependency family produces the same two-source-identity failure this ADR exists to avoid.
 
+## Amendment: Zinder's crates.io transition
+
+Zinder's current client and core revision uses released lower-level Zcash crates. Its internal Zebra stack also resolves released `zcash_*` packages. Zally's wallet plane still requires the unreleased librustzcash commit for Ironwood scanning, storage, and PCZT construction. Cargo source patches apply to the complete graph, so the original global librustzcash patch leaves no candidate that can satisfy Zinder's released requirements.
+
+This amendment supersedes Decisions 1 through 3, Decision 6, and the zero-duplicate invariant in Decision 2:
+
+1. **Zally names its unreleased wallet-plane crates as direct git dependencies.** `zcash_client_backend`, `zcash_client_sqlite`, `pczt`, `zcash_protocol`, `zcash_primitives`, `zcash_keys`, `zcash_address`, `zcash_transparent`, `zcash_proofs`, and `zip321` each point directly at commit `8e6864a3c67cab3c64a052dd20f83c553662e8b2`. Their intra-workspace path dependencies therefore remain one Git type family without globally replacing crates.io packages Zinder needs. The Orchard and incrementalmerkletree patches remain because the pinned librustzcash checkout needs those unreleased implementations.
+
+2. **The Zinder adapter is the only permitted family split.** Zinder's released `zcash_address` and `zcash_protocol` values, and its Zebra-internal registry family, may coexist with Zally's Git family. `zally-chain` converts Zinder's own domain values at the adapter boundary and exchanges transaction bytes and generated protobuf values, not upstream Zcash types. A new adapter method that exposes a Zinder-owned upstream Zcash type to another Zally crate is review-blocking.
+
+3. **The T3 funding fixture stays in Zally's type family.** The live Zinder round-trip test constructs its transparent funding transaction from Zally's pinned dependencies and the running node's advertised activation heights. It does not depend on `zinder-testkit`: that crate currently selects released Orchard and cannot share a graph with the unreleased Orchard required by Zally's Ironwood wallet plane.
+
+4. **Duplicate-source output is now a boundary audit, not a blanket failure.** `cargo tree -d --workspace --all-features -e no-dev` will report the expected registry and Git copies of portions of the Zcash family. Review each new duplicate for a public or cross-crate type crossing, then run the full workspace all-targets check. A duplicate reachable only inside Zinder's client implementation or Zebra stack is acceptable; a duplicate that reaches a Zally wallet, storage, PCZT, or public chain interface is not.
+
+5. **Downstream consumers that use Zally's Ironwood types must name the same Git packages directly.** They must not restore the removed global librustzcash patch, because doing so would again make Zinder's released lower-level dependencies unresolvable.
+
 ## Consequences
 
 - zally now tracks an unreleased, prerelease librustzcash family. `cargo update` inside this family can pick up new prerelease point releases (e.g. a future `orchard 0.15.0-pre.3`) without any zally action; a move to a *different* librustzcash commit (picking up further upstream changes) requires re-verifying Gate 2 and re-running the full validation gate, but does not require touching the patch topology itself.
 - `zally-storage`'s `WalletStorage::put_subtree_roots` and the `ext_zally_holds.locked_notes` wire format both type-check against a three-variant `ShieldedPool` (`Sapling`, `Orchard`, `Ironwood`) instead of two. Subtree-root priming now records Sapling, Orchard, and Ironwood roots through the corresponding upstream write paths. The locked-notes wire format reserves tag `2` for Ironwood so reservation metadata stays stable as live Ironwood notes appear.
 - Dropping the target-expiry export means one fewer git remote to keep in sync, at the cost of a heavier git checkout per patched crate (the full librustzcash workspace, not a single packaged crate) for anyone building zally from source.
+- The Zinder update keeps its current client and core revision, while the live fixture no longer couples Zally's build graph to Zinder's test-only dependency family.
 
 ## Revision History
 
 - 2026-07-06: Decision 1 extended to patch `zcash_encoding` and `equihash` from the same commit as the other ten crates. Decision 2's standing exception for these two crates is retired; the family gate now requires zero duplicates with no exception. Decision 5 added to document the bip32-driven RustCrypto pre-release cluster as a known split outside the family gate's scope, with its upstream resolution lever. The former Decision 5 is renumbered to Decision 6.
 - 2026-07-05: Decision 4 updated to reflect that `create_pczt_from_proposal` now supports Ironwood-touching proposals; the testnet-height availability gap it previously documented is closed at the pinned commit.
 - 2026-07-09: Decision 1 moved the family pin from `gustavovalverde/librustzcash` commit `693338fea7a50313905ad00d2f08be1b9e4e7322` to upstream `zcash/librustzcash` commit `8e6864a3c67cab3c64a052dd20f83c553662e8b2`, which now carries the target-expiry PCZT API and Ironwood wallet support. Decision 3 added the temporary `orchard` git patch required by the upstream bundle-type APIs.
+- 2026-07-10: Zinder's transition to released lower-level Zcash crates replaces the global librustzcash patch with direct Git dependencies for Zally's Ironwood wallet plane. The amended boundary audit permits Zinder-internal registry duplicates, forbids their upstream types from crossing the adapter, and removes `zinder-testkit` from the live funding fixture.
