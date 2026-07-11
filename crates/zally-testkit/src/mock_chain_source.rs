@@ -7,12 +7,16 @@
 //! - stream empty compact blocks (the fixture covers sync orchestration; tests that need
 //!   real note decryption point `Wallet::sync` at a live `ChainSource` instead),
 //! - serve scannable transactionless compact blocks via
-//!   [`MockChainSourceHandle::serve_compact_blocks`], so scan progress commits.
+//!   [`MockChainSourceHandle::serve_compact_blocks`], so scan progress commits,
+//! - serve a caller-supplied tree state at its height via
+//!   [`MockChainSourceHandle::serve_tree_state`], so tree-root verification sees
+//!   chain roots the test controls.
 //!
 //! The handle returned by [`MockChainSource::handle`] is `Clone` and shares state with the
 //! original mock; tests drive the mock through the handle while passing the mock itself to
 //! `Wallet::sync`.
 
+use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -40,6 +44,7 @@ struct MockState {
     transparent_utxo_failures: Vec<ChainSourceError>,
     failures_consumed: u32,
     is_serving_compact_blocks: bool,
+    tree_states_by_height: HashMap<u32, TreeState>,
 }
 
 /// In-memory `ChainSource` fixture.
@@ -61,6 +66,7 @@ impl MockChainSource {
                 transparent_utxo_failures: Vec::new(),
                 failures_consumed: 0,
                 is_serving_compact_blocks: false,
+                tree_states_by_height: HashMap::new(),
             })),
             event_tx,
         }
@@ -176,6 +182,16 @@ impl MockChainSourceHandle {
         self.state.lock().is_serving_compact_blocks = true;
     }
 
+    /// Serves `tree_state` from `tree_state_at` for the height it carries, instead of the
+    /// default all-empty tree state.
+    pub fn serve_tree_state(&self, tree_state: TreeState) {
+        let height = u32::try_from(tree_state.height).unwrap_or(u32::MAX);
+        self.state
+            .lock()
+            .tree_states_by_height
+            .insert(height, tree_state);
+    }
+
     /// Number of failures consumed since the mock was constructed.
     #[must_use]
     pub fn failures_consumed(&self) -> u32 {
@@ -246,8 +262,21 @@ impl ChainSource for MockChainSource {
         &self,
         block_height: BlockHeight,
     ) -> Result<TreeState, ChainSourceError> {
+        let (network, served_tree_state) = {
+            let guard = self.state.lock();
+            (
+                guard.network,
+                guard
+                    .tree_states_by_height
+                    .get(&block_height.as_u32())
+                    .cloned(),
+            )
+        };
+        if let Some(tree_state) = served_tree_state {
+            return Ok(tree_state);
+        }
         Ok(TreeState {
-            network: format!("{:?}", self.state.lock().network),
+            network: format!("{network:?}"),
             height: u64::from(block_height.as_u32()),
             hash: "00".repeat(32),
             time: 0,

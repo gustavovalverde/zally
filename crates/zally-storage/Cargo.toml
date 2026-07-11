@@ -26,6 +26,7 @@ tracing.workspace = true
 zally-core = { path = "../zally-core", version = "0.1" }
 zally-keys = { path = "../zally-keys", version = "0.1" }
 pczt = { workspace = true }
+incrementalmerkletree.workspace = true
 orchard.workspace = true
 sapling.workspace = true
 shardtree.workspace = true
@@ -42,7 +43,6 @@ uuid = { workspace = true, features = ["v5"] }
 
 [dev-dependencies]
 hex.workspace = true
-incrementalmerkletree.workspace = true
 prost = "0.14"
 serde_json.workspace = true
 tempfile.workspace = true

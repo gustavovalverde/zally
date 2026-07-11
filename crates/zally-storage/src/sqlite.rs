@@ -19,7 +19,9 @@ use rand::rngs::OsRng;
 use rusqlite::OptionalExtension as _;
 use sapling::Node as SaplingNode;
 use secrecy::{ExposeSecret as _, SecretVec};
-use shardtree::error::{InsertionError, ShardTreeError};
+use shardtree::ShardTree;
+use shardtree::error::{InsertionError, QueryError, ShardTreeError};
+use shardtree::store::ShardStore;
 use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
 use zally_core::{
@@ -730,23 +732,23 @@ impl WalletStorage for Sqlite {
             // would include backfilled subtree caps that commit leaves beyond the scanned
             // frontier.
             let sapling = db
-                .with_sapling_tree_mut(|tree| tree.root_at_checkpoint_depth(Some(0)))
+                .with_sapling_tree_mut(|tree| checkpoint_root_of_scanned_leaves(tree))
                 .map_err(|err| StorageError::SqliteFailed {
-                    reason: format!("sapling root_at_checkpoint_depth failed: {err}"),
+                    reason: format!("sapling checkpoint_root_of_scanned_leaves failed: {err}"),
                     posture: FailurePosture::NotRetryable,
                 })?
                 .map(|node| node.to_bytes());
             let orchard = db
-                .with_orchard_tree_mut(|tree| tree.root_at_checkpoint_depth(Some(0)))
+                .with_orchard_tree_mut(|tree| checkpoint_root_of_scanned_leaves(tree))
                 .map_err(|err| StorageError::SqliteFailed {
-                    reason: format!("orchard root_at_checkpoint_depth failed: {err}"),
+                    reason: format!("orchard checkpoint_root_of_scanned_leaves failed: {err}"),
                     posture: FailurePosture::NotRetryable,
                 })?
                 .map(|node| node.to_bytes());
             let ironwood = db
-                .with_ironwood_tree_mut(|tree| tree.root_at_checkpoint_depth(Some(0)))
+                .with_ironwood_tree_mut(|tree| checkpoint_root_of_scanned_leaves(tree))
                 .map_err(|err| StorageError::SqliteFailed {
-                    reason: format!("ironwood root_at_checkpoint_depth failed: {err}"),
+                    reason: format!("ironwood checkpoint_root_of_scanned_leaves failed: {err}"),
                     posture: FailurePosture::NotRetryable,
                 })?
                 .flatten()
@@ -2454,6 +2456,29 @@ where
     StorageError::SqliteFailed {
         reason: format!("scan_cached_blocks failed: {err}"),
         posture: FailurePosture::NotRetryable,
+    }
+}
+
+/// Computes the tree root at the latest retained checkpoint, or `None` when that checkpoint
+/// commits zero leaves.
+///
+/// A zero-leaf checkpoint (max leaf position `None`) proves the pool has nothing scanned
+/// into it, so its root is the constant empty root and carries no evidence about scan
+/// correctness; reporting `None` lets root verification skip the pool. Leaf presence is the
+/// discriminator (not comparison against the canonical empty root), so a real tree can
+/// never be misclassified. A missing checkpoint also reports `None`.
+fn checkpoint_root_of_scanned_leaves<H, C, S, const DEPTH: u8, const SHARD_HEIGHT: u8>(
+    tree: &ShardTree<S, DEPTH, SHARD_HEIGHT>,
+) -> Result<Option<H>, ShardTreeError<S::Error>>
+where
+    H: incrementalmerkletree::Hashable + Clone + PartialEq,
+    C: Clone + std::fmt::Debug + Ord,
+    S: ShardStore<H = H, CheckpointId = C>,
+{
+    match tree.max_leaf_position(Some(0)) {
+        Ok(Some(_)) => tree.root_at_checkpoint_depth(Some(0)),
+        Ok(None) | Err(ShardTreeError::Query(QueryError::CheckpointPruned)) => Ok(None),
+        Err(err) => Err(err),
     }
 }
 
