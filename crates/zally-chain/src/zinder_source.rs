@@ -19,6 +19,7 @@ use prost::Message;
 use zally_core::{BlockHeight, Network, TxId};
 use zcash_client_backend::proto::compact_formats::CompactBlock;
 use zcash_client_backend::proto::service::TreeState;
+use zcash_protocol::consensus::{NetworkUpgrade, Parameters as _};
 use zinder_client::{
     ChainEvent as ZinderChainEvent, ChainEventCursor as ZinderChainEventCursor,
     ChainEventEnvelope as ZinderChainEventEnvelope, EndpointBackedIndex,
@@ -371,21 +372,11 @@ fn decode_tree_state(
         .and_then(serde_json::Value::as_u64)
         .and_then(|t| u32::try_from(t).ok())
         .unwrap_or(0);
-    let sapling_tree = parsed
-        .pointer("/sapling/commitments/finalState")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or_default()
-        .to_owned();
-    let orchard_tree = parsed
-        .pointer("/orchard/commitments/finalState")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or_default()
-        .to_owned();
-    let ironwood_tree = parsed
-        .pointer("/ironwood/commitments/finalState")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or_default()
-        .to_owned();
+    let sapling_tree =
+        pool_final_state(&parsed, "sapling", NetworkUpgrade::Sapling, height, network)?;
+    let orchard_tree = pool_final_state(&parsed, "orchard", NetworkUpgrade::Nu5, height, network)?;
+    let ironwood_tree =
+        pool_final_state(&parsed, "ironwood", NetworkUpgrade::Nu6_3, height, network)?;
 
     Ok(TreeState {
         network: lightwalletd_network_label(network).to_owned(),
@@ -398,6 +389,41 @@ fn decode_tree_state(
     })
 }
 
+/// Reads one pool's `finalState` frontier from the tree-state JSON.
+///
+/// A missing or empty frontier is only valid below the pool's activation height, where no
+/// commitment tree exists yet. At or above activation the frontier seeds the scan's starting
+/// position, so defaulting it silently would build a tree whose root can never reconverge
+/// with the chain; the mismatch would later surface as a root divergence blamed on the scan.
+fn pool_final_state(
+    parsed: &serde_json::Value,
+    pool: &str,
+    upgrade: NetworkUpgrade,
+    height: BlockHeight,
+    network: Network,
+) -> Result<String, ChainSourceError> {
+    let final_state = parsed
+        .pointer(&format!("/{pool}/commitments/finalState"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    if final_state.is_empty() {
+        let is_pool_active = network
+            .to_parameters()
+            .activation_height(upgrade)
+            .map(BlockHeight::from)
+            .is_some_and(|activation| height >= activation);
+        if is_pool_active {
+            return Err(ChainSourceError::MalformedCompactBlock {
+                block_height: height,
+                reason: format!(
+                    "tree-state JSON missing `{pool}` finalState with the pool active at this height"
+                ),
+            });
+        }
+    }
+    Ok(final_state.to_owned())
+}
+
 #[allow(
     clippy::wildcard_enum_match_arm,
     reason = "lightwalletd TreeState distinguishes only main and test network labels"
@@ -406,5 +432,81 @@ const fn lightwalletd_network_label(network: Network) -> &'static str {
     match network {
         Network::Mainnet => "main",
         _ => "test",
+    }
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::expect_used,
+    reason = "tests panic on fixture decode outcomes that contradict the case under test"
+)]
+mod tests {
+    use super::*;
+
+    const TESTNET_NU5_HEIGHT: u32 = 1_842_420;
+
+    fn tree_state_json(pools: &[(&str, &str)]) -> Vec<u8> {
+        let mut root = serde_json::json!({
+            "height": 4_050_200,
+            "hash": "00".repeat(32),
+            "time": 1_700_000_000,
+        });
+        for (pool, final_state) in pools {
+            root[pool] = serde_json::json!({ "commitments": { "finalState": final_state } });
+        }
+        serde_json::to_vec(&root).expect("fixture serializes")
+    }
+
+    #[test]
+    fn missing_pool_frontier_defaults_below_activation() {
+        let payload = tree_state_json(&[("sapling", "abcd")]);
+        let tree_state = decode_tree_state(
+            &payload,
+            BlockHeight::from(TESTNET_NU5_HEIGHT - 1),
+            Network::Testnet,
+        )
+        .expect("pre-activation tree state decodes");
+        assert_eq!(tree_state.sapling_tree, "abcd");
+        assert_eq!(tree_state.orchard_tree, "");
+        assert_eq!(tree_state.ironwood_tree, "");
+    }
+
+    #[test]
+    fn missing_pool_frontier_faults_at_activation() {
+        let payload = tree_state_json(&[("sapling", "abcd")]);
+        let err = decode_tree_state(
+            &payload,
+            BlockHeight::from(TESTNET_NU5_HEIGHT),
+            Network::Testnet,
+        )
+        .expect_err("post-activation tree state without an orchard frontier faults");
+        assert!(matches!(
+            err,
+            ChainSourceError::MalformedCompactBlock { .. }
+        ));
+        assert!(err.to_string().contains("orchard"));
+    }
+
+    #[test]
+    fn empty_pool_frontier_faults_the_same_as_missing() {
+        let payload = tree_state_json(&[("sapling", "abcd"), ("orchard", "")]);
+        let err = decode_tree_state(
+            &payload,
+            BlockHeight::from(TESTNET_NU5_HEIGHT),
+            Network::Testnet,
+        )
+        .expect_err("an empty frontier string carries no more evidence than a missing one");
+        assert!(err.to_string().contains("orchard"));
+    }
+
+    #[test]
+    fn present_pool_frontiers_decode_at_any_height() {
+        let payload = tree_state_json(&[("sapling", "aa"), ("orchard", "bb"), ("ironwood", "cc")]);
+        let tree_state =
+            decode_tree_state(&payload, BlockHeight::from(4_200_000u32), Network::Testnet)
+                .expect("fully populated tree state decodes");
+        assert_eq!(tree_state.sapling_tree, "aa");
+        assert_eq!(tree_state.orchard_tree, "bb");
+        assert_eq!(tree_state.ironwood_tree, "cc");
     }
 }
