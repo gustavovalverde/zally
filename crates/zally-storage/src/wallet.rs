@@ -108,6 +108,10 @@ pub struct ProposalPaymentRequest {
     pub amount_zat: Zatoshis,
     /// Optional memo (the wallet layer enforces the no-memo-on-transparent rule before this).
     pub memo: Option<Vec<u8>>,
+    /// Shielded pool from which inputs may be selected.
+    ///
+    /// `None` permits the upstream default multi-pool policy.
+    pub source_pool: Option<ShieldedPool>,
 }
 
 impl ProposalPaymentRequest {
@@ -124,7 +128,15 @@ impl ProposalPaymentRequest {
             recipient_encoded,
             amount_zat,
             memo,
+            source_pool: None,
         }
+    }
+
+    /// Restricts shielded input selection to `source_pool`.
+    #[must_use]
+    pub const fn with_source_pool(mut self, source_pool: ShieldedPool) -> Self {
+        self.source_pool = Some(source_pool);
+        self
     }
 }
 
@@ -138,6 +150,10 @@ pub struct ShieldTransparentRequest {
     pub account_id: AccountId,
     /// Minimum total transparent input value to shield.
     pub shielding_threshold_zat: Zatoshis,
+    /// Shielded pool that receives the swept funds.
+    ///
+    /// `None` preserves the storage backend's activation-aware default.
+    pub destination_pool: Option<ShieldedPool>,
 }
 
 impl ShieldTransparentRequest {
@@ -147,7 +163,21 @@ impl ShieldTransparentRequest {
         Self {
             account_id,
             shielding_threshold_zat,
+            destination_pool: None,
         }
+    }
+
+    /// Returns the request with an explicit shielded destination pool.
+    #[must_use]
+    pub const fn with_destination_pool(mut self, destination_pool: ShieldedPool) -> Self {
+        self.destination_pool = Some(destination_pool);
+        self
+    }
+
+    /// Returns the explicit shielded destination pool, if one was selected.
+    #[must_use]
+    pub const fn destination_pool(&self) -> Option<ShieldedPool> {
+        self.destination_pool
     }
 }
 
@@ -649,6 +679,15 @@ pub trait WalletStorage: Send + Sync + 'static {
         &self,
         pczt_bytes: Vec<u8>,
     ) -> Result<PreparedTransaction, StorageError>;
+
+    /// Returns the finalized PCZT bytes retained when `tx_id` was extracted, or `None` when
+    /// the transaction predates disclosure-source retention or was not created through PCZT.
+    ///
+    /// The returned bytes contain wallet-sensitive proving material and must never be logged.
+    ///
+    /// `not_retryable` on malformed stored rows; `retryable` on transient storage I/O.
+    async fn find_finalized_pczt_bytes(&self, tx_id: TxId)
+    -> Result<Option<Vec<u8>>, StorageError>;
 
     /// Returns the [`TxId`] previously recorded for `key`, or `None` when the key has not
     /// been used. Backed by a Zally-owned `ext_zally_idempotency` table colocated with the

@@ -4959,6 +4959,7 @@ dependencies = [
  "orchard",
  "pczt",
  "postcard",
+ "rand",
  "sapling-crypto",
  "secp256k1",
  "serde",
@@ -4966,7 +4967,9 @@ dependencies = [
  "tokio",
  "zally-core",
  "zally-keys",
+ "zcash-payment-disclosure",
  "zcash_keys",
+ "zcash_note_encryption",
  "zcash_proofs",
  "zcash_protocol 0.10.0-pre.0",
  "zcash_transparent 0.9.0-pre.0",
@@ -5036,6 +5039,7 @@ dependencies = [
  "orchard",
  "parking_lot",
  "rand",
+ "sapling-crypto",
  "secp256k1",
  "serde",
  "serde_json",
@@ -5052,14 +5056,41 @@ dependencies = [
  "zally-pczt",
  "zally-storage",
  "zally-testkit",
+ "zcash-payment-disclosure",
  "zcash_address 0.13.0-pre.0",
  "zcash_client_backend",
  "zcash_keys",
  "zcash_primitives 0.29.0-pre.0 (git+https://github.com/zcash/librustzcash.git?rev=8e6864a3c67cab3c64a052dd20f83c553662e8b2)",
+ "zcash_proofs",
  "zcash_protocol 0.10.0-pre.0",
  "zcash_transparent 0.9.0-pre.0",
  "zip32",
  "zip321",
+]
+
+[[package]]
+name = "zcash-payment-disclosure"
+version = "0.1.0"
+dependencies = [
+ "bellman",
+ "blake2b_simd",
+ "bls12_381",
+ "ff",
+ "incrementalmerkletree",
+ "jubjub",
+ "nonempty",
+ "orchard",
+ "pasta_curves",
+ "rand",
+ "rand_core",
+ "redjubjub",
+ "sapling-crypto",
+ "thiserror 2.0.18",
+ "zcash_note_encryption",
+ "zcash_primitives 0.29.0-pre.0 (git+https://github.com/zcash/librustzcash.git?rev=8e6864a3c67cab3c64a052dd20f83c553662e8b2)",
+ "zcash_proofs",
+ "zcash_protocol 0.10.0-pre.0",
+ "zcash_transparent 0.9.0-pre.0",
 ]
 
 [[package]]

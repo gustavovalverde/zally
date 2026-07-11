@@ -17,6 +17,10 @@ async fn capabilities_reports_standing_surface() -> Result<(), TestWalletError> 
     assert_eq!(caps.sealing, SealingCapability::AgeFile);
     assert_eq!(caps.storage, StorageCapability::Sqlite);
     assert_eq!(caps.network, network);
+    assert!(
+        caps.features
+            .contains(&Capability::Zip311Draft1SaplingDisclosures)
+    );
     assert!(caps.features.contains(&Capability::Zip316UnifiedAddresses));
     assert!(caps.features.contains(&Capability::Zip302Memos));
     assert!(caps.features.contains(&Capability::Zip320TexAddresses));

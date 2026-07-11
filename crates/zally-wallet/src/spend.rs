@@ -7,7 +7,7 @@
 
 use std::collections::HashSet;
 
-use zally_chain::Submitter;
+use zally_chain::{ShieldedPool, Submitter};
 use zally_core::{
     AccountId, BlockHeight, IdempotencyKey, Memo, MemoBytes, Network, OutPoint, PaymentRecipient,
     TxId, Zatoshis,
@@ -151,7 +151,10 @@ fn classify_recipient(encoded: &str, network: Network) -> PaymentRecipient {
             encoded: encoded.to_owned(),
             network,
         }
-    } else if encoded.starts_with("zs") || encoded.starts_with("zregtestsapling") {
+    } else if encoded.starts_with("zs")
+        || encoded.starts_with("ztestsapling")
+        || encoded.starts_with("zregtestsapling")
+    {
         PaymentRecipient::SaplingAddress {
             encoded: encoded.to_owned(),
             network,
@@ -318,17 +321,10 @@ impl Wallet {
         validate_recipient_network(&plan.recipient, self.network())?;
         validate_memo_against_recipient(plan.memo.as_ref(), &plan.recipient)?;
         validate_non_zero(plan.amount_zat)?;
-        let recipient_encoded = plan.recipient.encoded().to_owned();
-        let memo_bytes = plan.memo.as_ref().map(memo_to_wire_bytes);
         let summary = self
             .inner
             .storage
-            .propose_payment(zally_storage::ProposalPaymentRequest::new(
-                plan.account_id,
-                recipient_encoded,
-                plan.amount_zat,
-                memo_bytes,
-            ))
+            .propose_payment(storage_proposal_request(&plan)?)
             .await
             .map_err(WalletError::from)?;
         Ok(Proposal::from_storage_summary(summary))
@@ -541,17 +537,11 @@ impl Wallet {
         let excluded_outpoints = self
             .collect_pending_broadcast_outpoints(plan.account_id)
             .await?;
+        let shielding_request = resolve_shielding_request(&plan)?;
         let prepared = self
             .inner
             .storage
-            .shield_transparent_funds(
-                zally_storage::ShieldTransparentRequest::new(
-                    plan.account_id,
-                    plan.shielding_threshold_zat,
-                ),
-                excluded_outpoints,
-                &seed,
-            )
+            .shield_transparent_funds(shielding_request, excluded_outpoints, &seed)
             .await
             .map_err(WalletError::from)?;
         let observed_tip = self.inner.storage.find_observed_tip().await?;
@@ -706,6 +696,36 @@ impl Wallet {
     }
 }
 
+fn resolve_shielding_request(
+    plan: &ShieldTransparentPlan<'_>,
+) -> Result<zally_storage::ShieldTransparentRequest, WalletError> {
+    let request =
+        zally_storage::ShieldTransparentRequest::new(plan.account_id, plan.shielding_threshold_zat);
+    let Some(destination_pool) = plan.destination_pool else {
+        return Ok(request);
+    };
+    Ok(request.with_destination_pool(protocol_shielded_pool(destination_pool)?))
+}
+
+pub(crate) fn protocol_shielded_pool(
+    source_pool: ShieldedPool,
+) -> Result<zcash_protocol::ShieldedPool, WalletError> {
+    #[allow(
+        clippy::wildcard_enum_match_arm,
+        reason = "ShieldedPool is non-exhaustive across the zally-chain crate boundary"
+    )]
+    Ok(match source_pool {
+        ShieldedPool::Sapling => zcash_protocol::ShieldedPool::Sapling,
+        ShieldedPool::Orchard => zcash_protocol::ShieldedPool::Orchard,
+        ShieldedPool::Ironwood => zcash_protocol::ShieldedPool::Ironwood,
+        _ => {
+            return Err(WalletError::ProposalRejected {
+                reason: "shielded pool is not supported by this release".into(),
+            });
+        }
+    })
+}
+
 #[allow(
     clippy::wildcard_enum_match_arm,
     reason = "non_exhaustive submit outcomes fall through to SubmissionRejected with a placeholder typed reason"
@@ -737,6 +757,21 @@ fn memo_to_wire_bytes(memo: &Memo) -> Vec<u8> {
     MemoBytes::from(memo).as_slice().to_vec()
 }
 
+pub(crate) fn storage_proposal_request(
+    plan: &ProposalPlan,
+) -> Result<zally_storage::ProposalPaymentRequest, WalletError> {
+    let mut request = zally_storage::ProposalPaymentRequest::new(
+        plan.account_id,
+        plan.recipient.encoded().to_owned(),
+        plan.amount_zat,
+        plan.memo.as_ref().map(memo_to_wire_bytes),
+    );
+    if let Some(source_pool) = plan.source_pool {
+        request = request.with_source_pool(protocol_shielded_pool(source_pool)?);
+    }
+    Ok(request)
+}
+
 impl Proposal {
     fn from_storage_summary(summary: zally_storage::ProposalSummary) -> Self {
         Self {
@@ -762,6 +797,11 @@ pub struct ProposalPlan {
     pub amount_zat: Zatoshis,
     /// Optional memo (rejected for transparent recipients).
     pub memo: Option<Memo>,
+    /// Shielded pool from which inputs may be selected.
+    ///
+    /// `None` permits the wallet's default multi-pool selection policy. Setting a pool fails
+    /// with insufficient funds rather than crossing into another pool.
+    pub source_pool: Option<ShieldedPool>,
 }
 
 impl ProposalPlan {
@@ -778,7 +818,21 @@ impl ProposalPlan {
             recipient,
             amount_zat,
             memo,
+            source_pool: None,
         }
+    }
+
+    /// Restricts shielded input selection to `source_pool`.
+    #[must_use]
+    pub const fn with_source_pool(mut self, source_pool: ShieldedPool) -> Self {
+        self.source_pool = Some(source_pool);
+        self
+    }
+
+    /// Shielded pool from which inputs may be selected, if restricted.
+    #[must_use]
+    pub const fn source_pool(&self) -> Option<ShieldedPool> {
+        self.source_pool
     }
 }
 
@@ -820,6 +874,10 @@ pub struct ShieldTransparentPlan<'submitter> {
     pub idempotency: IdempotencyKey,
     /// Minimum total transparent input value to shield, in zatoshis.
     pub shielding_threshold_zat: Zatoshis,
+    /// Shielded pool that receives the swept funds.
+    ///
+    /// `None` preserves the wallet's activation-aware default.
+    pub destination_pool: Option<ShieldedPool>,
     /// Submitter that delivers the signed shielding transaction.
     pub submitter: &'submitter dyn Submitter,
 }
@@ -837,8 +895,22 @@ impl<'submitter> ShieldTransparentPlan<'submitter> {
             account_id,
             idempotency,
             shielding_threshold_zat,
+            destination_pool: None,
             submitter,
         }
+    }
+
+    /// Returns the plan with an explicit shielded destination pool.
+    #[must_use]
+    pub const fn with_destination_pool(mut self, destination_pool: ShieldedPool) -> Self {
+        self.destination_pool = Some(destination_pool);
+        self
+    }
+
+    /// Returns the explicit shielded destination pool, if one was selected.
+    #[must_use]
+    pub const fn destination_pool(&self) -> Option<ShieldedPool> {
+        self.destination_pool
     }
 }
 
@@ -976,6 +1048,20 @@ mod tests {
     }
 
     #[test]
+    fn classify_recipient_recognizes_testnet_sapling_address() {
+        let encoded = "ztestsapling12p79hg7sffq7j2ukmpur208cyy7cxdr4mkwnn8eh09w3hgnysv6dmtwuwy8z7e6lvgmngrxeh6g";
+        let recipient = classify_recipient(encoded, Network::Testnet);
+
+        assert!(matches!(
+            recipient,
+            PaymentRecipient::SaplingAddress {
+                encoded: recipient_encoded,
+                network: Network::Testnet,
+            } if recipient_encoded == encoded
+        ));
+    }
+
+    #[test]
     fn validate_recipient_network_rejects_mismatch() {
         let recipient = PaymentRecipient::UnifiedAddress {
             encoded: "u1example".into(),
@@ -991,6 +1077,29 @@ mod tests {
             validate_non_zero(Zatoshis::zero()),
             Err(WalletError::ProposalRejected { .. })
         ));
+    }
+
+    #[test]
+    #[allow(
+        clippy::expect_used,
+        reason = "fixture amount is valid by construction; expect keeps the builder call readable"
+    )]
+    fn proposal_plan_can_restrict_the_source_pool() {
+        let plan = ProposalPlan::conventional(
+            zally_core::AccountId::from_uuid(uuid::Uuid::nil()),
+            PaymentRecipient::SaplingAddress {
+                encoded: "zregtestsapling1example".into(),
+                network: regtest(),
+            },
+            Zatoshis::try_from(1_u64).expect("zatoshis"),
+            None,
+        );
+
+        assert_eq!(plan.source_pool(), None);
+        assert_eq!(
+            plan.with_source_pool(ShieldedPool::Sapling).source_pool(),
+            Some(ShieldedPool::Sapling)
+        );
     }
 
     /// `SendPaymentPlan::conventional` starts with `target_expiry_height: None`, and
@@ -1021,6 +1130,34 @@ mod tests {
         assert_eq!(
             with_target.target_expiry_height,
             Some(BlockHeight::from(123))
+        );
+    }
+
+    #[test]
+    #[allow(
+        clippy::expect_used,
+        reason = "fixture literals are valid by construction; expect keeps the builder call readable"
+    )]
+    fn shield_transparent_plan_selects_destination_pool() {
+        let submitter = zally_testkit::MockSubmitter::accepting(regtest());
+        let plan = ShieldTransparentPlan::new(
+            zally_core::AccountId::from_uuid(uuid::Uuid::nil()),
+            zally_core::IdempotencyKey::try_from("shield-builder-key").expect("key"),
+            Zatoshis::try_from(1_u64).expect("zatoshis"),
+            &submitter,
+        );
+
+        assert_eq!(plan.destination_pool(), None);
+        let sapling_plan = plan.with_destination_pool(zally_chain::ShieldedPool::Sapling);
+        assert_eq!(
+            sapling_plan.destination_pool(),
+            Some(zally_chain::ShieldedPool::Sapling)
+        );
+        let storage_request =
+            resolve_shielding_request(&sapling_plan).expect("Sapling is supported");
+        assert_eq!(
+            storage_request.destination_pool(),
+            Some(zcash_protocol::ShieldedPool::Sapling)
         );
     }
 

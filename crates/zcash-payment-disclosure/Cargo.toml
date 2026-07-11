@@ -1,0 +1,38 @@
+[package]
+name = "zcash-payment-disclosure"
+description = "Incubating implementation of versioned Zcash payment disclosures."
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version = "0.1.0"
+readme = "README.md"
+keywords = ["zcash", "payment", "disclosure", "zip311"]
+categories = ["cryptography::cryptocurrencies"]
+
+[lints]
+workspace = true
+
+[dependencies]
+bellman = "0.14"
+blake2b_simd.workspace = true
+bls12_381 = "0.8"
+ff = "0.13"
+jubjub = "0.10"
+nonempty = "0.11"
+orchard.workspace = true
+pasta_curves = "0.5"
+rand_core = "0.6"
+redjubjub = "0.8"
+sapling.workspace = true
+thiserror.workspace = true
+zcash_note_encryption = "0.4.1"
+zcash_primitives.workspace = true
+zcash_protocol.workspace = true
+
+[dev-dependencies]
+incrementalmerkletree.workspace = true
+rand.workspace = true
+sapling = { workspace = true, features = ["test-dependencies"] }
+zcash_proofs.workspace = true
+zcash_transparent.workspace = true

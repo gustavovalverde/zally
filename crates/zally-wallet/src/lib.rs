@@ -3,6 +3,7 @@
 mod account_balance;
 mod capabilities;
 mod circuit_breaker;
+mod disclosure;
 mod error;
 mod event;
 mod exposed_address;
@@ -22,6 +23,7 @@ mod wallet;
 pub use account_balance::AccountBalance;
 pub use capabilities::{Capability, SealingCapability, StorageCapability, WalletCapabilities};
 pub use circuit_breaker::{CircuitBreaker, CircuitBreakerConfig, CircuitBreakerState};
+pub use disclosure::{ExportPaymentDisclosurePlan, PaymentDisclosure};
 pub use error::WalletError;
 pub use event::{WalletEvent, WalletEventStream};
 pub use exposed_address::ExposedAddress;
@@ -42,3 +44,4 @@ pub use sync::{
 };
 pub use unspent_note::UnspentShieldedNote;
 pub use wallet::{ReserveForDispensePlan, Wallet, WalletBuilder};
+pub use zcash_payment_disclosure::PaymentDisclosureProfile;

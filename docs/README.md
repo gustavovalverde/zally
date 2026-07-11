@@ -10,6 +10,7 @@ This documentation set defines Zally's product scope, library boundaries, and na
 ## ADRs
 
 - [ADR-0001: Workspace crate boundaries](adrs/0001-workspace-crate-boundaries.md)
+- [ADR-0007: Incubate ZIP-311 payment disclosures in Zally](adrs/0007-payment-disclosure-incubation.md)
 
 ## Reference
 

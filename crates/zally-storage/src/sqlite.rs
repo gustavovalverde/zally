@@ -30,7 +30,8 @@ use zally_keys::{KeyDerivationError, SeedMaterial, derive_ufvk};
 use zcash_client_backend::data_api::chain::{ChainState, CommitmentTreeRoot};
 use zcash_client_backend::data_api::scanning::ScanRange;
 use zcash_client_backend::data_api::wallet::{
-    ConfirmationsPolicy, SpendingKeys, input_selection::GreedyInputSelector,
+    ConfirmationsPolicy, SpendingKeys,
+    input_selection::{GreedyInputSelector, SpendPolicy},
 };
 use zcash_client_backend::data_api::{
     Account, AccountBirthday, WalletCommitmentTrees, WalletRead, WalletWrite,
@@ -321,6 +322,10 @@ fn open_wallet_db(
              CREATE TABLE IF NOT EXISTS ext_zally_observed_tip (\
                  id INTEGER PRIMARY KEY CHECK (id = 0),\
                  tip_height INTEGER NOT NULL\
+             ); \
+             CREATE TABLE IF NOT EXISTS ext_zally_finalized_pczts (\
+                 tx_id_bytes BLOB PRIMARY KEY NOT NULL,\
+                 pczt_bytes BLOB NOT NULL\
              ); \
              CREATE TABLE IF NOT EXISTS ext_zally_pending_broadcast_inputs (\
                  broadcast_tx_id BLOB NOT NULL,\
@@ -780,6 +785,7 @@ impl WalletStorage for Sqlite {
         })?;
         let memo_bytes = decode_memo_bytes(request.memo.as_deref())?;
         let account_id = request.account_id;
+        let source_pool = request.source_pool;
 
         self.with_db_mut(move |db| {
             let account_uuid = resolve_account_uuid(db, network, account_id)?;
@@ -790,6 +796,7 @@ impl WalletStorage for Sqlite {
                 &recipient,
                 amount,
                 memo_bytes,
+                source_pool,
             )?;
             let first_step = proposal.steps().first();
             let balance = first_step.balance();
@@ -826,6 +833,7 @@ impl WalletStorage for Sqlite {
         let seed_bytes = SecretVec::new(seed.expose_secret().to_vec());
         let network = self.options.network;
         let account_id = request.account_id;
+        let source_pool = request.source_pool;
 
         self.with_db_mut(move |db| {
             let account_uuid = resolve_account_uuid(db, network, account_id)?;
@@ -851,6 +859,7 @@ impl WalletStorage for Sqlite {
                     &recipient,
                     amount,
                     memo_bytes,
+                    source_pool,
                 )?
             };
 
@@ -890,6 +899,7 @@ impl WalletStorage for Sqlite {
         let seed_bytes = SecretVec::new(seed.expose_secret().to_vec());
         let network = self.options.network;
         let account_id = request.account_id;
+        let destination_pool = request.destination_pool;
 
         self.with_db_mut(move |db| {
             let account_uuid = resolve_account_uuid(db, network, account_id)?;
@@ -900,10 +910,13 @@ impl WalletStorage for Sqlite {
                 .map_err(|e| map_sqlite_error(&e))?
                 .into_keys()
                 .collect();
-            let change_pool = fallback_change_pool(
-                &params,
-                db.chain_height().map_err(|e| map_sqlite_error(&e))?,
-            );
+            let change_pool = match destination_pool {
+                Some(destination_pool) => destination_pool,
+                None => fallback_change_pool(
+                    &params,
+                    db.chain_height().map_err(|e| map_sqlite_error(&e))?,
+                ),
+            };
 
             let proposal = {
                 let mut filtered = FilteredWalletDb {
@@ -981,6 +994,7 @@ impl WalletStorage for Sqlite {
         let upstream_target_expiry_height = target_expiry_height
             .map(|height| zcash_protocol::consensus::BlockHeight::from(u32::from(height)));
         let account_id = request.account_id;
+        let source_pool = request.source_pool;
 
         self.with_db_mut(move |db| {
             let account_uuid = resolve_account_uuid(db, network, account_id)?;
@@ -991,6 +1005,7 @@ impl WalletStorage for Sqlite {
                 &recipient,
                 amount,
                 memo_bytes,
+                source_pool,
             )?;
 
             let pczt = zcash_client_backend::data_api::wallet::create_pczt_from_proposal::<
@@ -1032,8 +1047,9 @@ impl WalletStorage for Sqlite {
             .ok_or(StorageError::ProverUnavailable)?;
         let (spend_vk, output_vk) = prover.verifying_keys();
 
-        self.with_db_mut(move |db| {
-            let tx_id =
+        let prepared = self
+            .with_db_mut(move |db| {
+                let tx_id =
                 zcash_client_backend::data_api::wallet::extract_and_store_transaction_from_pczt::<
                     Db,
                     zcash_client_sqlite::ReceivedNoteId,
@@ -1043,30 +1059,50 @@ impl WalletStorage for Sqlite {
                     posture: FailurePosture::NotRetryable,
                 })?;
 
-            let stored = zcash_client_backend::data_api::WalletRead::get_transaction(db, tx_id)
-                .map_err(|e| map_sqlite_error(&e))?
-                .ok_or_else(|| StorageError::SqliteFailed {
-                    reason: format!("extracted tx {tx_id} not present in wallet store"),
-                    posture: FailurePosture::NotRetryable,
-                })?;
-            let mut raw_bytes = Vec::new();
-            stored
-                .write(&mut raw_bytes)
-                .map_err(|err| StorageError::SqliteFailed {
-                    reason: format!("transaction serialize failed: {err}"),
-                    posture: FailurePosture::NotRetryable,
-                })?;
-            let tx_expiry_height = BlockHeight::from(u32::from(stored.expiry_height()));
-            // PCZT extraction does not currently propagate transparent inputs through the
-            // envelope, so the resulting `PreparedTransaction` has no inputs to record in
-            // the pending-broadcast filter. Future signer integrations that need
-            // pending-broadcast protection should extend the PCZT envelope with the inputs.
-            Ok(crate::wallet::PreparedTransaction::new(
-                zally_core::TxId::from_bytes(*tx_id.as_ref()),
-                raw_bytes,
-                Vec::new(),
-                tx_expiry_height,
-            ))
+                let stored = zcash_client_backend::data_api::WalletRead::get_transaction(db, tx_id)
+                    .map_err(|e| map_sqlite_error(&e))?
+                    .ok_or_else(|| StorageError::SqliteFailed {
+                        reason: format!("extracted tx {tx_id} not present in wallet store"),
+                        posture: FailurePosture::NotRetryable,
+                    })?;
+                let mut raw_bytes = Vec::new();
+                stored
+                    .write(&mut raw_bytes)
+                    .map_err(|err| StorageError::SqliteFailed {
+                        reason: format!("transaction serialize failed: {err}"),
+                        posture: FailurePosture::NotRetryable,
+                    })?;
+                let tx_expiry_height = BlockHeight::from(u32::from(stored.expiry_height()));
+                // PCZT extraction does not currently propagate transparent inputs through the
+                // envelope, so the resulting `PreparedTransaction` has no inputs to record in
+                // the pending-broadcast filter. Future signer integrations that need
+                // pending-broadcast protection should extend the PCZT envelope with the inputs.
+                Ok(crate::wallet::PreparedTransaction::new(
+                    zally_core::TxId::from_bytes(*tx_id.as_ref()),
+                    raw_bytes,
+                    Vec::new(),
+                    tx_expiry_height,
+                ))
+            })
+            .await?;
+        let tx_id = prepared.tx_id;
+        self.with_ledger(move |conn| record_finalized_pczt_bytes(conn, tx_id, &pczt_bytes))
+            .await?;
+        Ok(prepared)
+    }
+
+    async fn find_finalized_pczt_bytes(
+        &self,
+        tx_id: TxId,
+    ) -> Result<Option<Vec<u8>>, StorageError> {
+        self.with_ledger(move |conn| {
+            conn.query_row(
+                "SELECT pczt_bytes FROM ext_zally_finalized_pczts WHERE tx_id_bytes = ?1",
+                [tx_id.as_bytes().as_slice()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|err| map_sqlite_error(&err))
         })
         .await
     }
@@ -2040,6 +2076,33 @@ impl WalletStorage for Sqlite {
     }
 }
 
+/// Records disclosure-source PCZT bytes idempotently for one transaction identifier.
+fn record_finalized_pczt_bytes(
+    conn: &rusqlite::Connection,
+    tx_id: TxId,
+    pczt_bytes: &[u8],
+) -> Result<(), StorageError> {
+    conn.execute(
+        "INSERT INTO ext_zally_finalized_pczts (tx_id_bytes, pczt_bytes) \
+         VALUES (?1, ?2) \
+         ON CONFLICT(tx_id_bytes) DO NOTHING",
+        rusqlite::params![tx_id.as_bytes().as_slice(), pczt_bytes],
+    )
+    .map_err(|err| map_sqlite_error(&err))?;
+    let stored_bytes: Vec<u8> = conn
+        .query_row(
+            "SELECT pczt_bytes FROM ext_zally_finalized_pczts WHERE tx_id_bytes = ?1",
+            [tx_id.as_bytes().as_slice()],
+            |row| row.get(0),
+        )
+        .map_err(|err| map_sqlite_error(&err))?;
+    if stored_bytes == pczt_bytes {
+        Ok(())
+    } else {
+        Err(StorageError::FinalizedPcztConflict { tx_id })
+    }
+}
+
 /// Upsert SQL for [`crate::WalletStorage::record_pending_broadcast_inputs`].
 ///
 /// Bound to one outpoint per execution. The whole batch runs inside one transaction with a
@@ -2517,6 +2580,7 @@ fn propose_payment_proposal<DbT>(
     recipient: &zcash_keys::address::Address,
     amount: UpstreamZatoshis,
     memo: Option<zcash_protocol::memo::MemoBytes>,
+    source_pool: Option<ShieldedPool>,
 ) -> Result<
     zcash_client_backend::proposal::Proposal<
         zcash_client_backend::fees::StandardFeeRule,
@@ -2536,21 +2600,49 @@ where
     let change_pool =
         fallback_change_pool(params, db.chain_height().map_err(|e| map_sqlite_error(&e))?);
 
-    zcash_client_backend::data_api::wallet::propose_standard_transfer_to_address::<
+    let payment = zcash_client_backend::zip321::Payment::new(
+        recipient.to_zcash_address(params),
+        Some(amount),
+        memo,
+        None,
+        None,
+        vec![],
+    )
+    .map_err(|err| StorageError::SqliteFailed {
+        reason: format!("could not construct payment request: {err}"),
+        posture: FailurePosture::NotRetryable,
+    })?;
+    let transaction_request = zcash_client_backend::zip321::TransactionRequest::new(vec![payment])
+        .map_err(|err| StorageError::SqliteFailed {
+            reason: format!("could not construct transaction request: {err}"),
+            posture: FailurePosture::NotRetryable,
+        })?;
+    let input_selector = GreedyInputSelector::<DbT>::new();
+    let change_strategy = standard::SingleOutputChangeStrategy::<DbT>::new(
+        StandardFeeRule::Zip317,
+        None,
+        change_pool,
+        DustOutputPolicy::default(),
+    );
+    let spend_policy = source_pool.map_or_else(SpendPolicy::default, |pool| {
+        SpendPolicy::shielded_pools([pool])
+    });
+
+    zcash_client_backend::data_api::wallet::propose_transfer::<
+        _,
+        _,
         _,
         _,
         zcash_client_sqlite::error::SqliteClientError,
     >(
         db,
         params,
-        zcash_client_backend::fees::StandardFeeRule::Zip317,
         account_uuid,
+        &input_selector,
+        &change_strategy,
+        transaction_request,
         zcash_client_backend::data_api::wallet::ConfirmationsPolicy::default(),
-        recipient,
-        amount,
-        memo,
-        None,
-        change_pool,
+        &spend_policy,
         None,
     )
     .map_err(|err| classify_proposal_build_error(&err))
@@ -3129,6 +3221,31 @@ mod tests {
             first, mainnet,
             "a different network encoding must yield a different identity"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn finalized_pczt_record_is_idempotent_and_rejects_conflicting_bytes()
+    -> Result<(), StorageError> {
+        let conn = rusqlite::Connection::open_in_memory().map_err(|err| map_sqlite_error(&err))?;
+        conn.execute_batch(
+            "CREATE TABLE ext_zally_finalized_pczts (\
+                 tx_id_bytes BLOB PRIMARY KEY NOT NULL,\
+                 pczt_bytes BLOB NOT NULL\
+             );",
+        )
+        .map_err(|err| map_sqlite_error(&err))?;
+        let tx_id = TxId::from_bytes([0x36; 32]);
+
+        record_finalized_pczt_bytes(&conn, tx_id, b"first")?;
+        record_finalized_pczt_bytes(&conn, tx_id, b"first")?;
+        let conflict = record_finalized_pczt_bytes(&conn, tx_id, b"second");
+        assert!(matches!(
+            conflict,
+            Err(StorageError::FinalizedPcztConflict {
+                tx_id: conflicting_transaction_id,
+            }) if conflicting_transaction_id == tx_id
+        ));
         Ok(())
     }
 

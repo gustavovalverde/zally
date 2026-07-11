@@ -1,6 +1,6 @@
 //! Errors returned by [`WalletStorage`](crate::WalletStorage) operations.
 
-use zally_core::{BlockHeight, FailurePosture, Zatoshis};
+use zally_core::{BlockHeight, FailurePosture, TxId, Zatoshis};
 
 /// Error returned by [`WalletStorage`](crate::WalletStorage) operations.
 ///
@@ -103,6 +103,16 @@ pub enum StorageError {
          prior tx_id was recorded for this key"
     )]
     IdempotencyKeyConflict,
+
+    /// A finalized PCZT is already stored for the transaction with different bytes.
+    ///
+    /// Posture: [`FailurePosture::NotRetryable`]; disclosure source material for an existing
+    /// transaction identifier must never be replaced.
+    #[error("transaction {tx_id} is already bound to different finalized PCZT bytes")]
+    FinalizedPcztConflict {
+        /// Transaction whose stored PCZT disagrees with the new bytes.
+        tx_id: TxId,
+    },
 
     /// `scan_blocks` rejected the batch because the chain source served a block whose parent
     /// hash does not match the wallet's stored view at `at_height`.
@@ -226,6 +236,7 @@ impl StorageError {
             | Self::AccountAlreadyExists
             | Self::KeyDerivationFailed { .. }
             | Self::IdempotencyKeyConflict
+            | Self::FinalizedPcztConflict { .. }
             | Self::CommitmentTreeConflict { .. }
             | Self::TransparentOutputNotRecognized { .. }
             | Self::TransparentOutputValueOutOfRange { .. }
@@ -271,6 +282,9 @@ mod tests {
             StorageError::KeyDerivationFailed { reason: "x".into() },
             StorageError::ProverUnavailable,
             StorageError::IdempotencyKeyConflict,
+            StorageError::FinalizedPcztConflict {
+                tx_id: TxId::from_bytes([0_u8; 32]),
+            },
             StorageError::ChainReorgDetected {
                 at_height: BlockHeight::from(1),
             },

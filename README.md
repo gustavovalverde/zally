@@ -6,12 +6,12 @@ Zally is an in-process Rust dependency for server applications that need wallet 
 
 ## Capabilities
 
-- Typed wallet API for create, open, sync, status, address derivation, spend, shield, and PCZT flows.
+- Typed wallet API for create, open, sync, status, address derivation, spend, shield, PCZT, and payment-disclosure flows.
 - Network-tagged public types for addresses, balances, accounts, transactions, and chain heights.
 - Seed sealing through `SeedSealing`, with age-encrypted file sealing as the default implementation.
 - Pluggable `ChainSource`, `Submitter`, and `WalletStorage` boundaries.
 - Structured wallet events, sync snapshots, metrics snapshots, retry posture, and circuit-breaker state.
-- ZIP-302 memo guard, ZIP-316 Unified Addresses, ZIP-317 conventional fees, ZIP-320 TEX recognition, and ZIP-321 payment URI parsing.
+- ZIP-311 Draft1 Sapling payment disclosures plus an explicitly nonstandard Zally Ironwood profile, ZIP-302 memo guards, ZIP-316 Unified Addresses, ZIP-317 conventional fees, ZIP-320 TEX recognition, and ZIP-321 payment URI parsing.
 
 ## Validation gate
 

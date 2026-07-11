@@ -9,7 +9,8 @@ use rand::rngs::OsRng;
 use secp256k1::{PublicKey, Secp256k1};
 use serde_json::{Value, json};
 use zally_chain::{
-    ChainSource, SubmitOutcome, Submitter, ZinderChainSource, ZinderRemoteOptions, ZinderSubmitter,
+    ChainSource, ShieldedPool, SubmitOutcome, Submitter, ZinderChainSource, ZinderRemoteOptions,
+    ZinderSubmitter,
 };
 use zally_core::{
     AccountId, BlockHeight, IdempotencyKey, Network, PaymentRecipient, TxId, Zatoshis,
@@ -20,10 +21,13 @@ use zally_testkit::{
     LiveTestError, TempWalletPath, init, require_live, require_network, require_zinder_endpoint,
 };
 use zally_wallet::{
-    ProposalPlan, SendPaymentPlan, ShieldTransparentPlan, SyncDriver, SyncDriverOptions,
-    SyncHandle, SyncSnapshotStream, SyncStatus, Wallet, WalletError,
+    ExportPaymentDisclosurePlan, ProposalPlan, SendPaymentPlan, ShieldTransparentPlan, SyncDriver,
+    SyncDriverOptions, SyncHandle, SyncSnapshotStream, SyncStatus, Wallet, WalletError,
 };
+use zcash_keys::address::Address;
+use zcash_payment_disclosure::{PaymentDisclosureProfile, verify_disclosure};
 use zcash_primitives::transaction::builder::{BuildConfig, Builder};
+use zcash_proofs::prover::LocalTxProver;
 use zcash_protocol::{
     consensus::{BlockHeight as ConsensusBlockHeight, NetworkType},
     local_consensus::LocalNetwork as ZallyLocalNetwork,
@@ -192,12 +196,15 @@ impl FundedZinderRoundTrip {
         let shield_idempotency = IdempotencyKey::try_from("t3-funded-shield")?;
         let shield_outcome = self
             .wallet
-            .shield_transparent_funds(ShieldTransparentPlan::new(
-                self.account_id,
-                shield_idempotency,
-                shielding_threshold_zat,
-                &self.submitter,
-            ))
+            .shield_transparent_funds(
+                ShieldTransparentPlan::new(
+                    self.account_id,
+                    shield_idempotency,
+                    shielding_threshold_zat,
+                    &self.submitter,
+                )
+                .with_destination_pool(ShieldedPool::Ironwood),
+            )
             .await?;
         self.miner
             .generate_blocks(SHIELDED_SPEND_CONFIRMATION_BLOCKS)?;
@@ -237,10 +244,12 @@ impl FundedZinderRoundTrip {
         let send_zat = send_zat_from_env()?;
         let pczt_recipient =
             derive_unified_recipient(&self.wallet, self.account_id, self.network).await?;
+        let disclosure_recipient = pczt_recipient.clone();
         let pczt = self
             .wallet
             .propose_pczt(
-                ProposalPlan::conventional(self.account_id, pczt_recipient, send_zat, None),
+                ProposalPlan::conventional(self.account_id, pczt_recipient, send_zat, None)
+                    .with_source_pool(ShieldedPool::Ironwood),
                 None,
             )
             .await?;
@@ -253,7 +262,61 @@ impl FundedZinderRoundTrip {
         self.miner.generate_blocks(1)?;
         let pczt_height = self.miner.safe_chain_tip_height()?;
         wait_until_at_tip_at_or_above(&mut self.sync_snapshots, pczt_height).await?;
-        Ok(pczt_outcome.tx_id())
+        let transaction_id = pczt_outcome.tx_id();
+        let disclosure = self
+            .wallet
+            .export_payment_disclosure(ExportPaymentDisclosurePlan::new(
+                transaction_id,
+                disclosure_recipient.clone(),
+                send_zat,
+                b"zally-regtest-ironwood-disclosure".to_vec(),
+                PaymentDisclosureProfile::ZallyIronwood,
+            ))
+            .await?;
+        let raw_transaction_bytes = self.miner.raw_transaction_bytes(transaction_id)?;
+        let prover =
+            LocalTxProver::with_default_location().ok_or(TestError::SaplingParametersMissing)?;
+        let (spend_verifying_key, _) = prover.verifying_keys();
+        let prepared_spend_verifying_key = spend_verifying_key.prepare();
+        let evidence = verify_disclosure(
+            disclosure.portable(),
+            &raw_transaction_bytes,
+            ConsensusBlockHeight::from_u32(pczt_height.as_u32()),
+            &self.network.to_parameters(),
+            &prepared_spend_verifying_key,
+        )?;
+        let Some(Address::Unified(expected_unified_address)) = Address::decode(
+            &self.network.to_parameters(),
+            disclosure_recipient.encoded(),
+        ) else {
+            return Err(TestError::Unexpected {
+                reason: "Ironwood disclosure recipient did not decode as a Unified Address"
+                    .to_owned(),
+            });
+        };
+        let expected_recipient =
+            expected_unified_address
+                .orchard()
+                .copied()
+                .ok_or_else(|| TestError::Unexpected {
+                    reason: "Ironwood disclosure recipient did not carry an Orchard receiver"
+                        .to_owned(),
+                })?;
+        assert_eq!(
+            evidence.transaction_id(),
+            disclosure.portable().transaction_id()
+        );
+        assert!(!evidence.ironwood_spends().is_empty());
+        assert_eq!(evidence.ironwood_outputs().len(), 1);
+        assert_eq!(
+            evidence.ironwood_outputs()[0].recipient(),
+            expected_recipient
+        );
+        assert_eq!(
+            evidence.ironwood_outputs()[0].amount_zat(),
+            send_zat.as_u64()
+        );
+        Ok(transaction_id)
     }
 
     // &mut self stays even though no field is mutated; the live test holds a
@@ -576,6 +639,18 @@ impl JsonRpcClient {
         Ok(BlockHeight::from(height))
     }
 
+    fn raw_transaction_bytes(&self, tx_id: TxId) -> Result<Vec<u8>, TestError> {
+        let rpc_result = self.call("getrawtransaction", &json!([tx_id.to_string(), 0]))?;
+        let transaction_hex = rpc_result.as_str().ok_or_else(|| TestError::RpcShape {
+            method: "getrawtransaction",
+            reason: "result was not a hex string".to_owned(),
+        })?;
+        hex::decode(transaction_hex).map_err(|err| TestError::RpcShape {
+            method: "getrawtransaction",
+            reason: format!("result was not valid transaction hex: {err}"),
+        })
+    }
+
     fn regtest_networks_from_node(&self) -> Result<(Network, ZallyLocalNetwork), TestError> {
         let node_upgrades = self.node_upgrade_activations()?;
         let local_network = zally_local_network_from_upgrades(&node_upgrades);
@@ -865,6 +940,12 @@ enum TestError {
     RegtestRequired,
     #[error("Zally transparent receiver was missing from the funding address")]
     TransparentReceiverMissing,
+    #[error("Sapling proving parameters are not installed")]
+    SaplingParametersMissing,
+    #[error("payment disclosure verification failed: {0}")]
+    PaymentDisclosureVerification(
+        #[from] zcash_payment_disclosure::PaymentDisclosureVerificationError,
+    ),
     #[error("no spendable regtest coinbase was found for transparent test address {address}")]
     RegtestCoinbaseUnavailable { address: String },
     #[error("invalid {var}: {reason}")]

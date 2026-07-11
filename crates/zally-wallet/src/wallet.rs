@@ -750,6 +750,7 @@ fn build_capabilities(
     storage: StorageCapability,
 ) -> WalletCapabilities {
     let mut features = BTreeSet::new();
+    features.insert(Capability::Zip311Draft1SaplingDisclosures);
     features.insert(Capability::Zip316UnifiedAddresses);
     features.insert(Capability::Zip302Memos);
     features.insert(Capability::Zip320TexAddresses);

@@ -32,6 +32,8 @@ Every chain-source and wallet error exposes a `posture()` method returning a [`F
 | `ProposalRejected` | `not_retryable` | Proposal construction failed. |
 | `SubmissionRejected` | `not_retryable` | The node rejected the submitted transaction. |
 | `Pczt` | Mirrors `PcztError` | A PCZT role failed. |
+| `PaymentDisclosureExport` | Mirrors `PaymentDisclosureExportError` | A retained PCZT could not produce the requested disclosure profile. |
+| `PaymentDisclosureSourceMissing` | `not_retryable` | No finalized PCZT was retained for the transaction. |
 | `CircuitBroken` | `retryable` | The wallet IO circuit breaker is open. |
 | `SyncDriverFailed` | Carries `FailurePosture` | The sync driver failed outside a wallet operation. Cancellation surfaces `Retryable`; panic surfaces `RequiresOperator`. |
 
@@ -76,6 +78,7 @@ Every chain-source and wallet error exposes a `posture()` method returning a [`F
 | `KeyDerivationFailed` | `not_retryable` | Deterministic key derivation failed inside storage. |
 | `ProverUnavailable` | `requires_operator` | Sapling proving parameters are missing from the platform-default location. |
 | `IdempotencyKeyConflict` | `not_retryable` | A send idempotency key already maps to a different transaction. |
+| `FinalizedPcztConflict` | `not_retryable` | A transaction ID is already bound to different finalized PCZT bytes. |
 | `ChainReorgDetected` | `retryable` | Scanner input diverged from persisted chain state and needs rollback. |
 | `TransparentOutputNotRecognized` | `not_retryable` | A chain source returned a transparent output script Zally cannot map. |
 | `TransparentOutputValueOutOfRange` | `not_retryable` | A chain source returned a transparent output value outside the zatoshis range. |
@@ -93,3 +96,47 @@ Every chain-source and wallet error exposes a `posture()` method returning a [`F
 | `CombineConflict` | `not_retryable` | Combining multiple PCZTs found incompatible contents. |
 | `UpstreamFailed` | Carries `is_retryable` | The upstream `pczt` role rejected the operation. |
 | `ProverUnavailable` | `requires_operator` | Sapling proving parameters are missing from the platform-default location. |
+
+## PaymentDisclosureExportError
+
+| Variant | Posture | Meaning |
+|---------|---------|---------|
+| `NetworkMismatch` | `requires_operator` | Recipient and retained PCZT networks disagree. |
+| `RecipientUnsupported` | `not_retryable` | The recipient lacks the receiver required by the selected profile: Sapling for Draft1 or Orchard for the Zally Ironwood extension. |
+| `ProfileUnsupported` | `not_retryable` | This build does not implement the requested disclosure profile. |
+| `PcztMalformed` | `requires_operator` | Retained finalized PCZT bytes cannot be parsed. |
+| `PcztSectionMalformed` | `requires_operator` | One retained PCZT protocol section cannot be parsed. |
+| `TransparentInputsUnsupported` | `not_retryable` | Draft1 does not support transparent spend authority. |
+| `SaplingActionsUnsupported` | `not_retryable` | The Zally Ironwood extension does not support Sapling sections. |
+| `OrchardActionsUnsupported` | `not_retryable` | Draft1 does not support Orchard actions. |
+| `IronwoodActionsUnsupported` | `not_retryable` | Draft1 does not support Ironwood actions. |
+| `IronwoodSpendInvalid` | `requires_operator` | A retained Ironwood spend fails its nullifier or randomized-key consistency check. |
+| `IronwoodSpendIncomplete` | `requires_operator` | A retained Ironwood spend lacks its action randomizer or another required field. |
+| `IronwoodActionIndexOutOfRange` | `not_retryable` | An Ironwood action index exceeds the extension's `u32` range. |
+| `IronwoodSpendsMissing` | `not_retryable` | The transaction proves no real Ironwood spend authority. |
+| `IronwoodOutputNotFound` | `not_retryable` | No Ironwood output matches the requested recipient and amount. |
+| `IronwoodOutputAmbiguous` | `not_retryable` | More than one Ironwood output matches the requested recipient and amount. |
+| `IronwoodOutputOckMissing` | `requires_operator` | The selected Ironwood output has no retained or derivable outgoing cipher key. |
+| `SaplingSpendInvalid` | `requires_operator` | A retained Sapling spend fails its nullifier consistency check. |
+| `SaplingSpendIncomplete` | `requires_operator` | A retained Sapling spend lacks proving material. |
+| `SaplingSpendIndexOutOfRange` | `not_retryable` | A Sapling spend index exceeds the Draft1 range. |
+| `SaplingSpendsMissing` | `not_retryable` | The transaction proves no Sapling spend authority. |
+| `SaplingOutputNotFound` | `not_retryable` | No Sapling output matches the requested recipient and amount. |
+| `SaplingOutputAmbiguous` | `not_retryable` | More than one Sapling output matches the requested recipient and amount. |
+| `SaplingOutputOckMissing` | `requires_operator` | The selected output has no retained outgoing cipher key. |
+| `SaplingOutputIndexOutOfRange` | `not_retryable` | A Sapling output index exceeds the Draft1 range. |
+| `KeyDerivationFailed` | `requires_operator` | ZIP-32 key derivation failed. |
+| `ProverUnavailable` | `requires_operator` | Sapling proving parameters are unavailable. |
+| `Codec` | `not_retryable` | The portable codec rejected the selected profile's production plan. |
+| `Production` | Mirrors `PaymentDisclosureProductionError` | Profile-specific proof or signature production failed. |
+
+## Portable Payment Disclosure Errors
+
+`zcash-payment-disclosure` is Zally-independent and does not depend on `FailurePosture`. Its public
+variant rustdoc records the equivalent posture used by Zally adapters.
+
+| Error | Variants |
+|-------|----------|
+| `PaymentDisclosureCodecError` | `ProfileUnsupported`, `ProfileShapeMismatch`, `MessageTooLong`, `NoProvenInput`, `TransparentInputsUnsupported`, `AddressProofUnsupported`, `IndexNotIncreasing`, `Truncated`, `CompactSizeNonMinimal`, `SizeOutOfRange`, and `TrailingBytes`: all `not_retryable`. |
+| `PaymentDisclosureProductionError` | `IronwoodSpendAuthorizingKeyMismatch`, `SpendAuthorizingKeyMismatch`, `SpendCircuitInvalid`, and `Codec`: `not_retryable`; `IronwoodSpendSignatureInvalid`, `RandomizedVerificationKeyMismatch`, and `SpendSignatureInvalid`: `requires_operator`. |
+| `PaymentDisclosureVerificationError` | All malformed proof, transaction, Sapling index, Ironwood action index, authority, and output-recovery variants: `not_retryable`; `TransactionIdMismatch`: `requires_operator`. |

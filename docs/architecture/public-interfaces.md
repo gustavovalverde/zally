@@ -104,6 +104,8 @@ A name must survive a change of its implementation.
 | `SignedPayload` | `zally-core` | Chain-neutral envelope returned by wallet-runtime signers and consumed by facilitators. `bytes` carry the opaque signed artifact, `format` names how to extract or broadcast it, and chain-specific amounts stay in the `Amount` decimal-string shape. |
 | `SignedPayloadFormat` | `zally-core` | Wire discriminant for `SignedPayload::bytes`. Zcash x402 exact uses `pczt-v2-extractable`; older PCZT v1 integrations use `pczt-v1`. |
 | `WalletOptions` | `zally-wallet` | Open-time wallet configuration; currently carries the pending-broadcast inflight window. |
+| `ExportPaymentDisclosurePlan` | `zally-wallet` | Network-tagged recipient, transaction, amount, message, and explicit ZIP-311 profile used by `Wallet::export_payment_disclosure`. |
+| `PaymentDisclosure` | `zally-wallet` | Network-tagged wrapper around the portable, canonically encoded disclosure. Its `Debug` output omits messages, proofs, and outgoing cipher keys. |
 | `OutPoint` | `zally-core` | Transparent transaction outpoint (`tx_id` + `output_index`). Zally-owned so the public surface composes only Zally domain types; inside `zally-storage` the upstream `zcash_transparent::bundle::OutPoint` is imported as `UpstreamOutPoint` to avoid the same-name collision. |
 | `WalletStatus` | `zally-wallet` | Operator readiness snapshot derived from persisted wallet progress. |
 | `SyncDriver` | `zally-wallet` | Caller-owned continuous sync loop over a `Wallet` and `ChainSource`. |
@@ -267,7 +269,7 @@ The contract surface Zally publishes, grouped by domain. Each item is a guarante
 - **SPEND-4**: Conventional fee per ZIP-317.
 - **SPEND-5**: `nExpiryHeight` set per ZIP-203.
 - **SPEND-6**: ZIP-321 payment URI parsing through `PaymentRequest::from_uri`.
-- **SPEND-7**: `Wallet::shield_transparent_funds(ShieldTransparentPlan) -> SendOutcome` explicitly shields wallet-owned transparent UTXOs before shielded spending. Transparent outpoints locked by a still-unconfirmed wallet-owned broadcast are excluded from input selection at the `InputSource::get_spendable_transparent_outputs` seam (see `WalletOptions::pending_broadcast_window_ms`). When the filter removes every eligible input the spend fails closed with `WalletError::InsufficientBalance`, not a generic proposal-rejected error.
+- **SPEND-7**: `Wallet::shield_transparent_funds(ShieldTransparentPlan) -> SendOutcome` explicitly shields wallet-owned transparent UTXOs before shielded spending. `ShieldTransparentPlan::with_destination_pool(ShieldedPool)` selects Sapling, Orchard, or Ironwood explicitly; omitting it preserves the activation-aware default. Transparent outpoints locked by a still-unconfirmed wallet-owned broadcast are excluded from input selection at the `InputSource::get_spendable_transparent_outputs` seam (see `WalletOptions::pending_broadcast_window_ms`). When the filter removes every eligible input the spend fails closed with `WalletError::InsufficientBalance`, not a generic proposal-rejected error.
 - **SPEND-8**: `Wallet::get_account_balance(account_id) -> AccountBalance` returns a per-pool balance snapshot (Sapling, Orchard, Ironwood, transparent-mature, transparent-immature) anchored to the wallet's last observed chain tip. Read-only; composes the persisted wallet rows that drive `Wallet::sync` and `Wallet::list_unspent_shielded_notes`. Transparent values split by ZIP-213 coinbase maturity (100 confirmations) computed against `as_of_height + 1`, matching `zcash_client_backend`'s `chain_tip + 1` convention.
 - **SPEND-9**: `Wallet::get_pending_transparent_inputs(account_id) -> PendingTransparentInputs` returns the transparent outpoints currently locked by wallet-owned broadcasts not yet observed mined. The snapshot honours `WalletOptions::pending_broadcast_window_ms`: rows whose broadcast timestamp falls outside the window are excluded so a permanently-dropped broadcast eventually frees its outpoints.
 - **SPEND-10**: `Wallet::send_payment` excludes the same pending-broadcast outpoints as SPEND-7 from transparent input selection via the same `InputSource` override; no path-specific filter exists. Records its broadcast inputs to storage *before* calling `Submitter::submit`, so a crash window between submit and persistence does not leave an in-flight broadcast unrecorded.
@@ -282,6 +284,16 @@ The contract surface Zally publishes, grouped by domain. Each item is a guarante
 - **PCZT-5**: `Wallet::extract_and_submit_pczt(final, submitter) -> SendOutcome`: extract the transaction from a fully-authorized PCZT and submit.
 - **PCZT-6**: PCZT support covers transparent, Sapling, Orchard, and Ironwood bundles.
 - **PCZT-7**: Wallet runtimes that return `SignedPayload` for Zcash x402 exact set `format = pczt-v2-extractable` and put extractor-ready ZIP-374 PCZT bytes in `bytes`; facilitators never need wallet private keys to verify, extract, and broadcast.
+- **PCZT-8**: Successful finalized-PCZT extraction retains the exact PCZT bytes by transaction ID before submission. The retained bytes are privacy-sensitive disclosure source material: they are never logged, identical writes are idempotent, and conflicting bytes fail closed.
+
+### Payment disclosures (DISCLOSURE)
+
+- **DISCLOSURE-1**: `zcash-payment-disclosure` owns the Zally-independent Draft1 and Zally Ironwood codecs, producers, and verifier. It has no dependency on a `zally-*` crate and is the boundary intended for upstream porting.
+- **DISCLOSURE-2**: `Wallet::export_payment_disclosure(ExportPaymentDisclosurePlan) -> PaymentDisclosure` produces a network-tagged disclosure from a retained finalized PCZT. The wallet validates the recipient network and retained source before unsealing its seed.
+- **DISCLOSURE-3**: Draft1 proves every Sapling spend, selects exactly one Sapling output by recipient and `amount_zat`, and rejects transparent inputs, Orchard actions, Ironwood actions, ZIP-304 address proofs, missing outgoing cipher keys, and ambiguous output matches.
+- **DISCLOSURE-4**: `verify_disclosure` verifies the transaction ID, fresh Sapling spend proof and authorization signature against the on-chain anchor and nullifier, and output recovery with the disclosed outgoing cipher key at the supplied mined height.
+- **DISCLOSURE-5**: Draft1 is an explicit experimental encoding while ZIP-311 leaves encoding and versioning unspecified. Unknown profiles fail closed; a future standardized encoding receives a different profile.
+- **DISCLOSURE-6**: `ZallyIronwood` is the explicitly nonstandard profile byte `0x02`. It signs the network-bound disclosure digest with each real mined action's randomized RedPallas spend key and recovers the selected output with its outgoing cipher key. The mined transaction's consensus proof supplies the nullifier-to-key binding; dummy padding actions are excluded. It is never labeled as ZIP-311 compliance.
 
 ### Observability (OBS)
 
@@ -316,6 +328,7 @@ Which ZIPs Zally implements directly, which it inherits through librustzcash, an
 - **ZIP-225**: v5 transaction format. The default on every supported network.
 - **ZIP-244**: Non-malleable TxID. Tracked in wallet state; exposed via `WalletEvent` and `SendOutcome`.
 - **ZIP-302**: Memo encoding (current 512-byte format). Encoded and decoded per spec.
+- **ZIP-311**: Draft1 Sapling payment-disclosure production and verification. The proof algorithms follow the Draft ZIP; the explicitly versioned wire encoding is incubating because the ZIP has not specified one.
 - **ZIP-315**: Wallet best practices. Explicit transparent shielding, trusted vs untrusted TXO accounting, confirmation-depth defaults aligned with the ZIP.
 - **ZIP-316**: Unified Addresses, UFVKs, UIVKs. First-class address type; UFVK export.
 - **ZIP-317**: Conventional fee mechanism.
@@ -334,7 +347,6 @@ Which ZIPs Zally implements directly, which it inherits through librustzcash, an
 - **ZIP-48**: Transparent multisig wallets.
 - **ZIP-211**: Sprout pool sunset. Sprout is dead; Zally never deposits to Sprout. Sprout sweeps are out of scope.
 - **ZIP-308**: Sprout-to-Sapling migration (see ZIP-211).
-- **ZIP-311**: Payment disclosures.
 
 ## Naming Priority
 

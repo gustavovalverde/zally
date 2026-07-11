@@ -12,6 +12,7 @@ mod create_then_create_returns_already_exists;
 mod create_then_open_round_trip;
 mod create_then_open_round_trip_in_memory;
 mod derive_address_populates_transparent;
+mod export_payment_disclosure_requires_retained_pczt;
 mod get_account_balance_round_trip;
 mod list_exposed_addresses_round_trip;
 mod list_unspent_shielded_notes_round_trip;

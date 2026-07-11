@@ -34,6 +34,8 @@ pub struct WalletCapabilities {
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[non_exhaustive]
 pub enum Capability {
+    /// ZIP-311 Draft1 Sapling payment-disclosure export.
+    Zip311Draft1SaplingDisclosures,
     /// ZIP-316 Unified Addresses.
     Zip316UnifiedAddresses,
     /// ZIP-302 memo encoding and the memo-on-transparent guard.

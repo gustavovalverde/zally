@@ -3,7 +3,7 @@
 use zally_chain::{ChainSourceError, FailurePosture, SubmitterError};
 use zally_core::{BlockHeight, Network, Zatoshis};
 use zally_keys::{KeyDerivationError, SealingError};
-use zally_pczt::PcztError;
+use zally_pczt::{PaymentDisclosureExportError, PcztError};
 use zally_storage::StorageError;
 
 /// Error returned by [`crate::Wallet`] operations.
@@ -125,6 +125,22 @@ pub enum WalletError {
     #[error("pczt error: {0}")]
     Pczt(#[from] PcztError),
 
+    /// Payment-disclosure export from retained PCZT material failed.
+    ///
+    /// Posture follows the inner [`PaymentDisclosureExportError`].
+    #[error("payment-disclosure export error: {0}")]
+    PaymentDisclosureExport(#[from] PaymentDisclosureExportError),
+
+    /// No finalized PCZT source was retained for the requested transaction.
+    ///
+    /// Posture: [`FailurePosture::NotRetryable`]: the same transaction cannot be disclosed by
+    /// this wallet unless source material is restored from an operator backup.
+    #[error("no finalized PCZT source retained for transaction {transaction_id}")]
+    PaymentDisclosureSourceMissing {
+        /// Transaction that lacks retained disclosure source material.
+        transaction_id: zally_core::TxId,
+    },
+
     /// The wallet's circuit breaker is open and short-circuited the call. The breaker
     /// re-closes after its cooldown expires or after a half-open probe succeeds.
     ///
@@ -201,6 +217,7 @@ impl WalletError {
             Self::Storage(e) => e.posture(),
             Self::KeyDerivation(e) => bool_to_posture(e.is_retryable()),
             Self::Pczt(e) => bool_to_posture(e.is_retryable()),
+            Self::PaymentDisclosureExport(e) => e.posture(),
             Self::ChainSource(e) => e.posture(),
             Self::Submitter(e) => e.posture(),
             Self::CircuitBroken { .. } => FailurePosture::Retryable,
@@ -216,6 +233,7 @@ impl WalletError {
             | Self::PaymentRequestParseFailed { .. }
             | Self::ProposalRejected { .. }
             | Self::SubmissionRejected { .. }
+            | Self::PaymentDisclosureSourceMissing { .. }
             | Self::TargetExpiryStale { .. }
             | Self::TreeRootsDiverged { .. } => FailurePosture::NotRetryable,
         }
@@ -296,6 +314,10 @@ mod tests {
                 detail: "x".into(),
             },
             WalletError::Pczt(PcztError::NoMatchingKeys),
+            WalletError::PaymentDisclosureExport(PaymentDisclosureExportError::ProfileUnsupported),
+            WalletError::PaymentDisclosureSourceMissing {
+                transaction_id: zally_core::TxId::from_bytes([0; 32]),
+            },
             WalletError::CircuitBroken { operation: "test" },
             WalletError::TargetExpiryStale {
                 target: BlockHeight::from(10),

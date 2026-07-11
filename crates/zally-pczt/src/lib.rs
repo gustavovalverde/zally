@@ -7,6 +7,7 @@
 mod bytes;
 mod combiner;
 mod creator;
+mod disclosure;
 mod error;
 mod extractor;
 mod prover;
@@ -16,6 +17,9 @@ mod updater;
 pub use bytes::PcztBytes;
 pub use combiner::Combiner;
 pub use creator::Creator;
+pub use disclosure::{
+    PaymentDisclosureExportError, PaymentDisclosureExportPlan, export_payment_disclosure,
+};
 pub use error::PcztError;
 pub use extractor::{ExtractedTransaction, Extractor};
 pub use prover::Prover;

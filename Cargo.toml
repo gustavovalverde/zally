@@ -1,6 +1,7 @@
 [workspace]
 resolver = "3"
 members = [
+    "crates/zcash-payment-disclosure",
     "crates/zally-core",
     "crates/zally-keys",
     "crates/zally-storage",
@@ -105,6 +106,7 @@ age = "0.10"
 secrecy = "0.8"
 zeroize = "1.8"
 rand = "0.8"
+blake2b_simd = "1.0"
 
 # Storage.
 rusqlite = { version = "0.37", features = ["bundled"] }

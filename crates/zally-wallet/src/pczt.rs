@@ -3,15 +3,16 @@
 //! `Wallet::propose_pczt` builds an unsigned PCZT against the wallet's live notes.
 //! `Wallet::prove_pczt` creates required zero-knowledge proofs.
 //! `Wallet::sign_pczt` authorizes a PCZT with the sealed seed.
-//! `Wallet::extract_and_submit_pczt` extracts a finalized PCZT, persists the
-//! transaction in the wallet DB, and broadcasts via the supplied `Submitter`.
+//! `Wallet::extract_pczt` extracts a finalized PCZT and persists the transaction
+//! in the wallet DB. `Wallet::extract_and_submit_pczt` additionally broadcasts it
+//! via the supplied `Submitter`.
 
 use zally_chain::Submitter;
-use zally_core::{BlockHeight, Network};
+use zally_core::{BlockHeight, Network, TxId};
 use zally_pczt::{PcztBytes, Prover, Signer};
 
 use crate::error::WalletError;
-use crate::spend::{ProposalPlan, SendOutcome};
+use crate::spend::{ProposalPlan, SendOutcome, storage_proposal_request};
 use crate::wallet::Wallet;
 
 impl Wallet {
@@ -33,20 +34,10 @@ impl Wallet {
         target_expiry_height: Option<BlockHeight>,
     ) -> Result<PcztBytes, WalletError> {
         validate_proposal_plan(&plan, self.network())?;
-        let recipient_encoded = plan.recipient.encoded().to_owned();
-        let memo_bytes = plan.memo.as_ref().map(memo_to_wire_bytes);
         let raw = self
             .inner
             .storage
-            .create_pczt(
-                zally_storage::ProposalPaymentRequest::new(
-                    plan.account_id,
-                    recipient_encoded,
-                    plan.amount_zat,
-                    memo_bytes,
-                ),
-                target_expiry_height,
-            )
+            .create_pczt(storage_proposal_request(&plan)?, target_expiry_height)
             .await
             .map_err(WalletError::from)?;
         Ok(PcztBytes::from_serialized(raw, self.network()))
@@ -95,6 +86,26 @@ impl Wallet {
         let pczt_prover = Prover::new(self.network());
         let proven = pczt_prover.prove_with_seed(pczt, &seed).await?;
         Ok(proven)
+    }
+
+    /// Extracts a finalized PCZT and persists its transaction without broadcasting it.
+    ///
+    /// This boundary is for embedders whose external facilitator or custody system owns
+    /// submission. Extraction updates the wallet's sent-transaction state and retains the
+    /// finalized PCZT as payment-disclosure source material. The returned transaction ID can
+    /// be compared with the external submitter's response.
+    ///
+    /// `not_retryable` on malformed or incomplete PCZTs; `requires_operator` when Sapling
+    /// verifying parameters are unavailable; `retryable` on transient storage I/O.
+    pub async fn extract_pczt(&self, pczt: PcztBytes) -> Result<TxId, WalletError> {
+        validate_pczt_network(pczt.network(), self.network())?;
+        let extracted = self
+            .inner
+            .storage
+            .extract_and_store_pczt(pczt.into_bytes())
+            .await
+            .map_err(WalletError::from)?;
+        Ok(extracted.tx_id)
     }
 
     /// Extracts a finalized PCZT, persists the transaction in the wallet DB, and broadcasts
@@ -170,10 +181,6 @@ fn validate_pczt_network(
             requested: pczt_network,
         })
     }
-}
-
-fn memo_to_wire_bytes(memo: &zally_core::Memo) -> Vec<u8> {
-    zally_core::MemoBytes::from(memo).as_slice().to_vec()
 }
 
 fn translate_submit_outcome(

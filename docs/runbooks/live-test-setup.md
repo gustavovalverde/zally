@@ -176,14 +176,17 @@ The funded T3 wallet test proves the full library path:
 3. Fund that receiver by spending a mature deterministic regtest coinbase.
 4. Mine enough regtest blocks for transparent and shielded spends.
 5. Let `SyncDriver` catch up through `ZinderChainSource`.
-6. Shield the transparent UTXO through `Wallet::shield_transparent_funds`.
+6. Shield the transparent UTXO into Ironwood through `Wallet::shield_transparent_funds`.
 7. Send a payment through `Wallet::send_payment` and `ZinderSubmitter`.
-8. Propose, prove, sign, extract, and submit a PCZT.
+8. Propose, prove, sign, extract, and submit an Ironwood PCZT.
+9. Export its Zally Ironwood disclosure and verify its message-bound spend authority and recovered
+   output against the mined transaction bytes.
 
 It is regtest-only because it spends a mature regtest coinbase controlled by the testkit key.
 It does not require Zallet or a separate funder wallet. The test derives regtest upgrade
 activations from the running node so Zally's transaction builder matches the node's active
-consensus branch.
+consensus branch. Using Ironwood avoids making this proof depend on the 32,256-block ZIP-212 grace
+period that applies to a fresh Sapling regtest chain.
 
 ```sh
 ZALLY_TEST_LIVE=1 \
