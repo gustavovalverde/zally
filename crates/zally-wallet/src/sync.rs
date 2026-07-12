@@ -1462,7 +1462,7 @@ impl Wallet {
         }
         let fully_scanned = self.inner.storage.fully_scanned_height().await?;
         if fully_scanned.is_none_or(|h| chain_tip.as_u32() > h.as_u32()) {
-            self.backfill_subtree_roots(chain).await?;
+            self.backfill_subtree_roots(chain, fully_scanned).await?;
             self.inner.storage.update_chain_tip(chain_tip).await?;
             self.next_scan_range(chain_tip).await
         } else {
@@ -1513,7 +1513,11 @@ impl Wallet {
     /// checkpoint-bootstrapped store missing historical root artifacts) is skipped with a
     /// warning instead of faulting: backfill is a fast-forward optimization, and scanning
     /// still builds each tree linearly.
-    async fn backfill_subtree_roots(&self, chain: &dyn ChainSource) -> Result<(), WalletError> {
+    async fn backfill_subtree_roots(
+        &self,
+        chain: &dyn ChainSource,
+        scan_floor: Option<BlockHeight>,
+    ) -> Result<(), WalletError> {
         for (pool, protocol) in [
             (ShieldedPool::Sapling, zcash_protocol::ShieldedPool::Sapling),
             (ShieldedPool::Orchard, zcash_protocol::ShieldedPool::Orchard),
@@ -1547,24 +1551,25 @@ impl Wallet {
                         break;
                     }
                 };
-                let (Some(first), Some(last)) = (roots.first(), roots.last()) else {
-                    break;
-                };
-                let start_index = u64::from(first.index.0);
-                let last_index = last.index.0;
                 let page_len = roots.len();
-                let entries: Vec<(BlockHeight, [u8; 32])> = roots
-                    .into_iter()
-                    .map(|root| (root.completing_block_height, root.root_bytes))
-                    .collect();
-                self.inner
-                    .storage
-                    .put_subtree_roots(protocol, start_index, entries)
-                    .await?;
-                if page_len < SUBTREE_ROOT_PAGE as usize {
+                let roots = subtree_roots_completed_at_or_below(roots, scan_floor);
+                let is_floor_reached = roots.len() < page_len;
+                if let (Some(first), Some(last)) = (roots.first(), roots.last()) {
+                    let start_index = u64::from(first.index.0);
+                    let last_index = last.index.0;
+                    let entries: Vec<(BlockHeight, [u8; 32])> = roots
+                        .into_iter()
+                        .map(|root| (root.completing_block_height, root.root_bytes))
+                        .collect();
+                    self.inner
+                        .storage
+                        .put_subtree_roots(protocol, start_index, entries)
+                        .await?;
+                    next_index = last_index.saturating_add(1);
+                }
+                if is_floor_reached || page_len < SUBTREE_ROOT_PAGE as usize {
                     break;
                 }
-                next_index = last_index.saturating_add(1);
             }
         }
         Ok(())
@@ -1945,9 +1950,66 @@ pub(crate) async fn fetch_prior_chain_state(
     .await
 }
 
+/// Keeps the prefix of `roots` whose completing block sits at or below the wallet's fully
+/// scanned height.
+///
+/// A subtree root completing above the scanned frontier folds leaves the wallet has not
+/// scanned into a single node inside the shard the frontier occupies; installing it makes
+/// any read spanning that shard commit to unscanned chain state. Completing heights grow
+/// with the subtree index, so everything past the first too-new root is deferred to a later
+/// backfill pass, once scanning crosses the shard boundary. A wallet with no fully scanned
+/// height yet defers every root.
+fn subtree_roots_completed_at_or_below(
+    roots: Vec<zally_chain::SubtreeRoot>,
+    scan_floor: Option<BlockHeight>,
+) -> Vec<zally_chain::SubtreeRoot> {
+    let Some(floor) = scan_floor else {
+        return Vec::new();
+    };
+    let keep_count = roots
+        .iter()
+        .take_while(|root| root.completing_block_height <= floor)
+        .count();
+    let mut roots = roots;
+    roots.truncate(keep_count);
+    roots
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use zally_chain::{SubtreeIndex, SubtreeRoot};
+
+    fn subtree_root_completing_at(index: u32, height: u32) -> SubtreeRoot {
+        SubtreeRoot {
+            index: SubtreeIndex(index),
+            root_bytes: [u8::try_from(index).unwrap_or(u8::MAX); 32],
+            completing_block_height: BlockHeight::from(height),
+        }
+    }
+
+    #[test]
+    fn subtree_roots_completing_above_the_scan_floor_are_deferred() {
+        let roots = vec![
+            subtree_root_completing_at(0, 3_364_755),
+            subtree_root_completing_at(1, 3_861_020),
+            subtree_root_completing_at(2, 4_094_022),
+        ];
+        let kept = subtree_roots_completed_at_or_below(
+            roots.clone(),
+            Some(BlockHeight::from(4_050_200u32)),
+        );
+        assert_eq!(kept.len(), 2);
+        assert_eq!(kept[1].index, SubtreeIndex(1));
+
+        let kept_at_boundary = subtree_roots_completed_at_or_below(
+            roots.clone(),
+            Some(BlockHeight::from(4_094_022u32)),
+        );
+        assert_eq!(kept_at_boundary.len(), 3);
+
+        assert!(subtree_roots_completed_at_or_below(roots, None).is_empty());
+    }
 
     #[test]
     fn named_cures_rewind_regardless_of_posture() {
