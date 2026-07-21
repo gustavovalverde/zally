@@ -71,7 +71,7 @@ pub struct PendingTransparentInputs {
     pub network: Network,
     pub account_id: AccountId,
     pub entries: Vec<PendingTransparentInput>,
-    /// Last observed chain tip the snapshot is anchored to. `None` when the
+    /// Persisted visible tip the snapshot is anchored to. `None` when the
     /// wallet has not yet recorded a tip.
     pub as_of_height: Option<BlockHeight>,
 }

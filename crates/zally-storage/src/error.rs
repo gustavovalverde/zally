@@ -52,6 +52,27 @@ pub enum StorageError {
     #[error("an account already exists in this wallet; one account per wallet")]
     AccountAlreadyExists,
 
+    /// A chain-tip pair violates the invariant that the settled tip cannot exceed the visible tip.
+    #[error("invalid chain tips: settled tip {settled_tip} exceeds visible tip {visible_tip}")]
+    InvalidChainTips {
+        /// Highest source-visible block.
+        visible_tip: BlockHeight,
+        /// Highest source-settled block.
+        settled_tip: BlockHeight,
+    },
+
+    /// A source-neutral wallet scan artifact cannot be represented by librustzcash.
+    ///
+    /// Posture: [`FailurePosture::NotRetryable`]. The source returned a field outside the
+    /// scanner protocol's representable range.
+    #[error("wallet scan artifact field {field} is invalid: {reason}")]
+    ScanArtifactInvalid {
+        /// Stable field path within the scan artifact.
+        field: &'static str,
+        /// Diagnostic reason without sensitive wallet material.
+        reason: String,
+    },
+
     /// A background task panicked or was cancelled.
     ///
     /// Posture: [`FailurePosture::Retryable`]; the tokio runtime may accept the task on
@@ -71,16 +92,16 @@ pub enum StorageError {
         reason: String,
     },
 
-    /// Sapling prover params are not available on disk.
+    /// Sapling proving parameters are not available on disk.
     ///
-    /// Posture: [`FailurePosture::RequiresOperator`]; download the Sapling spend/output
-    /// parameters into the platform-default location (`~/.local/share/ZcashParams/` on
-    /// macOS; `~/.zcash-params/` on Linux). The upstream
-    /// `zcash_proofs::download_sapling_parameters` helper or the canonical `zcash-params`
-    /// distribution bucket are the sources.
+    /// Posture: [`FailurePosture::RequiresOperator`]; configure existing Sapling spend/output
+    /// parameter paths through `SqliteOptions::with_sapling_proving_parameters`, or download
+    /// them into the platform-default location (`~/.local/share/ZcashParams/` on macOS;
+    /// `~/.zcash-params/` on Linux). The upstream `zcash_proofs::download_sapling_parameters`
+    /// helper or the canonical `zcash-params` distribution bucket are the sources.
     #[error(
-        "Sapling prover parameters are not available; install sapling-spend.params and \
-         sapling-output.params into the platform-default location"
+        "Sapling proving parameters are not available at the configured paths or the \
+         platform-default location"
     )]
     ProverUnavailable,
 
@@ -234,6 +255,8 @@ impl StorageError {
             Self::NotOpened
             | Self::AccountNotFound
             | Self::AccountAlreadyExists
+            | Self::InvalidChainTips { .. }
+            | Self::ScanArtifactInvalid { .. }
             | Self::KeyDerivationFailed { .. }
             | Self::IdempotencyKeyConflict
             | Self::FinalizedPcztConflict { .. }
@@ -278,6 +301,10 @@ mod tests {
             },
             StorageError::AccountNotFound,
             StorageError::AccountAlreadyExists,
+            StorageError::ScanArtifactInvalid {
+                field: "compact_transaction.fee_zat",
+                reason: "x".into(),
+            },
             StorageError::BlockingTaskFailed { reason: "x".into() },
             StorageError::KeyDerivationFailed { reason: "x".into() },
             StorageError::ProverUnavailable,

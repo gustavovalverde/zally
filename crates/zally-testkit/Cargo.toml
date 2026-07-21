@@ -24,7 +24,7 @@ tracing-subscriber.workspace = true
 zally-chain = { path = "../zally-chain", version = "0.1" }
 zally-core = { path = "../zally-core", version = "0.1" }
 zally-keys = { path = "../zally-keys", version = "0.1" }
-zcash_client_backend.workspace = true
+zcash_protocol.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt"] }

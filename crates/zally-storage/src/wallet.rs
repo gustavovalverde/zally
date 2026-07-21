@@ -2,7 +2,8 @@
 
 use async_trait::async_trait;
 use zally_core::{
-    AccountId, BlockHeight, HoldId, IdempotencyKey, Network, OutPoint, TxId, Zatoshis,
+    AccountId, BlockHeight, CompactBlockArtifact, HoldId, IdempotencyKey, Network, OutPoint,
+    TreeStateArtifact, TxId, Zatoshis,
 };
 
 /// The storage backend behind a wallet handle.
@@ -18,10 +19,17 @@ pub enum StorageKind {
     /// A custom storage backend provided by the operator.
     Custom,
 }
+
+/// One atomically recorded visible/settled chain-tip pair.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ChainTips {
+    /// Highest source-visible block.
+    pub visible: BlockHeight,
+    /// Source-settled reorg-window watermark used by finality policy.
+    pub settled: BlockHeight,
+}
 use zally_keys::SeedMaterial;
-use zcash_client_backend::data_api::chain::ChainState;
 use zcash_client_backend::data_api::scanning::ScanRange;
-use zcash_client_backend::proto::compact_formats::CompactBlock;
 use zcash_keys::address::UnifiedAddress;
 use zcash_protocol::ShieldedPool;
 
@@ -39,20 +47,20 @@ use crate::pending_broadcast_input_row::PendingBroadcastInputRow;
 /// the `ChainState` valid for the block just before `from_height`.
 pub struct ScanRequest {
     /// Compact blocks to scan, in ascending height order.
-    pub blocks: Vec<CompactBlock>,
+    pub blocks: Vec<CompactBlockArtifact>,
     /// Height of the first block in `blocks`. Must equal `from_state.block_height() + 1`.
     pub from_height: BlockHeight,
     /// Commitment tree state valid for the block at `from_height - 1`.
-    pub from_state: ChainState,
+    pub from_state: TreeStateArtifact,
 }
 
 impl ScanRequest {
     /// Constructs a scan request.
     #[must_use]
     pub fn new(
-        blocks: Vec<CompactBlock>,
+        blocks: Vec<CompactBlockArtifact>,
         from_height: BlockHeight,
-        from_state: ChainState,
+        from_state: TreeStateArtifact,
     ) -> Self {
         Self {
             blocks,
@@ -438,7 +446,7 @@ pub trait WalletStorage: Send + Sync + 'static {
     async fn create_account_for_seed(
         &self,
         seed: &SeedMaterial,
-        prior_chain_state: ChainState,
+        prior_chain_state: TreeStateArtifact,
     ) -> Result<AccountId, StorageError>;
 
     /// Deletes the wallet database and recreates it with a fresh account for `seed`,
@@ -461,7 +469,7 @@ pub trait WalletStorage: Send + Sync + 'static {
     async fn recreate_with_account(
         &self,
         seed: &SeedMaterial,
-        prior_chain_state: ChainState,
+        prior_chain_state: TreeStateArtifact,
     ) -> Result<AccountId, StorageError>;
 
     /// Looks up the [`AccountId`] for the account whose UFVK matches the seed.
@@ -577,6 +585,16 @@ pub trait WalletStorage: Send + Sync + 'static {
     /// tree correctly; a mismatch means a corrupt tree and a bad spend anchor.
     async fn commitment_tree_roots(&self) -> Result<CommitmentTreeRoots, StorageError>;
 
+    /// Decodes source-neutral tree-state frontiers and returns their exact final roots.
+    ///
+    /// The conversion into librustzcash's private chain-state representation remains inside
+    /// the storage boundary. `not_retryable` when the artifact is malformed or for another
+    /// network.
+    async fn tree_state_roots(
+        &self,
+        tree_state: TreeStateArtifact,
+    ) -> Result<CommitmentTreeRoots, StorageError>;
+
     /// Returns the account's birthday height, the earliest block the operator-configured
     /// account expects to receive funds at. `Wallet::sync` starts from this height on a
     /// fresh wallet (rather than genesis) to keep cold sync proportional to the operator's
@@ -597,9 +615,10 @@ pub trait WalletStorage: Send + Sync + 'static {
     /// `InputSource::get_spendable_transparent_outputs` seam so the proposal selector never
     /// picks them. An empty set disables the filter.
     ///
-    /// The storage layer constructs a `LocalTxProver` using the default params location
-    /// (`~/.local/share/ZcashParams/` on macOS, `~/.zcash-params/` on Linux). Returns
-    /// `StorageError::ProverUnavailable` if the params are not present.
+    /// The storage layer constructs a `LocalTxProver` from the paths configured through
+    /// `SqliteOptions::with_sapling_proving_parameters`, or from the platform-default
+    /// parameter directory when no paths are configured. Returns
+    /// `StorageError::ProverUnavailable` if either required parameter file is absent.
     ///
     /// `not_retryable` on insufficient balance or invalid recipient; `retryable` on
     /// transient I/O.
@@ -671,7 +690,9 @@ pub trait WalletStorage: Send + Sync + 'static {
     /// returns its raw bytes plus `tx_id`.
     ///
     /// Wraps `zcash_client_backend::data_api::wallet::extract_and_store_transaction_from_pczt`.
-    /// Loads Sapling verifying keys from the platform-default `ZcashParams` location.
+    /// Loads Sapling verifying keys from the paths configured through
+    /// `SqliteOptions::with_sapling_proving_parameters`, or from the platform-default
+    /// parameter directory when no paths are configured.
     ///
     /// `not_retryable` on malformed PCZTs or missing authorizations; `requires_operator` on
     /// missing parameters; `retryable` on transient I/O.
@@ -728,25 +749,30 @@ pub trait WalletStorage: Send + Sync + 'static {
         end: BlockHeight,
     ) -> Result<Vec<(TxId, BlockHeight)>, StorageError>;
 
-    /// Returns the chain tip recorded by the most recent sync, or `None` for a fresh wallet
+    /// Returns the visible tip recorded by the most recent sync, or `None` for a fresh wallet
     /// that has never recorded a tip.
     ///
     /// Decoupled from `fully_scanned_height`: a sync that fetched zero compact blocks still
-    /// records an observed tip if the chain source reported one. Used to detect reorgs by
-    /// comparing the current chain tip against the recorded observed tip.
+    /// records a visible tip if the chain source reported one. Used to detect reorgs by
+    /// comparing the current visible tip against the recorded visible tip.
     ///
     /// `not_retryable` on schema errors; `retryable` on transient I/O.
-    async fn find_observed_tip(&self) -> Result<Option<BlockHeight>, StorageError>;
+    async fn find_visible_tip(&self) -> Result<Option<BlockHeight>, StorageError>;
 
-    /// Records `new_tip` as the most recently observed chain tip, unconditionally: the
-    /// stored value always reflects the last observation, even when `new_tip` is lower than
-    /// a previously recorded tip. Reorg detection depends on this: a monotonic high-water
-    /// mark would hide a tip regress. Callers detect reorgs by reading
-    /// [`Self::find_observed_tip`] and comparing against the chain source's current tip
-    /// before this call.
+    /// Returns the visible/settled pair recorded by the most recent sync in one read.
+    async fn find_chain_tips(&self) -> Result<Option<ChainTips>, StorageError>;
+
+    /// Returns the settled finality watermark recorded by the most recent sync.
+    async fn find_settled_tip(&self) -> Result<Option<BlockHeight>, StorageError>;
+
+    /// Atomically records one source-authenticated visible/settled tip pair.
     ///
-    /// `not_retryable` on schema errors; `retryable` on transient I/O.
-    async fn record_observed_tip(&self, new_tip: BlockHeight) -> Result<(), StorageError>;
+    /// Rejects `settled_tip > visible_tip` before mutating storage.
+    async fn record_chain_tips(
+        &self,
+        visible_tip: BlockHeight,
+        settled_tip: BlockHeight,
+    ) -> Result<(), StorageError>;
 
     /// Informs the underlying `WalletDb` of the raw chain tip so transaction proposals
     /// compute a valid `expiry_height` against the live chain.
@@ -844,7 +870,7 @@ pub trait WalletStorage: Send + Sync + 'static {
     ) -> Result<u64, StorageError>;
 
     /// Returns the per-pool balance snapshot for `account_id`, anchored to the wallet's last
-    /// observed chain tip.
+    /// persisted visible tip.
     ///
     /// Sapling, Orchard, and Ironwood values come from `WalletRead::get_wallet_summary`; the
     /// transparent mature/immature split applies ZIP-213 coinbase maturity directly against
@@ -871,7 +897,10 @@ pub trait WalletStorage: Send + Sync + 'static {
     /// operator.
     ///
     /// `not_retryable` on schema errors; `retryable` on transient I/O.
-    async fn truncate_to_chain_state(&self, chain_state: ChainState) -> Result<(), StorageError>;
+    async fn truncate_to_chain_state(
+        &self,
+        chain_state: TreeStateArtifact,
+    ) -> Result<(), StorageError>;
 
     /// Returns every Sapling, Orchard, and Ironwood note received in the inclusive height range
     /// `[from_height, to_height]`, regardless of current spent state.

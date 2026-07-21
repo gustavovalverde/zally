@@ -1,9 +1,8 @@
 //! `Wallet::sync` skips the tree-root check for a wallet pool whose commitment tree holds
 //! no scanned leaves, instead of faulting `TreeRootsDiverged` against the chain's root.
 
-use zally_core::BlockHeight;
+use zally_core::{BlockHash, BlockHeight, TreeStateArtifact};
 use zally_testkit::MockChainSource;
-use zcash_client_backend::proto::service::TreeState;
 
 use super::fixtures::{TestWalletError, TestWalletFixture, create_test_wallet};
 
@@ -28,14 +27,15 @@ async fn sync_skips_tree_root_check_for_empty_pools() -> Result<(), TestWalletEr
     let handle = chain.handle();
     handle.serve_compact_blocks();
     handle.advance_tip(BlockHeight::from(CHAIN_TIP));
-    handle.serve_tree_state(TreeState {
-        network: String::new(),
-        height: u64::from(CHAIN_TIP),
-        hash: "00".repeat(32),
-        time: 0,
-        sapling_tree: String::new(),
-        orchard_tree: single_leaf_tree_hex(),
-        ironwood_tree: String::new(),
+    let nonempty_frontier = hex::decode(single_leaf_tree_hex()).unwrap_or_default();
+    handle.serve_tree_state(TreeStateArtifact {
+        network: wallet.network(),
+        height: BlockHeight::from(CHAIN_TIP),
+        block_hash: BlockHash::from_bytes([0; 32]),
+        block_time_seconds: 0,
+        sapling_final_state_bytes: nonempty_frontier.clone(),
+        orchard_final_state_bytes: nonempty_frontier.clone(),
+        ironwood_final_state_bytes: nonempty_frontier,
     });
 
     let mut scanned_to_height = BlockHeight::GENESIS;

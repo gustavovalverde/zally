@@ -14,7 +14,7 @@ Faucet-style and exchange-style operators repeatedly serialise a "reserve funds,
 - The earmark map and librustzcash's `GreedyInputSelector` disagree about "spendable." Two claims that race within the post-broadcast, pre-confirmation window can both pass the earmark precondition, and the second `send_payment` then fails inside `create_proposed_transactions` with insufficient balance even though the wallet has the funds; they are simply already committed.
 - The earmark map is in-memory and is not reconstructed at startup. A process restart between earmark and broadcast forgets the lock, and a subsequent call selects the same notes again.
 
-Both failures live one layer above Zally. The wallet layer already serialises every `WalletDb` access through a single-threaded actor (see `zally-storage::sqlite`) and already persists ancillary tables (`ext_zally_idempotency`, `ext_zally_pending_broadcast_inputs`, `ext_zally_observed_tip`) alongside the librustzcash schema. The atomic-reservation operation belongs here.
+Both failures live one layer above Zally. The wallet layer already serialises every `WalletDb` access through a single-threaded actor (see `zally-storage::sqlite`) and already persists ancillary tables (`ext_zally_idempotency`, `ext_zally_pending_broadcast_inputs`, `ext_zally_chain_tips`) alongside the librustzcash schema. The atomic-reservation operation belongs here.
 
 ## Decision
 

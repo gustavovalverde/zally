@@ -7,45 +7,71 @@
 //!
 //! The wrapper is intentionally thin: every method translates Zally domain types into
 //! zinder-core/zinder-client domain types, calls the underlying handle, and translates the
-//! result back. Network alignment is checked at construction; per-call re-validation is
-//! unnecessary because the underlying client pins the network at connect time.
+//! result back. Remote construction records the expected network; each response-bearing
+//! call validates the authenticated chain epoch against it before exposing facts to Zally.
 
+use std::collections::BTreeSet;
 use std::num::NonZeroU32;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use futures_util::StreamExt as _;
-use prost::Message;
-use zally_core::{BlockHeight, Network, TxId};
-use zcash_client_backend::proto::compact_formats::CompactBlock;
-use zcash_client_backend::proto::service::TreeState;
+use zally_core::{
+    BlockHash, BlockHeight, CompactBlockArtifact, CompactChainMetadata, CompactSaplingOutput,
+    CompactSaplingSpend, CompactShieldedAction, CompactTransaction, CompactTransparentInput,
+    CompactTransparentOutput, Network, TreeStateArtifact, TxId, Zatoshis,
+};
 use zcash_protocol::consensus::{NetworkUpgrade, Parameters as _};
 use zinder_client::{
     ChainEvent as ZinderChainEvent, ChainEventCursor as ZinderChainEventCursor,
+    ChainEventCursorRecovery as ZinderChainEventCursorRecovery,
     ChainEventEnvelope as ZinderChainEventEnvelope, EndpointBackedIndex,
     EventStreamStart as ZinderEventStreamStart, RemoteChainIndex, RemoteOpenOptions,
-    TransparentAddressUnspentOutputsQuery,
+    TransparentAddressUnspentOutputsQuery, WALLET_ADDRESS_TRANSPARENT_UNSPENT_OUTPUTS_V1,
+    WALLET_EVENTS_CHAIN_V1, WALLET_READ_COMPACT_BLOCK_IRONWOOD_V2,
+    WALLET_READ_COMPACT_BLOCK_RANGE_V2, WALLET_READ_SERVER_INFO_V2,
+    WALLET_READ_SETTLED_TIP_BLOCK_V1, WALLET_READ_SUBTREE_ROOTS_IN_RANGE_V1,
+    WALLET_READ_SUBTREE_ROOTS_IRONWOOD_V1, WALLET_READ_TRANSACTION_BY_ID_V2,
+    WALLET_READ_TREE_STATE_AT_HEIGHT_V2, WALLET_READ_VISIBLE_TIP_BLOCK_V1,
 };
 use zinder_core::{
     BlockHeight as ZinderBlockHeight, BlockHeightRange as ZinderBlockHeightRange,
-    Network as ZinderNetwork, ShieldedProtocol as ZinderShieldedProtocol,
-    SubtreeRootIndex as ZinderSubtreeRootIndex, SubtreeRootRange as ZinderSubtreeRootRange,
-    TransactionId as ZinderTransactionId, TransparentAddressScriptHash, TxStatus as ZinderTxStatus,
+    ChainEpochId as ZinderChainEpochId, Network as ZinderNetwork,
+    ShieldedProtocol as ZinderShieldedProtocol, SubtreeRootIndex as ZinderSubtreeRootIndex,
+    SubtreeRootRange as ZinderSubtreeRootRange, TransactionId as ZinderTransactionId,
+    TransparentAddressScriptHash, TreeStateArtifact as ZinderTreeStateArtifact,
+    TxStatus as ZinderTxStatus,
 };
 
 use crate::error::ChainSourceError;
 use crate::source::{
-    BlockHeightRange, ChainEvent, ChainEventCursor, ChainEventEnvelope, ChainEventEnvelopeStream,
-    ChainEventStreamStart, ChainSource, CompactBlockStream, ShieldedPool, SubtreeIndex,
-    SubtreeRoot, TransactionStatus, TransparentUtxo,
+    BlockHeightRange, BlockId, ChainEpoch, ChainEpochCommitted, ChainEpochId, ChainEvent,
+    ChainEventCursor, ChainEventCursorRecovery, ChainEventEnvelope, ChainEventEnvelopeStream,
+    ChainEventStreamStart, ChainRangeReverted, ChainSource, CompactBlockStream, ShieldedPool,
+    SubtreeIndex, SubtreeRoot, TransactionStatus, TransparentUtxo,
 };
 
 const DEFAULT_SUBTREE_PAGE_SIZE: u32 = 256;
+const REQUIRED_SYNC_CAPABILITIES: [&str; 10] = [
+    WALLET_READ_SERVER_INFO_V2,
+    WALLET_READ_VISIBLE_TIP_BLOCK_V1,
+    WALLET_READ_SETTLED_TIP_BLOCK_V1,
+    WALLET_READ_COMPACT_BLOCK_RANGE_V2,
+    WALLET_READ_COMPACT_BLOCK_IRONWOOD_V2,
+    WALLET_READ_TREE_STATE_AT_HEIGHT_V2,
+    WALLET_READ_SUBTREE_ROOTS_IN_RANGE_V1,
+    WALLET_READ_SUBTREE_ROOTS_IRONWOOD_V1,
+    WALLET_ADDRESS_TRANSPARENT_UNSPENT_OUTPUTS_V1,
+    WALLET_EVENTS_CHAIN_V1,
+];
+const MINIMUM_CONTRACT_REVISION: u32 = 2;
+
+pub(crate) type ZinderCapabilitySet = BTreeSet<String>;
 
 /// Options for connecting [`ZinderChainSource`] to a remote `zinder-query` endpoint.
 #[derive(Clone, Debug)]
 pub struct ZinderRemoteOptions {
-    /// Native `WalletQuery` gRPC endpoint URI (e.g. `http://127.0.0.1:9101`).
+    /// Native `WalletQuery` gRPC endpoint URI (e.g. `http://127.0.0.1:9102`).
     pub endpoint: String,
     /// Zally network this endpoint serves. Validated at connect time.
     pub network: Network,
@@ -59,6 +85,7 @@ pub struct ZinderRemoteOptions {
 pub struct ZinderChainSource {
     inner: Arc<dyn EndpointBackedIndex>,
     network: Network,
+    capabilities: Arc<tokio::sync::OnceCell<ZinderCapabilitySet>>,
 }
 
 impl std::fmt::Debug for ZinderChainSource {
@@ -85,6 +112,7 @@ impl ZinderChainSource {
         Ok(Self {
             inner: Arc::new(remote),
             network: options.network,
+            capabilities: Arc::new(tokio::sync::OnceCell::new()),
         })
     }
 
@@ -95,7 +123,11 @@ impl ZinderChainSource {
     /// `LocalChainIndex` cannot back it.
     #[must_use]
     pub fn from_chain_index(inner: Arc<dyn EndpointBackedIndex>, network: Network) -> Self {
-        Self { inner, network }
+        Self {
+            inner,
+            network,
+            capabilities: Arc::new(tokio::sync::OnceCell::new()),
+        }
     }
 
     /// Returns a [`crate::ZinderSubmitter`] backed by the same gRPC channel as this chain
@@ -104,7 +136,88 @@ impl ZinderChainSource {
     /// endpoint; sharing the channel avoids opening a second TCP connection.
     #[must_use]
     pub fn submitter(&self) -> crate::ZinderSubmitter {
-        crate::ZinderSubmitter::from_chain_index(Arc::clone(&self.inner), self.network)
+        crate::ZinderSubmitter::from_chain_index_with_capabilities(
+            Arc::clone(&self.inner),
+            self.network,
+            Arc::clone(&self.capabilities),
+        )
+    }
+
+    async fn ensure_capabilities(&self, required: &[&str]) -> Result<(), ChainSourceError> {
+        let capabilities = self
+            .capabilities
+            .get_or_try_init(|| async {
+                let descriptor = self
+                    .inner
+                    .server_info()
+                    .await
+                    .map_err(Self::map_indexer_error)?;
+                let common = descriptor
+                    .common
+                    .ok_or(ChainSourceError::UnsupportedResponse {
+                        response: "WalletServerInfo.common",
+                    })?;
+                if common.contract_revision < MINIMUM_CONTRACT_REVISION {
+                    return Err(ChainSourceError::ContractRevisionUnsupported {
+                        minimum_revision: MINIMUM_CONTRACT_REVISION,
+                        actual_revision: common.contract_revision,
+                    });
+                }
+                Ok::<_, ChainSourceError>(common.capabilities.into_iter().collect())
+            })
+            .await?;
+        let missing_capabilities = required
+            .iter()
+            .filter(|capability| !capabilities.contains(**capability))
+            .map(|capability| (*capability).to_owned())
+            .collect::<Vec<_>>();
+        if missing_capabilities.is_empty() {
+            Ok(())
+        } else {
+            Err(ChainSourceError::CapabilitiesUnavailable {
+                capabilities: missing_capabilities,
+            })
+        }
+    }
+
+    #[allow(
+        clippy::wildcard_enum_match_arm,
+        reason = "IndexerError is non-exhaustive; unknown typed errors must retain their source and retry policy"
+    )]
+    fn map_indexer_error(error: zinder_client::IndexerError) -> ChainSourceError {
+        match error {
+            zinder_client::IndexerError::ChainEpochPinUnavailable => {
+                ChainSourceError::ChainEpochPinUnavailable
+            }
+            zinder_client::IndexerError::ChainEventCursorExpired {
+                recovery: ZinderChainEventCursorRecovery::EarliestRetained,
+            } => ChainSourceError::ChainEventCursorExpired {
+                recovery: ChainEventCursorRecovery::EarliestRetained,
+            },
+            other => ChainSourceError::Indexer(other),
+        }
+    }
+
+    fn pinned_result<T>(
+        operation_result: Result<T, zinder_client::IndexerError>,
+    ) -> Result<T, ChainSourceError> {
+        match operation_result {
+            Ok(output) => Ok(output),
+            Err(error) => Err(Self::map_indexer_error(error)),
+        }
+    }
+
+    fn pinned_epoch(
+        &self,
+        chain_epoch: ChainEpoch,
+    ) -> Result<ZinderChainEpochId, ChainSourceError> {
+        if chain_epoch.network() != self.network {
+            return Err(ChainSourceError::NetworkMismatch {
+                chain_source_network: self.network,
+                requested_network: chain_epoch.network(),
+            });
+        }
+        Ok(ZinderChainEpochId::new(chain_epoch.id().value()))
     }
 }
 
@@ -114,53 +227,63 @@ impl ChainSource for ZinderChainSource {
         self.network
     }
 
-    async fn safe_chain_tip(&self) -> Result<BlockHeight, ChainSourceError> {
-        let block_id = self.inner.latest_safe_block(None).await?;
-        Ok(BlockHeight::from(block_id.height.value()))
-    }
-
-    async fn chain_tip(&self) -> Result<BlockHeight, ChainSourceError> {
-        let block_id = self.inner.latest_block(None).await?;
-        Ok(BlockHeight::from(block_id.height.value()))
+    async fn current_epoch(&self) -> Result<ChainEpoch, ChainSourceError> {
+        self.ensure_capabilities(&REQUIRED_SYNC_CAPABILITIES)
+            .await?;
+        translate_chain_epoch(self.inner.current_epoch().await?, self.network)
     }
 
     async fn compact_blocks(
         &self,
+        chain_epoch: ChainEpoch,
         block_range: BlockHeightRange,
     ) -> Result<CompactBlockStream, ChainSourceError> {
-        let zinder_range = ZinderBlockHeightRange::inclusive(
-            ZinderBlockHeight::new(block_range.start_height.as_u32()),
-            ZinderBlockHeight::new(block_range.end_height.as_u32()),
-        );
-        let stream = self
-            .inner
-            .compact_blocks_in_range(zinder_range, None)
+        self.ensure_capabilities(&REQUIRED_SYNC_CAPABILITIES)
             .await?;
+        let epoch = self.pinned_epoch(chain_epoch)?;
+        let zinder_range = ZinderBlockHeightRange::inclusive(
+            ZinderBlockHeight::new(block_range.start_height().as_u32()),
+            ZinderBlockHeight::new(block_range.end_height().as_u32()),
+        );
+        let stream = Self::pinned_result(
+            self.inner
+                .compact_blocks_in_range(zinder_range, Some(epoch))
+                .await,
+        )?;
 
-        let mapped = stream.map(|stream_item| match stream_item {
-            Ok(artifact) => decode_compact_block(&artifact.payload_bytes, artifact.height),
-            Err(err) => Err(ChainSourceError::from(err)),
+        let mapped = stream.map(move |stream_item| match stream_item {
+            Ok(artifact) => decode_compact_block(&artifact),
+            Err(error) => Err(Self::map_indexer_error(error)),
         });
         Ok(Box::pin(mapped) as CompactBlockStream)
     }
 
     async fn tree_state_at(
         &self,
+        chain_epoch: ChainEpoch,
         block_height: BlockHeight,
-    ) -> Result<TreeState, ChainSourceError> {
-        let artifact = self
-            .inner
-            .tree_state_at(ZinderBlockHeight::new(block_height.as_u32()), None)
+    ) -> Result<TreeStateArtifact, ChainSourceError> {
+        self.ensure_capabilities(&REQUIRED_SYNC_CAPABILITIES)
             .await?;
-        decode_tree_state(&artifact.payload_bytes, block_height, self.network)
+        let epoch = self.pinned_epoch(chain_epoch)?;
+        let artifact = Self::pinned_result(
+            self.inner
+                .tree_state_at(ZinderBlockHeight::new(block_height.as_u32()), Some(epoch))
+                .await,
+        )?;
+        decode_tree_state(&artifact, block_height, self.network)
     }
 
     async fn subtree_roots(
         &self,
+        chain_epoch: ChainEpoch,
         pool: ShieldedPool,
         start_index: SubtreeIndex,
         max_count: u32,
     ) -> Result<Vec<SubtreeRoot>, ChainSourceError> {
+        self.ensure_capabilities(&REQUIRED_SYNC_CAPABILITIES)
+            .await?;
+        let epoch = self.pinned_epoch(chain_epoch)?;
         let bounded = max_count.clamp(1, DEFAULT_SUBTREE_PAGE_SIZE);
         let max_entries = NonZeroU32::new(bounded).unwrap_or(NonZeroU32::MIN);
         let range = ZinderSubtreeRootRange::new(
@@ -168,7 +291,8 @@ impl ChainSource for ZinderChainSource {
             ZinderSubtreeRootIndex::new(start_index.0),
             max_entries,
         );
-        let artifacts = self.inner.subtree_roots_in_range(range, None).await?;
+        let artifacts =
+            Self::pinned_result(self.inner.subtree_roots_in_range(range, Some(epoch)).await)?;
         Ok(artifacts
             .into_iter()
             .map(|artifact| SubtreeRoot {
@@ -182,11 +306,13 @@ impl ChainSource for ZinderChainSource {
     }
 
     async fn transaction_status(&self, tx_id: TxId) -> Result<TransactionStatus, ChainSourceError> {
+        self.ensure_capabilities(&[WALLET_READ_TRANSACTION_BY_ID_V2])
+            .await?;
         let zinder_id = ZinderTransactionId::from_bytes(*tx_id.as_bytes());
         let status = self.inner.transaction_by_id(zinder_id, None).await?;
         #[allow(
             clippy::wildcard_enum_match_arm,
-            reason = "non_exhaustive zinder tx statuses map unknown variants to NotFound"
+            reason = "non_exhaustive zinder tx statuses fail closed on unknown variants"
         )]
         let translated = match status {
             ZinderTxStatus::Mined(mined) => TransactionStatus::Confirmed {
@@ -194,36 +320,59 @@ impl ChainSource for ZinderChainSource {
                 confirmed_at_height: BlockHeight::from(mined.location.block_height.value()),
             },
             ZinderTxStatus::InMempool(_) => TransactionStatus::InMempool { tx_id },
-            ZinderTxStatus::NotFound | ZinderTxStatus::ConflictingChain => {
-                TransactionStatus::NotFound
+            ZinderTxStatus::NotFound => TransactionStatus::NotFound,
+            _ => {
+                return Err(ChainSourceError::UnsupportedResponse {
+                    response: "TransactionStatus",
+                });
             }
-            _ => TransactionStatus::NotFound,
         };
         Ok(translated)
     }
 
     async fn transparent_utxos(
         &self,
+        chain_epoch: ChainEpoch,
         script_pub_key_bytes: &[u8],
     ) -> Result<Vec<TransparentUtxo>, ChainSourceError> {
+        self.ensure_capabilities(&[WALLET_ADDRESS_TRANSPARENT_UNSPENT_OUTPUTS_V1])
+            .await?;
+        let epoch = self.pinned_epoch(chain_epoch)?;
         let address_script_hash =
             TransparentAddressScriptHash::of_script_pub_key(script_pub_key_bytes);
         let query = TransparentAddressUnspentOutputsQuery {
             address_script_hash,
             start_height: ZinderBlockHeight::new(0),
-            at_epoch_id: None,
+            at_epoch_id: Some(epoch),
         };
-        let mut stream = self
-            .inner
-            .transparent_address_unspent_outputs(query)
-            .await?;
+        let mut stream =
+            Self::pinned_result(self.inner.transparent_address_unspent_outputs(query).await)?;
         let mut utxos = Vec::new();
         while let Some(stream_item) = stream.next().await {
-            let output = stream_item?.output;
+            let output = match stream_item {
+                Ok(chunk) => {
+                    if chunk.chain_epoch.id != epoch {
+                        return Err(ChainSourceError::ChainEpochPinUnavailable);
+                    }
+                    chunk.output
+                }
+                Err(error) => {
+                    return Err(Self::map_indexer_error(error));
+                }
+            };
+            let tx_id = TxId::from_bytes(output.outpoint.transaction_id.as_bytes());
+            let value_zat = Zatoshis::try_from(output.value_zat).map_err(|error| {
+                ChainSourceError::MalformedTransparentUtxoSet {
+                    reason: format!(
+                        "outpoint {tx_id}:{} has invalid value_zat {}: {error}",
+                        output.outpoint.output_index, output.value_zat
+                    ),
+                }
+            })?;
             utxos.push(TransparentUtxo {
-                tx_id: TxId::from_bytes(output.outpoint.transaction_id.as_bytes()),
+                tx_id,
                 output_index: output.outpoint.output_index,
-                value_zat: output.value_zat,
+                value_zat,
                 confirmed_at_height: BlockHeight::from(output.block_height.value()),
                 script_pub_key_bytes: output.script_pub_key,
             });
@@ -235,6 +384,7 @@ impl ChainSource for ZinderChainSource {
         &self,
         start: ChainEventStreamStart,
     ) -> Result<ChainEventEnvelopeStream, ChainSourceError> {
+        self.ensure_capabilities(&[WALLET_EVENTS_CHAIN_V1]).await?;
         let inner = self.inner.clone();
         let zinder_start = match start {
             ChainEventStreamStart::AfterCursor(cursor) => ZinderEventStreamStart::AfterCursor(
@@ -243,51 +393,138 @@ impl ChainSource for ZinderChainSource {
             ChainEventStreamStart::EarliestRetained => ZinderEventStreamStart::EarliestRetained,
             ChainEventStreamStart::LiveTail => ZinderEventStreamStart::LiveTail,
         };
-        let stream = inner.chain_events(zinder_start).await?;
-        let mapped = stream.map(|envelope_result| match envelope_result {
-            Ok(envelope) => Ok(translate_chain_event_envelope(&envelope)),
-            Err(err) => Err(ChainSourceError::from(err)),
+        let stream = inner
+            .chain_events(zinder_start)
+            .await
+            .map_err(Self::map_indexer_error)?;
+        let network = self.network;
+        let mapped = stream.map(move |envelope_result| match envelope_result {
+            Ok(envelope) => translate_chain_event_envelope(&envelope, network),
+            Err(err) => Err(Self::map_indexer_error(err)),
         });
         Ok(Box::pin(mapped) as ChainEventEnvelopeStream)
     }
 }
 
-fn translate_chain_event_envelope(envelope: &ZinderChainEventEnvelope) -> ChainEventEnvelope {
-    ChainEventEnvelope::new(
+fn translate_chain_event_envelope(
+    envelope: &ZinderChainEventEnvelope,
+    expected_network: Network,
+) -> Result<ChainEventEnvelope, ChainSourceError> {
+    let chain_epoch = translate_chain_epoch(envelope.chain_epoch, expected_network)?;
+    if BlockHeight::from(envelope.settled_tip_height.value()) != chain_epoch.settled_tip().height {
+        return Err(ChainSourceError::UnsupportedResponse {
+            response: "chain-event envelope settled tip differs from its epoch",
+        });
+    }
+    let event = translate_chain_event(envelope, expected_network)?;
+    let committed_epoch = match &event {
+        ChainEvent::ChainCommitted { committed } | ChainEvent::ChainReorged { committed, .. } => {
+            committed.chain_epoch
+        }
+    };
+    if committed_epoch != chain_epoch {
+        return Err(ChainSourceError::UnsupportedResponse {
+            response: "chain-event committed epoch differs from its envelope epoch",
+        });
+    }
+    Ok(ChainEventEnvelope::new(
         ChainEventCursor::from_bytes(envelope.cursor.as_bytes().to_vec()),
         envelope.event_sequence,
-        BlockHeight::from(envelope.safe_tip_height.value()),
-        translate_chain_event(envelope),
-    )
+        chain_epoch,
+        event,
+    ))
 }
 
 #[allow(
     clippy::wildcard_enum_match_arm,
-    reason = "non_exhaustive zinder chain events map unknown variants to SafeChainTipAdvanced"
+    reason = "non_exhaustive zinder chain events fail closed on unknown variants"
 )]
-fn translate_chain_event(envelope: &ZinderChainEventEnvelope) -> ChainEvent {
-    let safe_chain_tip = BlockHeight::from(envelope.safe_tip_height.value());
+fn translate_chain_event(
+    envelope: &ZinderChainEventEnvelope,
+    expected_network: Network,
+) -> Result<ChainEvent, ChainSourceError> {
     match &envelope.event {
-        ZinderChainEvent::ChainCommitted { committed } => ChainEvent::SafeChainTipAdvanced {
-            committed_range: zinder_range_to_zally(committed.block_range),
-            new_safe_chain_tip_height: safe_chain_tip,
-        },
+        ZinderChainEvent::ChainCommitted { committed } => Ok(ChainEvent::ChainCommitted {
+            committed: ChainEpochCommitted {
+                chain_epoch: translate_chain_epoch(committed.chain_epoch, expected_network)?,
+                block_range: zinder_range_to_zally(committed.block_range)?,
+            },
+        }),
         ZinderChainEvent::ChainReorged {
             reverted,
             committed,
-        } => ChainEvent::ChainReorged {
-            reverted_range: zinder_range_to_zally(reverted.block_range),
-            committed_range: zinder_range_to_zally(committed.block_range),
-            new_safe_chain_tip_height: safe_chain_tip,
-        },
-        _ => ChainEvent::SafeChainTipAdvanced {
-            committed_range: BlockHeightRange {
-                start_height: safe_chain_tip,
-                end_height: safe_chain_tip,
+        } => Ok(ChainEvent::ChainReorged {
+            reverted: ChainRangeReverted {
+                chain_epoch: translate_chain_epoch(reverted.chain_epoch, expected_network)?,
+                block_range: zinder_range_to_zally(reverted.block_range)?,
             },
-            new_safe_chain_tip_height: safe_chain_tip,
-        },
+            committed: ChainEpochCommitted {
+                chain_epoch: translate_chain_epoch(committed.chain_epoch, expected_network)?,
+                block_range: zinder_range_to_zally(committed.block_range)?,
+            },
+        }),
+        _ => Err(ChainSourceError::UnsupportedResponse {
+            response: "ChainEvent",
+        }),
     }
+}
+
+fn translate_chain_epoch(
+    epoch: zinder_core::ChainEpoch,
+    expected_network: Network,
+) -> Result<ChainEpoch, ChainSourceError> {
+    let actual_network = zinder_network_to_zally(epoch.network, expected_network)?;
+    if actual_network != expected_network {
+        return Err(ChainSourceError::NetworkMismatch {
+            chain_source_network: actual_network,
+            requested_network: expected_network,
+        });
+    }
+    ChainEpoch::new(
+        ChainEpochId::new(epoch.id.value()),
+        actual_network,
+        BlockId {
+            height: BlockHeight::from(epoch.visible_tip_height.value()),
+            hash: BlockHash::from_bytes(epoch.visible_tip_hash.as_bytes()),
+        },
+        BlockId {
+            height: BlockHeight::from(epoch.settled_tip_height.value()),
+            hash: BlockHash::from_bytes(epoch.settled_tip_hash.as_bytes()),
+        },
+    )
+    .ok_or(ChainSourceError::UnsupportedResponse {
+        response: "ChainEpoch(settled_tip_above_visible_tip)",
+    })
+}
+
+#[allow(
+    clippy::wildcard_enum_match_arm,
+    reason = "unknown future Zinder networks fail closed instead of inheriting configured parameters"
+)]
+fn zinder_network_to_zally(
+    network: ZinderNetwork,
+    expected_network: Network,
+) -> Result<Network, ChainSourceError> {
+    let actual_network = match network {
+        ZinderNetwork::ZcashMainnet => Network::Mainnet,
+        ZinderNetwork::ZcashTestnet => Network::Testnet,
+        ZinderNetwork::ZcashRegtest => match expected_network {
+            Network::Regtest(_) => expected_network,
+            _ => Network::regtest(),
+        },
+        _ => {
+            return Err(ChainSourceError::UnsupportedResponse {
+                response: "ChainEpoch.network",
+            });
+        }
+    };
+    if actual_network != expected_network {
+        return Err(ChainSourceError::NetworkMismatch {
+            chain_source_network: actual_network,
+            requested_network: expected_network,
+        });
+    }
+    Ok(actual_network)
 }
 
 #[allow(
@@ -314,78 +551,184 @@ const fn zally_pool_to_zinder(pool: ShieldedPool) -> ZinderShieldedProtocol {
     }
 }
 
-fn zinder_range_to_zally(range: ZinderBlockHeightRange) -> BlockHeightRange {
-    BlockHeightRange {
-        start_height: BlockHeight::from(range.start.value()),
-        end_height: BlockHeight::from(range.end.value()),
-    }
-}
-
-fn decode_compact_block(
-    payload_bytes: &[u8],
-    height: ZinderBlockHeight,
-) -> Result<CompactBlock, ChainSourceError> {
-    <CompactBlock as Message>::decode(payload_bytes).map_err(|err| {
-        ChainSourceError::MalformedCompactBlock {
-            block_height: BlockHeight::from(height.value()),
-            reason: err.to_string(),
-        }
+fn zinder_range_to_zally(
+    range: ZinderBlockHeightRange,
+) -> Result<BlockHeightRange, ChainSourceError> {
+    BlockHeightRange::new(
+        BlockHeight::from(range.start.value()),
+        BlockHeight::from(range.end.value()),
+    )
+    .ok_or(ChainSourceError::UnsupportedResponse {
+        response: "reversed Zinder block-height range",
     })
 }
 
-/// Translates zinder's stored `z_gettreestate` JSON payload into the lightwalletd
-/// `TreeState` protobuf shape that `zcash_client_backend` consumes.
+fn decode_compact_block(
+    artifact: &zinder_core::CompactBlockArtifact,
+) -> Result<CompactBlockArtifact, ChainSourceError> {
+    let block_height = BlockHeight::from(artifact.height().value());
+    let transactions = artifact
+        .transactions()
+        .iter()
+        .map(|transaction| compact_transaction(transaction, block_height))
+        .collect::<Result<Vec<_>, _>>()?;
+    let metadata = artifact.chain_metadata();
+    Ok(CompactBlockArtifact {
+        height: BlockHeight::from(artifact.height().value()),
+        block_hash: BlockHash::from_bytes(artifact.block_hash().as_bytes()),
+        previous_block_hash: BlockHash::from_bytes(artifact.previous_block_hash().as_bytes()),
+        block_time_seconds: artifact.time(),
+        transactions,
+        chain_metadata: CompactChainMetadata {
+            sapling_commitment_tree_size: metadata.sapling_commitment_tree_size,
+            orchard_commitment_tree_size: metadata.orchard_commitment_tree_size,
+            ironwood_commitment_tree_size: metadata.ironwood_commitment_tree_size,
+        },
+    })
+}
+
+fn compact_transaction(
+    transaction: &zinder_core::CompactTransaction,
+    block_height: BlockHeight,
+) -> Result<CompactTransaction, ChainSourceError> {
+    let fee_zat = transaction
+        .data
+        .fee_zat
+        .map(Zatoshis::try_from)
+        .transpose()
+        .map_err(|error| ChainSourceError::MalformedCompactBlock {
+            block_height,
+            reason: error.to_string(),
+        })?;
+    let transparent_outputs = transaction
+        .data
+        .transparent_outputs
+        .iter()
+        .map(|output| {
+            Ok(CompactTransparentOutput {
+                value_zat: Zatoshis::try_from(output.value_zat).map_err(|error| {
+                    ChainSourceError::MalformedCompactBlock {
+                        block_height,
+                        reason: error.to_string(),
+                    }
+                })?,
+                script_pub_key_bytes: output.script_pub_key.clone(),
+            })
+        })
+        .collect::<Result<Vec<_>, ChainSourceError>>()?;
+    Ok(CompactTransaction {
+        index: transaction.index,
+        tx_id: TxId::from_bytes(transaction.transaction_id.as_bytes()),
+        fee_zat,
+        sapling_spends: transaction
+            .data
+            .sapling_spends
+            .iter()
+            .map(|spend| CompactSaplingSpend {
+                nullifier_bytes: spend.nullifier,
+            })
+            .collect(),
+        sapling_outputs: transaction
+            .data
+            .sapling_outputs
+            .iter()
+            .map(|output| CompactSaplingOutput {
+                commitment_bytes: output.commitment,
+                ephemeral_key_bytes: output.ephemeral_key,
+                ciphertext_bytes: output.ciphertext,
+            })
+            .collect(),
+        orchard_actions: transaction
+            .data
+            .orchard_actions
+            .iter()
+            .map(compact_shielded_action)
+            .collect(),
+        ironwood_actions: transaction
+            .data
+            .ironwood_actions
+            .iter()
+            .map(compact_shielded_action)
+            .collect(),
+        transparent_inputs: transaction
+            .data
+            .transparent_inputs
+            .iter()
+            .map(|input| CompactTransparentInput {
+                previous_tx_id: TxId::from_bytes(input.previous_transaction_id.as_bytes()),
+                previous_output_index: input.previous_output_index,
+            })
+            .collect(),
+        transparent_outputs,
+    })
+}
+
+fn compact_shielded_action(action: &zinder_core::CompactShieldedAction) -> CompactShieldedAction {
+    CompactShieldedAction {
+        nullifier_bytes: action.nullifier,
+        commitment_bytes: action.commitment,
+        ephemeral_key_bytes: action.ephemeral_key,
+        ciphertext_bytes: action.ciphertext,
+    }
+}
+
+/// Translates Zinder's stored `z_gettreestate` JSON payload into Zally's source-neutral
+/// [`TreeStateArtifact`].
 ///
 /// Zinder stores Zebra's `z_gettreestate` JSON response verbatim. The fields map directly:
-/// `height`, `hash`, `time` are top-level; `sapling.commitments.finalState` and
-/// `orchard.commitments.finalState` become the hex-encoded `sapling_tree` and
-/// `orchard_tree` fields on the protobuf.
+/// `height`, `hash`, and `time` are top-level. Each pool's
+/// `commitments.finalState` hex becomes its serialized frontier bytes; the storage boundary
+/// later performs the librustzcash conversion.
 fn decode_tree_state(
-    payload_bytes: &[u8],
-    height: BlockHeight,
+    artifact: &ZinderTreeStateArtifact,
+    requested_height: BlockHeight,
     network: Network,
-) -> Result<TreeState, ChainSourceError> {
-    let parsed: serde_json::Value = serde_json::from_slice(payload_bytes).map_err(|err| {
-        ChainSourceError::MalformedCompactBlock {
-            block_height: height,
-            reason: format!("zinder tree-state payload is not JSON: {err}"),
-        }
-    })?;
-
-    let height_value = parsed
-        .get("height")
-        .and_then(serde_json::Value::as_u64)
-        .ok_or_else(|| ChainSourceError::MalformedCompactBlock {
-            block_height: height,
-            reason: "tree-state JSON missing `height`".into(),
+) -> Result<TreeStateArtifact, ChainSourceError> {
+    let artifact_height = BlockHeight::from(artifact.height.value());
+    if artifact_height != requested_height {
+        return Err(ChainSourceError::TreeStateAnchorHeightMismatch {
+            requested_height,
+            returned_height: artifact_height,
+        });
+    }
+    let parsed: serde_json::Value =
+        serde_json::from_slice(&artifact.payload_bytes).map_err(|err| {
+            ChainSourceError::MalformedCompactBlock {
+                block_height: requested_height,
+                reason: format!("zinder tree-state payload is not JSON: {err}"),
+            }
         })?;
-    let hash = parsed
-        .get("hash")
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| ChainSourceError::MalformedCompactBlock {
-            block_height: height,
-            reason: "tree-state JSON missing `hash`".into(),
-        })?
-        .to_owned();
-    let time = parsed
-        .get("time")
-        .and_then(serde_json::Value::as_u64)
-        .and_then(|t| u32::try_from(t).ok())
-        .unwrap_or(0);
-    let sapling_tree =
-        pool_final_state(&parsed, "sapling", NetworkUpgrade::Sapling, height, network)?;
-    let orchard_tree = pool_final_state(&parsed, "orchard", NetworkUpgrade::Nu5, height, network)?;
-    let ironwood_tree =
-        pool_final_state(&parsed, "ironwood", NetworkUpgrade::Nu6_3, height, network)?;
 
-    Ok(TreeState {
-        network: lightwalletd_network_label(network).to_owned(),
-        height: height_value,
-        hash,
-        time,
-        sapling_tree,
-        orchard_tree,
-        ironwood_tree,
+    let sapling_final_state_bytes = pool_final_state(
+        &parsed,
+        "sapling",
+        NetworkUpgrade::Sapling,
+        requested_height,
+        network,
+    )?;
+    let orchard_final_state_bytes = pool_final_state(
+        &parsed,
+        "orchard",
+        NetworkUpgrade::Nu5,
+        requested_height,
+        network,
+    )?;
+    let ironwood_final_state_bytes = pool_final_state(
+        &parsed,
+        "ironwood",
+        NetworkUpgrade::Nu6_3,
+        requested_height,
+        network,
+    )?;
+
+    Ok(TreeStateArtifact {
+        network,
+        height: artifact_height,
+        block_hash: BlockHash::from_bytes(artifact.block_hash.as_bytes()),
+        block_time_seconds: artifact.block_time_seconds,
+        sapling_final_state_bytes,
+        orchard_final_state_bytes,
+        ironwood_final_state_bytes,
     })
 }
 
@@ -401,7 +744,7 @@ fn pool_final_state(
     upgrade: NetworkUpgrade,
     height: BlockHeight,
     network: Network,
-) -> Result<String, ChainSourceError> {
+) -> Result<Vec<u8>, ChainSourceError> {
     let final_state = parsed
         .pointer(&format!("/{pool}/commitments/finalState"))
         .and_then(serde_json::Value::as_str)
@@ -421,18 +764,10 @@ fn pool_final_state(
             });
         }
     }
-    Ok(final_state.to_owned())
-}
-
-#[allow(
-    clippy::wildcard_enum_match_arm,
-    reason = "lightwalletd TreeState distinguishes only main and test network labels"
-)]
-const fn lightwalletd_network_label(network: Network) -> &'static str {
-    match network {
-        Network::Mainnet => "main",
-        _ => "test",
-    }
+    hex::decode(final_state).map_err(|error| ChainSourceError::MalformedCompactBlock {
+        block_height: height,
+        reason: format!("tree-state JSON `{pool}` finalState is not hexadecimal: {error}"),
+    })
 }
 
 #[cfg(test)]
@@ -442,40 +777,155 @@ const fn lightwalletd_network_label(network: Network) -> &'static str {
 )]
 mod tests {
     use super::*;
+    use zinder_core::{
+        BlockHash as ZinderBlockHash, BlockId as ZinderBlockId,
+        CompactBlockArtifact as ZinderCompactBlockArtifact,
+        CompactChainMetadata as ZinderCompactChainMetadata,
+        CompactSaplingOutput as ZinderCompactSaplingOutput,
+        CompactSaplingSpend as ZinderCompactSaplingSpend,
+        CompactShieldedAction as ZinderCompactShieldedAction,
+        CompactTransaction as ZinderCompactTransaction,
+        CompactTransactionData as ZinderCompactTransactionData,
+        CompactTransparentInput as ZinderCompactTransparentInput,
+        CompactTransparentOutput as ZinderCompactTransparentOutput,
+        TransactionId as ZinderTransactionId,
+    };
 
     const TESTNET_NU5_HEIGHT: u32 = 1_842_420;
 
-    fn tree_state_json(pools: &[(&str, &str)]) -> Vec<u8> {
+    fn compact_artifact(data: ZinderCompactTransactionData) -> ZinderCompactBlockArtifact {
+        ZinderCompactBlockArtifact::new(
+            ZinderBlockId::new(
+                ZinderBlockHeight::new(42),
+                ZinderBlockHash::from_bytes([7; 32]),
+            ),
+            ZinderBlockHash::from_bytes([6; 32]),
+            1_700_000_000,
+            vec![ZinderCompactTransaction {
+                index: 9,
+                transaction_id: ZinderTransactionId::from_bytes([8; 32]),
+                data,
+            }],
+            ZinderCompactChainMetadata {
+                sapling_commitment_tree_size: 10,
+                orchard_commitment_tree_size: 11,
+                ironwood_commitment_tree_size: 12,
+            },
+        )
+        .expect("ordered compact artifact")
+    }
+
+    #[test]
+    fn compact_block_maps_every_wallet_field_exactly() {
+        let action = ZinderCompactShieldedAction {
+            nullifier: [4; 32],
+            commitment: [5; 32],
+            ephemeral_key: [6; 32],
+            ciphertext: [7; 52],
+        };
+        let artifact = compact_artifact(ZinderCompactTransactionData {
+            fee_zat: Some(123),
+            sapling_spends: vec![ZinderCompactSaplingSpend { nullifier: [1; 32] }],
+            sapling_outputs: vec![ZinderCompactSaplingOutput {
+                commitment: [2; 32],
+                ephemeral_key: [3; 32],
+                ciphertext: [4; 52],
+            }],
+            orchard_actions: vec![action.clone()],
+            ironwood_actions: vec![action],
+            transparent_inputs: vec![ZinderCompactTransparentInput {
+                previous_transaction_id: ZinderTransactionId::from_bytes([9; 32]),
+                previous_output_index: 2,
+            }],
+            transparent_outputs: vec![ZinderCompactTransparentOutput {
+                value_zat: 456,
+                script_pub_key: vec![0x51],
+            }],
+        });
+        let mapped = decode_compact_block(&artifact).expect("valid artifact maps");
+        assert_eq!(mapped.height, BlockHeight::from(42));
+        assert_eq!(mapped.block_hash, BlockHash::from_bytes([7; 32]));
+        assert_eq!(mapped.previous_block_hash, BlockHash::from_bytes([6; 32]));
+        assert_eq!(mapped.block_time_seconds, 1_700_000_000);
+        assert_eq!(mapped.chain_metadata.sapling_commitment_tree_size, 10);
+        assert_eq!(mapped.chain_metadata.orchard_commitment_tree_size, 11);
+        assert_eq!(mapped.chain_metadata.ironwood_commitment_tree_size, 12);
+        let transaction = &mapped.transactions[0];
+        assert_eq!(transaction.index, 9);
+        assert_eq!(transaction.tx_id, TxId::from_bytes([8; 32]));
+        assert_eq!(transaction.fee_zat, Zatoshis::try_from(123).ok());
+        assert_eq!(transaction.sapling_spends[0].nullifier_bytes, [1; 32]);
+        assert_eq!(transaction.sapling_outputs[0].ciphertext_bytes, [4; 52]);
+        assert_eq!(transaction.orchard_actions[0].commitment_bytes, [5; 32]);
+        assert_eq!(transaction.ironwood_actions[0].ephemeral_key_bytes, [6; 32]);
+        assert_eq!(transaction.transparent_inputs[0].previous_output_index, 2);
+        assert_eq!(transaction.transparent_outputs[0].value_zat.as_u64(), 456);
+        assert_eq!(
+            transaction.transparent_outputs[0].script_pub_key_bytes,
+            vec![0x51]
+        );
+    }
+
+    #[test]
+    fn compact_block_rejects_money_above_maximum() {
+        let excessive = zcash_protocol::value::MAX_MONEY + 1;
+        let fee = compact_artifact(ZinderCompactTransactionData {
+            fee_zat: Some(excessive),
+            ..ZinderCompactTransactionData::default()
+        });
+        assert!(matches!(
+            decode_compact_block(&fee),
+            Err(ChainSourceError::MalformedCompactBlock { .. })
+        ));
+        let output = compact_artifact(ZinderCompactTransactionData {
+            transparent_outputs: vec![ZinderCompactTransparentOutput {
+                value_zat: excessive,
+                script_pub_key: Vec::new(),
+            }],
+            ..ZinderCompactTransactionData::default()
+        });
+        assert!(matches!(
+            decode_compact_block(&output),
+            Err(ChainSourceError::MalformedCompactBlock { .. })
+        ));
+    }
+
+    fn tree_state_artifact(height: u32, pools: &[(&str, &str)]) -> ZinderTreeStateArtifact {
         let mut root = serde_json::json!({
-            "height": 4_050_200,
+            "height": height,
             "hash": "00".repeat(32),
             "time": 1_700_000_000,
         });
         for (pool, final_state) in pools {
             root[pool] = serde_json::json!({ "commitments": { "finalState": final_state } });
         }
-        serde_json::to_vec(&root).expect("fixture serializes")
+        ZinderTreeStateArtifact::new(
+            ZinderBlockHeight::new(height),
+            ZinderBlockHash::from_bytes([0; 32]),
+            1_700_000_000,
+            serde_json::to_vec(&root).expect("fixture serializes"),
+        )
     }
 
     #[test]
     fn missing_pool_frontier_defaults_below_activation() {
-        let payload = tree_state_json(&[("sapling", "abcd")]);
+        let artifact = tree_state_artifact(TESTNET_NU5_HEIGHT - 1, &[("sapling", "abcd")]);
         let tree_state = decode_tree_state(
-            &payload,
+            &artifact,
             BlockHeight::from(TESTNET_NU5_HEIGHT - 1),
             Network::Testnet,
         )
         .expect("pre-activation tree state decodes");
-        assert_eq!(tree_state.sapling_tree, "abcd");
-        assert_eq!(tree_state.orchard_tree, "");
-        assert_eq!(tree_state.ironwood_tree, "");
+        assert_eq!(tree_state.sapling_final_state_bytes, vec![0xab, 0xcd]);
+        assert!(tree_state.orchard_final_state_bytes.is_empty());
+        assert!(tree_state.ironwood_final_state_bytes.is_empty());
     }
 
     #[test]
     fn missing_pool_frontier_faults_at_activation() {
-        let payload = tree_state_json(&[("sapling", "abcd")]);
+        let artifact = tree_state_artifact(TESTNET_NU5_HEIGHT, &[("sapling", "abcd")]);
         let err = decode_tree_state(
-            &payload,
+            &artifact,
             BlockHeight::from(TESTNET_NU5_HEIGHT),
             Network::Testnet,
         )
@@ -489,9 +939,10 @@ mod tests {
 
     #[test]
     fn empty_pool_frontier_faults_the_same_as_missing() {
-        let payload = tree_state_json(&[("sapling", "abcd"), ("orchard", "")]);
+        let artifact =
+            tree_state_artifact(TESTNET_NU5_HEIGHT, &[("sapling", "abcd"), ("orchard", "")]);
         let err = decode_tree_state(
-            &payload,
+            &artifact,
             BlockHeight::from(TESTNET_NU5_HEIGHT),
             Network::Testnet,
         )
@@ -501,12 +952,47 @@ mod tests {
 
     #[test]
     fn present_pool_frontiers_decode_at_any_height() {
-        let payload = tree_state_json(&[("sapling", "aa"), ("orchard", "bb"), ("ironwood", "cc")]);
+        let artifact = tree_state_artifact(
+            4_200_000,
+            &[("sapling", "aa"), ("orchard", "bb"), ("ironwood", "cc")],
+        );
         let tree_state =
-            decode_tree_state(&payload, BlockHeight::from(4_200_000u32), Network::Testnet)
+            decode_tree_state(&artifact, BlockHeight::from(4_200_000u32), Network::Testnet)
                 .expect("fully populated tree state decodes");
-        assert_eq!(tree_state.sapling_tree, "aa");
-        assert_eq!(tree_state.orchard_tree, "bb");
-        assert_eq!(tree_state.ironwood_tree, "cc");
+        assert_eq!(tree_state.sapling_final_state_bytes, vec![0xaa]);
+        assert_eq!(tree_state.orchard_final_state_bytes, vec![0xbb]);
+        assert_eq!(tree_state.ironwood_final_state_bytes, vec![0xcc]);
+        assert_eq!(tree_state.block_time_seconds, 1_700_000_000);
+    }
+
+    #[test]
+    fn tree_state_rejects_artifact_height_different_from_request() {
+        let artifact = tree_state_artifact(41, &[]);
+        let error = decode_tree_state(&artifact, BlockHeight::from(42), Network::Testnet)
+            .expect_err("artifact height mismatch must fail closed");
+        assert!(matches!(
+            error,
+            ChainSourceError::TreeStateAnchorHeightMismatch { .. }
+        ));
+    }
+
+    #[test]
+    fn zinder_network_mapping_rejects_every_mismatch() {
+        assert!(zinder_network_to_zally(ZinderNetwork::ZcashMainnet, Network::Mainnet).is_ok());
+        assert!(zinder_network_to_zally(ZinderNetwork::ZcashTestnet, Network::Testnet).is_ok());
+        assert!(zinder_network_to_zally(ZinderNetwork::ZcashRegtest, Network::regtest()).is_ok());
+        for (actual, expected) in [
+            (ZinderNetwork::ZcashMainnet, Network::Testnet),
+            (ZinderNetwork::ZcashMainnet, Network::regtest()),
+            (ZinderNetwork::ZcashTestnet, Network::Mainnet),
+            (ZinderNetwork::ZcashTestnet, Network::regtest()),
+            (ZinderNetwork::ZcashRegtest, Network::Mainnet),
+            (ZinderNetwork::ZcashRegtest, Network::Testnet),
+        ] {
+            assert!(matches!(
+                zinder_network_to_zally(actual, expected),
+                Err(ChainSourceError::NetworkMismatch { .. })
+            ));
+        }
     }
 }

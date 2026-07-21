@@ -13,22 +13,21 @@ categories.workspace = true
 [features]
 default = []
 serde = ["dep:serde", "zally-core/serde"]
-zinder = ["dep:zinder-client", "dep:zinder-core", "dep:tokio", "dep:prost", "dep:serde_json"]
+zinder = ["dep:zinder-client", "dep:zinder-core", "dep:tokio", "dep:serde_json"]
 
 [dependencies]
 async-trait.workspace = true
 futures-util.workspace = true
+hex.workspace = true
 serde = { workspace = true, optional = true }
 thiserror.workspace = true
-prost = { version = "0.14", optional = true }
 serde_json = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true }
 zally-core = { path = "../zally-core", version = "0.1" }
-zcash_client_backend = { workspace = true, features = ["orchard", "transparent-inputs"] }
 zcash_primitives.workspace = true
 zcash_protocol.workspace = true
-zinder-client = { workspace = true, optional = true }
-zinder-core = { workspace = true, optional = true }
+zinder-client = { workspace = true, default-features = false, features = ["remote"], optional = true }
+zinder-core = { workspace = true, default-features = false, optional = true }
 
 [dev-dependencies]
 thiserror.workspace = true

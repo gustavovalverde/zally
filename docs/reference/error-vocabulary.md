@@ -31,6 +31,7 @@ Every chain-source and wallet error exposes a `posture()` method returning a [`F
 | `PaymentRequestParseFailed` | `not_retryable` | ZIP-321 URI parsing failed. |
 | `ProposalRejected` | `not_retryable` | Proposal construction failed. |
 | `SubmissionRejected` | `not_retryable` | The node rejected the submitted transaction. |
+| `SubmittedTransactionIdMismatch` | `requires_operator` | A success-kind submitter response returned a transaction ID different from the submitted transaction bytes. |
 | `Pczt` | Mirrors `PcztError` | A PCZT role failed. |
 | `PaymentDisclosureExport` | Mirrors `PaymentDisclosureExportError` | A retained PCZT could not produce the requested disclosure profile. |
 | `PaymentDisclosureSourceMissing` | `not_retryable` | No finalized PCZT was retained for the transaction. |
@@ -43,9 +44,17 @@ Every chain-source and wallet error exposes a `posture()` method returning a [`F
 |---------|---------|---------|
 | `Unavailable` | `retryable` | Generic source-agnostic transient backend stall (used by mocks and future non-zinder sources). |
 | `BlockHeightBelowFloor` | `not_retryable` | Requested height is below the source's earliest available block. |
-| `BlockHeightAboveTip` | `not_retryable` | Requested height is above the source's tip; re-query `chain_tip()`. |
+| `BlockHeightAboveVisibleTip` | `not_retryable` | Requested height is above the epoch's visible tip; acquire a new `ChainEpoch`. |
 | `NetworkMismatch` | `requires_operator` | The source serves a different network than the caller asked for. |
+| `CapabilitiesUnavailable` | `requires_operator` | The endpoint does not advertise every capability required for event-driven native sync. |
+| `ContractRevisionUnsupported` | `requires_operator` | The endpoint contract revision is older than revision 2. |
+| `ChainEpochPinUnavailable` | `retryable` | The pinned epoch expired; restart the wallet sync against a fresh epoch. |
+| `ChainEventCursorExpired` | `retryable` | Reconcile the wallet against a fresh epoch, then subscribe from the earliest retained event. |
 | `MalformedCompactBlock` | `requires_operator` | The source returned bytes that did not decode; investigate the upstream version. |
+| `CompactBlockStreamOrder` | `requires_operator` | A compact-block range was incomplete, duplicated, or out of order. |
+| `TreeStateAnchorHeightMismatch` | `requires_operator` | A tree-state artifact did not match the exact requested anchor height. |
+| `MalformedSubtreeRootPage` | `requires_operator` | A subtree-root page exceeded its requested count or violated index or height ordering. |
+| `MalformedTransparentUtxoSet` | `requires_operator` | A UTXO set contained a future-height output, duplicate outpoint, or receiver mismatch. |
 | `BlockingTaskFailed` | `retryable` | A `spawn_blocking` task panicked or was cancelled. |
 | `ShieldedPoolUnsupported` | `requires_operator` | The requested shielded pool has no subtree-root query path on this chain source. |
 | `Indexer(IndexerError)` | Mirrors `IndexerError::retry_policy` | Lossless pass-through of a `zinder-client` error. |
@@ -55,7 +64,10 @@ Every chain-source and wallet error exposes a `posture()` method returning a [`F
 | Variant | Posture | Meaning |
 |---------|---------|---------|
 | `Unavailable` | `retryable` | Generic source-agnostic transient broadcast unavailability. |
+| `RequestRejected` | `not_retryable` | The submitter rejected request metadata or bytes before broadcast. |
 | `NetworkMismatch` | `requires_operator` | Submitter network disagrees with the transaction network. |
+| `CapabilitiesUnavailable` | `requires_operator` | The endpoint does not advertise transaction broadcast support. |
+| `UnsupportedResponse` | `requires_operator` | The submitter returned an unknown response variant. |
 | `BlockingTaskFailed` | `retryable` | A `spawn_blocking` task panicked or was cancelled. |
 | `Indexer(IndexerError)` | Mirrors `IndexerError::retry_policy` | Lossless pass-through of a `zinder-client` broadcast error. |
 
@@ -76,7 +88,7 @@ Every chain-source and wallet error exposes a `posture()` method returning a [`F
 | `AccountAlreadyExists` | `not_retryable` | The wallet already has its single supported account. |
 | `BlockingTaskFailed` | `retryable` | A blocking storage task was cancelled or panicked. |
 | `KeyDerivationFailed` | `not_retryable` | Deterministic key derivation failed inside storage. |
-| `ProverUnavailable` | `requires_operator` | Sapling proving parameters are missing from the platform-default location. |
+| `ProverUnavailable` | `requires_operator` | Sapling proving parameters are missing from the configured paths or the platform-default location. |
 | `IdempotencyKeyConflict` | `not_retryable` | A send idempotency key already maps to a different transaction. |
 | `FinalizedPcztConflict` | `not_retryable` | A transaction ID is already bound to different finalized PCZT bytes. |
 | `ChainReorgDetected` | `retryable` | Scanner input diverged from persisted chain state and needs rollback. |

@@ -140,7 +140,7 @@ async fn sync_clears_expired_pending_broadcast_rows() -> Result<(), TestError> {
     let chain = MockChainSource::new(network);
     chain.handle().advance_tip(BlockHeight::from(10));
     wallet.sync(&chain).await?;
-    let _ = chain.safe_chain_tip().await;
+    let _ = chain.current_epoch().await;
 
     let after_sync = storage.list_pending_broadcast_inputs(account_id, 0).await?;
     assert!(

@@ -33,7 +33,7 @@ pub enum WalletEvent {
         /// Height the wallet's scan progress was rolled back to.
         rolled_back_to_height: BlockHeight,
         /// New visible tip after the reorg.
-        new_safe_chain_tip_height: BlockHeight,
+        new_settled_tip_height: BlockHeight,
     },
     /// A transaction belonging to the wallet was confirmed at `confirmed_at_height`.
     TransactionConfirmed {

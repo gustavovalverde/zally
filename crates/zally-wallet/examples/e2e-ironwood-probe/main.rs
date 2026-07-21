@@ -34,7 +34,12 @@ async fn main() -> Result<(), ProbeError> {
 
     let settings = ProbeSettings::from_env()?;
     let chain = connect_chain(&settings)?;
-    let tip = chain.safe_chain_tip().await.map_err(ProbeError::Chain)?;
+    let tip = chain
+        .current_epoch()
+        .await
+        .map_err(ProbeError::Chain)?
+        .settled_tip()
+        .height;
     let birthday_height = settings.birthday_height(tip);
     log_probe_start(&settings, tip, birthday_height);
 
@@ -187,22 +192,23 @@ async fn observe_until_deadline(handle: &SyncHandle, probe_seconds: u64) -> bool
                     event = "probe_snapshot",
                     phase = ?snapshot.phase,
                     scanned_height = snapshot.scanned_height.map(BlockHeight::as_u32),
-                    safe_chain_tip = snapshot.safe_chain_tip_height.map(BlockHeight::as_u32),
+                    visible_tip = snapshot.visible_tip_height.map(BlockHeight::as_u32),
+                    settled_tip = snapshot.settled_tip_height.map(BlockHeight::as_u32),
                     lag_blocks = snapshot.lag_blocks,
                     fault = snapshot.last_fault.as_ref().map(|fault| fault.reason.clone()),
                     "sync driver transition"
                 );
                 if !has_reached_tip
-                    && let (Some(scanned), Some(safe_tip)) =
-                        (snapshot.scanned_height, snapshot.safe_chain_tip_height)
-                    && scanned >= safe_tip
+                    && let (Some(scanned), Some(visible_tip)) =
+                        (snapshot.scanned_height, snapshot.visible_tip_height)
+                    && scanned >= visible_tip
                 {
                     has_reached_tip = true;
                     info!(
                         target: "zally::e2e",
                         event = "probe_reached_tip",
                         scanned_height = scanned.as_u32(),
-                        "wallet reached the safe chain tip; observing for reorgs"
+                        "wallet reached the visible tip; observing for reorgs"
                     );
                 }
             }

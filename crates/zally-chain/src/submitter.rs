@@ -16,6 +16,8 @@ pub enum RejectionReason {
     /// Node returned a rejection that did not match any known reason.
     #[default]
     Unknown,
+    /// Submitted bytes were not a valid serialized transaction.
+    InvalidEncoding,
     /// Verifier rejected one or more transaction signatures.
     InvalidSignature,
     /// Transaction's `nExpiryHeight` is at or below the visible tip.

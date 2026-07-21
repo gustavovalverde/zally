@@ -8,7 +8,7 @@
 //! ```sh
 //! ZALLY_TEST_LIVE=1 \
 //!   ZALLY_NETWORK=regtest \
-//!   ZINDER_ENDPOINT=http://127.0.0.1:9101 \
+//!   ZINDER_ENDPOINT=http://127.0.0.1:9102 \
 //!   cargo nextest run --profile=ci-live --features zinder --run-ignored=all \
 //!     -p zally-chain --test live_zinder_source
 //! ```
@@ -22,6 +22,8 @@ use zally_chain::{
 use zally_core::BlockHeight;
 use zally_testkit::{LiveTestError, init, require_live, require_network, require_zinder_endpoint};
 
+const MAX_EPOCH_ATTEMPTS: u32 = 3;
+
 #[tokio::test]
 #[ignore = "live test; see CLAUDE.md §Live Node Tests"]
 async fn zinder_chain_source_reports_tip_and_streams_blocks() -> Result<(), TestError> {
@@ -32,23 +34,38 @@ async fn zinder_chain_source_reports_tip_and_streams_blocks() -> Result<(), Test
     let endpoint = require_zinder_endpoint()?;
 
     let chain = ZinderChainSource::connect_remote(ZinderRemoteOptions { endpoint, network })?;
+    let mut attempt = 0_u32;
+    loop {
+        attempt = attempt.saturating_add(1);
+        match acquire_epoch_and_drain_tip_range(&chain).await {
+            Ok(count) => {
+                assert!(count > 0, "compact_blocks returned an empty stream at tip");
+                return Ok(());
+            }
+            Err(TestError::Chain(ChainSourceError::ChainEpochPinUnavailable))
+                if attempt < MAX_EPOCH_ATTEMPTS => {}
+            Err(error) => return Err(error),
+        }
+    }
+}
 
-    let tip = chain.safe_chain_tip().await?;
+async fn acquire_epoch_and_drain_tip_range(chain: &ZinderChainSource) -> Result<usize, TestError> {
+    let chain_epoch = chain.current_epoch().await?;
+    let tip = chain_epoch.settled_tip().height;
     assert!(tip.as_u32() > 0, "live zinder reported tip height 0");
 
     let span = 5_u32.min(tip.as_u32().saturating_sub(1));
     let start = BlockHeight::from(tip.as_u32().saturating_sub(span));
     let range = BlockHeightRange::new(start, tip).ok_or(TestError::RangeOrder { start, tip })?;
 
-    let mut stream = chain.compact_blocks(range).await?;
+    let mut stream = chain.compact_blocks(chain_epoch, range).await?;
 
     let mut count = 0_usize;
     while let Some(block) = stream.next().await {
         block?;
         count += 1;
     }
-    assert!(count > 0, "compact_blocks returned an empty stream at tip");
-    Ok(())
+    Ok(count)
 }
 
 #[derive(Debug, thiserror::Error)]

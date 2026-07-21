@@ -1,5 +1,5 @@
 //! `Wallet::send_payment` rejects a `target_expiry_height` at or below the wallet's
-//! observed chain tip with [`WalletError::TargetExpiryStale`].
+//! visible tip with [`WalletError::TargetExpiryStale`].
 //!
 //! The wallet must not sign bytes whose `expiry_height` is already past, because
 //! consensus would reject the broadcast immediately. The check fires before any
@@ -46,15 +46,18 @@ async fn send_payment_rejects_stale_target_expiry() -> Result<(), TestError> {
 
     let outcome = wallet.send_payment(plan).await;
     match outcome {
-        Err(WalletError::TargetExpiryStale { target, chain_tip }) => {
+        Err(WalletError::TargetExpiryStale {
+            target,
+            visible_tip,
+        }) => {
             assert_eq!(
                 target, stale_target,
                 "the rejection must echo the caller's target"
             );
             assert_eq!(
-                chain_tip,
+                visible_tip,
                 BlockHeight::from(0),
-                "a fresh wallet's observed tip is the floor"
+                "a fresh wallet's visible tip is the floor"
             );
         }
         other => panic!("expected TargetExpiryStale, got {other:?}"),

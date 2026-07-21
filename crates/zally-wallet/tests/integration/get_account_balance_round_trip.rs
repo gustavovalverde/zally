@@ -42,7 +42,7 @@ async fn get_account_balance_returns_zeros_on_fresh_wallet() -> Result<(), TestE
 }
 
 #[tokio::test]
-async fn get_account_balance_anchors_to_observed_tip_after_sync() -> Result<(), TestError> {
+async fn get_account_balance_anchors_to_visible_tip_after_sync() -> Result<(), TestError> {
     let TestWalletFixture {
         temp: _temp,
         wallet,
@@ -54,11 +54,13 @@ async fn get_account_balance_anchors_to_observed_tip_after_sync() -> Result<(), 
     chain.handle().advance_tip(BlockHeight::from(200));
     wallet.sync(&chain).await?;
     let tip = chain
-        .safe_chain_tip()
+        .current_epoch()
         .await
         .map_err(|err| TestError::Chain {
             reason: err.to_string(),
-        })?;
+        })?
+        .settled_tip()
+        .height;
     assert_eq!(tip.as_u32(), 200, "mock chain tip must be set");
 
     let balance = wallet.get_account_balance(account_id).await?;

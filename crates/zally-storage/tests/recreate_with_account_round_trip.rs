@@ -10,8 +10,9 @@ use zally_core::{
 };
 use zally_keys::{Mnemonic, SeedMaterial};
 use zally_storage::{HoldRecord, Sqlite, SqliteOptions, StorageError, WalletStorage};
-use zcash_client_backend::data_api::chain::ChainState;
-use zcash_primitives::block::BlockHash;
+
+#[path = "fixtures/scan_artifact.rs"]
+mod scan_artifact;
 
 fn open_storage(temp: &TempDir) -> Sqlite {
     Sqlite::new(SqliteOptions::for_network(
@@ -24,8 +25,8 @@ fn fresh_seed() -> SeedMaterial {
     SeedMaterial::from_mnemonic(&Mnemonic::generate(), "")
 }
 
-fn genesis_chain_state() -> ChainState {
-    ChainState::empty(0.into(), BlockHash([0u8; 32]))
+fn genesis_chain_state() -> zally_core::TreeStateArtifact {
+    scan_artifact::genesis_tree_state(zally_core::Network::regtest(), 0, [0; 32])
 }
 
 #[tokio::test]
@@ -71,7 +72,9 @@ async fn recreate_drops_derived_and_ledger_state() -> Result<(), TestError> {
         .create_account_for_seed(&seed, genesis_chain_state())
         .await?;
 
-    storage.record_observed_tip(BlockHeight::from(50)).await?;
+    storage
+        .record_chain_tips(BlockHeight::from(50), BlockHeight::from(40))
+        .await?;
     let key = IdempotencyKey::try_from("idempotency-rebuild-1".to_owned())?;
     storage
         .record_idempotent_submission(key.clone(), TxId::from_bytes([0xAB; 32]))
@@ -89,12 +92,15 @@ async fn recreate_drops_derived_and_ledger_state() -> Result<(), TestError> {
         })
         .await?;
 
-    let rebuilt_id = storage
-        .recreate_with_account(&seed, ChainState::empty(9.into(), BlockHash([1u8; 32])))
-        .await?;
+    let mut rebuilt_anchor =
+        scan_artifact::genesis_tree_state(zally_core::Network::regtest(), 9, [1; 32]);
+    rebuilt_anchor.sapling_final_state_bytes = vec![0, 0, 0];
+    rebuilt_anchor.orchard_final_state_bytes = vec![0, 0, 0];
+    rebuilt_anchor.ironwood_final_state_bytes = vec![0, 0, 0];
+    let rebuilt_id = storage.recreate_with_account(&seed, rebuilt_anchor).await?;
 
     assert_eq!(
-        storage.find_observed_tip().await?,
+        storage.find_visible_tip().await?,
         None,
         "the observed tip is derived state and must not survive a rebuild"
     );

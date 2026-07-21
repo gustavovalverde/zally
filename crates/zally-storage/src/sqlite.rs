@@ -25,8 +25,9 @@ use shardtree::store::ShardStore;
 use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
 use zally_core::{
-    AccountId, BlockHeight, FailurePosture, HoldId, IdempotencyKey, Network, NetworkParameters,
-    TransparentGapLimit, TxId, Zatoshis,
+    AccountId, BlockHeight, CompactBlockArtifact, CompactShieldedAction, CompactTransaction,
+    FailurePosture, HoldId, IdempotencyKey, Network, NetworkParameters, TransparentGapLimit,
+    TreeStateArtifact, TxId, Zatoshis,
 };
 use zally_keys::{KeyDerivationError, SeedMaterial, derive_ufvk};
 use zcash_client_backend::data_api::chain::{ChainState, CommitmentTreeRoot};
@@ -39,6 +40,14 @@ use zcash_client_backend::data_api::{
     Account, AccountBirthday, WalletCommitmentTrees, WalletRead, WalletWrite,
 };
 use zcash_client_backend::fees::{DustOutputPolicy, StandardFeeRule, standard};
+use zcash_client_backend::proto::compact_formats::{
+    ChainMetadata as UpstreamChainMetadata, CompactBlock as UpstreamCompactBlock,
+    CompactOrchardAction as UpstreamCompactShieldedAction,
+    CompactSaplingOutput as UpstreamCompactSaplingOutput,
+    CompactSaplingSpend as UpstreamCompactSaplingSpend, CompactTx as UpstreamCompactTransaction,
+    CompactTxIn as UpstreamCompactTransparentInput, TxOut as UpstreamCompactTransparentOutput,
+};
+use zcash_client_backend::proto::service::TreeState as UpstreamTreeState;
 use zcash_client_backend::wallet::{NoteId, WalletTransparentOutput};
 use zcash_client_sqlite::AccountUuid;
 use zcash_client_sqlite::WalletDb;
@@ -57,7 +66,7 @@ use zcash_transparent::bundle::{OutPoint as UpstreamOutPoint, TxOut};
 
 use crate::error::StorageError;
 use crate::filtered_wallet_db::FilteredWalletDb;
-use crate::wallet::WalletStorage;
+use crate::wallet::{ChainTips, WalletStorage};
 
 type Db = WalletDb<rusqlite::Connection, NetworkParameters, SystemClock, OsRng>;
 
@@ -77,6 +86,11 @@ const ZALLY_ACCOUNT_NAMESPACE: Uuid = uuid::uuid!("665caaaf-8caa-4556-aa6d-92e76
 /// dispense and balance reads). Hitting the bound back-pressures the sender
 /// instead of letting an unbounded queue silently grow.
 const WALLET_DB_QUEUE_CAPACITY: usize = 256;
+
+const SAPLING_SPEND_PARAMETER_SIZE_BYTES: usize = 47_958_396;
+const SAPLING_OUTPUT_PARAMETER_SIZE_BYTES: usize = 3_592_860;
+const SAPLING_SPEND_PARAMETER_BLAKE2B_HEX: &str = "8270785a1a0d0bc77196f000ee6d221c9c9894f55307bd9357c3f0105d31ca63991ab91324160d8f53e2bbd3c2633a6eb8bdf5205d822e7f3f73edac51b2b70c";
+const SAPLING_OUTPUT_PARAMETER_BLAKE2B_HEX: &str = "657e3d38dbb5cb5e7dd2970e8b03d69b4787dd907285b5a7f0790dcc8072f60bf593b32cc2d1c030e00ff5ae64bf84c5c3beb84ddc841d48264b4a171744d028";
 
 /// Work item sent to the wallet-db actor.
 ///
@@ -100,6 +114,12 @@ enum WalletDbState {
     },
 }
 
+#[derive(Clone, Debug)]
+struct SaplingProvingParameterPaths {
+    spend: PathBuf,
+    output: PathBuf,
+}
+
 /// Options for [`Sqlite`].
 #[derive(Clone, Debug)]
 #[non_exhaustive]
@@ -115,6 +135,7 @@ pub struct SqliteOptions {
     /// other crate that walks the BIP-44 window honor the same wallet-policy
     /// invariant.
     pub gap_limit: TransparentGapLimit,
+    sapling_proving_parameter_paths: Option<SaplingProvingParameterPaths>,
 }
 
 impl SqliteOptions {
@@ -127,8 +148,67 @@ impl SqliteOptions {
             network,
             account_name: DEFAULT_ACCOUNT_NAME.to_owned(),
             gap_limit: TransparentGapLimit::DEFAULT,
+            sapling_proving_parameter_paths: None,
         }
     }
+
+    /// Uses explicit Sapling spend and output proving parameters instead of the
+    /// platform-default parameter directory.
+    #[must_use]
+    pub fn with_sapling_proving_parameters(
+        mut self,
+        spend_parameter_path: PathBuf,
+        output_parameter_path: PathBuf,
+    ) -> Self {
+        self.sapling_proving_parameter_paths = Some(SaplingProvingParameterPaths {
+            spend: spend_parameter_path,
+            output: output_parameter_path,
+        });
+        self
+    }
+
+    fn resolve_sapling_prover(&self) -> Result<zcash_proofs::prover::LocalTxProver, StorageError> {
+        let paths = self
+            .sapling_proving_parameter_paths
+            .clone()
+            .or_else(|| {
+                zcash_proofs::default_params_folder().map(|directory| {
+                    SaplingProvingParameterPaths {
+                        spend: directory.join(zcash_proofs::SAPLING_SPEND_NAME),
+                        output: directory.join(zcash_proofs::SAPLING_OUTPUT_NAME),
+                    }
+                })
+            })
+            .ok_or(StorageError::ProverUnavailable)?;
+        let spend_bytes = validated_sapling_parameter_bytes(
+            &paths.spend,
+            SAPLING_SPEND_PARAMETER_SIZE_BYTES,
+            SAPLING_SPEND_PARAMETER_BLAKE2B_HEX,
+        )?;
+        let output_bytes = validated_sapling_parameter_bytes(
+            &paths.output,
+            SAPLING_OUTPUT_PARAMETER_SIZE_BYTES,
+            SAPLING_OUTPUT_PARAMETER_BLAKE2B_HEX,
+        )?;
+        Ok(zcash_proofs::prover::LocalTxProver::from_bytes(
+            &spend_bytes,
+            &output_bytes,
+        ))
+    }
+}
+
+fn validated_sapling_parameter_bytes(
+    path: &Path,
+    expected_size_bytes: usize,
+    expected_blake2b_hex: &str,
+) -> Result<Vec<u8>, StorageError> {
+    let bytes = std::fs::read(path).map_err(|_| StorageError::ProverUnavailable)?;
+    if bytes.len() != expected_size_bytes
+        || hex::encode(blake2b_simd::blake2b(&bytes).as_bytes()) != expected_blake2b_hex
+    {
+        return Err(StorageError::ProverUnavailable);
+    }
+    Ok(bytes)
 }
 
 /// `SQLite`-backed [`WalletStorage`] implementation.
@@ -309,11 +389,16 @@ fn open_wallet_db(
             reason: e.to_string(),
         })?;
 
-    let ledger =
-        rusqlite::Connection::open(&options.db_path).map_err(|e| StorageError::SqliteFailed {
-            reason: format!("ledger connection open failed: {e}"),
-            posture: FailurePosture::NotRetryable,
-        })?;
+    let ledger = open_extension_ledger(&options.db_path)?;
+
+    Ok((Box::new(db), Box::new(ledger)))
+}
+
+fn open_extension_ledger(db_path: &Path) -> Result<rusqlite::Connection, StorageError> {
+    let ledger = rusqlite::Connection::open(db_path).map_err(|e| StorageError::SqliteFailed {
+        reason: format!("ledger connection open failed: {e}"),
+        posture: FailurePosture::NotRetryable,
+    })?;
     ledger
         .execute_batch(
             "CREATE TABLE IF NOT EXISTS ext_zally_idempotency (\
@@ -321,10 +406,15 @@ fn open_wallet_db(
                  tx_id_bytes BLOB NOT NULL,\
                  recorded_at_unix INTEGER NOT NULL\
              ); \
-             CREATE TABLE IF NOT EXISTS ext_zally_observed_tip (\
+             CREATE TABLE IF NOT EXISTS ext_zally_chain_tips (\
                  id INTEGER PRIMARY KEY CHECK (id = 0),\
-                 tip_height INTEGER NOT NULL\
+                 visible_tip_height INTEGER NOT NULL,\
+                 settled_tip_height INTEGER NOT NULL,\
+                 CHECK (settled_tip_height <= visible_tip_height)\
              ); \
+             /* The legacy single observed tip cannot establish a safe settled tip. Retire it
+                and let the next authenticated chain epoch repopulate both values. */ \
+             DROP TABLE IF EXISTS ext_zally_observed_tip; \
              CREATE TABLE IF NOT EXISTS ext_zally_finalized_pczts (\
                  tx_id_bytes BLOB PRIMARY KEY NOT NULL,\
                  pczt_bytes BLOB NOT NULL\
@@ -364,7 +454,7 @@ fn open_wallet_db(
             posture: FailurePosture::NotRetryable,
         })?;
 
-    Ok((Box::new(db), Box::new(ledger)))
+    Ok(ledger)
 }
 
 /// Removes the wallet database file plus its `-wal` and `-shm` siblings. The zally
@@ -412,9 +502,10 @@ impl WalletStorage for Sqlite {
     async fn create_account_for_seed(
         &self,
         seed: &SeedMaterial,
-        prior_chain_state: ChainState,
+        prior_chain_state: TreeStateArtifact,
     ) -> Result<AccountId, StorageError> {
         let network = self.options.network;
+        let prior_chain_state = tree_state_to_upstream(prior_chain_state, network)?;
         let account_name = self.options.account_name.clone();
         let secret = SecretVec::new(seed.expose_secret().to_vec());
 
@@ -427,9 +518,10 @@ impl WalletStorage for Sqlite {
     async fn recreate_with_account(
         &self,
         seed: &SeedMaterial,
-        prior_chain_state: ChainState,
+        prior_chain_state: TreeStateArtifact,
     ) -> Result<AccountId, StorageError> {
         let network = self.options.network;
+        let prior_chain_state = tree_state_to_upstream(prior_chain_state, network)?;
         let secret = SecretVec::new(seed.expose_secret().to_vec());
 
         self.dispatch(move |state, options| {
@@ -575,14 +667,32 @@ impl WalletStorage for Sqlite {
         &self,
         request: crate::wallet::ScanRequest,
     ) -> Result<crate::wallet::ScanResult, StorageError> {
+        if request
+            .from_state
+            .height
+            .as_u32()
+            .checked_add(1)
+            .is_none_or(|expected_from| expected_from != request.from_height.as_u32())
+        {
+            return Err(StorageError::ScanArtifactInvalid {
+                field: "scan_request.from_state.height",
+                reason: format!(
+                    "tree-state height {} must immediately precede scan height {}",
+                    request.from_state.height, request.from_height
+                ),
+            });
+        }
         let params = self.options.network.to_parameters();
         let from_height_proto: zcash_protocol::consensus::BlockHeight = request.from_height.into();
         let block_count = u64::try_from(request.blocks.len()).unwrap_or(u64::MAX);
         let limit = request.blocks.len().max(1);
-        let source = InMemoryBlockSource {
-            blocks: request.blocks,
-        };
-        let from_state = request.from_state;
+        let blocks = request
+            .blocks
+            .into_iter()
+            .map(compact_block_to_upstream)
+            .collect::<Result<Vec<_>, _>>()?;
+        let source = InMemoryBlockSource { blocks };
+        let from_state = tree_state_to_upstream(request.from_state, self.options.network)?;
 
         self.with_db_mut(move |db| {
             zcash_client_backend::data_api::chain::scan_cached_blocks(
@@ -687,7 +797,11 @@ impl WalletStorage for Sqlite {
         .await
     }
 
-    async fn truncate_to_chain_state(&self, chain_state: ChainState) -> Result<(), StorageError> {
+    async fn truncate_to_chain_state(
+        &self,
+        chain_state: TreeStateArtifact,
+    ) -> Result<(), StorageError> {
+        let chain_state = tree_state_to_upstream(chain_state, self.options.network)?;
         self.with_db_mut(move |db| {
             WalletWrite::truncate_to_chain_state(db, chain_state).map_err(|err| {
                 StorageError::SqliteFailed {
@@ -762,6 +876,18 @@ impl WalletStorage for Sqlite {
         .await
     }
 
+    async fn tree_state_roots(
+        &self,
+        tree_state: TreeStateArtifact,
+    ) -> Result<crate::wallet::CommitmentTreeRoots, StorageError> {
+        let chain_state = tree_state_to_upstream(tree_state, self.options.network)?;
+        Ok(crate::wallet::CommitmentTreeRoots {
+            sapling: Some(chain_state.final_sapling_tree().root().to_bytes()),
+            orchard: Some(chain_state.final_orchard_tree().root().to_bytes()),
+            ironwood: Some(chain_state.final_ironwood_tree().root().to_bytes()),
+        })
+    }
+
     async fn account_birthday(&self) -> Result<BlockHeight, StorageError> {
         self.with_db(move |db| {
             let height = zcash_client_backend::data_api::WalletRead::get_wallet_birthday(db)
@@ -830,8 +956,7 @@ impl WalletStorage for Sqlite {
             posture: FailurePosture::NotRetryable,
         })?;
         let memo_bytes = decode_memo_bytes(request.memo.as_deref())?;
-        let prover = zcash_proofs::prover::LocalTxProver::with_default_location()
-            .ok_or(StorageError::ProverUnavailable)?;
+        let prover = self.options.resolve_sapling_prover()?;
         let seed_bytes = SecretVec::new(seed.expose_secret().to_vec());
         let network = self.options.network;
         let account_id = request.account_id;
@@ -896,8 +1021,7 @@ impl WalletStorage for Sqlite {
     ) -> Result<Vec<crate::wallet::PreparedTransaction>, StorageError> {
         let params = self.options.network.to_parameters();
         let shielding_threshold = zally_to_upstream_zatoshis(request.shielding_threshold_zat);
-        let prover = zcash_proofs::prover::LocalTxProver::with_default_location()
-            .ok_or(StorageError::ProverUnavailable)?;
+        let prover = self.options.resolve_sapling_prover()?;
         let seed_bytes = SecretVec::new(seed.expose_secret().to_vec());
         let network = self.options.network;
         let account_id = request.account_id;
@@ -1045,8 +1169,7 @@ impl WalletStorage for Sqlite {
             reason: format!("pczt parse failed: {err:?}"),
             posture: FailurePosture::NotRetryable,
         })?;
-        let prover = zcash_proofs::prover::LocalTxProver::with_default_location()
-            .ok_or(StorageError::ProverUnavailable)?;
+        let prover = self.options.resolve_sapling_prover()?;
         let (spend_vk, output_vk) = prover.verifying_keys();
 
         let prepared = self
@@ -1246,24 +1369,26 @@ impl WalletStorage for Sqlite {
         .await
     }
 
-    async fn find_observed_tip(&self) -> Result<Option<BlockHeight>, StorageError> {
+    async fn find_visible_tip(&self) -> Result<Option<BlockHeight>, StorageError> {
         self.with_ledger(move |conn| {
             let outcome = conn
                 .query_row(
-                    "SELECT tip_height FROM ext_zally_observed_tip WHERE id = 0",
+                    "SELECT visible_tip_height FROM ext_zally_chain_tips WHERE id = 0",
                     [],
                     |row| row.get::<_, i64>(0),
                 )
                 .optional()
                 .map_err(|err| StorageError::SqliteFailed {
-                    reason: format!("ext_zally_observed_tip lookup failed: {err}"),
+                    reason: format!("ext_zally_chain_tips visible-tip lookup failed: {err}"),
                     posture: FailurePosture::NotRetryable,
                 })?;
             outcome
                 .map(|raw| {
                     u32::try_from(raw).map(BlockHeight::from).map_err(|_| {
                         StorageError::SqliteFailed {
-                            reason: format!("ext_zally_observed_tip.tip_height out of u32: {raw}"),
+                            reason: format!(
+                                "ext_zally_chain_tips.visible_tip_height out of u32: {raw}"
+                            ),
                             posture: FailurePosture::NotRetryable,
                         }
                     })
@@ -1273,16 +1398,107 @@ impl WalletStorage for Sqlite {
         .await
     }
 
-    async fn record_observed_tip(&self, new_tip: BlockHeight) -> Result<(), StorageError> {
-        let new_tip_i64 = i64::from(new_tip.as_u32());
+    async fn find_chain_tips(&self) -> Result<Option<ChainTips>, StorageError> {
+        self.with_ledger(move |conn| {
+            let outcome = conn
+                .query_row(
+                    "SELECT visible_tip_height, settled_tip_height \
+                     FROM ext_zally_chain_tips WHERE id = 0",
+                    [],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+                )
+                .optional()
+                .map_err(|err| StorageError::SqliteFailed {
+                    reason: format!("ext_zally_chain_tips pair lookup failed: {err}"),
+                    posture: FailurePosture::NotRetryable,
+                })?;
+            outcome
+                .map(|(visible_raw, settled_raw)| {
+                    let visible_tip = u32::try_from(visible_raw).map(BlockHeight::from).map_err(
+                        |_| StorageError::SqliteFailed {
+                            reason: format!(
+                                "ext_zally_chain_tips.visible_tip_height out of u32: {visible_raw}"
+                            ),
+                            posture: FailurePosture::NotRetryable,
+                        },
+                    )?;
+                    let settled_tip = u32::try_from(settled_raw).map(BlockHeight::from).map_err(
+                        |_| StorageError::SqliteFailed {
+                            reason: format!(
+                                "ext_zally_chain_tips.settled_tip_height out of u32: {settled_raw}"
+                            ),
+                            posture: FailurePosture::NotRetryable,
+                        },
+                    )?;
+                    if settled_tip > visible_tip {
+                        return Err(StorageError::InvalidChainTips {
+                            visible_tip,
+                            settled_tip,
+                        });
+                    }
+                    Ok(ChainTips {
+                        visible: visible_tip,
+                        settled: settled_tip,
+                    })
+                })
+                .transpose()
+        })
+        .await
+    }
+
+    async fn find_settled_tip(&self) -> Result<Option<BlockHeight>, StorageError> {
+        self.with_ledger(move |conn| {
+            let outcome = conn
+                .query_row(
+                    "SELECT settled_tip_height FROM ext_zally_chain_tips WHERE id = 0",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()
+                .map_err(|err| StorageError::SqliteFailed {
+                    reason: format!("ext_zally_chain_tips settled-tip lookup failed: {err}"),
+                    posture: FailurePosture::NotRetryable,
+                })?;
+            outcome
+                .map(|raw| {
+                    u32::try_from(raw).map(BlockHeight::from).map_err(|_| {
+                        StorageError::SqliteFailed {
+                            reason: format!(
+                                "ext_zally_chain_tips.settled_tip_height out of u32: {raw}"
+                            ),
+                            posture: FailurePosture::NotRetryable,
+                        }
+                    })
+                })
+                .transpose()
+        })
+        .await
+    }
+
+    async fn record_chain_tips(
+        &self,
+        visible_tip: BlockHeight,
+        settled_tip: BlockHeight,
+    ) -> Result<(), StorageError> {
+        if settled_tip > visible_tip {
+            return Err(StorageError::InvalidChainTips {
+                visible_tip,
+                settled_tip,
+            });
+        }
+        let visible_tip_i64 = i64::from(visible_tip.as_u32());
+        let settled_tip_i64 = i64::from(settled_tip.as_u32());
         self.with_ledger(move |conn| {
             conn.execute(
-                "INSERT INTO ext_zally_observed_tip (id, tip_height) VALUES (0, ?1) \
-                 ON CONFLICT(id) DO UPDATE SET tip_height = excluded.tip_height",
-                [new_tip_i64],
+                "INSERT INTO ext_zally_chain_tips \
+                     (id, visible_tip_height, settled_tip_height) VALUES (0, ?1, ?2) \
+                 ON CONFLICT(id) DO UPDATE SET \
+                     visible_tip_height = excluded.visible_tip_height, \
+                     settled_tip_height = excluded.settled_tip_height",
+                [visible_tip_i64, settled_tip_i64],
             )
             .map_err(|err| StorageError::SqliteFailed {
-                reason: format!("ext_zally_observed_tip upsert failed: {err}"),
+                reason: format!("ext_zally_chain_tips upsert failed: {err}"),
                 posture: FailurePosture::NotRetryable,
             })?;
             Ok(())
@@ -1627,13 +1843,13 @@ impl WalletStorage for Sqlite {
                     },
                 );
 
-            let observed_tip = find_observed_tip_on(ledger)?;
+            let visible_tip = find_visible_tip_on(ledger)?;
             // ZIP-213 maturity uses `chain_tip + 1` per `zcash_client_backend`'s convention so
             // an output mined at H is considered mature once the chain tip reaches H+99
             // (confirmations = 100). On a fresh wallet with no observed tip the maturity
             // check is moot because no coinbase has been recorded yet.
             let target_height_i64 =
-                i64::from(observed_tip.map_or(0_u32, |h| h.as_u32().saturating_add(1)));
+                i64::from(visible_tip.map_or(0_u32, |h| h.as_u32().saturating_add(1)));
 
             let immature_raw = ledger
                 .query_row(
@@ -1656,7 +1872,7 @@ impl WalletStorage for Sqlite {
                 ironwood_zat,
                 transparent_mature_zat,
                 transparent_immature_zat,
-                as_of_height: observed_tip,
+                as_of_height: visible_tip,
             })
         })
         .await
@@ -2140,7 +2356,7 @@ const EXPOSED_ADDRESSES_SQL: &str = "\
 /// Aggregate of unmatured wallet-owned coinbase transparent value at one target height.
 ///
 /// Bound to one account by uuid (`?1`) and one target height (`?2`, conventionally
-/// `observed_tip + 1` to match `zcash_client_backend`'s `chain_tip + 1` convention).
+/// `visible_tip + 1` to match `zcash_client_backend`'s `chain_tip + 1` convention).
 /// Returns the sum of `value_zat` across `transparent_received_outputs` whose producing
 /// transaction is coinbase and whose ZIP-213 100-block maturity window has not yet closed
 /// at `?2`. Outputs already consumed by a wallet-owned spending transaction are excluded
@@ -2377,8 +2593,215 @@ fn collect_received_shielded_note_rows(
     Ok(rows)
 }
 
+fn compact_block_to_upstream(
+    block: CompactBlockArtifact,
+) -> Result<UpstreamCompactBlock, StorageError> {
+    if block
+        .transactions
+        .windows(2)
+        .any(|pair| pair[0].index >= pair[1].index)
+    {
+        return Err(StorageError::ScanArtifactInvalid {
+            field: "compact_block.transactions.index",
+            reason: "transaction indexes must be strictly increasing".to_owned(),
+        });
+    }
+    Ok(UpstreamCompactBlock {
+        height: u64::from(block.height.as_u32()),
+        hash: block.block_hash.as_bytes().to_vec(),
+        prev_hash: block.previous_block_hash.as_bytes().to_vec(),
+        time: block.block_time_seconds,
+        header: Vec::new(),
+        vtx: block
+            .transactions
+            .into_iter()
+            .map(compact_transaction_to_upstream)
+            .collect::<Result<Vec<_>, _>>()?,
+        chain_metadata: Some(UpstreamChainMetadata {
+            sapling_commitment_tree_size: block.chain_metadata.sapling_commitment_tree_size,
+            orchard_commitment_tree_size: block.chain_metadata.orchard_commitment_tree_size,
+            ironwood_commitment_tree_size: block.chain_metadata.ironwood_commitment_tree_size,
+        }),
+    })
+}
+
+fn compact_transaction_to_upstream(
+    transaction: CompactTransaction,
+) -> Result<UpstreamCompactTransaction, StorageError> {
+    let fee = transaction
+        .fee_zat
+        .map(|fee_zat| u32::try_from(fee_zat.as_u64()))
+        .transpose()
+        .map_err(|_| StorageError::ScanArtifactInvalid {
+            field: "compact_transaction.fee_zat",
+            reason: "fee exceeds u32::MAX".to_owned(),
+        })?
+        .unwrap_or_default();
+    Ok(UpstreamCompactTransaction {
+        index: transaction.index,
+        txid: transaction.tx_id.as_bytes().to_vec(),
+        fee,
+        spends: transaction
+            .sapling_spends
+            .into_iter()
+            .map(|spend| UpstreamCompactSaplingSpend {
+                nf: spend.nullifier_bytes.to_vec(),
+            })
+            .collect(),
+        outputs: transaction
+            .sapling_outputs
+            .into_iter()
+            .map(|output| {
+                validate_ciphertext(&output.ciphertext_bytes)?;
+                Ok(UpstreamCompactSaplingOutput {
+                    cmu: output.commitment_bytes.to_vec(),
+                    ephemeral_key: output.ephemeral_key_bytes.to_vec(),
+                    ciphertext: output.ciphertext_bytes.to_vec(),
+                })
+            })
+            .collect::<Result<Vec<_>, StorageError>>()?,
+        actions: transaction
+            .orchard_actions
+            .iter()
+            .map(compact_action_to_upstream)
+            .collect::<Result<Vec<_>, _>>()?,
+        ironwood_actions: transaction
+            .ironwood_actions
+            .iter()
+            .map(compact_action_to_upstream)
+            .collect::<Result<Vec<_>, _>>()?,
+        vin: transaction
+            .transparent_inputs
+            .into_iter()
+            .map(|input| UpstreamCompactTransparentInput {
+                prevout_txid: input.previous_tx_id.as_bytes().to_vec(),
+                prevout_index: input.previous_output_index,
+            })
+            .collect(),
+        vout: transaction
+            .transparent_outputs
+            .into_iter()
+            .map(|output| UpstreamCompactTransparentOutput {
+                value: output.value_zat.as_u64(),
+                script_pub_key: output.script_pub_key_bytes,
+            })
+            .collect(),
+    })
+}
+
+fn compact_action_to_upstream(
+    action: &CompactShieldedAction,
+) -> Result<UpstreamCompactShieldedAction, StorageError> {
+    validate_ciphertext(&action.ciphertext_bytes)?;
+    Ok(UpstreamCompactShieldedAction {
+        nullifier: action.nullifier_bytes.to_vec(),
+        cmx: action.commitment_bytes.to_vec(),
+        ephemeral_key: action.ephemeral_key_bytes.to_vec(),
+        ciphertext: action.ciphertext_bytes.to_vec(),
+    })
+}
+
+fn validate_ciphertext(ciphertext_bytes: &[u8]) -> Result<(), StorageError> {
+    if ciphertext_bytes.len() != 52 {
+        return Err(StorageError::ScanArtifactInvalid {
+            field: "compact_transaction.ciphertext_bytes",
+            reason: format!(
+                "compact note ciphertext must be 52 bytes, got {}",
+                ciphertext_bytes.len()
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn tree_state_to_upstream(
+    tree_state: TreeStateArtifact,
+    expected_network: Network,
+) -> Result<ChainState, StorageError> {
+    if tree_state.network != expected_network {
+        return Err(StorageError::ScanArtifactInvalid {
+            field: "tree_state.network",
+            reason: format!(
+                "source network {:?} differs from storage network {expected_network:?}",
+                tree_state.network
+            ),
+        });
+    }
+    #[allow(
+        clippy::wildcard_enum_match_arm,
+        reason = "unknown future networks have no librustzcash TreeState label and fail closed"
+    )]
+    let network = match tree_state.network {
+        Network::Mainnet => "main",
+        Network::Testnet | Network::Regtest(_) => "test",
+        _ => {
+            return Err(StorageError::ScanArtifactInvalid {
+                field: "tree_state.network",
+                reason: "network has no librustzcash tree-state label".to_owned(),
+            });
+        }
+    };
+    let parameters = expected_network.to_parameters();
+    validate_active_pool_frontier(
+        &parameters,
+        tree_state.height,
+        NetworkUpgrade::Sapling,
+        "tree_state.sapling_final_state_bytes",
+        &tree_state.sapling_final_state_bytes,
+    )?;
+    validate_active_pool_frontier(
+        &parameters,
+        tree_state.height,
+        NetworkUpgrade::Nu5,
+        "tree_state.orchard_final_state_bytes",
+        &tree_state.orchard_final_state_bytes,
+    )?;
+    validate_active_pool_frontier(
+        &parameters,
+        tree_state.height,
+        NetworkUpgrade::Nu6_3,
+        "tree_state.ironwood_final_state_bytes",
+        &tree_state.ironwood_final_state_bytes,
+    )?;
+    UpstreamTreeState {
+        network: network.to_owned(),
+        height: u64::from(tree_state.height.as_u32()),
+        hash: tree_state.block_hash.to_rpc_hex(),
+        time: tree_state.block_time_seconds,
+        sapling_tree: hex::encode(tree_state.sapling_final_state_bytes),
+        orchard_tree: hex::encode(tree_state.orchard_final_state_bytes),
+        ironwood_tree: hex::encode(tree_state.ironwood_final_state_bytes),
+    }
+    .to_chain_state()
+    .map_err(|error| StorageError::ScanArtifactInvalid {
+        field: "tree_state",
+        reason: error.to_string(),
+    })
+}
+
+fn validate_active_pool_frontier(
+    parameters: &NetworkParameters,
+    height: BlockHeight,
+    activation: NetworkUpgrade,
+    field: &'static str,
+    frontier_bytes: &[u8],
+) -> Result<(), StorageError> {
+    let height = zcash_protocol::consensus::BlockHeight::from_u32(height.as_u32());
+    if parameters
+        .activation_height(activation)
+        .is_some_and(|activation_height| height >= activation_height)
+        && frontier_bytes.is_empty()
+    {
+        return Err(StorageError::ScanArtifactInvalid {
+            field,
+            reason: format!("active {activation:?} frontier is empty at height {height}"),
+        });
+    }
+    Ok(())
+}
+
 struct InMemoryBlockSource {
-    blocks: Vec<zcash_client_backend::proto::compact_formats::CompactBlock>,
+    blocks: Vec<UpstreamCompactBlock>,
 }
 
 impl zcash_client_backend::data_api::chain::BlockSource for InMemoryBlockSource {
@@ -2862,26 +3285,24 @@ fn decode_row_zatoshis(stored: i64, column: &'static str) -> Result<Zatoshis, St
     })
 }
 
-/// Reads the `ext_zally_observed_tip` row through `ledger` and decodes it into a typed
+/// Reads the visible tip from `ext_zally_chain_tips` through `ledger` and decodes it into a typed
 /// `BlockHeight`. Returns `Ok(None)` when the wallet has never recorded an observed tip.
-fn find_observed_tip_on(
-    ledger: &rusqlite::Connection,
-) -> Result<Option<BlockHeight>, StorageError> {
+fn find_visible_tip_on(ledger: &rusqlite::Connection) -> Result<Option<BlockHeight>, StorageError> {
     let raw = ledger
         .query_row(
-            "SELECT tip_height FROM ext_zally_observed_tip WHERE id = 0",
+            "SELECT visible_tip_height FROM ext_zally_chain_tips WHERE id = 0",
             [],
             |row| row.get::<_, i64>(0),
         )
         .optional()
         .map_err(|err| StorageError::SqliteFailed {
-            reason: format!("ext_zally_observed_tip lookup failed: {err}"),
+            reason: format!("ext_zally_chain_tips visible-tip lookup failed: {err}"),
             posture: FailurePosture::NotRetryable,
         })?;
     raw.map(|tip_i64| {
         u32::try_from(tip_i64).map(BlockHeight::from).map_err(|_| {
             StorageError::RowValueOutOfRange {
-                column: "ext_zally_observed_tip.tip_height",
+                column: "ext_zally_chain_tips.visible_tip_height",
                 raw: tip_i64.to_string(),
             }
         })
@@ -3205,11 +3626,149 @@ fn map_row_decode_error(err: &rusqlite::Error) -> StorageError {
 mod tests {
     use super::*;
     use zally_keys::Mnemonic;
+    use zcash_protocol::local_consensus::LocalNetwork;
 
     type TestChainError = zcash_client_backend::data_api::chain::error::Error<
         SqliteClientError,
         std::convert::Infallible,
     >;
+
+    fn activation_test_network() -> Network {
+        let height = |value| Some(zcash_protocol::consensus::BlockHeight::from_u32(value));
+        Network::Regtest(LocalNetwork {
+            overwinter: height(1),
+            sapling: height(10),
+            blossom: height(11),
+            heartwood: height(12),
+            canopy: height(13),
+            nu5: height(20),
+            nu6: height(21),
+            nu6_1: height(22),
+            nu6_2: height(23),
+            nu6_3: height(30),
+        })
+    }
+
+    #[test]
+    fn corrupt_explicit_sapling_parameters_return_typed_error() -> Result<(), std::io::Error> {
+        let directory = tempfile::TempDir::new()?;
+        let spend = directory.path().join(zcash_proofs::SAPLING_SPEND_NAME);
+        let output = directory.path().join(zcash_proofs::SAPLING_OUTPUT_NAME);
+        std::fs::write(&spend, b"corrupt spend parameters")?;
+        std::fs::write(&output, b"corrupt output parameters")?;
+        let options =
+            SqliteOptions::for_network(Network::Testnet, directory.path().join("wallet.db"))
+                .with_sapling_proving_parameters(spend, output);
+
+        assert!(matches!(
+            options.resolve_sapling_prover(),
+            Err(StorageError::ProverUnavailable)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn unreadable_explicit_sapling_parameter_path_returns_typed_error() -> Result<(), std::io::Error>
+    {
+        let directory = tempfile::TempDir::new()?;
+        let spend = directory.path().join("spend-directory");
+        let output = directory.path().join(zcash_proofs::SAPLING_OUTPUT_NAME);
+        std::fs::create_dir(&spend)?;
+        std::fs::write(&output, b"output parameters")?;
+        let options =
+            SqliteOptions::for_network(Network::Testnet, directory.path().join("wallet.db"))
+                .with_sapling_proving_parameters(spend, output);
+
+        assert!(matches!(
+            options.resolve_sapling_prover(),
+            Err(StorageError::ProverUnavailable)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn active_pool_frontiers_are_required_at_each_activation_boundary() {
+        let parameters = activation_test_network().to_parameters();
+        for (upgrade, activation_height) in [
+            (NetworkUpgrade::Sapling, 10),
+            (NetworkUpgrade::Nu5, 20),
+            (NetworkUpgrade::Nu6_3, 30),
+        ] {
+            assert!(
+                validate_active_pool_frontier(
+                    &parameters,
+                    BlockHeight::from(activation_height - 1),
+                    upgrade,
+                    "test.frontier",
+                    &[],
+                )
+                .is_ok()
+            );
+            assert!(matches!(
+                validate_active_pool_frontier(
+                    &parameters,
+                    BlockHeight::from(activation_height),
+                    upgrade,
+                    "test.frontier",
+                    &[],
+                ),
+                Err(StorageError::ScanArtifactInvalid { .. })
+            ));
+            assert!(
+                validate_active_pool_frontier(
+                    &parameters,
+                    BlockHeight::from(activation_height),
+                    upgrade,
+                    "test.frontier",
+                    &[1],
+                )
+                .is_ok()
+            );
+        }
+    }
+
+    fn compact_transaction(index: u64, fee_zat: Option<Zatoshis>) -> CompactTransaction {
+        CompactTransaction {
+            index,
+            tx_id: TxId::from_bytes([u8::try_from(index).unwrap_or(u8::MAX); 32]),
+            fee_zat,
+            sapling_spends: Vec::new(),
+            sapling_outputs: Vec::new(),
+            orchard_actions: Vec::new(),
+            ironwood_actions: Vec::new(),
+            transparent_inputs: Vec::new(),
+            transparent_outputs: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn storage_rejects_fee_that_cannot_fit_upstream_u32() {
+        let fee = Zatoshis::try_from(u64::from(u32::MAX) + 1).ok();
+        assert!(matches!(
+            compact_transaction_to_upstream(compact_transaction(0, fee)),
+            Err(StorageError::ScanArtifactInvalid { .. })
+        ));
+    }
+
+    #[test]
+    fn storage_rejects_nonincreasing_transaction_indexes() {
+        let block = CompactBlockArtifact {
+            height: BlockHeight::from(1),
+            block_hash: zally_core::BlockHash::from_bytes([1; 32]),
+            previous_block_hash: zally_core::BlockHash::from_bytes([0; 32]),
+            block_time_seconds: 0,
+            transactions: vec![compact_transaction(1, None), compact_transaction(1, None)],
+            chain_metadata: zally_core::CompactChainMetadata {
+                sapling_commitment_tree_size: 0,
+                orchard_commitment_tree_size: 0,
+                ironwood_commitment_tree_size: 0,
+            },
+        };
+        assert!(matches!(
+            compact_block_to_upstream(block),
+            Err(StorageError::ScanArtifactInvalid { .. })
+        ));
+    }
 
     #[test]
     fn mined_range_receive_query_covers_all_shielded_pools() {

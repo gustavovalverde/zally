@@ -38,7 +38,7 @@ The repo defines two nextest profiles:
    ```sh
    ZALLY_TEST_LIVE=1 \
      ZALLY_NETWORK=regtest \
-     ZINDER_ENDPOINT=http://127.0.0.1:9101 \
+     ZINDER_ENDPOINT=http://127.0.0.1:9102 \
      cargo nextest run --profile=ci-live --features zinder --run-ignored=all
    ```
 
@@ -108,15 +108,32 @@ cargo run --release -p zinder-ingest --bin zinder-ingest -- \
   tip-follow
 ```
 
-Start the reader (`zinder-query`) in a separate terminal:
+Start the wallet projector in a separate terminal. It owns the wallet primary; port 9101 is
+its private control endpoint and is not a wallet API:
 
 ```sh
-rm -rf .tmp/regtest.zinder-query-secondary && mkdir -p .tmp/regtest.zinder-query-secondary
+rm -rf .tmp/regtest.zinder-wallet .tmp/regtest.projector-canonical-secondary
+cargo run --release -p zinder-projector --bin zinder-projector -- \
+  --config .tmp/regtest.toml \
+  --canonical-path .tmp/regtest.zinder-store \
+  --canonical-secondary-path .tmp/regtest.projector-canonical-secondary \
+  --wallet-path .tmp/regtest.zinder-wallet \
+  --projector-control-listen-addr 127.0.0.1:9101 \
+  --ops-listen-addr 127.0.0.1:9104
+```
+
+Start the native reader (`zinder-query`) in another terminal:
+
+```sh
+rm -rf .tmp/regtest.query-canonical-secondary .tmp/regtest.query-wallet-secondary
 cargo run --release -p zinder-query --bin zinder-query -- \
-  --config .tmp/regtest.reader.toml \
-  --secondary-path .tmp/regtest.zinder-query-secondary \
+  --config .tmp/regtest.toml \
+  --canonical-primary-path .tmp/regtest.zinder-store \
+  --canonical-secondary-root .tmp/regtest.query-canonical-secondary \
+  --wallet-primary-path .tmp/regtest.zinder-wallet \
+  --wallet-secondary-root .tmp/regtest.query-wallet-secondary \
   --ingest-control-addr http://127.0.0.1:9100 \
-  --listen-addr 127.0.0.1:9101 \
+  --listen-addr 127.0.0.1:9102 \
   --ops-listen-addr 127.0.0.1:9106 \
   --node-json-rpc-addr http://127.0.0.1:39232
 ```
@@ -124,7 +141,7 @@ cargo run --release -p zinder-query --bin zinder-query -- \
 Verify Zally connects:
 
 ```sh
-ZINDER_ENDPOINT=http://127.0.0.1:9101 ZALLY_NETWORK=regtest \
+ZINDER_ENDPOINT=http://127.0.0.1:9102 ZALLY_NETWORK=regtest \
   cargo run -p zally-wallet --example live-zinder-probe --features zinder
 ```
 
@@ -141,7 +158,8 @@ sed -i.bak "s|^password = .*|password = \"$COOKIE_PW\"|" \
   .tmp/testnet/config/zinder-ingest.toml
 ```
 
-Start writer and reader on dedicated 92xx ports so they don't collide with the regtest 91xx pair:
+Start writer, projector, and reader on dedicated 92xx ports so they do not collide with the
+regtest 91xx processes:
 
 ```sh
 rm -rf .tmp/testnet/store && mkdir -p .tmp/testnet/store
@@ -150,10 +168,22 @@ cargo run --release -p zinder-ingest --bin zinder-ingest -- \
   --ops-listen-addr 127.0.0.1:9205 \
   tip-follow
 
-rm -rf .tmp/testnet/query-secondary && mkdir -p .tmp/testnet/query-secondary
+rm -rf .tmp/testnet/wallet .tmp/testnet/projector-canonical-secondary
+cargo run --release -p zinder-projector --bin zinder-projector -- \
+  --config .tmp/testnet/config/zinder-projector.toml \
+  --canonical-path .tmp/testnet/store \
+  --canonical-secondary-path .tmp/testnet/projector-canonical-secondary \
+  --wallet-path .tmp/testnet/wallet \
+  --projector-control-listen-addr 127.0.0.1:9202 \
+  --ops-listen-addr 127.0.0.1:9204
+
+rm -rf .tmp/testnet/query-canonical-secondary .tmp/testnet/query-wallet-secondary
 cargo run --release -p zinder-query --bin zinder-query -- \
   --config .tmp/testnet/config/zinder-query.toml \
-  --secondary-path .tmp/testnet/query-secondary \
+  --canonical-primary-path .tmp/testnet/store \
+  --canonical-secondary-root .tmp/testnet/query-canonical-secondary \
+  --wallet-primary-path .tmp/testnet/wallet \
+  --wallet-secondary-root .tmp/testnet/query-wallet-secondary \
   --ingest-control-addr http://127.0.0.1:9201 \
   --listen-addr 127.0.0.1:9203 \
   --ops-listen-addr 127.0.0.1:9206 \
@@ -191,7 +221,7 @@ period that applies to a fresh Sapling regtest chain.
 ```sh
 ZALLY_TEST_LIVE=1 \
   ZALLY_NETWORK=regtest \
-  ZINDER_ENDPOINT=http://127.0.0.1:9101 \
+  ZINDER_ENDPOINT=http://127.0.0.1:9102 \
   ZALLY_TEST_NODE_JSON_RPC_ADDR=http://127.0.0.1:39232/ \
   cargo nextest run --profile=ci-live --features zinder --run-ignored=all \
     -p zally-wallet funded_wallet_syncs_sends_and_submits_pczt_with_zinder
@@ -207,10 +237,10 @@ Optional amount overrides:
 
 ### Port allocation
 
-| Network | Zebra RPC | ingest control | ingest ops | query gRPC | query ops |
-|---------|-----------|----------------|------------|------------|-----------|
-| regtest | 39232     | 9100           | 9105       | 9101       | 9106      |
-| testnet | 18232     | 9201           | 9205       | 9203       | 9206      |
+| Network | Zebra RPC | ingest control | projector control | ingest ops | query gRPC | query ops |
+|---------|-----------|----------------|-------------------|------------|------------|-----------|
+| regtest | 39232     | 9100           | 9101              | 9105       | 9102       | 9106      |
+| testnet | 18232     | 9201           | 9202              | 9205       | 9203       | 9206      |
 
 ### Operator notes
 

@@ -19,7 +19,8 @@ async fn metrics_snapshot_reports_network_and_account_count() -> Result<(), Test
     assert_eq!(snapshot.network, network);
     assert_eq!(snapshot.account_count, 1);
     assert_eq!(snapshot.scanned_height, None);
-    assert_eq!(snapshot.safe_chain_tip_height, None);
+    assert_eq!(snapshot.visible_tip_height, None);
+    assert_eq!(snapshot.settled_tip_height, None);
     assert_eq!(snapshot.lag_blocks, None);
 
     // Attaching an observer reflects in the snapshot.
@@ -30,7 +31,8 @@ async fn metrics_snapshot_reports_network_and_account_count() -> Result<(), Test
 }
 
 #[tokio::test]
-async fn status_snapshot_reports_observed_tip_after_sync() -> Result<(), TestWalletError> {
+async fn sync_scans_to_visible_tip_and_records_the_lower_settled_tip() -> Result<(), TestWalletError>
+{
     let TestWalletFixture {
         temp: _temp,
         wallet,
@@ -39,21 +41,29 @@ async fn status_snapshot_reports_observed_tip_after_sync() -> Result<(), TestWal
     let network = wallet.network();
 
     let chain = MockChainSource::new(network);
-    chain.handle().advance_tip(BlockHeight::from(42));
+    assert!(
+        chain
+            .handle()
+            .set_chain_tips(BlockHeight::from(50), BlockHeight::from(42),)
+    );
     wallet.sync(&chain).await?;
 
     let status = wallet.status_snapshot().await?;
     assert_eq!(status.network, network);
-    assert_eq!(status.scanned_height, None);
-    assert_eq!(status.safe_chain_tip_height, Some(BlockHeight::from(42)));
+    assert_eq!(status.scanned_height, Some(BlockHeight::from(50)));
+    assert_eq!(status.visible_tip_height, Some(BlockHeight::from(50)));
+    assert_eq!(status.settled_tip_height, Some(BlockHeight::from(42)));
     assert_eq!(
         status.sync_status,
-        SyncStatus::Starting {
-            target_height: BlockHeight::from(42)
+        SyncStatus::AtTip {
+            visible_tip_height: BlockHeight::from(50)
         }
     );
+    assert_eq!(status.lag_blocks, Some(0));
 
     let metrics = wallet.metrics_snapshot().await?;
-    assert_eq!(metrics.safe_chain_tip_height, Some(BlockHeight::from(42)));
+    assert_eq!(metrics.visible_tip_height, Some(BlockHeight::from(50)));
+    assert_eq!(metrics.settled_tip_height, Some(BlockHeight::from(42)));
+    assert_eq!(metrics.lag_blocks, Some(0));
     Ok(())
 }

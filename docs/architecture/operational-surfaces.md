@@ -19,8 +19,9 @@ Zinder is a `ChainSource` and `Submitter` implementation. Zally public wallet AP
 
 - `SyncStatus`: scan lifecycle derived from persisted wallet progress.
 - `scanned_height`: the wallet's durable scan height.
-- `chain_tip_height`: the most recent tip observed by sync.
-- `lag_blocks`: known scan lag when the tip has not regressed.
+- `visible_tip_height`: the source-visible head recorded by sync.
+- `settled_tip_height`: the source-settled finality watermark recorded by sync.
+- `lag_blocks`: known scan lag to `visible_tip_height` when the tip has not regressed.
 - `circuit_breaker`: current outbound IO breaker state.
 
 `Wallet::metrics_snapshot()` is derived from the same persisted progress as `WalletStatus`.

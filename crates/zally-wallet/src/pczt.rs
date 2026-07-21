@@ -113,7 +113,7 @@ impl Wallet {
     ///
     /// The storage layer wraps `extract_and_store_transaction_from_pczt` so the wallet DB
     /// records the spend immediately; the returned `SendOutcome` carries the txid the
-    /// submitter accepted (or the wallet's own txid on `Duplicate`).
+    /// submitter accepted after validating that it matches the extracted transaction id.
     ///
     /// `not_retryable` on malformed PCZTs, missing prover params, or submitter rejection;
     /// `retryable` on transient submitter or storage I/O.
@@ -185,7 +185,7 @@ fn validate_pczt_network(
 
 fn translate_submit_outcome(
     outcome: zally_chain::SubmitOutcome,
-    fallback_tx_id: zally_core::TxId,
+    expected_tx_id: zally_core::TxId,
     tx_expiry_height: BlockHeight,
 ) -> Result<SendOutcome, WalletError> {
     #[allow(
@@ -193,32 +193,27 @@ fn translate_submit_outcome(
         reason = "non_exhaustive submit outcomes fall through to SubmissionRejected with a placeholder typed reason"
     )]
     match outcome {
-        zally_chain::SubmitOutcome::Accepted { tx_id } => Ok(SendOutcome {
-            signed: crate::SignedPczt {
-                tx_id,
-                fee_zat: zally_core::Zatoshis::zero(),
-                tx_expiry_height,
-            },
-            broadcast: crate::BroadcastOutcome {
-                tx_id,
-                broadcast_at_height: BlockHeight::from(0),
-            },
-        }),
-        // Duplicate and Queued are success-equivalent for idempotency; preserve the
-        // caller-provided fallback tx id (see `spend.rs::resolve_send_outcome` for the
-        // matching rationale on the high-level send path).
-        zally_chain::SubmitOutcome::Duplicate { .. }
-        | zally_chain::SubmitOutcome::Queued { .. } => Ok(SendOutcome {
-            signed: crate::SignedPczt {
-                tx_id: fallback_tx_id,
-                fee_zat: zally_core::Zatoshis::zero(),
-                tx_expiry_height,
-            },
-            broadcast: crate::BroadcastOutcome {
-                tx_id: fallback_tx_id,
-                broadcast_at_height: BlockHeight::from(0),
-            },
-        }),
+        zally_chain::SubmitOutcome::Accepted { tx_id }
+        | zally_chain::SubmitOutcome::Duplicate { tx_id }
+        | zally_chain::SubmitOutcome::Queued { tx_id } => {
+            if tx_id != expected_tx_id {
+                return Err(WalletError::SubmittedTransactionIdMismatch {
+                    expected: expected_tx_id,
+                    returned: tx_id,
+                });
+            }
+            Ok(SendOutcome {
+                signed: crate::SignedPczt {
+                    tx_id,
+                    fee_zat: zally_core::Zatoshis::zero(),
+                    tx_expiry_height,
+                },
+                broadcast: crate::BroadcastOutcome {
+                    tx_id,
+                    broadcast_at_height: BlockHeight::from(0),
+                },
+            })
+        }
         zally_chain::SubmitOutcome::Rejected { reason, detail } => {
             Err(WalletError::SubmissionRejected { reason, detail })
         }
@@ -226,5 +221,32 @@ fn translate_submit_outcome(
             reason: zally_chain::RejectionReason::Unknown,
             detail: "submitter returned an unrecognised outcome variant".into(),
         }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::translate_submit_outcome;
+    use crate::WalletError;
+    use zally_core::{BlockHeight, TxId};
+
+    #[test]
+    fn pczt_submission_rejects_success_for_a_different_transaction() {
+        let expected = TxId::from_bytes([1; 32]);
+        let returned = TxId::from_bytes([2; 32]);
+
+        let outcome = translate_submit_outcome(
+            zally_chain::SubmitOutcome::Queued { tx_id: returned },
+            expected,
+            BlockHeight::from(100),
+        );
+
+        assert!(matches!(
+            outcome,
+            Err(WalletError::SubmittedTransactionIdMismatch {
+                expected: actual_expected,
+                returned: actual_returned,
+            }) if actual_expected == expected && actual_returned == returned
+        ));
     }
 }

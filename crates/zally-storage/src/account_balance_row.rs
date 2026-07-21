@@ -10,7 +10,7 @@
 use zally_core::{BlockHeight, Zatoshis};
 
 /// One per-pool balance snapshot for a single account, anchored to the wallet's last
-/// observed chain tip.
+/// persisted visible tip.
 ///
 /// Sapling, Orchard, and Ironwood values report the upstream spendable totals reported by
 /// `WalletRead::get_wallet_summary` (notes whose witnesses are computable and whose

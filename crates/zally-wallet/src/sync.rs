@@ -1,13 +1,15 @@
 //! Wallet sync loop.
 //!
-//! `Wallet::sync` drives `zcash_client_backend::data_api::chain::scan_cached_blocks` through
-//! the storage-side `WalletStorage::scan_blocks` extension. The chain source streams compact
-//! blocks; the wallet drains them, builds a `ChainState`, and hands both to the storage layer,
-//! which runs the upstream scanner against the live `WalletDb`.
+//! `Wallet::sync` pins one source [`zally_chain::ChainEpoch`], selects a bounded scan range no
+//! higher than its visible tip, and requests the exact predecessor [`TreeStateArtifact`]. The
+//! chain source streams source-neutral compact blocks; the wallet validates their epoch and
+//! range, then hands the blocks and anchor to [`zally_storage::WalletStorage::scan_blocks`]. The
+//! storage boundary alone translates those values into librustzcash scan types and updates the
+//! live wallet database.
 //!
-//! Each call re-scans from the wallet's last fully-scanned height up to the current chain
-//! tip. The `ChainState` is rebuilt from the embedded genesis frontier on every call: correct,
-//! linear-in-tip-height.
+//! Successive calls advance through bounded chunks from the wallet's last fully scanned height.
+//! The exact predecessor tree artifact anchors each chunk, so work is proportional to the new
+//! scan range rather than the full chain height.
 //!
 //! The long-lived [`SyncDriver`] wraps the loop in a self-healing lifecycle. Wallet chain
 //! state is disposable derived state: every fault is classified onto an escalating repair
@@ -26,11 +28,12 @@ use tokio::task::JoinHandle;
 use tokio::time::{MissedTickBehavior, interval, sleep, timeout};
 use tokio_stream::wrappers::WatchStream;
 use zally_chain::{
-    BlockHeightRange, ChainEventEnvelope, ChainEventEnvelopeStream, ChainEventStreamStart,
-    ChainSource, ChainSourceError, ChainState, FailurePosture, ShieldedPool, SubtreeIndex,
+    BlockHeightRange, ChainEventCursorRecovery, ChainEventEnvelope, ChainEventEnvelopeStream,
+    ChainEventStreamStart, ChainSource, ChainSourceError, FailurePosture, ShieldedPool,
+    SubtreeIndex, TransparentUtxo,
 };
-use zally_core::{BlockHeight, Network};
-use zally_storage::{ScanRequest, StorageError, TransparentUtxoRow};
+use zally_core::{BlockHeight, CompactBlockArtifact, Network, TreeStateArtifact};
+use zally_storage::{ScanRequest, StorageError, TransparentReceiverRow, TransparentUtxoRow};
 use zcash_client_backend::data_api::scanning::ScanPriority;
 
 use crate::error::WalletError;
@@ -55,7 +58,7 @@ const SUBTREE_ROOT_PAGE: u32 = 128;
 const REWIND_LADDER_BLOCKS: [u32; 2] = [10, 100];
 
 struct ScanContext {
-    blocks: Vec<zcash_client_backend::proto::compact_formats::CompactBlock>,
+    blocks: Vec<CompactBlockArtifact>,
     scanned_from: BlockHeight,
     target_height: BlockHeight,
     block_count: u64,
@@ -336,9 +339,11 @@ pub struct SyncSnapshot {
     pub sync_status: SyncStatus,
     /// Highest block height the wallet has scanned, if any.
     pub scanned_height: Option<BlockHeight>,
-    /// Chain tip the wallet most recently observed, if any.
-    pub safe_chain_tip_height: Option<BlockHeight>,
-    /// Number of blocks between `scanned_height` and `safe_chain_tip_height`, if known.
+    /// Highest source-visible block recorded by the most recent sync, if any.
+    pub visible_tip_height: Option<BlockHeight>,
+    /// Settled finality height recorded by the most recent sync, if any.
+    pub settled_tip_height: Option<BlockHeight>,
+    /// Number of blocks between `scanned_height` and `visible_tip_height`, if known.
     pub lag_blocks: Option<u32>,
     /// Most recent completed [`Wallet::sync`] run summary.
     pub last_outcome: Option<SyncOutcome>,
@@ -355,7 +360,8 @@ impl SyncSnapshot {
             phase: SyncDriverPhase::Starting,
             sync_status: SyncStatus::NotStarted,
             scanned_height: None,
-            safe_chain_tip_height: None,
+            visible_tip_height: None,
+            settled_tip_height: None,
             lag_blocks: None,
             last_outcome: None,
             last_fault: None,
@@ -374,7 +380,8 @@ impl SyncSnapshot {
             phase,
             sync_status: wallet_status.sync_status,
             scanned_height: wallet_status.scanned_height,
-            safe_chain_tip_height: wallet_status.safe_chain_tip_height,
+            visible_tip_height: wallet_status.visible_tip_height,
+            settled_tip_height: wallet_status.settled_tip_height,
             lag_blocks: wallet_status.lag_blocks,
             last_outcome,
             last_fault,
@@ -509,6 +516,27 @@ struct DriverState {
     last_outcome: Option<SyncOutcome>,
     last_fault: Option<SyncFault>,
     recovery: Option<RecoveryState>,
+    cursor_recovery_pending: bool,
+    stream_consecutive_faults: u32,
+    stream_next_attempt_at_ms: u64,
+    stream_reprobe: StreamReprobe,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum StreamReprobe {
+    #[default]
+    Inactive,
+    ParkedWithoutDeadline,
+    At(u64),
+}
+
+impl StreamReprobe {
+    const fn deadline(self) -> Option<u64> {
+        match self {
+            Self::At(deadline) => Some(deadline),
+            Self::Inactive | Self::ParkedWithoutDeadline => None,
+        }
+    }
 }
 
 impl DriverState {
@@ -615,7 +643,8 @@ enum SyncRunAttempt {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SyncWakeupExit {
-    Waiting,
+    Reconciled,
+    Pending,
     CloseRequested,
 }
 
@@ -672,17 +701,18 @@ async fn run_sync_driver(
     poll.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut state = DriverState::default();
     let mut chain_events_start = ChainEventStreamStart::EarliestRetained;
-    let mut chain_events = open_chain_events(&ctx, &mut state, chain_events_start.clone()).await;
+    let mut chain_events = open_chain_events(&ctx, &mut state, &mut chain_events_start).await;
     let mut should_sync = true;
 
     loop {
         if should_sync && state.parked().is_none() {
-            if run_sync_wakeup(&ctx, &mut close_rx, &mut state).await
-                == SyncWakeupExit::CloseRequested
-            {
-                return close_sync_driver(&ctx, &state).await;
+            match run_sync_wakeup(&ctx, &mut close_rx, &mut state).await {
+                SyncWakeupExit::CloseRequested => {
+                    return close_sync_driver(&ctx, &state).await;
+                }
+                SyncWakeupExit::Reconciled => should_sync = false,
+                SyncWakeupExit::Pending => should_sync = true,
             }
-            should_sync = false;
         }
 
         tokio::select! {
@@ -694,7 +724,7 @@ async fn run_sync_driver(
                     &ctx,
                     &mut state,
                     &mut chain_events,
-                    chain_events_start.clone(),
+                    &mut chain_events_start,
                 )
                 .await;
             }
@@ -706,8 +736,11 @@ async fn run_sync_driver(
                     }
                     Some(Err(err)) => {
                         chain_events = None;
-                        if state.parked().is_none() {
-                            record_stream_fault(&ctx, &mut state, &err);
+                        if is_expired_cursor(&err) {
+                            chain_events_start = ChainEventStreamStart::EarliestRetained;
+                            should_sync = state.parked().is_none();
+                        } else if state.parked().is_none() {
+                            record_stream_fault(&ctx, &mut state, &err).await;
                         }
                     }
                     None => {
@@ -728,7 +761,7 @@ async fn handle_poll_tick(
     ctx: &DriverContext<'_>,
     state: &mut DriverState,
     chain_events: &mut Option<ChainEventEnvelopeStream>,
-    start: ChainEventStreamStart,
+    start: &mut ChainEventStreamStart,
 ) -> bool {
     if let Some(parked) = state.parked() {
         if parked
@@ -745,9 +778,22 @@ async fn handle_poll_tick(
         return false;
     }
     if chain_events.is_none() {
-        *chain_events = open_chain_events(ctx, state, start).await;
+        let now = current_unix_ms();
+        match state.stream_reprobe {
+            StreamReprobe::ParkedWithoutDeadline => return false,
+            StreamReprobe::At(deadline) if now < deadline => return false,
+            StreamReprobe::At(_) => {
+                state.stream_reprobe = StreamReprobe::Inactive;
+                state.stream_consecutive_faults = 0;
+                state.stream_next_attempt_at_ms = 0;
+            }
+            StreamReprobe::Inactive => {}
+        }
+        if now >= state.stream_next_attempt_at_ms {
+            *chain_events = open_chain_events(ctx, state, start).await;
+        }
     }
-    true
+    std::mem::take(&mut state.cursor_recovery_pending)
 }
 
 async fn close_sync_driver(ctx: &DriverContext<'_>, state: &DriverState) {
@@ -768,7 +814,7 @@ async fn run_sync_wakeup(
         {
             if recovery.rung == SyncRepair::Park {
                 enter_park(ctx, state).await;
-                return SyncWakeupExit::Waiting;
+                return SyncWakeupExit::Pending;
             }
             let backoff_ms = recovery.backoff_ms;
             tokio::select! {
@@ -799,7 +845,7 @@ async fn run_sync_wakeup(
         match attempt {
             SyncRunAttempt::Completed(outcome) => {
                 if !complete_sync(ctx, state, outcome).await {
-                    return SyncWakeupExit::Waiting;
+                    return SyncWakeupExit::Reconciled;
                 }
             }
             SyncRunAttempt::Faulted { reason, repair } => {
@@ -818,7 +864,7 @@ async fn run_sync_wakeup(
             }
         }
     }
-    SyncWakeupExit::Waiting
+    SyncWakeupExit::Pending
 }
 
 /// Publishes the outcome of a completed sync run.
@@ -1187,17 +1233,50 @@ async fn build_snapshot(
     }
 }
 
-/// Records a chain-event stream interruption without engaging the repair ladder: polling
-/// keeps sync healthy while the stream reopens on the next tick.
-fn record_stream_fault(ctx: &DriverContext<'_>, state: &mut DriverState, error: &ChainSourceError) {
-    state.last_fault = Some(SyncFault {
+/// Records a chain-event stream interruption and applies bounded reconnect backoff.
+async fn record_stream_fault(
+    ctx: &DriverContext<'_>,
+    state: &mut DriverState,
+    error: &ChainSourceError,
+) {
+    let now = current_unix_ms();
+    state.stream_consecutive_faults = state.stream_consecutive_faults.saturating_add(1);
+    let backoff_ms = backoff_for(ctx.options.recovery, state.stream_consecutive_faults);
+    state.stream_next_attempt_at_ms = now.saturating_add(backoff_ms);
+    let should_park = state.stream_consecutive_faults >= ctx.options.recovery.escalate_after_faults;
+    if should_park {
+        state.stream_reprobe = ctx
+            .options
+            .recovery
+            .park_reprobe_ms
+            .map_or(StreamReprobe::ParkedWithoutDeadline, |hold_ms| {
+                StreamReprobe::At(now.saturating_add(hold_ms))
+            });
+    }
+    let fault = SyncFault {
         reason: error.to_string(),
-        repair: SyncRepair::Retry,
-        occurred_at_ms: current_unix_ms(),
-        consecutive_faults: 0,
-    });
-    let mut snapshot = ctx.status_tx.borrow().clone();
-    snapshot.last_fault.clone_from(&state.last_fault);
+        repair: if should_park {
+            SyncRepair::Park
+        } else {
+            SyncRepair::Retry
+        },
+        occurred_at_ms: now,
+        consecutive_faults: state.stream_consecutive_faults,
+    };
+    state.last_fault = Some(fault);
+    let phase = if should_park {
+        SyncDriverPhase::Parked {
+            since_ms: now,
+            reprobe_at_ms: state.stream_reprobe.deadline(),
+        }
+    } else {
+        SyncDriverPhase::Recovering {
+            repair: SyncRepair::Retry,
+            attempt: state.stream_consecutive_faults,
+            next_attempt_at_ms: state.stream_next_attempt_at_ms,
+        }
+    };
+    let snapshot = build_snapshot(ctx, phase, state).await;
     publish_snapshot(ctx.status_tx, snapshot);
 }
 
@@ -1316,15 +1395,40 @@ fn publish_snapshot(status_tx: &watch::Sender<SyncSnapshot>, mut snapshot: SyncS
 async fn open_chain_events(
     ctx: &DriverContext<'_>,
     state: &mut DriverState,
-    start: ChainEventStreamStart,
+    start: &mut ChainEventStreamStart,
 ) -> Option<ChainEventEnvelopeStream> {
-    match ctx.chain.chain_event_envelopes(start).await {
-        Ok(stream) => Some(stream),
+    match ctx.chain.chain_event_envelopes(start.clone()).await {
+        Ok(stream) => {
+            let recovered_stream = state.stream_consecutive_faults > 0;
+            state.stream_consecutive_faults = 0;
+            state.stream_next_attempt_at_ms = 0;
+            state.stream_reprobe = StreamReprobe::Inactive;
+            if recovered_stream {
+                state.last_fault = None;
+                let snapshot = build_snapshot(ctx, SyncDriverPhase::Waiting, state).await;
+                publish_snapshot(ctx.status_tx, snapshot);
+            }
+            Some(stream)
+        }
+        Err(err) if is_expired_cursor(&err) => {
+            *start = ChainEventStreamStart::EarliestRetained;
+            state.cursor_recovery_pending = true;
+            None
+        }
         Err(err) => {
-            record_stream_fault(ctx, state, &err);
+            record_stream_fault(ctx, state, &err).await;
             None
         }
     }
+}
+
+fn is_expired_cursor(error: &ChainSourceError) -> bool {
+    matches!(
+        error,
+        ChainSourceError::ChainEventCursorExpired {
+            recovery: ChainEventCursorRecovery::EarliestRetained,
+        }
+    )
 }
 
 async fn next_chain_event_envelope(
@@ -1337,7 +1441,7 @@ async fn next_chain_event_envelope(
 }
 
 impl Wallet {
-    /// Advances the wallet by one bounded scan step toward `chain.chain_tip()`.
+    /// Advances the wallet by one bounded scan step toward the current epoch's visible tip.
     ///
     /// Each call primes commitment-tree subtree roots, calls `update_chain_tip` with the live
     /// tip, then scans the highest-priority range `suggest_scan_ranges` returns (chunked to
@@ -1355,7 +1459,14 @@ impl Wallet {
     /// `requires_operator` on network mismatch. `retryable` on transient chain-source
     /// failures.
     pub async fn sync(&self, chain: &dyn ChainSource) -> Result<SyncOutcome, WalletError> {
-        let outcome = self.sync_inner(chain).await?;
+        let outcome = with_breaker_and_retry(
+            &self.inner.circuit_breaker,
+            self.retry_policy(),
+            "sync.attempt",
+            || self.sync_inner(chain),
+            std::convert::identity,
+        )
+        .await?;
         self.retire_expired_pending_broadcasts().await?;
         Ok(outcome)
     }
@@ -1377,38 +1488,39 @@ impl Wallet {
                 requested: chain.network(),
             });
         }
-        let policy = self.retry_policy();
-        let chain_tip = with_breaker_and_retry(
-            &self.inner.circuit_breaker,
-            policy,
-            "sync.chain_tip",
-            || chain.chain_tip(),
-            WalletError::from,
-        )
-        .await?;
-        self.inner.storage.record_observed_tip(chain_tip).await?;
+        let chain_epoch = chain.current_epoch().await?;
+        let visible_tip = chain_epoch.visible_tip().height;
+        let settled_tip = chain_epoch.settled_tip().height;
+        self.inner.storage.update_chain_tip(visible_tip).await?;
+        self.inner
+            .storage
+            .record_chain_tips(visible_tip, settled_tip)
+            .await?;
 
-        let Some((scan_start, scan_end, priority)) = self.plan_scan_range(chain, chain_tip).await?
+        let Some((scan_start, scan_end, priority)) = self
+            .plan_scan_range(chain, chain_epoch, visible_tip)
+            .await?
         else {
-            let transparent_utxo_count = self.sync_transparent_utxos(chain).await?;
-            return Ok(self.emit_caught_up(chain_tip, transparent_utxo_count));
+            let transparent_utxo_count = self.sync_transparent_utxos(chain, chain_epoch).await?;
+            return Ok(self.emit_caught_up(visible_tip, transparent_utxo_count));
         };
         self.publish_event(WalletEvent::ScanProgress {
             scanned_height: scan_start,
-            target_height: chain_tip,
+            target_height: visible_tip,
         });
         tracing::info!(
             target: "zally::sync",
             event = "wallet_sync_cycle",
             scanned_from = scan_start.as_u32(),
             scan_end = scan_end.as_u32(),
-            chain_tip = chain_tip.as_u32(),
+            settled_tip = settled_tip.as_u32(),
+            visible_tip = visible_tip.as_u32(),
             priority,
             "sync cycle: scanning a suggested range chunk"
         );
 
-        let from_state = fetch_prior_chain_state(chain, scan_start).await?;
-        let blocks = fetch_compact_blocks(chain, scan_start, scan_end).await?;
+        let from_state = fetch_prior_chain_state(chain, chain_epoch, scan_start).await?;
+        let blocks = fetch_compact_blocks(chain, chain_epoch, scan_start, scan_end).await?;
         let block_count = u64::try_from(blocks.len()).unwrap_or(u64::MAX);
         tracing::info!(
             target: "zally::sync",
@@ -1418,53 +1530,39 @@ impl Wallet {
             block_count,
             "fetched compact blocks for scan"
         );
-        if blocks.is_empty() {
-            tracing::warn!(
-                target: "zally::sync",
-                event = "wallet_sync_empty_fetch",
-                scanned_from = scan_start.as_u32(),
-                scan_end = scan_end.as_u32(),
-                "suggested-range fetch returned no blocks"
-            );
-            let transparent_utxo_count = self.sync_transparent_utxos(chain).await?;
-            return Ok(self.emit_caught_up(chain_tip, transparent_utxo_count));
-        }
-
         self.scan_and_emit(
             ScanContext {
                 blocks,
                 scanned_from: scan_start,
-                target_height: chain_tip,
+                target_height: visible_tip,
                 block_count,
             },
             from_state,
             chain,
+            chain_epoch,
         )
         .await
     }
 
-    /// Resolves the next scan range, advancing the chain tip only when the queue is drained.
+    /// Resolves the next scan range at or below the visible tip.
     ///
-    /// Each `update_chain_tip` call re-creates a short `Verify` range (`VERIFY_LOOKAHEAD`
-    /// blocks) at the scan frontier while the wallet is far behind, so calling it every cycle
-    /// would force catch-up into 10-block steps. This drains the existing queue first and
-    /// only advances the tip, re-priming subtree roots, once the queue is empty and the live
-    /// tip is ahead. That matches the library recipe: update the tip once, then scan all
-    /// suggested ranges (one `Verify`, then bulk `Historic`/`ChainTip`) before touching it
-    /// again.
+    /// `sync_inner` updates the wallet database with the same visible tip used here. Keeping the
+    /// upstream chain tip and scan frontier aligned prevents an unscanned settlement-window gap
+    /// from making notes in an incomplete commitment-tree shard appear unspendable.
     async fn plan_scan_range(
         &self,
         chain: &dyn ChainSource,
-        chain_tip: BlockHeight,
+        chain_epoch: zally_chain::ChainEpoch,
+        visible_tip: BlockHeight,
     ) -> Result<Option<(BlockHeight, BlockHeight, &'static str)>, WalletError> {
-        if let Some(range) = self.next_scan_range(chain_tip).await? {
+        if let Some(range) = self.next_scan_range(visible_tip).await? {
             return Ok(Some(range));
         }
         let fully_scanned = self.inner.storage.fully_scanned_height().await?;
-        if fully_scanned.is_none_or(|h| chain_tip.as_u32() > h.as_u32()) {
-            self.backfill_subtree_roots(chain, fully_scanned).await?;
-            self.inner.storage.update_chain_tip(chain_tip).await?;
-            self.next_scan_range(chain_tip).await
+        if fully_scanned.is_none_or(|h| visible_tip.as_u32() > h.as_u32()) {
+            self.backfill_subtree_roots(chain, chain_epoch, fully_scanned)
+                .await?;
+            self.next_scan_range(visible_tip).await
         } else {
             Ok(None)
         }
@@ -1472,17 +1570,17 @@ impl Wallet {
 
     /// Returns the highest-priority suggested scan range that lies at or below `chain_tip`,
     /// chunked to at most [`MAX_BLOCKS_PER_SYNC`] blocks, as `(start, end_inclusive,
-    /// priority_label)`. `None` when nothing at or below the tip remains to scan.
+    /// priority_label)`. `None` when nothing at or below the visible tip remains to scan.
     ///
-    /// Ranges are clamped to `chain_tip`: a suggested range can start above the tip when the
+    /// Ranges are clamped to `visible_tip`: a suggested range can start above that height when the
     /// wallet birthday is ahead of the chain (the chain has not reached it yet), and a range
     /// can extend past the tip if the queue was planned against a higher tip; neither is
     /// fetchable, so both are skipped or trimmed.
     async fn next_scan_range(
         &self,
-        chain_tip: BlockHeight,
+        visible_tip: BlockHeight,
     ) -> Result<Option<(BlockHeight, BlockHeight, &'static str)>, WalletError> {
-        let tip = chain_tip.as_u32();
+        let tip = visible_tip.as_u32();
         for range in self.inner.storage.suggest_scan_ranges().await? {
             if range.is_empty() {
                 continue;
@@ -1508,14 +1606,12 @@ impl Wallet {
     /// Fetches and records every new subtree root for all shielded pools.
     ///
     /// Idempotent: re-recording a root the wallet already holds is a no-op, so this runs from
-    /// index 0 each cycle and stops at the first short page. A pool whose roots the chain
-    /// source cannot serve (a server that predates Ironwood subtree roots, or a
-    /// checkpoint-bootstrapped store missing historical root artifacts) is skipped with a
-    /// warning instead of faulting: backfill is a fast-forward optimization, and scanning
-    /// still builds each tree linearly.
+    /// index 0 each cycle and stops at the first short page. Subtree roots are part of the
+    /// required native sync contract, so any source failure aborts the current sync attempt.
     async fn backfill_subtree_roots(
         &self,
         chain: &dyn ChainSource,
+        chain_epoch: zally_chain::ChainEpoch,
         scan_floor: Option<BlockHeight>,
     ) -> Result<(), WalletError> {
         for (pool, protocol) in [
@@ -1528,29 +1624,15 @@ impl Wallet {
         ] {
             let mut next_index = 0_u32;
             loop {
-                let policy = self.retry_policy();
-                let fetched = with_breaker_and_retry(
-                    &self.inner.circuit_breaker,
-                    policy,
-                    "sync.subtree_roots",
-                    || chain.subtree_roots(pool, SubtreeIndex(next_index), SUBTREE_ROOT_PAGE),
-                    WalletError::from,
-                )
-                .await;
-                let roots = match fetched {
-                    Ok(roots) => roots,
-                    Err(err) => {
-                        tracing::warn!(
-                            target: "zally::sync",
-                            event = "wallet_subtree_root_backfill_skipped",
-                            pool = ?pool,
-                            error = %err,
-                            "chain source cannot serve subtree roots for this pool; its \
-                             tree will build from linear scanning"
-                        );
-                        break;
-                    }
-                };
+                let roots = chain
+                    .subtree_roots(
+                        chain_epoch,
+                        pool,
+                        SubtreeIndex(next_index),
+                        SUBTREE_ROOT_PAGE,
+                    )
+                    .await?;
+                validate_subtree_root_page(pool, next_index, SUBTREE_ROOT_PAGE, &roots)?;
                 let page_len = roots.len();
                 let roots = subtree_roots_completed_at_or_below(roots, scan_floor);
                 let is_floor_reached = roots.len() < page_len;
@@ -1587,14 +1669,15 @@ impl Wallet {
         chain: &dyn ChainSource,
         rewind_to: BlockHeight,
     ) -> Result<(), WalletError> {
-        let chain_state = chain_state_at(chain, rewind_to).await?;
+        let chain_epoch = chain.current_epoch().await?;
+        let chain_state = chain_state_at(chain, chain_epoch, rewind_to).await?;
         self.inner
             .storage
             .truncate_to_chain_state(chain_state)
             .await?;
         self.publish_event(WalletEvent::ReorgDetected {
             rolled_back_to_height: rewind_to,
-            new_safe_chain_tip_height: rewind_to,
+            new_settled_tip_height: rewind_to,
         });
         Ok(())
     }
@@ -1620,8 +1703,9 @@ impl Wallet {
     async fn scan_and_emit(
         &self,
         context: ScanContext,
-        from_state: ChainState,
+        from_state: TreeStateArtifact,
         chain: &dyn ChainSource,
+        chain_epoch: zally_chain::ChainEpoch,
     ) -> Result<SyncOutcome, WalletError> {
         let ScanContext {
             blocks,
@@ -1677,11 +1761,11 @@ impl Wallet {
             });
         }
 
-        let transparent_utxo_count = self.sync_transparent_utxos(chain).await?;
+        let transparent_utxo_count = self.sync_transparent_utxos(chain, chain_epoch).await?;
 
         if let Some(diverged_height) = self
-            .verify_tree_roots(chain, outcome.scanned_to_height)
-            .await
+            .verify_tree_roots(chain, chain_epoch, outcome.scanned_to_height)
+            .await?
         {
             return Err(WalletError::TreeRootsDiverged {
                 height: diverged_height,
@@ -1709,45 +1793,29 @@ impl Wallet {
     /// the suspect and points at the proving inputs instead. The wallet roots are anchored at
     /// the latest retained checkpoint, which each scan creates at its final block, so they
     /// correspond to exactly `height`. Both sides decode roots little-endian, so the
-    /// comparison is exact. Skipped checks (read or fetch failures, empty trees) are logged
-    /// and return `None`; only a proven mismatch faults the sync.
+    /// comparison is exact. Empty trees skip the comparison, but storage and chain-source
+    /// failures propagate so an expired epoch pin restarts the complete sync attempt.
     async fn verify_tree_roots(
         &self,
         chain: &dyn ChainSource,
+        chain_epoch: zally_chain::ChainEpoch,
         height: BlockHeight,
-    ) -> Option<BlockHeight> {
-        let wallet_roots = match self.inner.storage.commitment_tree_roots().await {
-            Ok(roots) => roots,
-            Err(err) => {
-                tracing::warn!(
-                    target: "zally::sync",
-                    event = "wallet_tree_root_check_skipped",
-                    height = height.as_u32(),
-                    error = %err,
-                    "could not read wallet commitment-tree roots"
-                );
-                return None;
-            }
-        };
-        let chain_state = match chain_state_at(chain, height).await {
-            Ok(state) => state,
-            Err(err) => {
-                tracing::warn!(
-                    target: "zally::sync",
-                    event = "wallet_tree_root_check_skipped",
-                    height = height.as_u32(),
-                    error = %err,
-                    "could not fetch chain tree state for root check"
-                );
-                return None;
-            }
-        };
-        let chain_sapling = chain_state.final_sapling_tree().root().to_bytes();
-        let chain_orchard = chain_state.final_orchard_tree().root().to_bytes();
-        let chain_ironwood = chain_state.final_ironwood_tree().root().to_bytes();
-        let sapling_match = wallet_roots.sapling.map(|root| root == chain_sapling);
-        let orchard_match = wallet_roots.orchard.map(|root| root == chain_orchard);
-        let ironwood_match = wallet_roots.ironwood.map(|root| root == chain_ironwood);
+    ) -> Result<Option<BlockHeight>, WalletError> {
+        let wallet_roots = self.inner.storage.commitment_tree_roots().await?;
+        let chain_state = chain_state_at(chain, chain_epoch, height).await?;
+        let chain_roots = self.inner.storage.tree_state_roots(chain_state).await?;
+        let sapling_match = wallet_roots
+            .sapling
+            .zip(chain_roots.sapling)
+            .map(|(wallet_root, chain_root)| wallet_root == chain_root);
+        let orchard_match = wallet_roots
+            .orchard
+            .zip(chain_roots.orchard)
+            .map(|(wallet_root, chain_root)| wallet_root == chain_root);
+        let ironwood_match = wallet_roots
+            .ironwood
+            .zip(chain_roots.ironwood)
+            .map(|(wallet_root, chain_root)| wallet_root == chain_root);
 
         match (sapling_match, orchard_match, ironwood_match) {
             (None, None, None) => {
@@ -1757,7 +1825,7 @@ impl Wallet {
                     height = height.as_u32(),
                     "wallet commitment trees are empty"
                 );
-                None
+                Ok(None)
             }
             _ if sapling_match != Some(false)
                 && orchard_match != Some(false)
@@ -1773,7 +1841,7 @@ impl Wallet {
                     ironwood_checked = ironwood_match.is_some(),
                     "wallet commitment-tree roots agree with the chain"
                 );
-                None
+                Ok(None)
             }
             _ => {
                 tracing::warn!(
@@ -1785,14 +1853,14 @@ impl Wallet {
                     orchard_match = ?orchard_match,
                     ironwood_match = ?ironwood_match,
                     wallet_sapling = %wallet_roots.sapling.map_or_else(String::new, hex::encode),
-                    chain_sapling = %hex::encode(chain_sapling),
+                    chain_sapling = %chain_roots.sapling.map_or_else(String::new, hex::encode),
                     wallet_orchard = %wallet_roots.orchard.map_or_else(String::new, hex::encode),
-                    chain_orchard = %hex::encode(chain_orchard),
+                    chain_orchard = %chain_roots.orchard.map_or_else(String::new, hex::encode),
                     wallet_ironwood = %wallet_roots.ironwood.map_or_else(String::new, hex::encode),
-                    chain_ironwood = %hex::encode(chain_ironwood),
+                    chain_ironwood = %chain_roots.ironwood.map_or_else(String::new, hex::encode),
                     "wallet commitment-tree roots diverge from the chain; spends will be rejected"
                 );
-                Some(height)
+                Ok(Some(height))
             }
         }
     }
@@ -1812,69 +1880,88 @@ impl Wallet {
         Ok(())
     }
 
-    async fn sync_transparent_utxos(&self, chain: &dyn ChainSource) -> Result<u64, WalletError> {
+    async fn sync_transparent_utxos(
+        &self,
+        chain: &dyn ChainSource,
+        chain_epoch: zally_chain::ChainEpoch,
+    ) -> Result<u64, WalletError> {
         let receivers = self.inner.storage.list_transparent_receivers().await?;
-        let mut transparent_utxo_count = 0_u64;
+        let mut receiver_batches = Vec::with_capacity(receivers.len());
         for receiver in receivers {
-            let policy = self.retry_policy();
-            let utxos = with_breaker_and_retry(
-                &self.inner.circuit_breaker,
-                policy,
-                "sync.transparent_utxos",
-                || chain.transparent_utxos(&receiver.script_pub_key_bytes),
-                WalletError::from,
-            )
-            .await?;
-
-            let mut transparent_utxo_rows = Vec::with_capacity(utxos.len());
-            for utxo in utxos {
-                if utxo.script_pub_key_bytes != receiver.script_pub_key_bytes {
-                    return Err(WalletError::ChainSource(
-                        ChainSourceError::MalformedCompactBlock {
-                            block_height: utxo.confirmed_at_height,
-                            reason: format!(
-                                "transparent UTXO script did not match wallet receiver for account {:?}",
-                                receiver.account_id
-                            ),
-                        },
-                    ));
-                }
-                let value_zat = zally_core::Zatoshis::try_from(utxo.value_zat).map_err(|_| {
-                    WalletError::ChainSource(ChainSourceError::MalformedCompactBlock {
-                        block_height: utxo.confirmed_at_height,
-                        reason: format!(
-                            "transparent UTXO value {} exceeds MAX_MONEY for account {:?}",
-                            utxo.value_zat, receiver.account_id
-                        ),
-                    })
-                })?;
-                transparent_utxo_rows.push(TransparentUtxoRow::new(
-                    utxo.tx_id,
-                    utxo.output_index,
-                    value_zat,
-                    utxo.confirmed_at_height,
-                    utxo.script_pub_key_bytes,
-                ));
-            }
-            transparent_utxo_count = transparent_utxo_count.saturating_add(
-                self.inner
-                    .storage
-                    .record_transparent_utxos(transparent_utxo_rows)
-                    .await?,
-            );
+            let utxos = chain
+                .transparent_utxos(chain_epoch, &receiver.script_pub_key_bytes)
+                .await?;
+            receiver_batches.push((receiver, utxos));
         }
-        Ok(transparent_utxo_count)
+        let transparent_utxo_rows =
+            validate_transparent_utxo_batches(chain_epoch, receiver_batches)?;
+        Ok(self
+            .inner
+            .storage
+            .record_transparent_utxos(transparent_utxo_rows)
+            .await?)
     }
 }
 
-fn block_timestamp_index(
-    blocks: &[zcash_client_backend::proto::compact_formats::CompactBlock],
-) -> HashMap<u32, u64> {
+fn validate_transparent_utxo_batches(
+    chain_epoch: zally_chain::ChainEpoch,
+    receiver_batches: Vec<(TransparentReceiverRow, Vec<TransparentUtxo>)>,
+) -> Result<Vec<TransparentUtxoRow>, WalletError> {
+    let mut outpoints = std::collections::HashSet::new();
+    let mut transparent_utxo_rows = Vec::new();
+    for (receiver, utxos) in receiver_batches {
+        for utxo in utxos {
+            if utxo.confirmed_at_height > chain_epoch.visible_tip().height {
+                return Err(WalletError::ChainSource(
+                    ChainSourceError::MalformedTransparentUtxoSet {
+                        reason: format!(
+                            "outpoint {}:{} is confirmed at {} above pinned visible tip {}",
+                            utxo.tx_id,
+                            utxo.output_index,
+                            utxo.confirmed_at_height,
+                            chain_epoch.visible_tip().height,
+                        ),
+                    },
+                ));
+            }
+            if !outpoints.insert((utxo.tx_id, utxo.output_index)) {
+                return Err(WalletError::ChainSource(
+                    ChainSourceError::MalformedTransparentUtxoSet {
+                        reason: format!(
+                            "outpoint {}:{} appears more than once",
+                            utxo.tx_id, utxo.output_index
+                        ),
+                    },
+                ));
+            }
+            if utxo.script_pub_key_bytes != receiver.script_pub_key_bytes {
+                return Err(WalletError::ChainSource(
+                    ChainSourceError::MalformedTransparentUtxoSet {
+                        reason: format!(
+                            "outpoint {}:{} script did not match wallet receiver for account {:?}",
+                            utxo.tx_id, utxo.output_index, receiver.account_id
+                        ),
+                    },
+                ));
+            }
+            transparent_utxo_rows.push(TransparentUtxoRow::new(
+                utxo.tx_id,
+                utxo.output_index,
+                utxo.value_zat,
+                utxo.confirmed_at_height,
+                utxo.script_pub_key_bytes,
+            ));
+        }
+    }
+    Ok(transparent_utxo_rows)
+}
+
+fn block_timestamp_index(blocks: &[CompactBlockArtifact]) -> HashMap<u32, u64> {
     blocks
         .iter()
         .map(|block| {
-            let height = u32::try_from(block.height).unwrap_or(u32::MAX);
-            let timestamp_ms = u64::from(block.time).saturating_mul(1_000);
+            let height = block.height.as_u32();
+            let timestamp_ms = u64::from(block.block_time_seconds).saturating_mul(1_000);
             (height, timestamp_ms)
         })
         .collect()
@@ -1902,19 +1989,80 @@ const fn scan_priority_label(priority: ScanPriority) -> &'static str {
 
 async fn fetch_compact_blocks(
     chain: &dyn ChainSource,
+    chain_epoch: zally_chain::ChainEpoch,
     start_height: BlockHeight,
     end_height: BlockHeight,
-) -> Result<Vec<zcash_client_backend::proto::compact_formats::CompactBlock>, WalletError> {
-    let range = BlockHeightRange {
-        start_height,
-        end_height,
-    };
-    let mut stream = chain.compact_blocks(range).await?;
+) -> Result<Vec<CompactBlockArtifact>, WalletError> {
+    let range = BlockHeightRange::new(start_height, end_height).ok_or(WalletError::ChainSource(
+        ChainSourceError::CompactBlockStreamOrder {
+            expected_height: start_height,
+            actual_height: Some(end_height),
+        },
+    ))?;
+    let mut stream = chain.compact_blocks(chain_epoch, range).await?;
     let mut blocks = Vec::new();
     while let Some(stream_item) = stream.next().await {
-        blocks.push(stream_item?);
+        let block = stream_item?;
+        let actual_height = Some(BlockHeight::from(u32::from(block.height)));
+        let received_count = u64::try_from(blocks.len()).unwrap_or(u64::MAX);
+        validate_compact_block_height(start_height, end_height, received_count, actual_height)?;
+        blocks.push(block);
     }
+    let received_count = u64::try_from(blocks.len()).unwrap_or(u64::MAX);
+    validate_compact_block_count(start_height, end_height, received_count)?;
     Ok(blocks)
+}
+
+fn validate_compact_block_height(
+    start_height: BlockHeight,
+    end_height: BlockHeight,
+    received_count: u64,
+    actual_height: Option<BlockHeight>,
+) -> Result<(), WalletError> {
+    let expected_count = u64::from(end_height.as_u32())
+        .saturating_sub(u64::from(start_height.as_u32()))
+        .saturating_add(1);
+    let expected_height = if received_count < expected_count {
+        start_height
+            .as_u32()
+            .checked_add(u32::try_from(received_count).unwrap_or(u32::MAX))
+            .map(BlockHeight::from)
+    } else {
+        None
+    };
+    if actual_height != expected_height {
+        return Err(WalletError::ChainSource(
+            ChainSourceError::CompactBlockStreamOrder {
+                expected_height: expected_height.unwrap_or(end_height),
+                actual_height,
+            },
+        ));
+    }
+    Ok(())
+}
+
+fn validate_compact_block_count(
+    start_height: BlockHeight,
+    end_height: BlockHeight,
+    received_count: u64,
+) -> Result<(), WalletError> {
+    let expected_count = u64::from(end_height.as_u32())
+        .saturating_sub(u64::from(start_height.as_u32()))
+        .saturating_add(1);
+    if received_count != expected_count {
+        let missing_offset = u32::try_from(received_count).unwrap_or(u32::MAX);
+        let expected_height = start_height
+            .as_u32()
+            .checked_add(missing_offset)
+            .map_or(end_height, BlockHeight::from);
+        return Err(WalletError::ChainSource(
+            ChainSourceError::CompactBlockStreamOrder {
+                expected_height,
+                actual_height: None,
+            },
+        ));
+    }
+    Ok(())
 }
 
 /// Fetches the `ChainState` at exactly `height` (the note-commitment frontier after `height`).
@@ -1923,15 +2071,19 @@ async fn fetch_compact_blocks(
 /// decoded.
 pub(crate) async fn chain_state_at(
     chain: &dyn ChainSource,
+    chain_epoch: zally_chain::ChainEpoch,
     height: BlockHeight,
-) -> Result<ChainState, WalletError> {
-    let tree_state = chain.tree_state_at(height).await?;
-    tree_state.to_chain_state().map_err(|io| {
-        WalletError::ChainSource(ChainSourceError::MalformedCompactBlock {
-            block_height: height,
-            reason: format!("invalid tree state: {io}"),
-        })
-    })
+) -> Result<TreeStateArtifact, WalletError> {
+    let tree_state = chain.tree_state_at(chain_epoch, height).await?;
+    if tree_state.height != height {
+        return Err(WalletError::ChainSource(
+            ChainSourceError::TreeStateAnchorHeightMismatch {
+                requested_height: height,
+                returned_height: tree_state.height,
+            },
+        ));
+    }
+    Ok(tree_state)
 }
 
 /// Fetches the `ChainState` anchor immediately below `at_height`.
@@ -1941,10 +2093,12 @@ pub(crate) async fn chain_state_at(
 /// serves the tree state at the exact prior height.
 pub(crate) async fn fetch_prior_chain_state(
     chain: &dyn ChainSource,
+    chain_epoch: zally_chain::ChainEpoch,
     at_height: BlockHeight,
-) -> Result<ChainState, WalletError> {
+) -> Result<TreeStateArtifact, WalletError> {
     chain_state_at(
         chain,
+        chain_epoch,
         BlockHeight::from(at_height.as_u32().saturating_sub(1)),
     )
     .await
@@ -1975,7 +2129,54 @@ fn subtree_roots_completed_at_or_below(
     roots
 }
 
+fn validate_subtree_root_page(
+    pool: ShieldedPool,
+    requested_start: u32,
+    requested_count: u32,
+    roots: &[zally_chain::SubtreeRoot],
+) -> Result<(), WalletError> {
+    if roots.len() > requested_count as usize {
+        return Err(WalletError::ChainSource(
+            ChainSourceError::MalformedSubtreeRootPage {
+                pool,
+                reason: format!(
+                    "returned {} roots for requested count {requested_count}",
+                    roots.len()
+                ),
+            },
+        ));
+    }
+    for (offset, root) in roots.iter().enumerate() {
+        let expected_index =
+            requested_start.saturating_add(u32::try_from(offset).unwrap_or(u32::MAX));
+        if root.index.0 != expected_index {
+            return Err(WalletError::ChainSource(
+                ChainSourceError::MalformedSubtreeRootPage {
+                    pool,
+                    reason: format!("expected index {expected_index}, received {}", root.index.0),
+                },
+            ));
+        }
+    }
+    if roots
+        .windows(2)
+        .any(|pair| pair[0].completing_block_height > pair[1].completing_block_height)
+    {
+        return Err(WalletError::ChainSource(
+            ChainSourceError::MalformedSubtreeRootPage {
+                pool,
+                reason: "completing block heights must be nondecreasing".to_owned(),
+            },
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
+#[allow(
+    clippy::expect_used,
+    reason = "unit-test constructors use fixed values whose invalidity is a fixture bug"
+)]
 mod tests {
     use super::*;
     use zally_chain::{SubtreeIndex, SubtreeRoot};
@@ -1986,6 +2187,78 @@ mod tests {
             root_bytes: [u8::try_from(index).unwrap_or(u8::MAX); 32],
             completing_block_height: BlockHeight::from(height),
         }
+    }
+
+    fn transparent_test_epoch() -> zally_chain::ChainEpoch {
+        let tip = zally_chain::BlockId {
+            height: BlockHeight::from(10),
+            hash: zally_core::BlockHash::from_bytes([10; 32]),
+        };
+        zally_chain::ChainEpoch::new(
+            zally_chain::ChainEpochId::new(1),
+            Network::regtest(),
+            tip,
+            tip,
+        )
+        .expect("test epoch is valid")
+    }
+
+    fn transparent_receiver(id: u128, script: &[u8]) -> TransparentReceiverRow {
+        TransparentReceiverRow::new(
+            zally_core::AccountId::from_uuid(uuid::Uuid::from_u128(id)),
+            script.to_vec(),
+        )
+    }
+
+    fn transparent_utxo(tx_byte: u8, script: &[u8], height: u32) -> TransparentUtxo {
+        TransparentUtxo {
+            tx_id: zally_core::TxId::from_bytes([tx_byte; 32]),
+            output_index: 0,
+            value_zat: zally_core::Zatoshis::try_from(1).unwrap_or(zally_core::Zatoshis::zero()),
+            confirmed_at_height: BlockHeight::from(height),
+            script_pub_key_bytes: script.to_vec(),
+        }
+    }
+
+    #[test]
+    fn later_malformed_receiver_yields_no_storage_batch() {
+        let result = validate_transparent_utxo_batches(
+            transparent_test_epoch(),
+            vec![
+                (
+                    transparent_receiver(1, &[1]),
+                    vec![transparent_utxo(1, &[1], 9)],
+                ),
+                (
+                    transparent_receiver(2, &[2]),
+                    vec![transparent_utxo(2, &[2], 11)],
+                ),
+            ],
+        );
+        assert!(matches!(
+            result,
+            Err(WalletError::ChainSource(
+                ChainSourceError::MalformedTransparentUtxoSet { .. }
+            ))
+        ));
+    }
+
+    #[test]
+    fn cross_receiver_duplicate_yields_no_storage_batch() {
+        let duplicate = transparent_utxo(1, &[1], 9);
+        let result = validate_transparent_utxo_batches(
+            transparent_test_epoch(),
+            vec![
+                (transparent_receiver(1, &[1]), vec![duplicate.clone()]),
+                (transparent_receiver(2, &[1]), vec![duplicate]),
+            ],
+        );
+        assert!(matches!(
+            result,
+            Err(WalletError::ChainSource(
+                ChainSourceError::MalformedTransparentUtxoSet { .. }
+            ))
+        ));
     }
 
     #[test]
@@ -2009,6 +2282,109 @@ mod tests {
         assert_eq!(kept_at_boundary.len(), 3);
 
         assert!(subtree_roots_completed_at_or_below(roots, None).is_empty());
+    }
+
+    #[test]
+    fn subtree_root_pages_require_requested_bounds_and_ordering() {
+        let pool = ShieldedPool::Orchard;
+        assert!(
+            validate_subtree_root_page(
+                pool,
+                3,
+                2,
+                &[
+                    subtree_root_completing_at(3, 10),
+                    subtree_root_completing_at(4, 11),
+                ]
+            )
+            .is_ok()
+        );
+        for malformed in [
+            vec![
+                subtree_root_completing_at(3, 10),
+                subtree_root_completing_at(5, 11),
+            ],
+            vec![
+                subtree_root_completing_at(3, 11),
+                subtree_root_completing_at(4, 10),
+            ],
+            vec![
+                subtree_root_completing_at(3, 10),
+                subtree_root_completing_at(4, 11),
+                subtree_root_completing_at(5, 12),
+            ],
+        ] {
+            assert!(matches!(
+                validate_subtree_root_page(pool, 3, 2, &malformed),
+                Err(WalletError::ChainSource(
+                    ChainSourceError::MalformedSubtreeRootPage { .. }
+                ))
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn chain_state_at_rejects_custom_source_height_mismatch() {
+        let chain = zally_testkit::MockChainSource::new(Network::regtest());
+        let handle = chain.handle();
+        handle.advance_tip(BlockHeight::from(8));
+        let chain_epoch = chain.current_epoch().await.expect("mock epoch");
+        handle.serve_tree_state_for(
+            BlockHeight::from(7),
+            TreeStateArtifact {
+                network: Network::regtest(),
+                height: BlockHeight::from(8),
+                block_hash: zally_core::BlockHash::from_bytes([8; 32]),
+                block_time_seconds: 0,
+                sapling_final_state_bytes: vec![1],
+                orchard_final_state_bytes: vec![1],
+                ironwood_final_state_bytes: Vec::new(),
+            },
+        );
+        assert!(matches!(
+            chain_state_at(&chain, chain_epoch, BlockHeight::from(7)).await,
+            Err(WalletError::ChainSource(
+                ChainSourceError::TreeStateAnchorHeightMismatch { .. }
+            ))
+        ));
+    }
+
+    #[test]
+    fn compact_block_sequence_rejects_missing_duplicate_and_out_of_order_heights() {
+        let start = BlockHeight::from(10);
+        let end = BlockHeight::from(12);
+
+        assert!(matches!(
+            validate_compact_block_count(start, end, 2),
+            Err(WalletError::ChainSource(
+                ChainSourceError::CompactBlockStreamOrder {
+                    expected_height,
+                    actual_height: None,
+                }
+            )) if expected_height == BlockHeight::from(12)
+        ));
+        for actual_height in [BlockHeight::from(10), BlockHeight::from(12)] {
+            assert!(matches!(
+                validate_compact_block_height(start, end, 1, Some(actual_height)),
+                Err(WalletError::ChainSource(
+                    ChainSourceError::CompactBlockStreamOrder {
+                        expected_height,
+                        actual_height: Some(observed_height),
+                    }
+                )) if expected_height == BlockHeight::from(11)
+                    && observed_height == actual_height
+            ));
+        }
+    }
+
+    #[test]
+    fn compact_block_sequence_accepts_the_full_u32_height_domain() {
+        let start = BlockHeight::from(0);
+        let end = BlockHeight::from(u32::MAX);
+
+        assert!(validate_compact_block_height(start, end, 0, Some(start)).is_ok());
+        assert!(validate_compact_block_height(start, end, u64::from(u32::MAX), Some(end),).is_ok());
+        assert!(validate_compact_block_count(start, end, u64::from(u32::MAX) + 1).is_ok());
     }
 
     #[test]

@@ -19,9 +19,11 @@ pub struct WalletMetrics {
     /// Highest block height the wallet has scanned, if any. `None` until the first
     /// successful [`Wallet::sync`] call records progress.
     pub scanned_height: Option<BlockHeight>,
-    /// Chain tip the wallet's most recent sync observed, if any.
-    pub safe_chain_tip_height: Option<BlockHeight>,
-    /// Number of blocks between `scanned_height` and `safe_chain_tip_height`, if both are known
+    /// Highest source-visible block recorded by the most recent sync, if any.
+    pub visible_tip_height: Option<BlockHeight>,
+    /// Settled finality height recorded by the most recent sync, if any.
+    pub settled_tip_height: Option<BlockHeight>,
+    /// Number of blocks between `scanned_height` and `visible_tip_height`, if both are known
     /// and the tip has not regressed.
     pub lag_blocks: Option<u32>,
     /// Number of accounts the wallet manages. Always 1: Zally holds one account per wallet.
@@ -36,14 +38,15 @@ impl Wallet {
     /// Returns a typed metrics snapshot.
     ///
     /// `not_retryable` only for catastrophic storage failures; otherwise infallible.
-    /// `scanned_height` and `safe_chain_tip_height` stay `None` until the first successful
+    /// `scanned_height`, `visible_tip_height`, and `settled_tip_height` stay `None` until the first successful
     /// [`Wallet::sync`] records progress.
     pub async fn metrics_snapshot(&self) -> Result<WalletMetrics, WalletError> {
         let status = self.status_snapshot().await?;
         Ok(WalletMetrics {
             network: status.network,
             scanned_height: status.scanned_height,
-            safe_chain_tip_height: status.safe_chain_tip_height,
+            visible_tip_height: status.visible_tip_height,
+            settled_tip_height: status.settled_tip_height,
             lag_blocks: status.lag_blocks,
             account_count: status.account_count,
             event_subscriber_count: status.event_subscriber_count,
