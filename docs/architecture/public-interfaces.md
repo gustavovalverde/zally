@@ -94,7 +94,7 @@ A name must survive a change of its implementation.
 | `Memo` | `zally-core` | ZIP-302 memo wrapper. Refuses construction over 512 bytes. |
 | `TransparentGapLimit` | `zally-core` | BIP-44 gap-limit policy (`external`, `internal`, `ephemeral`). Zally raises the external/ephemeral defaults above the upstream `GapLimits::default()` to avoid Sapling-diversifier-driven first-reservation failures on a randomly-seeded fresh wallet. |
 | `Wallet` | `zally-wallet` | The operator-facing handle. Async API. |
-| `AccountBalance` | `zally-wallet` | Per-pool balance snapshot anchored to the last observed chain tip; network-tagged with mature/immature transparent split. |
+| `AccountBalance` | `zally-wallet` | Per-pool balance snapshot anchored to the persisted visible tip; network-tagged with mature/immature transparent split. |
 | `ExposedAddress` | `zally-wallet` | Previously-derived Unified Address in derivation order, with diversifier index and transparent-receiver flag. |
 | `PendingTransparentInputs` | `zally-wallet` | Snapshot of transparent outpoints locked by wallet-owned broadcasts not yet observed mined. |
 | `PendingTransparentInput` | `zally-wallet` | Single locked outpoint, with `broadcast_tx_id`, `broadcast_at_ms`, and `broadcast_at_height`. The same field names appear on the storage-side row; no rename across layers. |
@@ -140,8 +140,8 @@ pub enum SyncStatus {
     NotStarted,
     Starting { target_height: BlockHeight },
     CatchingUp { scanned_height: BlockHeight, target_height: BlockHeight, lag_blocks: u32 },
-    AtTip { tip_height: BlockHeight },
-    TipRegressed { scanned_height: BlockHeight, chain_tip_height: BlockHeight },
+    AtTip { visible_tip_height: BlockHeight },
+    TipRegressed { scanned_height: BlockHeight, visible_tip_height: BlockHeight },
 }
 
 pub enum ReceiverKind {
@@ -186,6 +186,7 @@ Zally is library-shaped and does not own a TOML config. Crates that surface conf
 When operators integrating Zally construct their own TOML or env-var layout:
 
 - Env var prefix per consumer: for example, `WALLET_` or an application-specific product prefix. Zally itself does not prescribe one.
+- Explicit Sapling proving-parameter paths are selected through `SqliteOptions::with_sapling_proving_parameters`; omitting them uses the platform-default parameter directory.
 - Test-only env vars (read by `zally-testkit`) use `ZALLY_TEST_*`. Production binaries strip these.
 - Live-node gate: `ZALLY_TEST_LIVE=1`. Mainnet allowance: `ZALLY_TEST_ALLOW_MAINNET=1`.
 - Sensitive leaves (`password`, `secret`, `token`, `key`, `seed`, `wif`) are never set via env var on their own; they come from a secret manager or sealed at-rest material.
@@ -197,7 +198,7 @@ Per the Zally identifier-naming and codebase-structure rules:
 - File names match the primary export, with the crate-context prefix dropped. `zally-wallet/src/wallet.rs` exports `Wallet`; `zally-chain/src/source.rs` exports `ChainSource`; `zally-chain/src/error.rs` exports `ChainSourceError` and `SubmitterError`; `zally-wallet/src/error.rs` exports `WalletError`. The type retains the bounded-context prefix (`WalletError`, `ChainSourceError`, `PcztError`) so cross-workspace grep stays exact; the file drops it so in-crate paths stay short.
 - No `mod.rs` files. Use `{module_name}.rs` siblings.
 - No `index.rs`, no `lib_internal.rs`, no other barrel-shaped names. Each file declares what it exports.
-- No stuttering paths: inside `zally-pczt/src/` the error file is `error.rs`, not `pczt_error.rs`; inside `zally-chain/src/` the buffered adapter is `buffered_source.rs`, not `buffered_chain_source.rs`.
+- No stuttering paths: inside `zally-pczt/src/` the error file is `error.rs`, not `pczt_error.rs`; inside `zally-chain/src/` the Zinder adapter is `zinder_source.rs`, not `zinder_chain_source.rs`.
 - No single-file directories. If `keys/` contains only `sealing.rs`, promote to `keys_sealing.rs` at the crate root.
 
 ## Cross-domain disambiguation
@@ -242,7 +243,7 @@ The contract surface Zally publishes, grouped by domain. Each item is a guarante
 
 ### Chain source and submission (CHAIN)
 
-- **CHAIN-1**: `ChainSource` trait with methods for compact-block range fetch, latest tree state, transaction lookup, address-UTXO read, and cursor-bound chain events.
+- **CHAIN-1**: `ChainSource` trait with source-neutral `CompactBlockArtifact` and `TreeStateArtifact` values, epoch-pinned range and tree-state reads, transaction lookup, address-UTXO reads, and cursor-bound chain events. Librustzcash and lightwalletd protocol types remain private to storage conversion and compatibility services.
 - **CHAIN-2**: `Submitter` trait with a single `submit(raw_tx) -> SubmitOutcome` method.
 - **CHAIN-3**: Reconnect, retry, and circuit-breaker logic at the wallet boundary, not duplicated in each embedding application.
 - **CHAIN-4**: `ChainEventCursor` is opaque Zally vocabulary. Backend cursor types never cross the public Zally API.
@@ -256,7 +257,7 @@ The contract surface Zally publishes, grouped by domain. Each item is a guarante
 - **SYNC-3**: Reorg handling: on continuity error, automatic rollback to the longest common prefix; emit `WalletEvent::ReorgDetected`.
 - **SYNC-4**: Configurable confirmation depth per receiver purpose (default 1 for non-coinbase, mandatory 100 for coinbase per ZIP-213).
 - **SYNC-5**: `WalletEvent` async stream for `ShieldedReceiveObserved`, `TransactionConfirmed`, `ReorgDetected`, `ScanProgress`.
-- **SYNC-6**: `SyncDriver` provides a caller-owned continuous sync loop over `Wallet::sync`, `ChainSource::chain_event_envelopes`, polling fallback, and bounded per-sync timeouts.
+- **SYNC-6**: `SyncDriver` performs one immediate catch-up, then starts wallet sync only for delivered chain events or explicit expired-cursor reconciliation. Timer ticks are limited to bounded reconnect, backoff, park, and reprobe work.
 - **SYNC-7**: `Wallet::status_snapshot() -> WalletStatus` reports `SyncStatus`, scan height, observed tip, lag, subscriber count, and circuit-breaker state.
 - **SYNC-8**: `Wallet::open_or_create_account(...) -> (Wallet, AccountId)` opens the sealed-seed account or creates it on a fresh storage volume.
 - **SYNC-9**: `Wallet::sync(...)` refreshes wallet-owned transparent UTXOs through `ChainSource::transparent_utxos` because compact blocks do not expose transparent receive details.
@@ -270,7 +271,7 @@ The contract surface Zally publishes, grouped by domain. Each item is a guarante
 - **SPEND-5**: `nExpiryHeight` set per ZIP-203.
 - **SPEND-6**: ZIP-321 payment URI parsing through `PaymentRequest::from_uri`.
 - **SPEND-7**: `Wallet::shield_transparent_funds(ShieldTransparentPlan) -> SendOutcome` explicitly shields wallet-owned transparent UTXOs before shielded spending. `ShieldTransparentPlan::with_destination_pool(ShieldedPool)` selects Sapling, Orchard, or Ironwood explicitly; omitting it preserves the activation-aware default. Transparent outpoints locked by a still-unconfirmed wallet-owned broadcast are excluded from input selection at the `InputSource::get_spendable_transparent_outputs` seam (see `WalletOptions::pending_broadcast_window_ms`). When the filter removes every eligible input the spend fails closed with `WalletError::InsufficientBalance`, not a generic proposal-rejected error.
-- **SPEND-8**: `Wallet::get_account_balance(account_id) -> AccountBalance` returns a per-pool balance snapshot (Sapling, Orchard, Ironwood, transparent-mature, transparent-immature) anchored to the wallet's last observed chain tip. Read-only; composes the persisted wallet rows that drive `Wallet::sync` and `Wallet::list_unspent_shielded_notes`. Transparent values split by ZIP-213 coinbase maturity (100 confirmations) computed against `as_of_height + 1`, matching `zcash_client_backend`'s `chain_tip + 1` convention.
+- **SPEND-8**: `Wallet::get_account_balance(account_id) -> AccountBalance` returns a per-pool balance snapshot (Sapling, Orchard, Ironwood, transparent-mature, transparent-immature) anchored to the wallet's persisted visible tip. Read-only; composes the persisted wallet rows that drive `Wallet::sync` and `Wallet::list_unspent_shielded_notes`. Transparent values split by ZIP-213 coinbase maturity (100 confirmations) computed against `as_of_height + 1`, matching `zcash_client_backend`'s `chain_tip + 1` convention.
 - **SPEND-9**: `Wallet::get_pending_transparent_inputs(account_id) -> PendingTransparentInputs` returns the transparent outpoints currently locked by wallet-owned broadcasts not yet observed mined. The snapshot honours `WalletOptions::pending_broadcast_window_ms`: rows whose broadcast timestamp falls outside the window are excluded so a permanently-dropped broadcast eventually frees its outpoints.
 - **SPEND-10**: `Wallet::send_payment` excludes the same pending-broadcast outpoints as SPEND-7 from transparent input selection via the same `InputSource` override; no path-specific filter exists. Records its broadcast inputs to storage *before* calling `Submitter::submit`, so a crash window between submit and persistence does not leave an in-flight broadcast unrecorded.
 - **SPEND-11**: `Wallet::reserve_for_dispense(ReserveForDispensePlan) -> DispenseReservation` atomically locks `amount_zat` of the account's shielded balance against the caller-supplied `request_id`. The reservation persists in storage so it survives a process restart; concurrent reservations whose amounts sum above spendable cannot both pass (one returns `InsufficientBalance`). The wallet plane exposes `Wallet::release_dispense_reservation`, `Wallet::finalize_dispense_reservation`, and `Wallet::spendable_for_next_dispense` to complete the lifecycle; the latter subtracts every active reservation from the wallet's shielded view. See [ADR-0003](../adrs/0003-dispense-reservations.md).

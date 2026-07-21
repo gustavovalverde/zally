@@ -30,6 +30,7 @@ mod receiver_purpose;
 mod signed_payload;
 mod transparent_gap;
 mod txid;
+mod wallet_scan;
 mod zatoshis;
 
 pub use account_id::AccountId;
@@ -54,4 +55,9 @@ pub use receiver_purpose::ReceiverPurpose;
 pub use signed_payload::{Amount, AmountUnit, ExpiresAt, SignedPayload, SignedPayloadFormat};
 pub use transparent_gap::TransparentGapLimit;
 pub use txid::TxId;
+pub use wallet_scan::{
+    CompactBlockArtifact, CompactChainMetadata, CompactSaplingOutput, CompactSaplingSpend,
+    CompactShieldedAction, CompactTransaction, CompactTransparentInput, CompactTransparentOutput,
+    TreeStateArtifact,
+};
 pub use zatoshis::{Zatoshis, ZatoshisError};

@@ -142,7 +142,7 @@ impl FundedZinderRoundTrip {
 
         let chain = ZinderChainSource::connect_remote(ZinderRemoteOptions { endpoint, network })?;
         let submitter = chain.submitter();
-        let tip = chain.safe_chain_tip().await?;
+        let tip = chain.current_epoch().await?.settled_tip().height;
         let (wallet_path, wallet, account_id) = create_wallet_at_tip(&chain, network, tip).await?;
 
         let chain_source: Arc<dyn ChainSource> = Arc::new(chain.clone());
@@ -186,7 +186,7 @@ impl FundedZinderRoundTrip {
         let funding_tx_id = require_accepted(self.submitter.submit(&funding_tx).await?, "funding")?;
         self.miner
             .generate_blocks(TRANSPARENT_FUNDING_CONFIRMATION_BLOCKS)?;
-        let funded_height = self.miner.safe_chain_tip_height()?;
+        let funded_height = self.miner.visible_tip_height()?;
         wait_until_transparent_utxo_at_tip(&mut self.sync_snapshots, funded_height).await?;
         Ok(funding_tx_id)
     }
@@ -208,7 +208,7 @@ impl FundedZinderRoundTrip {
             .await?;
         self.miner
             .generate_blocks(SHIELDED_SPEND_CONFIRMATION_BLOCKS)?;
-        let shielded_height = self.miner.safe_chain_tip_height()?;
+        let shielded_height = self.miner.visible_tip_height()?;
         wait_until_at_tip_at_or_above(&mut self.sync_snapshots, shielded_height).await?;
         let receives = self.wallet.list_shielded_receives(self.account_id).await?;
         assert!(
@@ -235,7 +235,7 @@ impl FundedZinderRoundTrip {
             .await?;
         self.miner
             .generate_blocks(SHIELDED_SPEND_CONFIRMATION_BLOCKS)?;
-        let send_height = self.miner.safe_chain_tip_height()?;
+        let send_height = self.miner.visible_tip_height()?;
         wait_until_at_tip_at_or_above(&mut self.sync_snapshots, send_height).await?;
         Ok(send_outcome.tx_id())
     }
@@ -260,7 +260,7 @@ impl FundedZinderRoundTrip {
             .extract_and_submit_pczt(signed_pczt, &self.submitter)
             .await?;
         self.miner.generate_blocks(1)?;
-        let pczt_height = self.miner.safe_chain_tip_height()?;
+        let pczt_height = self.miner.visible_tip_height()?;
         wait_until_at_tip_at_or_above(&mut self.sync_snapshots, pczt_height).await?;
         let transaction_id = pczt_outcome.tx_id();
         let disclosure = self
@@ -409,8 +409,8 @@ async fn wait_until_at_tip_at_or_above(
         while let Some(snapshot) = snapshots.next().await {
             if matches!(
                 snapshot.sync_status,
-                SyncStatus::AtTip { safe_chain_tip_height }
-                    if safe_chain_tip_height.as_u32() >= min_tip_height.as_u32()
+                SyncStatus::AtTip { visible_tip_height }
+                    if visible_tip_height.as_u32() >= min_tip_height.as_u32()
             ) {
                 return Ok(());
             }
@@ -433,8 +433,8 @@ async fn wait_until_transparent_utxo_at_tip(
         while let Some(snapshot) = snapshots.next().await {
             let is_at_target_tip = matches!(
                 snapshot.sync_status,
-                SyncStatus::AtTip { safe_chain_tip_height }
-                    if safe_chain_tip_height.as_u32() >= min_tip_height.as_u32()
+                SyncStatus::AtTip { visible_tip_height }
+                    if visible_tip_height.as_u32() >= min_tip_height.as_u32()
             );
             let has_transparent_utxo = snapshot
                 .last_outcome
@@ -623,7 +623,7 @@ impl JsonRpcClient {
         Ok(())
     }
 
-    fn safe_chain_tip_height(&self) -> Result<BlockHeight, TestError> {
+    fn visible_tip_height(&self) -> Result<BlockHeight, TestError> {
         let rpc_result = self.call("getblockchaininfo", &json!([]))?;
         let blocks = rpc_result
             .get("blocks")
@@ -675,7 +675,7 @@ impl JsonRpcClient {
     }
 
     fn locate_spendable_coinbase(&self, test_address: &str) -> Result<TestCoinbase, TestError> {
-        let target_height = self.safe_chain_tip_height()?.as_u32().saturating_add(1);
+        let target_height = self.visible_tip_height()?.as_u32().saturating_add(1);
         let maturity_cutoff = target_height.saturating_sub(100);
         let mut utxos = self.address_utxos(test_address)?;
         utxos.sort_by_key(|utxo| utxo.satoshis);

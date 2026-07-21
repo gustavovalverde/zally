@@ -8,7 +8,7 @@
 //! 3. Reading one tree-state artifact at the tip.
 //!
 //! ```sh
-//! ZINDER_ENDPOINT=http://127.0.0.1:9101 \
+//! ZINDER_ENDPOINT=http://127.0.0.1:9102 \
 //!   ZALLY_NETWORK=regtest \
 //!   cargo run --example live-zinder-probe --features zinder
 //! ```
@@ -51,7 +51,8 @@ async fn main() -> Result<(), ExampleError> {
     })
     .map_err(ExampleError::Chain)?;
 
-    let tip = chain.safe_chain_tip().await.map_err(ExampleError::Chain)?;
+    let chain_epoch = chain.current_epoch().await.map_err(ExampleError::Chain)?;
+    let tip = chain_epoch.settled_tip().height;
     info!(
         target: "zally::example",
         event = "live_zinder_tip_observed",
@@ -83,17 +84,20 @@ async fn main() -> Result<(), ExampleError> {
         "Wallet::sync completed against live zinder"
     );
 
+    let tree_epoch = chain.current_epoch().await.map_err(ExampleError::Chain)?;
+    let tree_tip = tree_epoch.settled_tip().height;
     let tree_state = chain
-        .tree_state_at(tip)
+        .tree_state_at(tree_epoch, tree_tip)
         .await
         .map_err(ExampleError::Chain)?;
     info!(
         target: "zally::example",
         event = "live_zinder_tree_state",
-        height = tree_state.height,
-        sapling_tree_bytes = tree_state.sapling_tree.len(),
-        orchard_tree_bytes = tree_state.orchard_tree.len(),
-        "live zinder served tree state at tip (JSON->proto translated)"
+        height = tree_state.height.as_u32(),
+        sapling_tree_bytes = tree_state.sapling_final_state_bytes.len(),
+        orchard_tree_bytes = tree_state.orchard_final_state_bytes.len(),
+        ironwood_tree_bytes = tree_state.ironwood_final_state_bytes.len(),
+        "live zinder served source-neutral tree state at tip"
     );
 
     probe_live_propose(&wallet, account_id, network).await?;

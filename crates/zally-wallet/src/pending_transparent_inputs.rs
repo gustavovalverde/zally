@@ -21,7 +21,7 @@ pub struct PendingTransparentInput {
 }
 
 /// Snapshot of every transparent outpoint currently locked by wallet-owned broadcasts for
-/// one account, anchored to the wallet's last observed chain tip.
+/// one account, anchored to the wallet's persisted visible tip.
 ///
 /// Returned by [`crate::Wallet::get_pending_transparent_inputs`]. Operators use this view to
 /// reason about "what funds are in flight right now?" without inspecting the spending

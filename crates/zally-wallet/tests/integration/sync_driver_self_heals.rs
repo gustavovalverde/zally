@@ -8,17 +8,16 @@ use std::time::Duration;
 use async_trait::async_trait;
 use parking_lot::Mutex;
 use zally_chain::{
-    BlockHeightRange, ChainEventEnvelopeStream, ChainEventStreamStart, ChainSource,
+    BlockHeightRange, ChainEpoch, ChainEventEnvelopeStream, ChainEventStreamStart, ChainSource,
     ChainSourceError, CompactBlockStream, ShieldedPool, SubtreeIndex, SubtreeRoot,
     TransactionStatus, TransparentUtxo,
 };
-use zally_core::{BlockHeight, Network, TxId};
+use zally_core::{BlockHeight, Network, TreeStateArtifact, TxId};
 use zally_testkit::MockChainSource;
 use zally_wallet::{
     SyncDriver, SyncDriverOptions, SyncDriverPhase, SyncRecoveryPolicy, SyncRepair, WalletError,
     WalletEvent,
 };
-use zcash_client_backend::proto::service::TreeState;
 
 use super::fixtures::{
     SnapshotWaitError, TestWalletError, TestWalletFixture, create_test_wallet, wait_for_snapshot,
@@ -46,7 +45,7 @@ async fn fault_ladder_escalates_through_rewind_to_rescan_then_recovers() -> Resu
     let chain = Arc::new(MockChainSource::new(network));
     let chain_handle = chain.handle();
     chain_handle.advance_tip(BlockHeight::from(40));
-    chain_handle.fail_chain_tip_next(3, || ChainSourceError::BlockHeightBelowFloor {
+    chain_handle.fail_current_epoch_next(3, || ChainSourceError::BlockHeightBelowFloor {
         requested_height: BlockHeight::from(10),
         earliest_height: BlockHeight::from(20),
     });
@@ -238,7 +237,7 @@ async fn close_returns_promptly_during_fault_backoff() -> Result<(), TestError> 
     let chain = Arc::new(MockChainSource::new(network));
     let chain_handle = chain.handle();
     chain_handle.advance_tip(BlockHeight::from(10));
-    chain_handle.fail_chain_tip_next(10, || ChainSourceError::Unavailable {
+    chain_handle.fail_current_epoch_next(10, || ChainSourceError::Unavailable {
         reason: "synthetic fault for backoff".into(),
     });
 
@@ -296,35 +295,36 @@ impl ChainSource for ShiftingNetworkChain {
         *self.reported_network.lock()
     }
 
-    async fn safe_chain_tip(&self) -> Result<BlockHeight, ChainSourceError> {
-        self.inner.safe_chain_tip().await
-    }
-
-    async fn chain_tip(&self) -> Result<BlockHeight, ChainSourceError> {
-        self.inner.chain_tip().await
+    async fn current_epoch(&self) -> Result<ChainEpoch, ChainSourceError> {
+        self.inner.current_epoch().await
     }
 
     async fn compact_blocks(
         &self,
+        chain_epoch: ChainEpoch,
         block_range: BlockHeightRange,
     ) -> Result<CompactBlockStream, ChainSourceError> {
-        self.inner.compact_blocks(block_range).await
+        self.inner.compact_blocks(chain_epoch, block_range).await
     }
 
     async fn tree_state_at(
         &self,
+        chain_epoch: ChainEpoch,
         block_height: BlockHeight,
-    ) -> Result<TreeState, ChainSourceError> {
-        self.inner.tree_state_at(block_height).await
+    ) -> Result<TreeStateArtifact, ChainSourceError> {
+        self.inner.tree_state_at(chain_epoch, block_height).await
     }
 
     async fn subtree_roots(
         &self,
+        chain_epoch: ChainEpoch,
         pool: ShieldedPool,
         start_index: SubtreeIndex,
         max_count: u32,
     ) -> Result<Vec<SubtreeRoot>, ChainSourceError> {
-        self.inner.subtree_roots(pool, start_index, max_count).await
+        self.inner
+            .subtree_roots(chain_epoch, pool, start_index, max_count)
+            .await
     }
 
     async fn transaction_status(&self, tx_id: TxId) -> Result<TransactionStatus, ChainSourceError> {
@@ -333,9 +333,12 @@ impl ChainSource for ShiftingNetworkChain {
 
     async fn transparent_utxos(
         &self,
+        chain_epoch: ChainEpoch,
         script_pub_key_bytes: &[u8],
     ) -> Result<Vec<TransparentUtxo>, ChainSourceError> {
-        self.inner.transparent_utxos(script_pub_key_bytes).await
+        self.inner
+            .transparent_utxos(chain_epoch, script_pub_key_bytes)
+            .await
     }
 
     async fn chain_event_envelopes(

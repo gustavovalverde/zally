@@ -16,7 +16,7 @@
 
 This design is the same shape that produced the zinder 2026-05-15 production incident (writer exits on an unknown JSON-RPC error code). The bool cannot describe operator-action failures distinctly from caller-bug failures, and the mapping table loses every typed identity the upstream client already provides. New `IndexerError` variants default to `UpstreamFailed { is_retryable: false }` until the table is updated, which means a future zinder release can silently degrade.
 
-In parallel, `zinder-client` already exposes `IndexerError::retry_policy() -> RetryPolicy` with three variants (`RetryWithBackoff`, `OperatorActionRequired`, `ClientError`) that is documented to be stable across zinder releases. Zally was re-deriving this classification with strictly less information.
+In parallel, `zinder-client` already exposes `IndexerError::retry_policy() -> RetryPolicy` with four variants (`RetryWithBackoff`, `RefreshChainEpoch`, `OperatorActionRequired`, `ClientError`) that is documented to be stable across zinder releases. Zally was re-deriving this classification with strictly less information.
 
 ## Decision
 
@@ -32,7 +32,7 @@ In parallel, `zinder-client` already exposes `IndexerError::retry_policy() -> Re
 
 6. **Boundary-error types keep their bool.** `StorageError`, `SealingError`, `KeyDerivationError`, and `PcztError` retain their `is_retryable()` method because their domains only need a binary retry signal. The wallet-side `HasFailurePosture` impl maps their bool to `{Retryable, NotRetryable}` mechanically.
 
-7. **Testkit injects errors via a closure factory.** `MockChainSource::fail_chain_tip_next` and `MockSubmitter::fail_submit_next` take `impl FnMut() -> ChainSourceError` rather than a single cloneable error. This removes the `Clone` derive requirement on error types (which would otherwise force an `Arc<IndexerError>` indirection because zinder-client's `IndexerError` does not implement `Clone`).
+7. **Testkit injects errors via a closure factory.** `MockChainSource::fail_current_epoch_next` and `MockSubmitter::fail_submit_next` take `impl FnMut() -> ChainSourceError` rather than a single cloneable error. This removes the `Clone` derive requirement on error types (which would otherwise force an `Arc<IndexerError>` indirection because zinder-client's `IndexerError` does not implement `Clone`).
 
 ## Consequences
 
@@ -40,7 +40,7 @@ In parallel, `zinder-client` already exposes `IndexerError::retry_policy() -> Re
 - Operator dashboards have access to the typed cause (`zinder indexer error: invalid request: …`) instead of the previous adapter-rewritten string (`zinder rejected the request: …`).
 - The circuit breaker is no longer poisoned by operator-action failures. A misconfigured upstream (`IndexerError::FailedPrecondition`) or a malformed compact block (`ChainSourceError::MalformedCompactBlock`) keeps the breaker closed; only genuine transient backend trouble flips it open.
 - `WalletError::ChainSource` and `WalletError::Submitter` change from struct variants to tuple variants. Consumers that pattern-match must rewrite `Upstream::ChainSource { .. }` to `Upstream::ChainSource(_)`. There is no compatibility shim: the previous shape was the source of the bug class this ADR removes.
-- The testkit failure-injection API takes a closure. Call sites change from `fail_chain_tip_next(2, ChainSourceError::Unavailable { reason: "…".into() })` to `fail_chain_tip_next(2, || ChainSourceError::Unavailable { reason: "…".into() })`. New tests can inject distinct errors per attempt without API friction.
+- The testkit failure-injection API takes a closure. Call sites change from `fail_current_epoch_next(2, ChainSourceError::Unavailable { reason: "…".into() })` to `fail_current_epoch_next(2, || ChainSourceError::Unavailable { reason: "…".into() })`. New tests can inject distinct errors per attempt without API friction.
 - The sync driver lifecycle has no failed state: `SyncSnapshot::last_fault` (`SyncFault`) carries the repair classification (`SyncRepair`) the driver applies, and faults engage the repair ladder instead of terminating the task.
 - `IsRetryable` is removed from the public surface; consumers that took `IsRetryable` as a trait bound import `HasFailurePosture` and call `failure_posture()`.
 

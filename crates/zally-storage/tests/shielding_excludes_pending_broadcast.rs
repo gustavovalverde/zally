@@ -18,13 +18,19 @@ use std::path::{Path, PathBuf};
 
 use prost::Message as _;
 use tempfile::TempDir;
-use zally_core::{BlockHeight, Network, OutPoint, TxId, Zatoshis};
+#[path = "fixtures/sapling_proving_parameters.rs"]
+mod sapling_proving_parameters;
+#[path = "fixtures/scan_artifact.rs"]
+mod scan_artifact;
+
+use zally_core::{
+    BlockHeight, CompactBlockArtifact, Network, OutPoint, TreeStateArtifact, TxId, Zatoshis,
+};
 use zally_keys::{Mnemonic, SeedMaterial};
 use zally_storage::{
     ScanRequest, ShieldTransparentRequest, Sqlite, SqliteOptions, StorageError, TransparentUtxoRow,
     WalletStorage,
 };
-use zcash_client_backend::data_api::chain::ChainState;
 use zcash_client_backend::proto::compact_formats::CompactBlock;
 use zcash_client_backend::proto::service::TreeState;
 use zcash_transparent::address::Script;
@@ -37,10 +43,12 @@ const TRANSPARENT_MINED_HEIGHT: u32 = ANCHOR_HEIGHT - 1;
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn shielding_skips_excluded_outpoint_via_batched_gather() -> Result<(), TestError> {
     let temp = TempDir::new()?;
-    let storage = Sqlite::new(SqliteOptions::for_network(
-        Network::Testnet,
-        temp.path().join("wallet.db"),
-    ));
+    let proving_parameters =
+        sapling_proving_parameters::create_sapling_proving_parameters(temp.path())?;
+    let storage = Sqlite::new(
+        SqliteOptions::for_network(Network::Testnet, temp.path().join("wallet.db"))
+            .with_sapling_proving_parameters(proving_parameters.spend, proving_parameters.output),
+    );
     storage.open_or_create().await?;
 
     let mnemonic = Mnemonic::generate();
@@ -127,7 +135,7 @@ fn fixtures_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")
 }
 
-fn chain_state_at(height: u32) -> Result<ChainState, TestError> {
+fn chain_state_at(height: u32) -> Result<TreeStateArtifact, TestError> {
     let text = fs::read_to_string(fixtures_dir().join(format!("treestate_{height}.json")))?;
     let json: serde_json::Value = serde_json::from_str(&text)?;
     let rpc_result = &json["result"];
@@ -156,10 +164,13 @@ fn chain_state_at(height: u32) -> Result<ChainState, TestError> {
         orchard_tree: tree_hex("orchard")?,
         ironwood_tree: String::new(),
     };
-    Ok(tree_state.to_chain_state()?)
+    Ok(scan_artifact::tree_state_from_upstream(
+        Network::Testnet,
+        tree_state,
+    ))
 }
 
-fn load_blocks(from_height: u64, to_height: u64) -> Result<Vec<CompactBlock>, TestError> {
+fn load_blocks(from_height: u64, to_height: u64) -> Result<Vec<CompactBlockArtifact>, TestError> {
     let framed = fs::read(fixtures_dir().join("compact_blocks_4009900_4009999.bin"))?;
     let mut blocks = Vec::new();
     let mut at = 0_usize;
@@ -177,7 +188,7 @@ fn load_blocks(from_height: u64, to_height: u64) -> Result<Vec<CompactBlock>, Te
         at += frame_len;
         let block = CompactBlock::decode(body)?;
         if (from_height..=to_height).contains(&block.height) {
-            blocks.push(block);
+            blocks.push(scan_artifact::compact_block_from_upstream(block));
         }
     }
     Ok(blocks)

@@ -5,7 +5,7 @@
 //! state reproduces deterministically without funded notes. Each sync step captures
 //! the wallet's checkpoint roots next to the chain's tree state at the same height.
 
-use zally_chain::{ChainSource, ChainState, ZinderChainSource, ZinderRemoteOptions};
+use zally_chain::{ChainSource, ZinderChainSource, ZinderRemoteOptions};
 use zally_core::{BlockHeight, Network};
 use zally_keys::{AgeFileSealing, AgeFileSealingOptions};
 use zally_storage::{CommitmentTreeRoots, Sqlite, SqliteOptions, WalletStorage};
@@ -38,12 +38,16 @@ async fn orchard_root_converges_from_legacy_birthday() -> Result<(), TestError> 
     let endpoint = require_zinder_endpoint()?;
     let chain = ZinderChainSource::connect_remote(ZinderRemoteOptions { endpoint, network })?;
 
-    log_chain_frontier(&chain, BlockHeight::from(LEGACY_BIRTHDAY_HEIGHT - 1)).await?;
-    log_chain_frontier(&chain, BlockHeight::from(LEGACY_BIRTHDAY_HEIGHT)).await?;
-
     let temp = TempWalletPath::create()?;
     let sealing = AgeFileSealing::new(AgeFileSealingOptions::at_path(temp.seed_path()));
     let storage = Sqlite::new(SqliteOptions::for_network(network, temp.db_path()));
+    log_chain_frontier(
+        &chain,
+        &storage,
+        BlockHeight::from(LEGACY_BIRTHDAY_HEIGHT - 1),
+    )
+    .await?;
+    log_chain_frontier(&chain, &storage, BlockHeight::from(LEGACY_BIRTHDAY_HEIGHT)).await?;
     let (wallet, _account_id, _mnemonic) = Wallet::builder(network, sealing, storage.clone())
         .create(&chain, BlockHeight::from(LEGACY_BIRTHDAY_HEIGHT))
         .await?;
@@ -73,7 +77,7 @@ async fn orchard_root_converges_from_legacy_birthday() -> Result<(), TestError> 
         };
         let wallet_roots = storage.commitment_tree_roots().await?;
         let fully_scanned = storage.fully_scanned_height().await?;
-        let chain_state = chain_frontier_at(&chain, outcome.scanned_to_height).await?;
+        let chain_state = chain_frontier_at(&chain, &storage, outcome.scanned_to_height).await?;
         log_root_capture(RootCapture {
             iteration,
             outcome: &outcome,
@@ -111,13 +115,13 @@ async fn require_converged_roots(
     checkpoint_height: BlockHeight,
 ) -> Result<(), TestError> {
     let wallet_roots = storage.commitment_tree_roots().await?;
-    let chain_state = chain_frontier_at(chain, checkpoint_height).await?;
-    let chain_sapling = chain_state.final_sapling_tree().root().to_bytes();
-    let chain_orchard = chain_state.final_orchard_tree().root().to_bytes();
+    let chain_state = chain_frontier_at(chain, storage, checkpoint_height).await?;
+    let chain_sapling = chain_state.sapling.unwrap_or([0; 32]);
+    let chain_orchard = chain_state.orchard.unwrap_or([0; 32]);
     if wallet_roots.orchard.is_none() {
         return Err(TestError::OrchardRootMissing {
             height: checkpoint_height.as_u32(),
-            chain_tree_size: chain_state.final_orchard_tree().tree_size(),
+            chain_tree_size: 0,
         });
     }
     let sapling_matches = wallet_roots.sapling == Some(chain_sapling);
@@ -148,7 +152,7 @@ struct RootCapture<'a> {
     outcome: &'a SyncOutcome,
     fully_scanned: Option<BlockHeight>,
     wallet_roots: CommitmentTreeRoots,
-    chain_state: &'a ChainState,
+    chain_state: &'a CommitmentTreeRoots,
     previous_roots: Option<CommitmentTreeRoots>,
 }
 
@@ -161,8 +165,8 @@ fn log_root_capture(capture: RootCapture<'_>) {
         chain_state,
         previous_roots,
     } = capture;
-    let chain_sapling = chain_state.final_sapling_tree().root().to_bytes();
-    let chain_orchard = chain_state.final_orchard_tree().root().to_bytes();
+    let chain_sapling = chain_state.sapling.unwrap_or([0; 32]);
+    let chain_orchard = chain_state.orchard.unwrap_or([0; 32]);
     let sapling_match = wallet_roots.sapling.map(|root| root == chain_sapling);
     let orchard_match = wallet_roots.orchard.map(|root| root == chain_orchard);
     let orchard_changed = previous_roots.map(|previous| previous.orchard != wallet_roots.orchard);
@@ -182,26 +186,23 @@ fn log_root_capture(capture: RootCapture<'_>) {
         wallet_orchard = %hex_or_empty(wallet_roots.orchard),
         chain_orchard = %hex::encode(chain_orchard),
         wallet_ironwood = %hex_or_empty(wallet_roots.ironwood),
-        chain_sapling_tree_size = chain_state.final_sapling_tree().tree_size(),
-        chain_orchard_tree_size = chain_state.final_orchard_tree().tree_size(),
         "wallet vs chain commitment-tree roots after one sync step"
     );
 }
 
 async fn log_chain_frontier(
     chain: &ZinderChainSource,
+    storage: &Sqlite,
     height: BlockHeight,
 ) -> Result<(), TestError> {
-    let chain_state = chain_frontier_at(chain, height).await?;
+    let chain_state = chain_frontier_at(chain, storage, height).await?;
     tracing::info!(
         target: "zally::live",
         event = "legacy_birthday_chain_frontier",
         height = height.as_u32(),
-        sapling_root = %hex::encode(chain_state.final_sapling_tree().root().to_bytes()),
-        sapling_tree_size = chain_state.final_sapling_tree().tree_size(),
-        orchard_root = %hex::encode(chain_state.final_orchard_tree().root().to_bytes()),
-        orchard_tree_size = chain_state.final_orchard_tree().tree_size(),
-        ironwood_tree_size = chain_state.final_ironwood_tree().tree_size(),
+        sapling_root = %hex_or_empty(chain_state.sapling),
+        orchard_root = %hex_or_empty(chain_state.orchard),
+        ironwood_root = %hex_or_empty(chain_state.ironwood),
         "chain tree state at the birthday boundary"
     );
     Ok(())
@@ -209,10 +210,12 @@ async fn log_chain_frontier(
 
 async fn chain_frontier_at(
     chain: &ZinderChainSource,
+    storage: &Sqlite,
     height: BlockHeight,
-) -> Result<ChainState, TestError> {
-    let tree_state = chain.tree_state_at(height).await?;
-    Ok(tree_state.to_chain_state()?)
+) -> Result<CommitmentTreeRoots, TestError> {
+    let chain_epoch = chain.current_epoch().await?;
+    let tree_state = chain.tree_state_at(chain_epoch, height).await?;
+    Ok(storage.tree_state_roots(tree_state).await?)
 }
 
 #[allow(

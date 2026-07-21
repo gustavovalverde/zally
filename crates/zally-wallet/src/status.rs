@@ -11,38 +11,38 @@ use crate::wallet::Wallet;
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[non_exhaustive]
 pub enum SyncStatus {
-    /// The wallet has not observed a chain tip and has no recorded scan progress.
+    /// The wallet has no recorded chain-tip pair and no recorded scan progress.
     NotStarted,
-    /// The wallet has scan progress, but no observed chain tip is recorded.
+    /// The wallet has scan progress, but no visible tip is recorded.
     WaitingForTip {
         /// Highest block height the wallet has scanned.
         scanned_height: BlockHeight,
     },
-    /// The wallet has observed a chain tip and has not recorded scan progress yet.
+    /// The wallet has recorded a visible tip and no scan progress yet.
     Starting {
-        /// Chain tip the wallet is catching up to.
+        /// Visible tip the wallet is catching up to.
         target_height: BlockHeight,
     },
-    /// The wallet is behind the most recently observed chain tip.
+    /// The wallet is behind the most recently recorded visible tip.
     CatchingUp {
         /// Highest block height the wallet has scanned.
         scanned_height: BlockHeight,
-        /// Chain tip the wallet is catching up to.
+        /// Visible tip the wallet is catching up to.
         target_height: BlockHeight,
         /// Number of blocks between `scanned_height` and `target_height`.
         lag_blocks: u32,
     },
-    /// The wallet has scanned to the most recently observed safe chain tip.
+    /// The wallet has scanned to the most recently recorded visible tip.
     AtTip {
-        /// Safe chain tip height the wallet has scanned to.
-        safe_chain_tip_height: BlockHeight,
+        /// Visible tip height the wallet has scanned to.
+        visible_tip_height: BlockHeight,
     },
-    /// The last observed chain tip is lower than the wallet's scanned height.
+    /// The recorded visible tip is lower than the wallet's scanned height.
     TipRegressed {
         /// Highest block height the wallet has scanned.
         scanned_height: BlockHeight,
-        /// Lower chain tip most recently observed.
-        safe_chain_tip_height: BlockHeight,
+        /// Lower visible tip most recently recorded.
+        visible_tip_height: BlockHeight,
     },
 }
 
@@ -60,9 +60,11 @@ pub struct WalletStatus {
     pub sync_status: SyncStatus,
     /// Highest block height the wallet has scanned, if any.
     pub scanned_height: Option<BlockHeight>,
-    /// Chain tip the wallet most recently observed, if any.
-    pub safe_chain_tip_height: Option<BlockHeight>,
-    /// Number of blocks between `scanned_height` and `safe_chain_tip_height`, if both are known
+    /// Highest source-visible block recorded by the most recent sync, if any.
+    pub visible_tip_height: Option<BlockHeight>,
+    /// Settled finality height recorded by the most recent sync, if any.
+    pub settled_tip_height: Option<BlockHeight>,
+    /// Number of blocks between `scanned_height` and `visible_tip_height`, if both are known
     /// and the tip has not regressed.
     pub lag_blocks: Option<u32>,
     /// Number of accounts the wallet manages. Always 1: Zally holds one account per wallet.
@@ -80,14 +82,17 @@ impl Wallet {
     /// failures surfaced by the storage implementation.
     pub async fn status_snapshot(&self) -> Result<WalletStatus, WalletError> {
         let scanned_height = self.inner.storage.fully_scanned_height().await?;
-        let safe_chain_tip_height = self.inner.storage.find_observed_tip().await?;
-        let sync_status = sync_status_from_heights(scanned_height, safe_chain_tip_height);
+        let chain_tips = self.inner.storage.find_chain_tips().await?;
+        let visible_tip_height = chain_tips.map(|tips| tips.visible);
+        let settled_tip_height = chain_tips.map(|tips| tips.settled);
+        let sync_status = sync_status_from_heights(scanned_height, visible_tip_height);
         Ok(WalletStatus {
             network: self.network(),
             sync_status,
             scanned_height,
-            safe_chain_tip_height,
-            lag_blocks: compute_lag_blocks(scanned_height, safe_chain_tip_height),
+            visible_tip_height,
+            settled_tip_height,
+            lag_blocks: compute_lag_blocks(scanned_height, visible_tip_height),
             account_count: 1,
             event_subscriber_count: self.observer_count(),
             circuit_breaker: self.circuit_breaker_state(),
@@ -97,9 +102,9 @@ impl Wallet {
 
 fn sync_status_from_heights(
     scanned_height: Option<BlockHeight>,
-    safe_chain_tip_height: Option<BlockHeight>,
+    visible_tip_height: Option<BlockHeight>,
 ) -> SyncStatus {
-    match (scanned_height, safe_chain_tip_height) {
+    match (scanned_height, visible_tip_height) {
         (None, None) => SyncStatus::NotStarted,
         (Some(scanned), None) => SyncStatus::WaitingForTip {
             scanned_height: scanned,
@@ -112,11 +117,11 @@ fn sync_status_from_heights(
                 lag_blocks: tip.as_u32() - scanned.as_u32(),
             },
             std::cmp::Ordering::Equal => SyncStatus::AtTip {
-                safe_chain_tip_height: tip,
+                visible_tip_height: tip,
             },
             std::cmp::Ordering::Greater => SyncStatus::TipRegressed {
                 scanned_height: scanned,
-                safe_chain_tip_height: tip,
+                visible_tip_height: tip,
             },
         },
     }
@@ -124,10 +129,10 @@ fn sync_status_from_heights(
 
 fn compute_lag_blocks(
     scanned_height: Option<BlockHeight>,
-    safe_chain_tip_height: Option<BlockHeight>,
+    visible_tip_height: Option<BlockHeight>,
 ) -> Option<u32> {
     let scanned = scanned_height?;
-    let tip = safe_chain_tip_height?;
+    let tip = visible_tip_height?;
     if tip.as_u32() < scanned.as_u32() {
         None
     } else {
@@ -167,7 +172,7 @@ mod tests {
             sync_status_from_heights(Some(BlockHeight::from(10)), Some(BlockHeight::from(7))),
             SyncStatus::TipRegressed {
                 scanned_height: BlockHeight::from(10),
-                safe_chain_tip_height: BlockHeight::from(7),
+                visible_tip_height: BlockHeight::from(7),
             }
         );
         assert_eq!(

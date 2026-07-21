@@ -29,7 +29,7 @@ Both gaps push consumers toward workarounds that drift away from Zally's typed-b
 - No change to `shield_transparent_funds` semantics, idempotency, or the `ShieldTransparentPlan` shape.
 - No change to `WalletStorage::list_transparent_receivers` or `ChainSource::transparent_utxos` shapes; the new methods compose existing storage reads, they do not redefine them.
 - No new spending or signing path. The proposal is strictly observational.
-- No change to confirmations policy. Transparent maturity stays "what the chain source reports as unspent at the current `observed_tip`."
+- No change to confirmations policy. Transparent maturity stays "what the chain source reports as unspent at the current `visible_tip`."
 
 ## Proposed API additions
 
@@ -38,7 +38,7 @@ Both gaps push consumers toward workarounds that drift away from Zally's typed-b
 ```rust
 impl Wallet {
     /// Returns the per-pool balance for `account_id`, anchored to the wallet's
-    /// last observed chain tip.
+    /// persisted visible tip.
     ///
     /// `not_retryable` on unknown account; `retryable` on transient storage I/O.
     pub async fn get_account_balance(
@@ -60,7 +60,7 @@ pub struct AccountBalance {
     pub orchard_zat: Zatoshis,
     pub transparent_mature_zat: Zatoshis,
     pub transparent_immature_zat: Zatoshis,
-    /// Last observed chain tip the values are computed against. `None` when the
+    /// Persisted visible tip the values are computed against. `None` when the
     /// wallet has not yet recorded a tip.
     pub as_of_height: Option<BlockHeight>,
 }
@@ -78,7 +78,7 @@ impl AccountBalance {
 
 Naming follows the spine: `_zat` for integer zatoshis, `_height` for the tip anchor, `get_` for a cached read (the values are computed from the same `WalletStorage` rows that drive `list_unspent_shielded_notes`).
 
-The mature/immature split for transparent value uses the same height arithmetic Zally already runs internally: `mature` are UTXOs with `mined_height + 100 <= observed_tip`; the remainder is `immature`. Coinbase maturity remains a chain-source property, not a Zally gate. The 100-block constant is the only Zcash-protocol constant baked into the method.
+The mature/immature split for transparent value uses the same height arithmetic Zally already runs internally: `mature` are UTXOs with `mined_height + 100 <= visible_tip`; the remainder is `immature`. Coinbase maturity remains a chain-source property, not a Zally gate. The 100-block constant is the only Zcash-protocol constant baked into the method.
 
 ### `Wallet::list_exposed_addresses(account_id) -> Vec<ExposedAddress>`
 

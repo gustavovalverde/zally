@@ -25,7 +25,7 @@ async fn list_unspent_shielded_notes_returns_empty_on_fresh_wallet() -> Result<(
 }
 
 #[tokio::test]
-async fn list_unspent_shielded_notes_uses_observed_tip_after_sync() -> Result<(), TestError> {
+async fn list_unspent_shielded_notes_uses_visible_tip_after_sync() -> Result<(), TestError> {
     let TestWalletFixture {
         temp: _temp,
         wallet,
@@ -34,16 +34,18 @@ async fn list_unspent_shielded_notes_uses_observed_tip_after_sync() -> Result<()
     let network = wallet.network();
 
     // Advance the wallet's observed tip via sync; the MockChainSource returns an empty
-    // block stream so no notes get persisted, but observed_tip lands.
+    // block stream so no notes get persisted, but the visible tip lands.
     let chain = MockChainSource::new(network);
     chain.handle().advance_tip(BlockHeight::from(200));
     wallet.sync(&chain).await?;
     let tip = chain
-        .safe_chain_tip()
+        .current_epoch()
         .await
         .map_err(|err| TestError::Chain {
             reason: err.to_string(),
-        })?;
+        })?
+        .settled_tip()
+        .height;
     assert_eq!(tip.as_u32(), 200, "mock chain tip must be set");
 
     // No notes still (mock returned empty), but the surface compiles and returns Ok.

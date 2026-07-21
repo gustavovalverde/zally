@@ -19,20 +19,20 @@ use crate::wallet::{Wallet, current_unix_ms};
 /// Submit-time context bundled per spend call.
 ///
 /// Holds the operator-label, the submitter, the account being spent from, and the
-/// wallet's current observed tip so submit-time helpers can stay under the clippy
+/// wallet's current visible tip so submit-time helpers can stay under the clippy
 /// argument-count limit.
 struct SubmissionContext<'a> {
     operation: &'static str,
     submitter: &'a dyn Submitter,
     account_id: AccountId,
-    observed_tip: Option<BlockHeight>,
+    visible_tip: Option<BlockHeight>,
 }
 
 /// Pending-broadcast row contents derived from one prepared transaction.
 struct PendingBroadcastSnapshot {
     broadcast_tx_id: TxId,
     broadcast_at_ms: u64,
-    observed_tip: Option<BlockHeight>,
+    visible_tip: Option<BlockHeight>,
     inputs: Vec<(OutPoint, Zatoshis)>,
 }
 
@@ -364,7 +364,7 @@ impl Wallet {
             .find_idempotent_submission(&plan.idempotency)
             .await?
         {
-            let broadcast_at_height = self.observed_tip_or_zero().await?;
+            let broadcast_at_height = self.visible_tip_or_zero().await?;
             return Ok(SendOutcome {
                 signed: SignedPczt {
                     tx_id: prior_tx_id,
@@ -407,14 +407,14 @@ impl Wallet {
                 .await
                 .map_err(WalletError::from)?
         };
-        let observed_tip = self.inner.storage.find_observed_tip().await?;
+        let visible_tip = self.inner.storage.find_visible_tip().await?;
         let (result_tx_id, tx_expiry_height) = self
             .submit_and_record_pending(
                 SubmissionContext {
                     operation: "send_payment.submit",
                     submitter: plan.submitter,
                     account_id: plan.account_id,
-                    observed_tip,
+                    visible_tip,
                 },
                 prepared,
             )
@@ -433,30 +433,33 @@ impl Wallet {
             },
             broadcast: BroadcastOutcome {
                 tx_id: result_tx_id,
-                broadcast_at_height: observed_tip.unwrap_or_else(|| BlockHeight::from(0)),
+                broadcast_at_height: visible_tip.unwrap_or_else(|| BlockHeight::from(0)),
             },
         })
     }
 
     /// Routes a `SendPaymentPlan` with `target_expiry_height` through the PCZT path.
     ///
-    /// Composes propose -> `Updater(expiry_height)` -> prove -> sign -> extract, then
+    /// Composes propose-with-expiry -> prove -> sign -> extract, then
     /// validates the signed expiry against the caller's target before handing the
     /// prepared transaction back to `send_payment` for submission.
     ///
-    /// Rejects targets at or below the wallet's observed chain tip with
+    /// Rejects targets at or below the wallet's visible chain tip with
     /// [`WalletError::TargetExpiryStale`]: any signed bytes carrying such an expiry
     /// would already be unmineable. Rejects a signed expiry that diverges from the
-    /// target with [`WalletError::TargetExpiryMismatch`], which catches bugs in the
-    /// Updater mutation at the wallet boundary rather than at the caller.
+    /// target with [`WalletError::TargetExpiryMismatch`], which catches expiry propagation
+    /// bugs at the wallet boundary rather than at the caller.
     async fn prepare_send_with_target_expiry(
         &self,
         plan: &SendPaymentPlan<'_>,
         target: BlockHeight,
     ) -> Result<Vec<zally_storage::PreparedTransaction>, WalletError> {
-        let chain_tip = self.observed_tip_or_zero().await?;
-        if u32::from(target) <= u32::from(chain_tip) {
-            return Err(WalletError::TargetExpiryStale { target, chain_tip });
+        let visible_tip = self.visible_tip_or_zero().await?;
+        if u32::from(target) <= u32::from(visible_tip) {
+            return Err(WalletError::TargetExpiryStale {
+                target,
+                visible_tip,
+            });
         }
 
         let proposal_plan = ProposalPlan::conventional(
@@ -514,7 +517,7 @@ impl Wallet {
             .find_idempotent_submission(&plan.idempotency)
             .await?
         {
-            let broadcast_at_height = self.observed_tip_or_zero().await?;
+            let broadcast_at_height = self.visible_tip_or_zero().await?;
             return Ok(SendOutcome {
                 signed: SignedPczt {
                     tx_id: prior_tx_id,
@@ -544,14 +547,14 @@ impl Wallet {
             .shield_transparent_funds(shielding_request, excluded_outpoints, &seed)
             .await
             .map_err(WalletError::from)?;
-        let observed_tip = self.inner.storage.find_observed_tip().await?;
+        let visible_tip = self.inner.storage.find_visible_tip().await?;
         let (result_tx_id, tx_expiry_height) = self
             .submit_and_record_pending(
                 SubmissionContext {
                     operation: "shield_transparent_funds.submit",
                     submitter: plan.submitter,
                     account_id: plan.account_id,
-                    observed_tip,
+                    visible_tip,
                 },
                 prepared,
             )
@@ -570,7 +573,7 @@ impl Wallet {
             },
             broadcast: BroadcastOutcome {
                 tx_id: result_tx_id,
-                broadcast_at_height: observed_tip.unwrap_or_else(|| BlockHeight::from(0)),
+                broadcast_at_height: visible_tip.unwrap_or_else(|| BlockHeight::from(0)),
             },
         })
     }
@@ -596,7 +599,7 @@ impl Wallet {
                 PendingBroadcastSnapshot {
                     broadcast_tx_id: transaction.tx_id,
                     broadcast_at_ms,
-                    observed_tip: submission.observed_tip,
+                    visible_tip: submission.visible_tip,
                     inputs: transaction.transparent_inputs.clone(),
                 },
             )
@@ -650,7 +653,7 @@ impl Wallet {
                 broadcast_tx_id: snapshot.broadcast_tx_id,
                 account_id,
                 broadcast_at_ms: snapshot.broadcast_at_ms,
-                broadcast_at_height: snapshot.observed_tip,
+                broadcast_at_height: snapshot.visible_tip,
                 inputs: snapshot.inputs,
             })
             .await
@@ -686,11 +689,11 @@ impl Wallet {
         current_unix_ms().saturating_sub(self.inner.options.pending_broadcast_window_ms)
     }
 
-    async fn observed_tip_or_zero(&self) -> Result<BlockHeight, WalletError> {
+    async fn visible_tip_or_zero(&self) -> Result<BlockHeight, WalletError> {
         Ok(self
             .inner
             .storage
-            .find_observed_tip()
+            .find_visible_tip()
             .await?
             .unwrap_or_else(|| BlockHeight::from(0)))
     }
@@ -732,17 +735,20 @@ pub(crate) fn protocol_shielded_pool(
 )]
 fn resolve_send_outcome(
     outcome: zally_chain::SubmitOutcome,
-    fallback_tx_id: TxId,
+    expected_tx_id: TxId,
 ) -> Result<TxId, WalletError> {
     match outcome {
-        zally_chain::SubmitOutcome::Accepted { tx_id } => Ok(tx_id),
-        // Duplicate and Queued are success-equivalent for idempotency: the upstream node
-        // either already has this byte-identical transaction or has it queued for
-        // verification. The pending-broadcast row recorded just before `submit` stays
-        // in place so the wallet still treats the inputs as in-flight, and the caller
-        // observes the tx id it computed at proposal time.
-        zally_chain::SubmitOutcome::Duplicate { .. }
-        | zally_chain::SubmitOutcome::Queued { .. } => Ok(fallback_tx_id),
+        zally_chain::SubmitOutcome::Accepted { tx_id }
+        | zally_chain::SubmitOutcome::Duplicate { tx_id }
+        | zally_chain::SubmitOutcome::Queued { tx_id } => {
+            if tx_id != expected_tx_id {
+                return Err(WalletError::SubmittedTransactionIdMismatch {
+                    expected: expected_tx_id,
+                    returned: tx_id,
+                });
+            }
+            Ok(tx_id)
+        }
         zally_chain::SubmitOutcome::Rejected { reason, detail } => {
             Err(WalletError::SubmissionRejected { reason, detail })
         }
@@ -841,7 +847,7 @@ impl ProposalPlan {
 /// Naming convention: fields prefixed with `target_` are caller-controlled wallet
 /// parameters that the wallet honours rather than derives. For example,
 /// `target_expiry_height` lets the caller commit to a specific expiry instead of
-/// letting the wallet derive one from its observed chain tip.
+/// letting the wallet derive one from its visible tip.
 #[non_exhaustive]
 pub struct SendPaymentPlan<'submitter> {
     /// Account that funds the send.
@@ -856,10 +862,9 @@ pub struct SendPaymentPlan<'submitter> {
     pub memo: Option<Memo>,
     /// Caller-supplied expiry height to commit to.
     ///
-    /// When set, the wallet builds the transaction through the PCZT path and mutates
-    /// the `global.expiry_height` field via the [`zally_pczt::Updater`] role before
-    /// proving and signing. When `None`, the wallet uses its own chain-tip-derived
-    /// default.
+    /// When set, the wallet builds the transaction through the PCZT path and sets
+    /// `global.expiry_height` before the IO Finalizer, prover, and signer run. When
+    /// `None`, the wallet uses its own chain-tip-derived default.
     pub target_expiry_height: Option<BlockHeight>,
     /// Submitter that delivers the signed transaction.
     pub submitter: &'submitter dyn Submitter,
@@ -945,9 +950,8 @@ impl<'submitter> SendPaymentPlan<'submitter> {
     /// Returns the plan with `target_expiry_height` set.
     ///
     /// Routes the send through the PCZT path so the caller-supplied height can be
-    /// committed via the [`zally_pczt::Updater`] role before the Prover and Signer
-    /// run. Without this builder call the wallet picks its own expiry from the
-    /// chain tip.
+    /// committed before the IO Finalizer, prover, and signer run. Without this
+    /// builder call the wallet picks its own expiry from the chain tip.
     #[must_use]
     pub fn with_target_expiry_height(mut self, height: BlockHeight) -> Self {
         self.target_expiry_height = Some(height);
@@ -1209,38 +1213,51 @@ mod tests {
         #[test]
         fn returns_accepted_tx_id() {
             let accepted_tx_id = TxId::from_bytes([7_u8; 32]);
-            let fallback_tx_id = TxId::from_bytes([1_u8; 32]);
             let outcome = zally_chain::SubmitOutcome::Accepted {
                 tx_id: accepted_tx_id,
             };
-            let tx_id = resolve_send_outcome(outcome, fallback_tx_id).expect("Accepted is Ok");
+            let tx_id = resolve_send_outcome(outcome, accepted_tx_id).expect("Accepted is Ok");
             assert_eq!(tx_id, accepted_tx_id);
         }
 
         #[test]
-        fn returns_fallback_on_duplicate() {
-            let fallback_tx_id = TxId::from_bytes([1_u8; 32]);
+        fn returns_canonical_tx_id_on_duplicate() {
+            let expected_tx_id = TxId::from_bytes([1_u8; 32]);
             let outcome = zally_chain::SubmitOutcome::Duplicate {
-                tx_id: TxId::from_bytes([0_u8; 32]),
+                tx_id: expected_tx_id,
             };
-            let tx_id = resolve_send_outcome(outcome, fallback_tx_id).expect("Duplicate is Ok");
-            assert_eq!(
-                tx_id, fallback_tx_id,
-                "Duplicate must surface the caller-computed fallback tx id, not the zinder placeholder"
-            );
+            let tx_id = resolve_send_outcome(outcome, expected_tx_id).expect("Duplicate is Ok");
+            assert_eq!(tx_id, expected_tx_id);
         }
 
         #[test]
-        fn returns_fallback_on_queued() {
-            let fallback_tx_id = TxId::from_bytes([1_u8; 32]);
+        fn returns_canonical_tx_id_on_queued() {
+            let expected_tx_id = TxId::from_bytes([1_u8; 32]);
             let outcome = zally_chain::SubmitOutcome::Queued {
-                tx_id: TxId::from_bytes([0_u8; 32]),
+                tx_id: expected_tx_id,
             };
-            let tx_id = resolve_send_outcome(outcome, fallback_tx_id).expect("Queued is Ok");
-            assert_eq!(
-                tx_id, fallback_tx_id,
-                "Queued is success-equivalent: the caller observes its own tx id and the pending-broadcast row stays in place"
-            );
+            let tx_id = resolve_send_outcome(outcome, expected_tx_id).expect("Queued is Ok");
+            assert_eq!(tx_id, expected_tx_id);
+        }
+
+        #[test]
+        fn rejects_success_outcome_for_a_different_transaction() {
+            let expected_tx_id = TxId::from_bytes([1_u8; 32]);
+            let returned_tx_id = TxId::from_bytes([2_u8; 32]);
+            let outcome = zally_chain::SubmitOutcome::Duplicate {
+                tx_id: returned_tx_id,
+            };
+
+            let error = resolve_send_outcome(outcome, expected_tx_id)
+                .expect_err("mismatched success txid must fail closed");
+
+            assert!(matches!(
+                error,
+                WalletError::SubmittedTransactionIdMismatch {
+                    expected,
+                    returned,
+                } if expected == expected_tx_id && returned == returned_tx_id
+            ));
         }
 
         #[test]

@@ -1,6 +1,6 @@
 //! Serialized transaction parsing at the chain-plane boundary.
 
-use zally_core::{BlockHeight, BranchId, FailurePosture};
+use zally_core::{BlockHeight, BranchId, FailurePosture, TxId};
 use zcash_primitives::transaction::Transaction;
 
 /// Error returned by [`parse_transaction_expiry_height`].
@@ -50,15 +50,33 @@ pub fn parse_transaction_expiry_height(
     Ok(transaction.expiry_height().into())
 }
 
+/// Parses serialized Zcash transaction bytes and returns their canonical transaction id.
+///
+/// The linked librustzcash reader applies the version-appropriate transaction-id digest,
+/// including ZIP-244 for v5 and later transactions.
+///
+/// # Errors
+///
+/// Returns [`TransactionParseError::Read`] when the bytes are truncated,
+/// malformed, or use an unsupported transaction format.
+pub fn parse_transaction_id(raw_tx_bytes: &[u8]) -> Result<TxId, TransactionParseError> {
+    let transaction = Transaction::read(raw_tx_bytes, BranchId::Nu5).map_err(|err| {
+        TransactionParseError::Read {
+            reason: err.to_string(),
+        }
+    })?;
+    Ok(TxId::from_bytes(*transaction.txid().as_ref()))
+}
+
 #[cfg(test)]
 #[allow(
     clippy::expect_used,
     reason = "test helpers panic on impossible failures when building minimal transactions"
 )]
 mod tests {
-    use super::{TransactionParseError, parse_transaction_expiry_height};
+    use super::{TransactionParseError, parse_transaction_expiry_height, parse_transaction_id};
     use zally_core::{BlockHeight, BranchId};
-    use zcash_primitives::transaction::{TransactionData, TxVersion};
+    use zcash_primitives::transaction::{Transaction, TransactionData, TxVersion};
     use zcash_protocol::consensus::BlockHeight as UpstreamBlockHeight;
 
     fn build_minimal_v5(expiry_height: u32) -> Vec<u8> {
@@ -79,6 +97,18 @@ mod tests {
             .write(&mut raw_tx_bytes)
             .expect("write minimal v5 transaction");
         raw_tx_bytes
+    }
+
+    #[test]
+    fn transaction_id_matches_the_canonical_transaction_digest() {
+        let raw_tx_bytes = build_minimal_v5(123_456);
+        let parsed = Transaction::read(raw_tx_bytes.as_slice(), BranchId::Nu5)
+            .expect("parse minimal v5 transaction");
+
+        assert_eq!(
+            parse_transaction_id(&raw_tx_bytes).expect("derive transaction id"),
+            zally_core::TxId::from_bytes(*parsed.txid().as_ref())
+        );
     }
 
     fn build_minimal_v6(expiry_height: u32) -> Vec<u8> {

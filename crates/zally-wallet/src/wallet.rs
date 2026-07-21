@@ -143,7 +143,8 @@ impl Wallet {
             Err(SealingError::NoSealedSeed) => return Err(WalletError::NoSealedSeed),
             Err(e) => return Err(WalletError::from(e)),
         };
-        let prior_chain_state = fetch_prior_chain_state(chain, birthday).await?;
+        let chain_epoch = chain.current_epoch().await?;
+        let prior_chain_state = fetch_prior_chain_state(chain, chain_epoch, birthday).await?;
         let account_id = self
             .inner
             .storage
@@ -192,11 +193,11 @@ impl Wallet {
 
     /// Returns every unspent Sapling, Orchard, and Ironwood note owned by `account_id`.
     ///
-    /// The wallet uses its persisted observed chain tip (the highest tip reported to it by
+    /// The wallet uses its persisted visible chain tip (the highest tip reported to it by
     /// [`Wallet::sync`]) to compute the `confirmations` field. Operators that need a fresh
     /// confirmation count should call [`Wallet::sync`] before this method.
     ///
-    /// When the wallet has not yet observed a tip (no prior `sync`), `confirmations` is set
+    /// When the wallet has not yet recorded a tip (no prior `sync`), `confirmations` is set
     /// to `0` and `mined_height` carries the note's actual mined height.
     ///
     /// `requires_operator` on unknown account; `retryable` on transient storage I/O.
@@ -204,13 +205,13 @@ impl Wallet {
         &self,
         account_id: AccountId,
     ) -> Result<Vec<crate::unspent_note::UnspentShieldedNote>, WalletError> {
-        let observed_tip = self
+        let visible_tip = self
             .inner
             .storage
-            .find_observed_tip()
+            .find_visible_tip()
             .await
             .map_err(WalletError::from)?;
-        let target = observed_tip.unwrap_or_else(|| BlockHeight::from(0));
+        let target = visible_tip.unwrap_or_else(|| BlockHeight::from(0));
         let rows = self
             .inner
             .storage
@@ -219,7 +220,7 @@ impl Wallet {
             .map_err(WalletError::from)?;
         Ok(rows
             .into_iter()
-            .map(|row| translate_unspent_note(row, observed_tip))
+            .map(|row| translate_unspent_note(row, visible_tip))
             .collect())
     }
 
@@ -247,7 +248,7 @@ impl Wallet {
         let as_of_height = self
             .inner
             .storage
-            .find_observed_tip()
+            .find_visible_tip()
             .await
             .map_err(WalletError::from)?;
         let inputs = rows
@@ -291,7 +292,7 @@ impl Wallet {
     }
 
     /// Returns the per-pool balance snapshot for `account_id`, anchored to the wallet's
-    /// last observed chain tip.
+    /// persisted visible tip.
     ///
     /// Composes the same persisted wallet rows that drive
     /// [`Wallet::list_unspent_shielded_notes`] and the transparent UTXO refresh in
@@ -453,16 +454,16 @@ impl Wallet {
             });
         }
 
-        let observed_tip = self
+        let visible_tip = self
             .inner
             .storage
-            .find_observed_tip()
+            .find_visible_tip()
             .await?
             .unwrap_or_else(|| BlockHeight::from(0));
         let candidate_notes = self
             .inner
             .storage
-            .list_unspent_shielded_notes(account_id, observed_tip)
+            .list_unspent_shielded_notes(account_id, visible_tip)
             .await?;
         let spendable = self.spendable_for_next_dispense(account_id).await?;
         if amount_zat.as_u64() > spendable.as_u64() {
@@ -620,10 +621,11 @@ where
             Err(SealingError::NoSealedSeed) => {}
             Err(e) => return Err(WalletError::from(e)),
         }
+        let chain_epoch = chain.current_epoch().await?;
+        let prior_chain_state = fetch_prior_chain_state(chain, chain_epoch, birthday).await?;
         let mnemonic = Mnemonic::generate();
         let seed = SeedMaterial::from_mnemonic(&mnemonic, "");
         sealing.seal_seed(&seed).await?;
-        let prior_chain_state = fetch_prior_chain_state(chain, birthday).await?;
         let account_id = storage
             .create_account_for_seed(&seed, prior_chain_state)
             .await?;
@@ -684,7 +686,8 @@ where
         let account_id = if let Some(existing) = storage.find_account_for_seed(&seed).await? {
             existing
         } else {
-            let prior_chain_state = fetch_prior_chain_state(chain, birthday).await?;
+            let chain_epoch = chain.current_epoch().await?;
+            let prior_chain_state = fetch_prior_chain_state(chain, chain_epoch, birthday).await?;
             storage
                 .create_account_for_seed(&seed, prior_chain_state)
                 .await?
@@ -923,9 +926,9 @@ fn translate_received_note(
 
 fn translate_unspent_note(
     row: zally_storage::UnspentShieldedNoteRow,
-    observed_tip: Option<BlockHeight>,
+    visible_tip: Option<BlockHeight>,
 ) -> crate::unspent_note::UnspentShieldedNote {
-    let confirmations = match observed_tip {
+    let confirmations = match visible_tip {
         Some(tip) if tip.as_u32() >= row.mined_height.as_u32() => tip
             .as_u32()
             .saturating_sub(row.mined_height.as_u32())

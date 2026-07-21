@@ -29,7 +29,9 @@ pub(crate) fn posture_for_indexer(policy: IndexerRetryPolicy) -> FailurePosture 
                   conservative posture as OperatorActionRequired for any future variant"
     )]
     match policy {
-        IndexerRetryPolicy::RetryWithBackoff => FailurePosture::Retryable,
+        IndexerRetryPolicy::RetryWithBackoff | IndexerRetryPolicy::RefreshChainEpoch => {
+            FailurePosture::Retryable
+        }
         IndexerRetryPolicy::OperatorActionRequired => FailurePosture::RequiresOperator,
         IndexerRetryPolicy::ClientError => FailurePosture::NotRetryable,
         _ => FailurePosture::RequiresOperator,
@@ -64,18 +66,66 @@ pub enum ChainSourceError {
         earliest_height: BlockHeight,
     },
 
-    /// Requested height is above the source's safe chain tip.
+    /// Requested height is above the source's visible chain tip.
     ///
     /// Posture: [`FailurePosture::NotRetryable`] until the chain advances; caller
-    /// should re-query `safe_chain_tip()`.
-    #[error(
-        "block height {requested_height} is above source's safe chain tip {safe_chain_tip_height}"
-    )]
-    BlockHeightAboveSafeChainTip {
+    /// should acquire a new [`crate::ChainEpoch`].
+    #[error("block height {requested_height} is above source's visible tip {visible_tip_height}")]
+    BlockHeightAboveVisibleTip {
         /// Height the caller requested.
         requested_height: BlockHeight,
-        /// Safe chain tip height the source currently exposes.
-        safe_chain_tip_height: BlockHeight,
+        /// Visible chain tip height the source currently exposes.
+        visible_tip_height: BlockHeight,
+    },
+
+    /// The connected source does not advertise capabilities required by this operation.
+    ///
+    /// Posture: [`FailurePosture::RequiresOperator`]. The endpoint must be upgraded or
+    /// reconfigured before the operation can be retried.
+    #[error("chain source does not advertise required capabilities: {capabilities:?}")]
+    CapabilitiesUnavailable {
+        /// Stable Zinder capability strings absent from `ServerInfo`.
+        capabilities: Vec<String>,
+    },
+
+    /// The source contract revision is older than this Zally build requires.
+    ///
+    /// Posture: [`FailurePosture::RequiresOperator`]. Upgrade the endpoint before retrying.
+    #[error(
+        "chain source contract revision {actual_revision} is older than required revision {minimum_revision}"
+    )]
+    ContractRevisionUnsupported {
+        /// Minimum revision implemented by this Zally build.
+        minimum_revision: u32,
+        /// Revision advertised by the source.
+        actual_revision: u32,
+    },
+
+    /// The exact chain epoch pinned for the current sync attempt is no longer retained.
+    ///
+    /// Posture: [`FailurePosture::Retryable`]. Restarting sync obtains a fresh visible epoch
+    /// before requesting any settled artifacts.
+    #[error("chain epoch pin became unavailable; restart sync against a fresh epoch")]
+    ChainEpochPinUnavailable,
+
+    /// The resume cursor precedes the source's retained chain-event window.
+    ///
+    /// Posture: [`FailurePosture::Retryable`]. Apply `recovery` after reconciling the
+    /// source epoch and wallet state.
+    #[error("chain event cursor expired; restart from the earliest retained event")]
+    ChainEventCursorExpired {
+        /// Safe source-neutral subscription recovery.
+        recovery: crate::ChainEventCursorRecovery,
+    },
+
+    /// The source returned a protocol variant this Zally build does not understand.
+    ///
+    /// Posture: [`FailurePosture::RequiresOperator`]. Upgrade Zally before interpreting the
+    /// new response; silently fabricating an older meaning would corrupt wallet state.
+    #[error("unsupported chain-source response variant: {response}")]
+    UnsupportedResponse {
+        /// Stable name of the response family containing the unknown variant.
+        response: &'static str,
     },
 
     /// The chain source returned a tree-state anchor at a height other than
@@ -88,7 +138,7 @@ pub enum ChainSourceError {
     /// Posture: [`FailurePosture::RequiresOperator`]. The operator must
     /// investigate the chain source: re-querying yields the same answer.
     #[error(
-        "chain source returned tree-state anchor at height {returned_height} for requested height {requested_height}; the chain source is violating the safe-chain-tip cadence contract"
+        "chain source returned tree-state anchor at height {returned_height} for requested height {requested_height}; the chain source is violating the exact-height contract"
     )]
     TreeStateAnchorHeightMismatch {
         /// Height the wallet requested.
@@ -121,6 +171,36 @@ pub enum ChainSourceError {
         /// Height of the offending block.
         block_height: BlockHeight,
         /// Underlying decode error description.
+        reason: String,
+    },
+
+    /// The compact-block stream did not contain the exact requested height sequence.
+    ///
+    /// Posture: [`FailurePosture::RequiresOperator`]. A successful range response must be
+    /// complete, ordered, and contain each requested height exactly once.
+    #[error(
+        "compact-block stream expected height {expected_height}, but received {actual_height:?}"
+    )]
+    CompactBlockStreamOrder {
+        /// Next height required by the inclusive request range.
+        expected_height: BlockHeight,
+        /// Height received instead, or `None` when the stream ended early.
+        actual_height: Option<BlockHeight>,
+    },
+
+    /// A subtree-root page violated its requested bounds or ordering.
+    #[error("malformed {pool:?} subtree-root page: {reason}")]
+    MalformedSubtreeRootPage {
+        /// Shielded pool whose page was malformed.
+        pool: crate::ShieldedPool,
+        /// Contract violation.
+        reason: String,
+    },
+
+    /// A transparent UTXO response violated the pinned epoch or set contract.
+    #[error("malformed transparent UTXO set: {reason}")]
+    MalformedTransparentUtxoSet {
+        /// Contract violation.
         reason: String,
     },
 
@@ -158,12 +238,21 @@ impl ChainSourceError {
     #[must_use]
     pub fn posture(&self) -> FailurePosture {
         match self {
-            Self::Unavailable { .. } | Self::BlockingTaskFailed { .. } => FailurePosture::Retryable,
-            Self::BlockHeightBelowFloor { .. } | Self::BlockHeightAboveSafeChainTip { .. } => {
+            Self::Unavailable { .. }
+            | Self::BlockingTaskFailed { .. }
+            | Self::ChainEpochPinUnavailable
+            | Self::ChainEventCursorExpired { .. } => FailurePosture::Retryable,
+            Self::BlockHeightBelowFloor { .. } | Self::BlockHeightAboveVisibleTip { .. } => {
                 FailurePosture::NotRetryable
             }
             Self::NetworkMismatch { .. }
+            | Self::CapabilitiesUnavailable { .. }
+            | Self::ContractRevisionUnsupported { .. }
+            | Self::UnsupportedResponse { .. }
             | Self::MalformedCompactBlock { .. }
+            | Self::CompactBlockStreamOrder { .. }
+            | Self::MalformedSubtreeRootPage { .. }
+            | Self::MalformedTransparentUtxoSet { .. }
             | Self::TreeStateAnchorHeightMismatch { .. }
             | Self::ShieldedPoolUnsupported { .. } => FailurePosture::RequiresOperator,
             #[cfg(feature = "zinder")]
@@ -186,6 +275,16 @@ pub enum SubmitterError {
         reason: String,
     },
 
+    /// The submitter rejected the request before transaction broadcast.
+    ///
+    /// Posture: [`FailurePosture::NotRetryable`]. Retrying the same bytes and request
+    /// metadata cannot satisfy the submitter's contract.
+    #[error("submitter rejected the request: {reason}")]
+    RequestRejected {
+        /// Stable rejection detail returned by the submitter.
+        reason: String,
+    },
+
     /// Configuration mismatch between the submitter and the transaction.
     ///
     /// Posture: [`FailurePosture::RequiresOperator`].
@@ -195,6 +294,23 @@ pub enum SubmitterError {
         submitter: Network,
         /// Network the transaction is for.
         transaction: Network,
+    },
+
+    /// The connected source does not advertise transaction broadcast support.
+    ///
+    /// Posture: [`FailurePosture::RequiresOperator`]. The endpoint must be reconfigured
+    /// with a broadcaster before submission can succeed.
+    #[error("submitter source does not advertise required capabilities: {capabilities:?}")]
+    CapabilitiesUnavailable {
+        /// Stable Zinder capability strings absent from `ServerInfo`.
+        capabilities: Vec<String>,
+    },
+
+    /// The source returned a broadcast outcome this Zally build does not understand.
+    #[error("unsupported submitter response variant: {response}")]
+    UnsupportedResponse {
+        /// Stable name of the response family containing the unknown variant.
+        response: &'static str,
     },
 
     /// A background task panicked or was cancelled.
@@ -220,7 +336,11 @@ impl SubmitterError {
     pub fn posture(&self) -> FailurePosture {
         match self {
             Self::Unavailable { .. } | Self::BlockingTaskFailed { .. } => FailurePosture::Retryable,
+            Self::RequestRejected { .. } => FailurePosture::NotRetryable,
             Self::NetworkMismatch { .. } => FailurePosture::RequiresOperator,
+            Self::CapabilitiesUnavailable { .. } | Self::UnsupportedResponse { .. } => {
+                FailurePosture::RequiresOperator
+            }
             #[cfg(feature = "zinder")]
             Self::Indexer(err) => posture_for_indexer(err.retry_policy()),
         }
@@ -263,9 +383,9 @@ mod tests {
                 FailurePosture::NotRetryable,
             ),
             (
-                ChainSourceError::BlockHeightAboveSafeChainTip {
+                ChainSourceError::BlockHeightAboveVisibleTip {
                     requested_height: BlockHeight::from(2),
-                    safe_chain_tip_height: BlockHeight::from(1),
+                    visible_tip_height: BlockHeight::from(1),
                 },
                 FailurePosture::NotRetryable,
             ),
@@ -277,9 +397,22 @@ mod tests {
                 FailurePosture::RequiresOperator,
             ),
             (
+                ChainSourceError::UnsupportedResponse {
+                    response: "ChainEvent",
+                },
+                FailurePosture::RequiresOperator,
+            ),
+            (
                 ChainSourceError::MalformedCompactBlock {
                     block_height: BlockHeight::from(1),
                     reason: "x".into(),
+                },
+                FailurePosture::RequiresOperator,
+            ),
+            (
+                ChainSourceError::CompactBlockStreamOrder {
+                    expected_height: BlockHeight::from(1),
+                    actual_height: None,
                 },
                 FailurePosture::RequiresOperator,
             ),
@@ -314,6 +447,10 @@ mod tests {
                 FailurePosture::Retryable,
             ),
             (
+                SubmitterError::RequestRejected { reason: "x".into() },
+                FailurePosture::NotRetryable,
+            ),
+            (
                 SubmitterError::NetworkMismatch {
                     submitter: Network::Mainnet,
                     transaction: Network::Testnet,
@@ -323,6 +460,12 @@ mod tests {
             (
                 SubmitterError::BlockingTaskFailed { reason: "x".into() },
                 FailurePosture::Retryable,
+            ),
+            (
+                SubmitterError::UnsupportedResponse {
+                    response: "TransactionBroadcastOutcome",
+                },
+                FailurePosture::RequiresOperator,
             ),
         ];
         for (variant, expected) in cases {
@@ -335,6 +478,10 @@ mod tests {
     fn indexer_retry_policy_maps_to_posture() {
         assert_eq!(
             posture_for_indexer(IndexerRetryPolicy::RetryWithBackoff),
+            FailurePosture::Retryable,
+        );
+        assert_eq!(
+            posture_for_indexer(IndexerRetryPolicy::RefreshChainEpoch),
             FailurePosture::Retryable,
         );
         assert_eq!(

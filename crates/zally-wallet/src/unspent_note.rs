@@ -9,7 +9,7 @@ use zally_core::{BlockHeight, TxId, Zatoshis};
 /// snapshot of spendable shielded inputs for an account: balance dashboards, observation
 /// channels (e.g., donation observers), and reservation logic before a custody flow.
 ///
-/// The `confirmations` field is computed against the wallet's last observed chain tip at
+/// The `confirmations` field is computed against the wallet's persisted visible tip at
 /// the moment of the call. Operators that need a fresher number should call
 /// [`crate::Wallet::sync`] first.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -27,7 +27,7 @@ pub struct UnspentShieldedNote {
     pub output_index: u32,
     /// Block height at which the producing transaction was mined.
     pub mined_height: BlockHeight,
-    /// Confirmations on this note computed as `observed_tip - mined_height + 1`, saturating
+    /// Confirmations on this note computed as `visible_tip - mined_height + 1`, saturating
     /// at `0` if the wallet has not yet observed a tip at or above `mined_height`.
     pub confirmations: u32,
 }

@@ -4,9 +4,10 @@ use tempfile::TempDir;
 use zally_core::{BlockHeight, TxId, Zatoshis};
 use zally_keys::{Mnemonic, SeedMaterial};
 use zally_storage::{Sqlite, SqliteOptions, StorageError, TransparentUtxoRow, WalletStorage};
-use zcash_client_backend::data_api::chain::ChainState;
-use zcash_primitives::block::BlockHash;
 use zcash_transparent::address::Script;
+
+#[path = "fixtures/scan_artifact.rs"]
+mod scan_artifact;
 
 #[tokio::test]
 async fn transparent_utxo_round_trip_records_exposed_receiver() -> Result<(), TestError> {
@@ -20,7 +21,10 @@ async fn transparent_utxo_round_trip_records_exposed_receiver() -> Result<(), Te
     let mnemonic = Mnemonic::generate();
     let seed = SeedMaterial::from_mnemonic(&mnemonic, "");
     let account_id = storage
-        .create_account_for_seed(&seed, ChainState::empty(0.into(), BlockHash([0u8; 32])))
+        .create_account_for_seed(
+            &seed,
+            scan_artifact::genesis_tree_state(zally_core::Network::regtest(), 0, [0; 32]),
+        )
         .await?;
     let ua = storage
         .derive_next_address_with_transparent(account_id)

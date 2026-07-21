@@ -16,6 +16,8 @@ serde = ["dep:serde", "zally-core/serde", "zally-keys/serde"]
 
 [dependencies]
 async-trait.workspace = true
+blake2b_simd.workspace = true
+hex.workspace = true
 rand.workspace = true
 rusqlite.workspace = true
 secrecy.workspace = true
@@ -47,6 +49,7 @@ prost = "0.14"
 serde_json.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
+wagyu-zcash-parameters = "0.2"
 
 [lints]
 workspace = true

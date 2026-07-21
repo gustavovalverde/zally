@@ -1,7 +1,7 @@
 //! Operator-facing wallet error.
 
 use zally_chain::{ChainSourceError, FailurePosture, SubmitterError};
-use zally_core::{BlockHeight, Network, Zatoshis};
+use zally_core::{BlockHeight, Network, TxId, Zatoshis};
 use zally_keys::{KeyDerivationError, SealingError};
 use zally_pczt::{PaymentDisclosureExportError, PcztError};
 use zally_storage::StorageError;
@@ -119,6 +119,18 @@ pub enum WalletError {
         detail: String,
     },
 
+    /// A success-kind submitter response named a transaction other than the bytes submitted.
+    ///
+    /// Posture: [`FailurePosture::RequiresOperator`]: the submitter contract is inconsistent
+    /// and must be corrected before the wallet can safely report success.
+    #[error("submitter transaction id mismatch: expected {expected}, returned {returned}")]
+    SubmittedTransactionIdMismatch {
+        /// Transaction identifier derived from the submitted bytes.
+        expected: TxId,
+        /// Transaction identifier returned by the submitter.
+        returned: TxId,
+    },
+
     /// A PCZT role (Creator, Prover, Signer, Combiner, Extractor) returned an error.
     ///
     /// Posture follows the underlying [`PcztError`].
@@ -151,19 +163,19 @@ pub enum WalletError {
         operation: &'static str,
     },
 
-    /// The caller-supplied `target_expiry_height` is at or below the wallet's observed chain
-    /// tip, so any signed transaction would already be past its allowed expiry window.
+    /// The caller-supplied `target_expiry_height` is at or below the wallet's visible tip,
+    /// so any signed transaction would already be past its allowed expiry window.
     ///
     /// Posture: [`FailurePosture::NotRetryable`] until the caller picks a fresh height
     /// (typically after observing a new tip).
     #[error(
-        "target_expiry_height={target:?} is at or below the wallet's observed tip={chain_tip:?}"
+        "target_expiry_height={target:?} is at or below the wallet's visible tip={visible_tip:?}"
     )]
     TargetExpiryStale {
         /// Height the caller asked the wallet to commit to.
         target: BlockHeight,
-        /// Chain tip the wallet had observed at the time of the call.
-        chain_tip: BlockHeight,
+        /// Visible tip the wallet had recorded at the time of the call.
+        visible_tip: BlockHeight,
     },
 
     /// The signed transaction's `expiry_height` does not match the caller-supplied
@@ -224,6 +236,7 @@ impl WalletError {
             Self::NetworkMismatch { .. }
             | Self::NoSealedSeed
             | Self::AccountNotFound
+            | Self::SubmittedTransactionIdMismatch { .. }
             | Self::TargetExpiryMismatch { .. }
             | Self::SyncDriverFailed { .. } => FailurePosture::RequiresOperator,
             Self::AccountAlreadyExists
@@ -313,6 +326,10 @@ mod tests {
                 reason: zally_chain::RejectionReason::Unknown,
                 detail: "x".into(),
             },
+            WalletError::SubmittedTransactionIdMismatch {
+                expected: TxId::from_bytes([1; 32]),
+                returned: TxId::from_bytes([2; 32]),
+            },
             WalletError::Pczt(PcztError::NoMatchingKeys),
             WalletError::PaymentDisclosureExport(PaymentDisclosureExportError::ProfileUnsupported),
             WalletError::PaymentDisclosureSourceMissing {
@@ -321,7 +338,7 @@ mod tests {
             WalletError::CircuitBroken { operation: "test" },
             WalletError::TargetExpiryStale {
                 target: BlockHeight::from(10),
-                chain_tip: BlockHeight::from(20),
+                visible_tip: BlockHeight::from(20),
             },
             WalletError::TargetExpiryMismatch {
                 target: BlockHeight::from(10),

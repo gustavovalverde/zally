@@ -12,8 +12,9 @@ use tempfile::TempDir;
 use zally_core::{AccountId, BlockHeight};
 use zally_keys::{Mnemonic, SeedMaterial};
 use zally_storage::{Sqlite, SqliteOptions, StorageError, WalletStorage};
-use zcash_client_backend::data_api::chain::ChainState;
-use zcash_primitives::block::BlockHash;
+
+#[path = "fixtures/scan_artifact.rs"]
+mod scan_artifact;
 
 #[tokio::test]
 async fn list_unspent_shielded_notes_round_trip_empty_account() -> Result<(), TestError> {
@@ -27,7 +28,10 @@ async fn list_unspent_shielded_notes_round_trip_empty_account() -> Result<(), Te
     let mnemonic = Mnemonic::generate();
     let seed = SeedMaterial::from_mnemonic(&mnemonic, "");
     let account_id = storage
-        .create_account_for_seed(&seed, ChainState::empty(0.into(), BlockHash([0u8; 32])))
+        .create_account_for_seed(
+            &seed,
+            scan_artifact::genesis_tree_state(zally_core::Network::regtest(), 0, [0; 32]),
+        )
         .await?;
 
     let rows = storage
@@ -52,7 +56,10 @@ async fn list_unspent_shielded_notes_fails_closed_for_unknown_account() -> Resul
     let mnemonic = Mnemonic::generate();
     let seed = SeedMaterial::from_mnemonic(&mnemonic, "");
     storage
-        .create_account_for_seed(&seed, ChainState::empty(0.into(), BlockHash([0u8; 32])))
+        .create_account_for_seed(
+            &seed,
+            scan_artifact::genesis_tree_state(zally_core::Network::regtest(), 0, [0; 32]),
+        )
         .await?;
 
     let unknown = AccountId::from_uuid(uuid::Uuid::nil());
