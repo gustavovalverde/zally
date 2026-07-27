@@ -289,7 +289,10 @@ impl From<StorageError> for WalletError {
                 requested_zat: required_zat,
                 spendable_zat: available_zat,
             },
-            StorageError::ProposalBuildFailed { reason, .. } => Self::ProposalRejected { reason },
+            StorageError::ProposalBuildFailed {
+                reason,
+                posture: FailurePosture::NotRetryable,
+            } => Self::ProposalRejected { reason },
             other => Self::Storage(other),
         }
     }
@@ -363,6 +366,16 @@ mod tests {
         };
         assert_eq!(err.posture(), FailurePosture::RequiresOperator);
         assert!(!err.is_retryable());
+    }
+
+    #[test]
+    fn retryable_proposal_failure_preserves_storage_posture() {
+        let err = WalletError::from(StorageError::ProposalBuildFailed {
+            reason: "InputsLocked".to_owned(),
+            posture: FailurePosture::Retryable,
+        });
+        assert!(matches!(err, WalletError::Storage(_)));
+        assert_eq!(err.posture(), FailurePosture::Retryable);
     }
 
     #[test]

@@ -3,7 +3,6 @@
 mod account_balance_row;
 mod error;
 mod exposed_address_row;
-mod filtered_wallet_db;
 mod hold_row;
 mod pending_broadcast_input_row;
 mod sqlite;

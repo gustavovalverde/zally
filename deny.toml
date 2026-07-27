@@ -4,10 +4,6 @@ all-features = true
 [advisories]
 yanked = "deny"
 ignore = [
-    # time 0.3 stack overflow on extremely large datetime parse input. Pulled transitively
-    # via rusqlite -> schemerz-rusqlite -> zcash_client_sqlite. Zally does not parse
-    # untrusted datetime input. Track upstream release of time >=0.3.47.
-    "RUSTSEC-2026-0009",
     # proc-macro-error unmaintained advisory; pulled transitively through age's i18n stack.
     # Not a vulnerability; tracking upstream replacement.
     "RUSTSEC-2024-0370",
@@ -22,14 +18,9 @@ allow = [
     "ISC",
     "Unicode-3.0",
     "Zlib",
-    "MPL-2.0",
     # CC0-1.0 is FSF Free/Libre and OSI-approved. Used by upstream crypto crates
     # (bounded-vec, secp256k1) pulled transitively through librustzcash.
     "CC0-1.0",
-    # CDLA-Permissive-2.0 is a Linux Foundation permissive license used by the
-    # webpki-root-certs crate that ships the Mozilla root CA bundle. Pulled
-    # transitively via tonic + rustls when the zinder integration is enabled.
-    "CDLA-Permissive-2.0",
 ]
 confidence-threshold = 0.93
 
@@ -48,23 +39,9 @@ unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 allow-git = [
-    # librustzcash and adjacent ecosystem repositories pinned to specific
-    # commits are added here as the dependency set is locked. Never add a
-    # branch reference; always pin a commit so supply-chain review has a
-    # fixed artifact to evaluate.
-    #
     # zinder-client and zinder-core back the optional `zinder` feature on
     # zally-chain. Pulled from a pinned git revision so external consumers can
     # build Zally without a local checkout. Pin a specific commit rather than
     # tracking a branch.
     "https://github.com/gustavovalverde/zinder",
-    # Upstream librustzcash commit carrying the unreleased Ironwood/NU6.3
-    # dependency family plus the target-expiry PCZT API. See ADR-0006.
-    "https://github.com/zcash/librustzcash.git",
-    # Temporary Orchard patch required by the pinned librustzcash commit's
-    # bundle-type APIs.
-    "https://github.com/zcash/orchard",
-    # Temporary incrementalmerkletree fork carrying retained-checkpoint and exact
-    # checkpoint truncation fixes until they are released upstream.
-    "https://github.com/gustavovalverde/incrementalmerkletree",
 ]

@@ -400,7 +400,7 @@ pub struct HoldRecord {
 /// Request body for [`WalletStorage::record_pending_broadcast_inputs`].
 ///
 /// Carries the metadata a wallet-owned broadcast needs to register itself with the
-/// pending-broadcast filter: the broadcast txid, the account it belongs to, when the
+/// operator read model: the broadcast txid, the account it belongs to, when the
 /// broadcast happened (wall-clock and chain tip), and the transparent outpoints the
 /// transaction consumes (each paired with its value).
 #[derive(Clone, Debug)]
@@ -610,10 +610,8 @@ pub trait WalletStorage: Send + Sync + 'static {
     /// and returns the raw transaction bytes (one per step) for the caller to submit via
     /// a `Submitter` (see `zally_chain::Submitter`).
     ///
-    /// `excluded_outpoints` is the set of transparent outpoints locked by a still-unconfirmed
-    /// wallet-owned broadcast; the storage layer filters these out at the
-    /// `InputSource::get_spendable_transparent_outputs` seam so the proposal selector never
-    /// picks them. An empty set disables the filter.
+    /// The storage layer asks librustzcash to lock the proposal's inputs until transaction
+    /// creation persists the spends. Failed builds release those locks before returning.
     ///
     /// The storage layer constructs a `LocalTxProver` from the paths configured through
     /// `SqliteOptions::with_sapling_proving_parameters`, or from the platform-default
@@ -625,14 +623,10 @@ pub trait WalletStorage: Send + Sync + 'static {
     async fn prepare_payment(
         &self,
         request: ProposalPaymentRequest,
-        excluded_outpoints: std::collections::HashSet<OutPoint>,
         seed: &SeedMaterial,
     ) -> Result<Vec<PreparedTransaction>, StorageError>;
 
     /// Shields wallet-owned transparent UTXOs into the account's internal shielded receiver.
-    ///
-    /// `excluded_outpoints` follows the same contract as on `prepare_payment`. Empty set
-    /// disables the filter.
     ///
     /// Wraps `zcash_client_backend::data_api::wallet::shield_transparent_funds` using ZIP-317
     /// conventional fees and the default ZIP-315 confirmations policy. The storage layer
@@ -645,7 +639,6 @@ pub trait WalletStorage: Send + Sync + 'static {
     async fn shield_transparent_funds(
         &self,
         request: ShieldTransparentRequest,
-        excluded_outpoints: std::collections::HashSet<OutPoint>,
         seed: &SeedMaterial,
     ) -> Result<Vec<PreparedTransaction>, StorageError>;
 
@@ -685,6 +678,15 @@ pub trait WalletStorage: Send + Sync + 'static {
         request: ProposalPaymentRequest,
         target_expiry_height: Option<BlockHeight>,
     ) -> Result<Vec<u8>, StorageError>;
+
+    /// Releases the exact proposal inputs held for a PCZT that will not be completed.
+    ///
+    /// Zally-created PCZTs carry an opaque lock-owner token while the storage backend
+    /// retains the matching output references. The operation is idempotent after the
+    /// first successful release. PCZTs created outside this storage backend are rejected.
+    ///
+    /// `not_retryable` on malformed or foreign PCZTs; `retryable` on transient storage I/O.
+    async fn abandon_pczt(&self, pczt_bytes: Vec<u8>) -> Result<(), StorageError>;
 
     /// Extracts a finalised PCZT, persists the resulting transaction in the wallet DB, and
     /// returns its raw bytes plus `tx_id`.
@@ -829,13 +831,12 @@ pub trait WalletStorage: Send + Sync + 'static {
         account_id: AccountId,
     ) -> Result<Vec<ExposedAddressRow>, StorageError>;
 
-    /// Records the transparent inputs of a wallet-owned transaction that was just broadcast.
+    /// Records the transparent inputs of a wallet-owned transaction about to be broadcast.
     ///
-    /// Used by the spend path immediately after `zally_chain::Submitter::submit` returns
-    /// success. The recorded rows are what
-    /// [`Self::list_pending_broadcast_inputs`] returns and what the input-selection filter
-    /// excludes from new spends, so callers must record every transparent input the
-    /// broadcast consumed.
+    /// Used by the spend path immediately before `zally_chain::Submitter::submit`, so an
+    /// accepted broadcast remains visible if the process exits before the submit call returns.
+    /// The recorded rows back [`Self::list_pending_broadcast_inputs`]. They do not override
+    /// librustzcash input selection.
     ///
     /// Inserts are idempotent on `(broadcast_tx_id, outpoint_tx_id, outpoint_index)`: a
     /// second call with the same triple replaces the prior `broadcast_at_*` fields.

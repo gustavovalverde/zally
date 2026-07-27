@@ -29,7 +29,7 @@ async fn capabilities_reports_standing_surface() -> Result<(), TestWalletError> 
     assert!(caps.features.contains(&Capability::SyncDriver));
     assert!(caps.features.contains(&Capability::EventStream));
     assert!(caps.features.contains(&Capability::IdempotentSend));
-    assert!(caps.features.contains(&Capability::PcztV06));
+    assert!(caps.features.contains(&Capability::PcztV1AndV2));
     assert!(caps.features.contains(&Capability::MetricsSnapshot));
     assert!(caps.features.contains(&Capability::StatusSnapshot));
     Ok(())

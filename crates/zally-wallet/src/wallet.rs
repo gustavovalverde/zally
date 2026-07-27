@@ -224,13 +224,13 @@ impl Wallet {
             .collect())
     }
 
-    /// Returns the snapshot of transparent outpoints currently locked by wallet-owned
+    /// Returns the snapshot of transparent outpoints recorded for recent wallet-owned
     /// broadcasts that have not yet been observed mined.
     ///
     /// The snapshot honours [`WalletOptions::pending_broadcast_window_ms`]: entries whose
-    /// `broadcast_at_ms` falls outside the window are excluded so a permanently-dropped
-    /// broadcast eventually frees its locked outpoints from the read view as well as the
-    /// spend filter.
+    /// `broadcast_at_ms` falls outside the window is excluded from this operator read view.
+    /// librustzcash's lock, persisted-spend, and transaction-expiry state independently
+    /// determines whether an outpoint is eligible for selection.
     ///
     /// `requires_operator` on unknown account; `retryable` on transient storage I/O.
     pub async fn get_pending_transparent_inputs(
@@ -766,7 +766,7 @@ fn build_capabilities(
     features.insert(Capability::SyncDriver);
     features.insert(Capability::EventStream);
     features.insert(Capability::IdempotentSend);
-    features.insert(Capability::PcztV06);
+    features.insert(Capability::PcztV1AndV2);
     features.insert(Capability::MetricsSnapshot);
     features.insert(Capability::StatusSnapshot);
     WalletCapabilities {

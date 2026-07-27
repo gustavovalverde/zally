@@ -135,6 +135,23 @@ pub enum StorageError {
         tx_id: TxId,
     },
 
+    /// A PCZT supplied for abandonment was not created by this wallet storage.
+    ///
+    /// Posture: [`FailurePosture::NotRetryable`]; only a Zally-created PCZT carries the
+    /// owner token required to release its exact input locks.
+    #[error("PCZT does not carry a Zally input-lock owner")]
+    PcztLockOwnerMissing,
+
+    /// A PCZT carries a malformed Zally input-lock owner.
+    ///
+    /// Posture: [`FailurePosture::NotRetryable`]; the proprietary field must contain one
+    /// 32-byte librustzcash `LockOwner`.
+    #[error("PCZT input-lock owner has invalid length {byte_count}; expected 32 bytes")]
+    PcztLockOwnerMalformed {
+        /// Number of bytes in the malformed proprietary field.
+        byte_count: usize,
+    },
+
     /// `scan_blocks` rejected the batch because the chain source served a block whose parent
     /// hash does not match the wallet's stored view at `at_height`.
     ///
@@ -260,6 +277,8 @@ impl StorageError {
             | Self::KeyDerivationFailed { .. }
             | Self::IdempotencyKeyConflict
             | Self::FinalizedPcztConflict { .. }
+            | Self::PcztLockOwnerMissing
+            | Self::PcztLockOwnerMalformed { .. }
             | Self::CommitmentTreeConflict { .. }
             | Self::TransparentOutputNotRecognized { .. }
             | Self::TransparentOutputValueOutOfRange { .. }
@@ -312,6 +331,8 @@ mod tests {
             StorageError::FinalizedPcztConflict {
                 tx_id: TxId::from_bytes([0_u8; 32]),
             },
+            StorageError::PcztLockOwnerMissing,
+            StorageError::PcztLockOwnerMalformed { byte_count: 31 },
             StorageError::ChainReorgDetected {
                 at_height: BlockHeight::from(1),
             },

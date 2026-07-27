@@ -5,8 +5,6 @@
 //! `Wallet::send_payment` adds signing and submission through the caller-supplied
 //! `Submitter`.
 
-use std::collections::HashSet;
-
 use zally_chain::{ShieldedPool, Submitter};
 use zally_core::{
     AccountId, BlockHeight, IdempotencyKey, Memo, MemoBytes, Network, OutPoint, PaymentRecipient,
@@ -389,9 +387,6 @@ impl Wallet {
                 .map_err(WalletError::from)?;
             let recipient_encoded = plan.recipient.encoded().to_owned();
             let memo_bytes = plan.memo.as_ref().map(memo_to_wire_bytes);
-            let excluded_outpoints = self
-                .collect_pending_broadcast_outpoints(plan.account_id)
-                .await?;
             self.inner
                 .storage
                 .prepare_payment(
@@ -401,7 +396,6 @@ impl Wallet {
                         plan.amount_zat,
                         memo_bytes,
                     ),
-                    excluded_outpoints,
                     &seed,
                 )
                 .await
@@ -469,15 +463,32 @@ impl Wallet {
             plan.memo.clone(),
         );
         let proposed = self.propose_pczt(proposal_plan, Some(target)).await?;
-        let proven = self.prove_pczt(proposed).await?;
-        let signed = self.sign_pczt(proven).await?;
+        let proven = match self.prove_pczt(&proposed).await {
+            Ok(proven) => proven,
+            Err(error) => {
+                return Err(self.abandon_pczt_after_error(&proposed, error).await);
+            }
+        };
+        let signed = match self.sign_pczt(&proven).await {
+            Ok(signed) => signed,
+            Err(error) => {
+                return Err(self.abandon_pczt_after_error(&proven, error).await);
+            }
+        };
 
-        let prepared = self
+        let prepared = match self
             .inner
             .storage
-            .extract_and_store_pczt(signed.into_bytes())
+            .extract_and_store_pczt(signed.as_bytes().to_vec())
             .await
-            .map_err(WalletError::from)?;
+        {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                return Err(self
+                    .abandon_pczt_after_error(&signed, WalletError::from(error))
+                    .await);
+            }
+        };
         let signed_height = prepared.tx_expiry_height;
         if u32::from(signed_height) != u32::from(target) {
             return Err(WalletError::TargetExpiryMismatch {
@@ -537,14 +548,11 @@ impl Wallet {
             .unseal_seed()
             .await
             .map_err(WalletError::from)?;
-        let excluded_outpoints = self
-            .collect_pending_broadcast_outpoints(plan.account_id)
-            .await?;
         let shielding_request = resolve_shielding_request(&plan)?;
         let prepared = self
             .inner
             .storage
-            .shield_transparent_funds(shielding_request, excluded_outpoints, &seed)
+            .shield_transparent_funds(shielding_request, &seed)
             .await
             .map_err(WalletError::from)?;
         let visible_tip = self.inner.storage.find_visible_tip().await?;
@@ -666,27 +674,6 @@ impl Wallet {
             .storage
             .clear_pending_broadcast_inputs_for_mined(&[broadcast_tx_id])
             .await;
-    }
-
-    async fn collect_pending_broadcast_outpoints(
-        &self,
-        account_id: AccountId,
-    ) -> Result<HashSet<OutPoint>, WalletError> {
-        let after_at_ms = self.pending_broadcast_cutoff_ms();
-        let rows = self
-            .inner
-            .storage
-            .list_pending_broadcast_inputs(account_id, after_at_ms)
-            .await?;
-        Ok(rows.into_iter().map(|row| row.outpoint).collect())
-    }
-
-    /// Unix millisecond cutoff used by every pending-broadcast read: rows older than this
-    /// fall outside the operator-configured inflight window. Centralized so the three call
-    /// sites (`Wallet::get_pending_transparent_inputs`, the spend filter, and the sync
-    /// cleanup) cannot drift.
-    pub(crate) fn pending_broadcast_cutoff_ms(&self) -> u64 {
-        current_unix_ms().saturating_sub(self.inner.options.pending_broadcast_window_ms)
     }
 
     async fn visible_tip_or_zero(&self) -> Result<BlockHeight, WalletError> {

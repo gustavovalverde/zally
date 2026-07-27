@@ -115,7 +115,7 @@ async fn extract_pczt_rejects_network_mismatch_before_storage() -> Result<(), Te
     let fixture = create_test_wallet().await?;
     let foreign_pczt = PcztBytes::from_serialized(vec![0_u8; 4], Network::Mainnet);
 
-    let outcome = fixture.wallet.extract_pczt(foreign_pczt).await;
+    let outcome = fixture.wallet.extract_pczt(&foreign_pczt).await;
     assert!(matches!(
         outcome,
         Err(WalletError::NetworkMismatch {

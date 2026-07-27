@@ -68,6 +68,7 @@ async fn funded_wallet_syncs_sends_and_submits_pczt_with_zinder() -> Result<(), 
     let shield_tx_id = round_trip.shield_transparent_funds().await?;
     assert_ne!(funding_tx_id, shield_tx_id);
 
+    round_trip.abandon_pczt_releases_inputs().await?;
     let send_tx_id = round_trip.submit_shielded_payment().await?;
     let pczt_tx_id = round_trip.submit_pczt_payment().await?;
     assert_ne!(send_tx_id, pczt_tx_id);
@@ -77,7 +78,7 @@ async fn funded_wallet_syncs_sends_and_submits_pczt_with_zinder() -> Result<(), 
 
 #[tokio::test]
 #[ignore = "live test; see CLAUDE.md §Live Node Tests"]
-async fn shielding_excludes_pending_broadcast_inputs() -> Result<(), TestError> {
+async fn shielding_does_not_reselect_a_pending_spend() -> Result<(), TestError> {
     let _guard = init();
     require_live()?;
     if !matches!(require_network()?, Network::Regtest(_)) {
@@ -95,18 +96,18 @@ async fn shielding_excludes_pending_broadcast_inputs() -> Result<(), TestError> 
         .await?;
     assert!(
         !pending.inputs.is_empty(),
-        "after a successful broadcast the pending-broadcast snapshot must report at least one locked outpoint"
+        "after a successful broadcast the operator pending-broadcast snapshot must report at least one recorded outpoint"
     );
 
     let second_outcome = round_trip
         .attempt_shield_with_idempotency("t3-duplicate-protect")
         .await;
     match second_outcome {
-        Err(WalletError::InsufficientBalance { .. } | WalletError::ProposalRejected { .. }) => {}
+        Err(WalletError::InsufficientBalance { .. }) => {}
         Err(other) => {
             return Err(TestError::Unexpected {
                 reason: format!(
-                    "expected InsufficientBalance or ProposalRejected on second immediate shield, got {other:?}"
+                    "expected InsufficientBalance on second immediate shield, got {other:?}"
                 ),
             });
         }
@@ -127,7 +128,7 @@ async fn shielding_excludes_pending_broadcast_inputs() -> Result<(), TestError> 
 }
 
 struct FundedZinderRoundTrip {
-    _wallet_path: TempWalletPath,
+    wallet_path: TempWalletPath,
     miner: JsonRpcClient,
     wallet: Wallet,
     account_id: AccountId,
@@ -163,7 +164,7 @@ impl FundedZinderRoundTrip {
         let sync_snapshots = sync_handle.observe_status();
 
         Ok(Self {
-            _wallet_path: wallet_path,
+            wallet_path,
             miner,
             wallet,
             account_id,
@@ -246,6 +247,50 @@ impl FundedZinderRoundTrip {
         Ok(send_outcome.tx_id())
     }
 
+    #[allow(
+        clippy::needless_pass_by_ref_mut,
+        reason = "Sync auto-trait coercion requires exclusive borrow on this !Sync struct"
+    )]
+    async fn abandon_pczt_releases_inputs(&mut self) -> Result<(), TestError> {
+        let send_zat = send_zat_from_env()?;
+        let first_recipient =
+            derive_unified_recipient(&self.wallet, self.account_id, self.network).await?;
+        let first_pczt = self
+            .wallet
+            .propose_pczt(
+                ProposalPlan::conventional(self.account_id, first_recipient, send_zat, None)
+                    .with_source_pool(ShieldedPool::Ironwood),
+                None,
+            )
+            .await?;
+        let reopened_sealing =
+            AgeFileSealing::new(AgeFileSealingOptions::at_path(self.wallet_path.seed_path()));
+        let reopened_storage = Sqlite::new(SqliteOptions::for_network(
+            self.network,
+            self.wallet_path.db_path(),
+        ));
+        let (reopened_wallet, reopened_account_id) =
+            Wallet::builder(self.network, reopened_sealing, reopened_storage)
+                .open()
+                .await?;
+        assert_eq!(reopened_account_id, self.account_id);
+        reopened_wallet.abandon_pczt(&first_pczt).await?;
+
+        let second_recipient =
+            derive_unified_recipient(&self.wallet, self.account_id, self.network).await?;
+        let second_pczt = self
+            .wallet
+            .propose_pczt(
+                ProposalPlan::conventional(self.account_id, second_recipient, send_zat, None)
+                    .with_source_pool(ShieldedPool::Ironwood),
+                None,
+            )
+            .await?;
+        self.wallet.abandon_pczt(&second_pczt).await?;
+        self.wallet.abandon_pczt(&second_pczt).await?;
+        Ok(())
+    }
+
     async fn submit_pczt_payment(&mut self) -> Result<TxId, TestError> {
         let send_zat = send_zat_from_env()?;
         let pczt_recipient =
@@ -259,11 +304,11 @@ impl FundedZinderRoundTrip {
                 None,
             )
             .await?;
-        let proven_pczt = self.wallet.prove_pczt(pczt).await?;
-        let signed_pczt = self.wallet.sign_pczt(proven_pczt).await?;
+        let proven_pczt = self.wallet.prove_pczt(&pczt).await?;
+        let signed_pczt = self.wallet.sign_pczt(&proven_pczt).await?;
         let pczt_outcome = self
             .wallet
-            .extract_and_submit_pczt(signed_pczt, &self.submitter)
+            .extract_and_submit_pczt(&signed_pczt, &self.submitter)
             .await?;
         self.miner.generate_blocks(1)?;
         let pczt_height = self.miner.visible_tip_height()?;
@@ -514,7 +559,8 @@ fn build_regtest_funding_transaction(
             sapling_anchor: None,
             orchard_anchor: None,
             ironwood_anchor: None,
-            orchard_pool_bundle_type: orchard::builder::BundleType::DEFAULT,
+            orchard_padding: zcash_primitives::transaction::builder::BundlePadding::DEFAULT,
+            ironwood_padding: zcash_primitives::transaction::builder::BundlePadding::DEFAULT,
         },
     );
     builder

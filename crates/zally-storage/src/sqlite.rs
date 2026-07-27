@@ -33,8 +33,8 @@ use zally_keys::{KeyDerivationError, SeedMaterial, derive_ufvk};
 use zcash_client_backend::data_api::chain::{ChainState, CommitmentTreeRoot};
 use zcash_client_backend::data_api::scanning::ScanRange;
 use zcash_client_backend::data_api::wallet::{
-    ConfirmationsPolicy, SpendingKeys,
-    input_selection::{GreedyInputSelector, SpendPolicy},
+    ConfirmationsPolicy, LockRequest, SpendingKeys,
+    input_selection::{GreedyInputSelector, LockFilter, LockedInputPolicy, SpendPolicy},
 };
 use zcash_client_backend::data_api::{
     Account, AccountBirthday, MaxSpendMode, TargetValue, WalletCommitmentTrees, WalletRead,
@@ -49,7 +49,7 @@ use zcash_client_backend::proto::compact_formats::{
     CompactTxIn as UpstreamCompactTransparentInput, TxOut as UpstreamCompactTransparentOutput,
 };
 use zcash_client_backend::proto::service::TreeState as UpstreamTreeState;
-use zcash_client_backend::wallet::{NoteId, WalletTransparentOutput};
+use zcash_client_backend::wallet::{LockOwner, NoteId, OutputRef, WalletTransparentOutput};
 use zcash_client_sqlite::AccountUuid;
 use zcash_client_sqlite::WalletDb;
 use zcash_client_sqlite::error::SqliteClientError;
@@ -58,20 +58,22 @@ use zcash_client_sqlite::wallet::init::WalletMigrator;
 use zcash_keys::address::UnifiedAddress;
 use zcash_keys::keys::transparent::gap_limits::GapLimits;
 use zcash_keys::keys::{UnifiedAddressRequest, UnifiedFullViewingKey};
-use zcash_protocol::ShieldedPool;
 use zcash_protocol::consensus::{NetworkUpgrade, Parameters as _};
 use zcash_protocol::memo::Memo;
 use zcash_protocol::value::Zatoshis as UpstreamZatoshis;
+use zcash_protocol::{PoolType, ShieldedPool};
 use zcash_transparent::address::Script;
 use zcash_transparent::bundle::{OutPoint as UpstreamOutPoint, TxOut};
 
 use crate::error::StorageError;
-use crate::filtered_wallet_db::FilteredWalletDb;
 use crate::wallet::{ChainTips, WalletStorage};
 
 type Db = WalletDb<rusqlite::Connection, NetworkParameters, SystemClock, OsRng>;
 
 const DEFAULT_ACCOUNT_NAME: &str = "primary";
+/// Far exceeds the local proving window; successful transaction storage clears the lock.
+const PROPOSAL_INPUT_LOCK_BLOCKS: u32 = 100;
+const PCZT_LOCK_OWNER_PROPRIETARY_KEY: &str = "org.zfnd.zally/pczt-lock-owner/v1";
 
 /// Namespace for key-derived account identity.
 ///
@@ -282,6 +284,64 @@ impl Sqlite {
             })?
     }
 
+    async fn dispatch_pczt_creation<F>(&self, create_on_actor: F) -> Result<Vec<u8>, StorageError>
+    where
+        F: FnOnce(&mut WalletDbState, &SqliteOptions) -> Result<(Vec<u8>, LockOwner), StorageError>
+            + Send
+            + 'static,
+    {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let work: DbWork = Box::new(move |state, options| {
+            let creation = create_on_actor(state, options);
+            match creation {
+                Ok((pczt_bytes, lock_owner)) => {
+                    let (acknowledged_tx, acknowledged_rx) = oneshot::channel();
+                    if reply_tx.send(Ok((pczt_bytes, acknowledged_tx))).is_err()
+                        || acknowledged_rx.blocking_recv().is_err()
+                    {
+                        let cleanup = match state {
+                            WalletDbState::NotOpened => Err(StorageError::NotOpened),
+                            WalletDbState::Opened { db, ledger } => release_pending_pczt_inputs(
+                                db.as_mut(),
+                                ledger.as_ref(),
+                                lock_owner,
+                            ),
+                        };
+                        if let Err(error) = cleanup {
+                            tracing::error!(
+                                target: "zally::storage",
+                                event = "unacknowledged_pczt_cleanup_failed",
+                                %error,
+                                "failed to release PCZT inputs after its caller was cancelled"
+                            );
+                        }
+                    }
+                }
+                Err(error) => {
+                    drop(reply_tx.send(Err(error)));
+                }
+            }
+        });
+        self.request_tx
+            .send(work)
+            .await
+            .map_err(|_| StorageError::BlockingTaskFailed {
+                reason: "wallet-db actor channel closed".to_owned(),
+            })?;
+        let (pczt_bytes, acknowledged_tx) =
+            reply_rx
+                .await
+                .map_err(|_| StorageError::BlockingTaskFailed {
+                    reason: "wallet-db actor dropped the PCZT creation reply".to_owned(),
+                })??;
+        acknowledged_tx
+            .send(())
+            .map_err(|()| StorageError::BlockingTaskFailed {
+                reason: "wallet-db actor dropped the PCZT creation acknowledgement".to_owned(),
+            })?;
+        Ok(pczt_bytes)
+    }
+
     async fn with_ledger<F, T>(&self, work: F) -> Result<T, StorageError>
     where
         F: FnOnce(&rusqlite::Connection) -> Result<T, StorageError> + Send + 'static,
@@ -419,6 +479,13 @@ fn open_extension_ledger(db_path: &Path) -> Result<rusqlite::Connection, Storage
              CREATE TABLE IF NOT EXISTS ext_zally_finalized_pczts (\
                  tx_id_bytes BLOB PRIMARY KEY NOT NULL,\
                  pczt_bytes BLOB NOT NULL\
+             ); \
+             CREATE TABLE IF NOT EXISTS ext_zally_pending_pczt_inputs (\
+                 lock_owner BLOB NOT NULL,\
+                 pool_code INTEGER NOT NULL,\
+                 tx_id_bytes BLOB NOT NULL,\
+                 output_index INTEGER NOT NULL,\
+                 PRIMARY KEY (lock_owner, pool_code, tx_id_bytes, output_index)\
              ); \
              CREATE TABLE IF NOT EXISTS ext_zally_pending_broadcast_inputs (\
                  broadcast_tx_id BLOB NOT NULL,\
@@ -926,6 +993,7 @@ impl WalletStorage for Sqlite {
                 amount,
                 memo_bytes,
                 source_pool,
+                None,
             )?;
             let first_step = proposal.steps().first();
             let balance = first_step.balance();
@@ -946,7 +1014,6 @@ impl WalletStorage for Sqlite {
     async fn prepare_payment(
         &self,
         request: crate::wallet::ProposalPaymentRequest,
-        excluded_outpoints: std::collections::HashSet<zally_core::OutPoint>,
         seed: &SeedMaterial,
     ) -> Result<Vec<crate::wallet::PreparedTransaction>, StorageError> {
         let params = self.options.network.to_parameters();
@@ -967,50 +1034,42 @@ impl WalletStorage for Sqlite {
             let account_uuid = resolve_account_uuid(db, network, account_id)?;
             let usk = derive_unified_spending_key(&params, &seed_bytes)?;
             let spending_keys = SpendingKeys::from_unified_spending_key(usk);
-
-            // Propose against the FilteredWalletDb wrapper so the InputSource override
-            // hides outpoints locked by a pending broadcast. Drop the wrapper before
-            // signing: `create_proposed_transactions` needs `WalletWrite +
-            // WalletCommitmentTrees`, which the wrapper does not implement and the inner
-            // `WalletDb` does.
-            let proposal = {
-                let mut filtered = FilteredWalletDb {
-                    inner: db,
-                    excluded_outpoints,
-                    network,
-                    account_id,
-                };
-                propose_payment_proposal(
-                    &mut filtered,
-                    &params,
-                    account_uuid,
-                    &recipient,
-                    amount,
-                    memo_bytes,
-                    source_pool,
-                )?
-            };
-            ensure_proposal_anchors(db, &proposal)?;
-
-            let txids = zcash_client_backend::data_api::wallet::create_proposed_transactions::<
-                Db,
-                NetworkParameters,
-                zcash_client_sqlite::error::SqliteClientError,
-                zcash_client_backend::fees::StandardFeeRule,
-                std::convert::Infallible,
-                zcash_client_sqlite::ReceivedNoteId,
-            >(
+            let lock_request = proposal_lock_request();
+            let proposal = propose_payment_proposal(
                 db,
                 &params,
-                &prover,
-                &prover,
-                &spending_keys,
-                zcash_client_backend::wallet::OvkPolicy::Sender,
-                &proposal,
-            )
-            .map_err(|err| classify_proposal_build_error(&err))?;
+                account_uuid,
+                &recipient,
+                amount,
+                memo_bytes,
+                source_pool,
+                Some(lock_request),
+            )?;
+            let build_result = (|| {
+                ensure_proposal_anchors(db, &proposal)?;
+                let txids = zcash_client_backend::data_api::wallet::create_proposed_transactions::<
+                    Db,
+                    NetworkParameters,
+                    zcash_client_sqlite::error::SqliteClientError,
+                    zcash_client_backend::fees::StandardFeeRule,
+                    std::convert::Infallible,
+                    zcash_client_sqlite::ReceivedNoteId,
+                >(
+                    db,
+                    &params,
+                    &prover,
+                    &prover,
+                    &spending_keys,
+                    zcash_client_backend::wallet::OvkPolicy::Sender,
+                    &proposal,
+                    None,
+                )
+                .map_err(|err| classify_proposal_build_error(&err))?;
 
-            prepared_transactions_with_inputs(db, &txids, &proposal, "created")
+                prepared_transactions_with_inputs(db, &txids, &proposal, "created")
+            })();
+
+            release_proposal_inputs_after_failure(db, &proposal, lock_request.owner(), build_result)
         })
         .await
     }
@@ -1018,7 +1077,6 @@ impl WalletStorage for Sqlite {
     async fn shield_transparent_funds(
         &self,
         request: crate::wallet::ShieldTransparentRequest,
-        excluded_outpoints: std::collections::HashSet<zally_core::OutPoint>,
         seed: &SeedMaterial,
     ) -> Result<Vec<crate::wallet::PreparedTransaction>, StorageError> {
         let params = self.options.network.to_parameters();
@@ -1046,62 +1104,58 @@ impl WalletStorage for Sqlite {
                 ),
             };
 
-            let proposal = {
-                let mut filtered = FilteredWalletDb {
-                    inner: db,
-                    excluded_outpoints,
-                    network,
-                    account_id,
-                };
-                let input_selector = GreedyInputSelector::<FilteredWalletDb<'_>>::new();
-                let change_strategy =
-                    standard::SingleOutputChangeStrategy::<FilteredWalletDb<'_>>::new(
-                        StandardFeeRule::Zip317,
-                        None,
-                        change_pool,
-                        DustOutputPolicy::default(),
-                    );
-
-                zcash_client_backend::data_api::wallet::propose_shielding::<
-                    FilteredWalletDb<'_>,
-                    NetworkParameters,
-                    _,
-                    _,
-                    std::convert::Infallible,
-                >(
-                    &mut filtered,
-                    &params,
-                    &input_selector,
-                    &change_strategy,
-                    shielding_threshold,
-                    &from_addrs,
-                    account_uuid,
-                    coinbase_safe_shielding_policy(),
-                    zcash_client_backend::data_api::CoinbaseFilter::AllTransparentOutputs,
-                )
-                .map_err(|err| classify_proposal_build_error(&err))?
-            };
-            ensure_proposal_anchors(db, &proposal)?;
-
-            let txids = zcash_client_backend::data_api::wallet::create_proposed_transactions::<
+            let lock_request = proposal_lock_request();
+            let input_selector = GreedyInputSelector::<Db>::new();
+            let change_strategy = standard::SingleOutputChangeStrategy::<Db>::new(
+                StandardFeeRule::Zip317,
+                None,
+                change_pool,
+                DustOutputPolicy::default(),
+            );
+            let proposal = zcash_client_backend::data_api::wallet::propose_shielding::<
                 Db,
                 NetworkParameters,
-                zcash_client_sqlite::error::SqliteClientError,
-                StandardFeeRule,
-                std::convert::Infallible,
+                _,
+                _,
                 std::convert::Infallible,
             >(
                 db,
                 &params,
-                &prover,
-                &prover,
-                &spending_keys,
-                zcash_client_backend::wallet::OvkPolicy::Sender,
-                &proposal,
+                &input_selector,
+                &change_strategy,
+                shielding_threshold,
+                &from_addrs,
+                account_uuid,
+                coinbase_safe_shielding_policy(),
+                zcash_client_backend::data_api::CoinbaseFilter::AllTransparentOutputs,
+                Some(lock_request),
             )
             .map_err(|err| classify_proposal_build_error(&err))?;
+            let build_result = (|| {
+                ensure_proposal_anchors(db, &proposal)?;
+                let txids = zcash_client_backend::data_api::wallet::create_proposed_transactions::<
+                    Db,
+                    NetworkParameters,
+                    zcash_client_sqlite::error::SqliteClientError,
+                    StandardFeeRule,
+                    std::convert::Infallible,
+                    std::convert::Infallible,
+                >(
+                    db,
+                    &params,
+                    &prover,
+                    &prover,
+                    &spending_keys,
+                    zcash_client_backend::wallet::OvkPolicy::Sender,
+                    &proposal,
+                    None,
+                )
+                .map_err(|err| classify_proposal_build_error(&err))?;
 
-            prepared_transactions_with_inputs(db, txids.iter(), &proposal, "shielding")
+                prepared_transactions_with_inputs(db, txids.iter(), &proposal, "shielding")
+            })();
+
+            release_proposal_inputs_after_failure(db, &proposal, lock_request.owner(), build_result)
         })
         .await
     }
@@ -1125,42 +1179,67 @@ impl WalletStorage for Sqlite {
         let account_id = request.account_id;
         let source_pool = request.source_pool;
 
-        self.with_db_mut(move |db| {
-            let account_uuid = resolve_account_uuid(db, network, account_id)?;
-            let proposal = propose_payment_proposal(
-                db,
-                &params,
-                account_uuid,
-                &recipient,
-                amount,
-                memo_bytes,
-                source_pool,
-            )?;
-            ensure_proposal_anchors(db, &proposal)?;
+        self.dispatch_pczt_creation(move |state, _options| match state {
+            WalletDbState::NotOpened => Err(StorageError::NotOpened),
+            WalletDbState::Opened { db, ledger } => {
+                let db = db.as_mut();
+                let account_uuid = resolve_account_uuid(db, network, account_id)?;
+                let lock_request = proposal_lock_request();
+                let lock_owner = lock_request.owner();
+                let proposal = propose_payment_proposal(
+                    db,
+                    &params,
+                    account_uuid,
+                    &recipient,
+                    amount,
+                    memo_bytes,
+                    source_pool,
+                    Some(lock_request),
+                )?;
+                let build_result = (|| {
+                    ensure_proposal_anchors(db, &proposal)?;
+                    let pczt = zcash_client_backend::data_api::wallet::create_pczt_from_proposal::<
+                        Db,
+                        NetworkParameters,
+                        std::convert::Infallible,
+                        zcash_client_backend::fees::StandardFeeRule,
+                        std::convert::Infallible,
+                        zcash_client_sqlite::ReceivedNoteId,
+                    >(
+                        db,
+                        &params,
+                        account_uuid,
+                        zcash_client_backend::wallet::OvkPolicy::Sender,
+                        &proposal,
+                        upstream_target_expiry_height,
+                        zcash_primitives::transaction::builder::BundlePadding::DEFAULT,
+                    )
+                    .map_err(|err| classify_proposal_build_error(&err))?;
+                    let pczt = pczt::roles::updater::Updater::new(pczt)
+                        .update_global_with(|mut global| {
+                            global.set_proprietary(
+                                PCZT_LOCK_OWNER_PROPRIETARY_KEY.to_owned(),
+                                lock_owner.as_bytes().to_vec(),
+                            );
+                        })
+                        .finish();
+                    let pczt_bytes =
+                        pczt.serialize()
+                            .map_err(|err| StorageError::ProposalBuildFailed {
+                                reason: format!("pczt serialize failed: {err:?}"),
+                                posture: FailurePosture::NotRetryable,
+                            })?;
+                    record_pending_pczt_inputs(
+                        ledger.as_ref(),
+                        lock_owner,
+                        &proposal_input_refs(&proposal),
+                    )?;
+                    Ok(pczt_bytes)
+                })();
 
-            let pczt = zcash_client_backend::data_api::wallet::create_pczt_from_proposal::<
-                Db,
-                NetworkParameters,
-                std::convert::Infallible,
-                zcash_client_backend::fees::StandardFeeRule,
-                std::convert::Infallible,
-                zcash_client_sqlite::ReceivedNoteId,
-            >(
-                db,
-                &params,
-                account_uuid,
-                zcash_client_backend::wallet::OvkPolicy::Sender,
-                &proposal,
-                upstream_target_expiry_height,
-                orchard::builder::BundleType::DEFAULT,
-            )
-            .map_err(|err| classify_proposal_build_error(&err))?;
-
-            pczt.serialize()
-                .map_err(|err| StorageError::ProposalBuildFailed {
-                    reason: format!("pczt serialize failed: {err:?}"),
-                    posture: FailurePosture::NotRetryable,
-                })
+                release_proposal_inputs_after_failure(db, &proposal, lock_owner, build_result)
+                    .map(|pczt_bytes| (pczt_bytes, lock_owner))
+            }
         })
         .await
     }
@@ -1173,20 +1252,23 @@ impl WalletStorage for Sqlite {
             reason: format!("pczt parse failed: {err:?}"),
             posture: FailurePosture::NotRetryable,
         })?;
+        let lock_owner = pending_pczt_lock_owner(&parsed)?;
         let prover = self.options.resolve_sapling_prover()?;
         let (spend_vk, output_vk) = prover.verifying_keys();
 
-        let prepared = self
-            .with_db_mut(move |db| {
+        self.dispatch(move |state, _options| match state {
+            WalletDbState::NotOpened => Err(StorageError::NotOpened),
+            WalletDbState::Opened { db, ledger } => {
+                let db = db.as_mut();
                 let tx_id =
-                zcash_client_backend::data_api::wallet::extract_and_store_transaction_from_pczt::<
-                    Db,
-                    zcash_client_sqlite::ReceivedNoteId,
-                >(db, parsed, Some((&spend_vk, &output_vk)), None)
-                .map_err(|err| StorageError::SqliteFailed {
-                    reason: format!("extract_and_store_transaction_from_pczt failed: {err}"),
-                    posture: FailurePosture::NotRetryable,
-                })?;
+                    zcash_client_backend::data_api::wallet::extract_and_store_transaction_from_pczt::<
+                        Db,
+                        zcash_client_sqlite::ReceivedNoteId,
+                    >(db, parsed, Some((&spend_vk, &output_vk)), None)
+                    .map_err(|err| StorageError::SqliteFailed {
+                        reason: format!("extract_and_store_transaction_from_pczt failed: {err}"),
+                        posture: FailurePosture::NotRetryable,
+                    })?;
 
                 let stored = zcash_client_backend::data_api::WalletRead::get_transaction(db, tx_id)
                     .map_err(|e| map_sqlite_error(&e))?
@@ -1203,21 +1285,39 @@ impl WalletStorage for Sqlite {
                     })?;
                 let tx_expiry_height = BlockHeight::from(u32::from(stored.expiry_height()));
                 // PCZT extraction does not currently propagate transparent inputs through the
-                // envelope, so the resulting `PreparedTransaction` has no inputs to record in
-                // the pending-broadcast filter. Future signer integrations that need
-                // pending-broadcast protection should extend the PCZT envelope with the inputs.
-                Ok(crate::wallet::PreparedTransaction::new(
+                // envelope, so the operator pending-broadcast read model has no inputs to
+                // record. Upstream transaction storage still persists the spends and clears
+                // the proposal locks.
+                let prepared = crate::wallet::PreparedTransaction::new(
                     zally_core::TxId::from_bytes(*tx_id.as_ref()),
                     raw_bytes,
                     Vec::new(),
                     tx_expiry_height,
-                ))
-            })
-            .await?;
-        let tx_id = prepared.tx_id;
-        self.with_ledger(move |conn| record_finalized_pczt_bytes(conn, tx_id, &pczt_bytes))
-            .await?;
-        Ok(prepared)
+                );
+                record_finalized_pczt_bytes(ledger.as_ref(), prepared.tx_id, &pczt_bytes)?;
+                if let Some(lock_owner) = lock_owner {
+                    delete_pending_pczt_inputs(ledger.as_ref(), lock_owner)?;
+                }
+                Ok(prepared)
+            }
+        })
+        .await
+    }
+
+    async fn abandon_pczt(&self, pczt_bytes: Vec<u8>) -> Result<(), StorageError> {
+        let parsed = pczt::Pczt::parse(&pczt_bytes).map_err(|err| StorageError::SqliteFailed {
+            reason: format!("pczt parse failed: {err:?}"),
+            posture: FailurePosture::NotRetryable,
+        })?;
+        let lock_owner =
+            pending_pczt_lock_owner(&parsed)?.ok_or(StorageError::PcztLockOwnerMissing)?;
+        self.dispatch(move |state, _options| match state {
+            WalletDbState::NotOpened => Err(StorageError::NotOpened),
+            WalletDbState::Opened { db, ledger } => {
+                release_pending_pczt_inputs(db.as_mut(), ledger.as_ref(), lock_owner)
+            }
+        })
+        .await
     }
 
     async fn find_finalized_pczt_bytes(
@@ -1838,6 +1938,7 @@ impl WalletStorage for Sqlite {
                     proposal_target,
                     ConfirmationsPolicy::default(),
                     &[],
+                    LockFilter::Policy(&LockedInputPolicy::Exclude),
                 )
                 .map_err(|err| StorageError::SqliteFailed {
                     reason: format!("account balance spendable-note selection failed: {err}"),
@@ -1911,6 +2012,7 @@ impl WalletStorage for Sqlite {
                 ],
                 target,
                 &[],
+                LockFilter::Policy(&LockedInputPolicy::Exclude),
             )
             .map_err(|err| StorageError::SqliteFailed {
                 reason: format!("select_unspent_notes failed: {err}"),
@@ -1945,6 +2047,7 @@ impl WalletStorage for Sqlite {
                 target,
                 ConfirmationsPolicy::default(),
                 &[],
+                LockFilter::Policy(&LockedInputPolicy::Exclude),
             )
             .map_err(|err| StorageError::SqliteFailed {
                 reason: format!("select_spendable_notes failed: {err}"),
@@ -2310,6 +2413,144 @@ fn record_finalized_pczt_bytes(
     } else {
         Err(StorageError::FinalizedPcztConflict { tx_id })
     }
+}
+
+fn record_pending_pczt_inputs(
+    conn: &rusqlite::Connection,
+    lock_owner: LockOwner,
+    inputs: &[OutputRef],
+) -> Result<(), StorageError> {
+    let transaction = conn
+        .unchecked_transaction()
+        .map_err(|err| map_sqlite_error(&err))?;
+    for input in inputs {
+        transaction
+            .execute(
+                "INSERT INTO ext_zally_pending_pczt_inputs \
+                     (lock_owner, pool_code, tx_id_bytes, output_index) \
+                 VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![
+                    lock_owner.as_bytes().as_slice(),
+                    pending_pczt_pool_code(input.pool()),
+                    input.txid().as_ref().as_slice(),
+                    i64::from(input.output_index()),
+                ],
+            )
+            .map_err(|err| map_sqlite_error(&err))?;
+    }
+    transaction.commit().map_err(|err| map_sqlite_error(&err))
+}
+
+fn find_pending_pczt_inputs(
+    conn: &rusqlite::Connection,
+    lock_owner: LockOwner,
+) -> Result<Vec<OutputRef>, StorageError> {
+    let mut statement = conn
+        .prepare(
+            "SELECT pool_code, tx_id_bytes, output_index \
+             FROM ext_zally_pending_pczt_inputs \
+             WHERE lock_owner = ?1 \
+             ORDER BY pool_code, tx_id_bytes, output_index",
+        )
+        .map_err(|err| map_sqlite_error(&err))?;
+    let rows = statement
+        .query_map([lock_owner.as_bytes().as_slice()], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, Vec<u8>>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })
+        .map_err(|err| map_sqlite_error(&err))?;
+    let mut inputs = Vec::new();
+    for row in rows {
+        let (pool_code, tx_id_bytes, output_index) =
+            row.map_err(|err| map_row_decode_error(&err))?;
+        let tx_id_bytes: [u8; 32] =
+            tx_id_bytes
+                .try_into()
+                .map_err(|bytes: Vec<u8>| StorageError::RowValueOutOfRange {
+                    column: "ext_zally_pending_pczt_inputs.tx_id_bytes",
+                    raw: format!("{} bytes", bytes.len()),
+                })?;
+        let output_index =
+            u32::try_from(output_index).map_err(|_| StorageError::RowValueOutOfRange {
+                column: "ext_zally_pending_pczt_inputs.output_index",
+                raw: output_index.to_string(),
+            })?;
+        inputs.push(OutputRef::new(
+            zcash_protocol::TxId::from_bytes(tx_id_bytes),
+            pending_pczt_pool(pool_code)?,
+            output_index,
+        ));
+    }
+    Ok(inputs)
+}
+
+fn delete_pending_pczt_inputs(
+    conn: &rusqlite::Connection,
+    lock_owner: LockOwner,
+) -> Result<(), StorageError> {
+    conn.execute(
+        "DELETE FROM ext_zally_pending_pczt_inputs WHERE lock_owner = ?1",
+        [lock_owner.as_bytes().as_slice()],
+    )
+    .map(|_| ())
+    .map_err(|err| map_sqlite_error(&err))
+}
+
+fn release_pending_pczt_inputs(
+    db: &mut Db,
+    conn: &rusqlite::Connection,
+    lock_owner: LockOwner,
+) -> Result<(), StorageError> {
+    for input in find_pending_pczt_inputs(conn, lock_owner)? {
+        db.unlock_output(&input, lock_owner)
+            .map_err(|err| map_sqlite_error(&err))?;
+    }
+    delete_pending_pczt_inputs(conn, lock_owner)
+}
+
+const PENDING_PCZT_POOL_TRANSPARENT: i64 = 0;
+const PENDING_PCZT_POOL_SAPLING: i64 = 1;
+const PENDING_PCZT_POOL_ORCHARD: i64 = 2;
+const PENDING_PCZT_POOL_IRONWOOD: i64 = 3;
+
+const fn pending_pczt_pool_code(pool: PoolType) -> i64 {
+    match pool {
+        PoolType::Transparent => PENDING_PCZT_POOL_TRANSPARENT,
+        PoolType::Shielded(ShieldedPool::Sapling) => PENDING_PCZT_POOL_SAPLING,
+        PoolType::Shielded(ShieldedPool::Orchard) => PENDING_PCZT_POOL_ORCHARD,
+        PoolType::Shielded(ShieldedPool::Ironwood) => PENDING_PCZT_POOL_IRONWOOD,
+    }
+}
+
+fn pending_pczt_pool(pool_code: i64) -> Result<PoolType, StorageError> {
+    match pool_code {
+        PENDING_PCZT_POOL_TRANSPARENT => Ok(PoolType::Transparent),
+        PENDING_PCZT_POOL_SAPLING => Ok(PoolType::Shielded(ShieldedPool::Sapling)),
+        PENDING_PCZT_POOL_ORCHARD => Ok(PoolType::Shielded(ShieldedPool::Orchard)),
+        PENDING_PCZT_POOL_IRONWOOD => Ok(PoolType::Shielded(ShieldedPool::Ironwood)),
+        _ => Err(StorageError::RowValueOutOfRange {
+            column: "ext_zally_pending_pczt_inputs.pool_code",
+            raw: pool_code.to_string(),
+        }),
+    }
+}
+
+fn pending_pczt_lock_owner(pczt: &pczt::Pczt) -> Result<Option<LockOwner>, StorageError> {
+    pczt.global()
+        .proprietary()
+        .get(PCZT_LOCK_OWNER_PROPRIETARY_KEY)
+        .map(|owner_bytes| {
+            let owner_bytes: [u8; 32] = owner_bytes.as_slice().try_into().map_err(|_| {
+                StorageError::PcztLockOwnerMalformed {
+                    byte_count: owner_bytes.len(),
+                }
+            })?;
+            Ok(LockOwner::new(owner_bytes))
+        })
+        .transpose()
 }
 
 /// Upsert SQL for [`crate::WalletStorage::record_pending_broadcast_inputs`].
@@ -3096,6 +3337,7 @@ fn propose_payment_proposal<DbT>(
     amount: UpstreamZatoshis,
     memo: Option<zcash_protocol::memo::MemoBytes>,
     source_pool: Option<ShieldedPool>,
+    lock_request: Option<LockRequest>,
 ) -> Result<
     zcash_client_backend::proposal::Proposal<
         zcash_client_backend::fees::StandardFeeRule,
@@ -3104,10 +3346,10 @@ fn propose_payment_proposal<DbT>(
     StorageError,
 >
 where
-    DbT: zcash_client_backend::data_api::InputSource<
+    DbT: zcash_client_backend::data_api::WalletWrite<
             AccountId = AccountUuid,
             Error = zcash_client_sqlite::error::SqliteClientError,
-        > + zcash_client_backend::data_api::WalletRead<
+        > + zcash_client_backend::data_api::InputSource<
             AccountId = AccountUuid,
             Error = zcash_client_sqlite::error::SqliteClientError,
         >,
@@ -3158,9 +3400,68 @@ where
         transaction_request,
         zcash_client_backend::data_api::wallet::ConfirmationsPolicy::default(),
         &spend_policy,
+        lock_request,
         None,
     )
     .map_err(|err| classify_proposal_build_error(&err))
+}
+
+fn proposal_lock_request() -> LockRequest {
+    LockRequest::new(LockOwner::random(&mut OsRng), PROPOSAL_INPUT_LOCK_BLOCKS)
+}
+
+fn proposal_input_refs<FeeRuleT, NoteRefT>(
+    proposal: &zcash_client_backend::proposal::Proposal<FeeRuleT, NoteRefT>,
+) -> Vec<OutputRef> {
+    proposal
+        .steps()
+        .iter()
+        .flat_map(|step| {
+            step.shielded_inputs()
+                .into_iter()
+                .flat_map(|shielded_inputs| {
+                    shielded_inputs.notes().iter().map(|note| {
+                        OutputRef::new(
+                            *note.txid(),
+                            PoolType::Shielded(note.note().pool()),
+                            u32::from(note.output_index()),
+                        )
+                    })
+                })
+                .chain(step.transparent_inputs().iter().map(|utxo| {
+                    let outpoint = utxo.outpoint();
+                    OutputRef::new(
+                        zcash_protocol::TxId::from_bytes(*outpoint.hash()),
+                        PoolType::Transparent,
+                        outpoint.n(),
+                    )
+                }))
+        })
+        .collect()
+}
+
+fn release_proposal_inputs_after_failure<T, FeeRuleT, NoteRefT>(
+    db: &mut Db,
+    proposal: &zcash_client_backend::proposal::Proposal<FeeRuleT, NoteRefT>,
+    lock_owner: LockOwner,
+    build_result: Result<T, StorageError>,
+) -> Result<T, StorageError> {
+    match build_result {
+        Ok(built) => Ok(built),
+        Err(build_error) => {
+            zcash_client_backend::data_api::wallet::unlock_proposal_inputs(
+                db, proposal, lock_owner,
+            )
+            .map_err(|unlock_error| StorageError::SqliteFailed {
+                reason: format!(
+                    "proposal failed ({build_error}); releasing its input locks failed: \
+                     {unlock_error}"
+                ),
+                posture: FailurePosture::Retryable,
+            })?;
+            Err(build_error)
+        }
+    }
 }
 
 /// Confirmation policy used when proposing transparent-to-shielded sweeps.
@@ -3230,10 +3531,12 @@ pub(crate) fn classify_proposal_build_error<E: std::fmt::Debug>(err: &E) -> Stor
             available_zat: Zatoshis::zero(),
         };
     }
-    StorageError::ProposalBuildFailed {
-        reason,
-        posture: FailurePosture::NotRetryable,
-    }
+    let posture = if lc.contains("inputslocked") || lc.contains("inputs locked") {
+        FailurePosture::Retryable
+    } else {
+        FailurePosture::NotRetryable
+    };
+    StorageError::ProposalBuildFailed { reason, posture }
 }
 
 /// Builds prepared-transaction records for each proposal step.
@@ -3805,6 +4108,18 @@ mod tests {
     }
 
     #[test]
+    fn proposal_input_lock_conflict_is_retryable() {
+        let error = classify_proposal_build_error(&"InputsLocked");
+        assert!(matches!(
+            error,
+            StorageError::ProposalBuildFailed {
+                posture: FailurePosture::Retryable,
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn corrupt_explicit_sapling_parameters_return_typed_error() -> Result<(), std::io::Error> {
         let directory = tempfile::TempDir::new()?;
         let spend = directory.path().join(zcash_proofs::SAPLING_SPEND_NAME);
@@ -3985,6 +4300,44 @@ mod tests {
                 tx_id: conflicting_transaction_id,
             }) if conflicting_transaction_id == tx_id
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn pending_pczt_input_rows_round_trip_every_pool() -> Result<(), StorageError> {
+        let conn = rusqlite::Connection::open_in_memory().map_err(|err| map_sqlite_error(&err))?;
+        conn.execute_batch(
+            "CREATE TABLE ext_zally_pending_pczt_inputs (\
+                 lock_owner BLOB NOT NULL,\
+                 pool_code INTEGER NOT NULL,\
+                 tx_id_bytes BLOB NOT NULL,\
+                 output_index INTEGER NOT NULL,\
+                 PRIMARY KEY (lock_owner, pool_code, tx_id_bytes, output_index)\
+             );",
+        )
+        .map_err(|err| map_sqlite_error(&err))?;
+        let lock_owner = LockOwner::new([0x72; 32]);
+        let inputs = [
+            PoolType::Transparent,
+            PoolType::Shielded(ShieldedPool::Sapling),
+            PoolType::Shielded(ShieldedPool::Orchard),
+            PoolType::Shielded(ShieldedPool::Ironwood),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, pool)| {
+            OutputRef::new(
+                zcash_protocol::TxId::from_bytes([u8::try_from(index).unwrap_or(u8::MAX); 32]),
+                pool,
+                u32::try_from(index).unwrap_or(u32::MAX),
+            )
+        })
+        .collect::<Vec<_>>();
+
+        record_pending_pczt_inputs(&conn, lock_owner, &inputs)?;
+        assert_eq!(find_pending_pczt_inputs(&conn, lock_owner)?, inputs);
+        delete_pending_pczt_inputs(&conn, lock_owner)?;
+        assert!(find_pending_pczt_inputs(&conn, lock_owner)?.is_empty());
         Ok(())
     }
 

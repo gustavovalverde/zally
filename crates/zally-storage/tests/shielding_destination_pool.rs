@@ -4,7 +4,6 @@
 //! mature transparent UTXO. This gives the real `SQLite` backend enough chain state to build and
 //! prove a shielding transaction through the public [`WalletStorage`] boundary.
 
-use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -117,9 +116,7 @@ async fn prepare_shielding(
     if let Some(destination_pool) = destination_pool {
         request = request.with_destination_pool(destination_pool);
     }
-    let mut prepared = storage
-        .shield_transparent_funds(request, HashSet::new(), &seed)
-        .await?;
+    let mut prepared = storage.shield_transparent_funds(request, &seed).await?;
     prepared
         .pop()
         .ok_or_else(|| TestError::fixture("shielding returned no transaction"))

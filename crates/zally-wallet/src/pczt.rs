@@ -52,7 +52,7 @@ impl Wallet {
     ///
     /// `not_retryable` on no-matching-keys or upstream signer error; `retryable` on transient
     /// sealing I/O.
-    pub async fn sign_pczt(&self, pczt: PcztBytes) -> Result<PcztBytes, WalletError> {
+    pub async fn sign_pczt(&self, pczt: &PcztBytes) -> Result<PcztBytes, WalletError> {
         validate_pczt_network(pczt.network(), self.network())?;
         let seed = self
             .inner
@@ -61,7 +61,7 @@ impl Wallet {
             .await
             .map_err(WalletError::from)?;
         let pczt_signer = Signer::new(self.network());
-        let authorized = pczt_signer.sign_with_seed(pczt, &seed).await?;
+        let authorized = pczt_signer.sign_with_seed(pczt.clone(), &seed).await?;
         Ok(authorized)
     }
 
@@ -75,7 +75,7 @@ impl Wallet {
     ///
     /// `requires_operator` on missing Sapling proving parameters; `not_retryable` on
     /// malformed PCZT contents; `retryable` on transient sealing I/O.
-    pub async fn prove_pczt(&self, pczt: PcztBytes) -> Result<PcztBytes, WalletError> {
+    pub async fn prove_pczt(&self, pczt: &PcztBytes) -> Result<PcztBytes, WalletError> {
         validate_pczt_network(pczt.network(), self.network())?;
         let seed = self
             .inner
@@ -84,8 +84,44 @@ impl Wallet {
             .await
             .map_err(WalletError::from)?;
         let pczt_prover = Prover::new(self.network());
-        let proven = pczt_prover.prove_with_seed(pczt, &seed).await?;
+        let proven = pczt_prover.prove_with_seed(pczt.clone(), &seed).await?;
         Ok(proven)
+    }
+
+    /// Abandons a Zally-created PCZT and releases only the inputs reserved for it.
+    ///
+    /// Call this when a custody, proving, signing, or facilitator flow will not complete.
+    /// The operation is idempotent after its first successful release. Foreign PCZTs do not
+    /// carry Zally's opaque lock-owner token and are rejected.
+    ///
+    /// `not_retryable` on malformed or foreign PCZTs; `retryable` on transient storage I/O.
+    pub async fn abandon_pczt(&self, pczt: &PcztBytes) -> Result<(), WalletError> {
+        validate_pczt_network(pczt.network(), self.network())?;
+        self.inner
+            .storage
+            .abandon_pczt(pczt.as_bytes().to_vec())
+            .await
+            .map_err(WalletError::from)
+    }
+
+    pub(crate) async fn abandon_pczt_after_error(
+        &self,
+        pczt: &PcztBytes,
+        role_error: WalletError,
+    ) -> WalletError {
+        match self.abandon_pczt(pczt).await {
+            Ok(()) => role_error,
+            Err(cleanup_error) => {
+                tracing::error!(
+                    target: "zally::wallet",
+                    event = "pczt_role_failure_cleanup_failed",
+                    %role_error,
+                    %cleanup_error,
+                    "PCZT role failed and its exact input locks could not be released"
+                );
+                cleanup_error
+            }
+        }
     }
 
     /// Extracts a finalized PCZT and persists its transaction without broadcasting it.
@@ -97,12 +133,12 @@ impl Wallet {
     ///
     /// `not_retryable` on malformed or incomplete PCZTs; `requires_operator` when Sapling
     /// verifying parameters are unavailable; `retryable` on transient storage I/O.
-    pub async fn extract_pczt(&self, pczt: PcztBytes) -> Result<TxId, WalletError> {
+    pub async fn extract_pczt(&self, pczt: &PcztBytes) -> Result<TxId, WalletError> {
         validate_pczt_network(pczt.network(), self.network())?;
         let extracted = self
             .inner
             .storage
-            .extract_and_store_pczt(pczt.into_bytes())
+            .extract_and_store_pczt(pczt.as_bytes().to_vec())
             .await
             .map_err(WalletError::from)?;
         Ok(extracted.tx_id)
@@ -119,7 +155,7 @@ impl Wallet {
     /// `retryable` on transient submitter or storage I/O.
     pub async fn extract_and_submit_pczt(
         &self,
-        pczt: PcztBytes,
+        pczt: &PcztBytes,
         submitter: &dyn Submitter,
     ) -> Result<SendOutcome, WalletError> {
         validate_pczt_network(pczt.network(), self.network())?;
@@ -132,7 +168,7 @@ impl Wallet {
         let prepared = self
             .inner
             .storage
-            .extract_and_store_pczt(pczt.into_bytes())
+            .extract_and_store_pczt(pczt.as_bytes().to_vec())
             .await
             .map_err(WalletError::from)?;
         let policy = self.broadcast_retry_policy();

@@ -1,7 +1,7 @@
 //! `Signer` role: applies Sapling, Orchard, Ironwood, and transparent signatures using a sealed seed.
 //!
 //! Derives the per-account ZIP-32 `UnifiedSpendingKey` from the supplied seed and uses the
-//! pczt 0.6 signer to apply each pool's spend authorization. Transparent inputs are matched
+//! upstream PCZT signer to apply each pool's spend authorization. Transparent inputs are matched
 //! against the wallet's external- and internal-scope addresses within the standard BIP-44
 //! gap limit; matched inputs are signed by deriving the corresponding `secp256k1::SecretKey`
 //! and calling `Signer::sign_transparent`.

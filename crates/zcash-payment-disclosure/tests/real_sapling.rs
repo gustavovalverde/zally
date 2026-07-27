@@ -12,7 +12,7 @@ use zcash_payment_disclosure::{
     verify_disclosure,
 };
 use zcash_primitives::transaction::{
-    builder::{BuildConfig, Builder},
+    builder::{BuildConfig, Builder, BundlePadding},
     fees::zip317,
 };
 use zcash_proofs::prover::LocalTxProver;
@@ -60,7 +60,8 @@ fn real_sapling_round_trip() -> Result<(), Box<dyn std::error::Error>> {
             sapling_anchor: Some(witness_root.into()),
             orchard_anchor: None,
             ironwood_anchor: None,
-            orchard_pool_bundle_type: orchard::builder::BundleType::DEFAULT,
+            orchard_padding: BundlePadding::DEFAULT,
+            ironwood_padding: BundlePadding::DEFAULT,
         },
     );
     builder.add_sapling_spend::<Infallible>(

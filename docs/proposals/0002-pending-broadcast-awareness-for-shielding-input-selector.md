@@ -2,12 +2,18 @@
 
 | Field        | Value                                                                                                                                |
 | ------------ | ------------------------------------------------------------------------------------------------------------------------------------ |
-| Status       | Proposed                                                                                                                             |
+| Status       | Superseded on 2026-07-27                                                                                                             |
 | Product      | Zally                                                                                                                                |
 | Domain       | `zally-wallet` shielding entrypoint, `zally-storage` transparent UTXO read surface                                                   |
 | Consumer     | [fauzec](https://github.com/ZcashFoundation/fauzec) (testnet faucet)                                                                 |
 | Pinned at    | `zally-wallet` rev `ba15aa307bd6a2cbabab6e0c0ad5d0451dfed779`                                                                        |
 | Related      | [Proposal 0001](0001-wallet-read-surface-for-fauzec-auto-shield.md), [Public interfaces](../architecture/public-interfaces.md)        |
+
+## Resolution
+
+The released librustzcash wallet family now provides owner-scoped proposal input locks, lock-aware selection, and persisted-spend exclusion for unmined transactions. Zally uses `LockRequest` for payment, shielding, and PCZT proposals, releases locks when construction fails, and relies on transaction storage to clear the proposal locks while preserving spend exclusion. The former `FilteredWalletDb` overlay and its `transparent_inputs_filtered_pending_broadcast` event are removed.
+
+`Wallet::get_pending_transparent_inputs` and the `ext_zally_pending_broadcast_inputs` table remain as an operator-facing record of recent broadcasts. Their configured timestamp window controls only that read model; librustzcash is the authority for whether an input is eligible. This resolves the duplicate-shielding failure without maintaining a second selector.
 
 ## Context
 

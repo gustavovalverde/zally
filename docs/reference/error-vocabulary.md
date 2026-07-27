@@ -91,9 +91,12 @@ Every chain-source and wallet error exposes a `posture()` method returning a [`F
 | `ProverUnavailable` | `requires_operator` | Sapling proving parameters are missing from the configured paths or the platform-default location. |
 | `IdempotencyKeyConflict` | `not_retryable` | A send idempotency key already maps to a different transaction. |
 | `FinalizedPcztConflict` | `not_retryable` | A transaction ID is already bound to different finalized PCZT bytes. |
+| `PcztLockOwnerMissing` | `not_retryable` | A PCZT supplied for abandonment was not created by this Zally storage and lacks its owner-scoped recovery token. |
+| `PcztLockOwnerMalformed` | `not_retryable` | A PCZT carries a Zally lock-owner field that is not exactly 32 bytes. |
 | `ChainReorgDetected` | `retryable` | Scanner input diverged from persisted chain state and needs rollback. |
 | `TransparentOutputNotRecognized` | `not_retryable` | A chain source returned a transparent output script Zally cannot map. |
 | `TransparentOutputValueOutOfRange` | `not_retryable` | A chain source returned a transparent output value outside the zatoshis range. |
+| `ProposalBuildFailed` | Carries `FailurePosture` | Proposal construction failed. An upstream input-lock conflict is retryable; malformed proposal state is not retryable. |
 | `ShieldedPoolUnsupported` | `requires_operator` | The requested shielded pool has no subtree-root write path in this storage backend. |
 
 ## PcztError

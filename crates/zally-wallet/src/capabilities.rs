@@ -52,8 +52,8 @@ pub enum Capability {
     EventStream,
     /// `Wallet::send_payment` honours the caller-supplied `zally_core::IdempotencyKey`.
     IdempotentSend,
-    /// PCZT v0.6 export and import via `zally-pczt`.
-    PcztV06,
+    /// PCZT v1 and v2 export and import via `zally-pczt`.
+    PcztV1AndV2,
     /// `Wallet::metrics_snapshot` returns a typed [`crate::WalletMetrics`].
     MetricsSnapshot,
     /// `Wallet::status_snapshot` returns a typed [`crate::WalletStatus`].
