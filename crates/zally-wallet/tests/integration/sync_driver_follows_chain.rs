@@ -66,6 +66,45 @@ async fn sync_driver_wakes_from_chain_event() -> Result<(), TestError> {
     Ok(())
 }
 
+/// Only the first iteration of a wakeup records the chain tip, so a wallet already at the
+/// tip depends on the next wakeup to learn that the chain moved.
+#[tokio::test]
+async fn wallet_at_tip_records_every_later_tip() -> Result<(), TestError> {
+    let TestWalletFixture {
+        temp: _temp,
+        wallet,
+        account_id: _account_id,
+    } = create_test_wallet().await?;
+    let network = wallet.network();
+
+    let chain = Arc::new(MockChainSource::new(network));
+    let chain_handle = chain.handle();
+    let chain_source: Arc<dyn ChainSource> = chain;
+    let driver = SyncDriver::new(
+        wallet,
+        chain_source,
+        SyncDriverOptions::default().with_poll_interval_ms(60_000),
+    )?;
+    let handle = driver.sync_continuously();
+    let mut snapshots = handle.observe_status();
+
+    for tip in [BlockHeight::from(42), BlockHeight::from(84)] {
+        chain_handle.advance_tip(tip);
+        let observed = wait_for_snapshot(&mut snapshots, |snapshot| {
+            snapshot.sync_status
+                == SyncStatus::AtTip {
+                    visible_tip_height: tip,
+                }
+        })
+        .await?;
+        assert_eq!(observed.scanned_height, Some(tip));
+        assert_eq!(observed.last_fault, None);
+    }
+
+    handle.close().await?;
+    Ok(())
+}
+
 #[tokio::test]
 async fn close_returns_while_sync_attempt_is_blocked() -> Result<(), TestError> {
     let TestWalletFixture {

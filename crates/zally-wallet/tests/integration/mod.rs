@@ -28,6 +28,7 @@ mod reserve_hold_round_trip;
 mod send_payment_rejects_stale_target_expiry;
 mod send_payment_short_circuits_on_known_idempotency_key;
 mod sync_catches_up_to_tip;
+mod sync_drains_bulk_ranges;
 mod sync_driver_follows_chain;
 mod sync_driver_self_heals;
 mod sync_driver_slow_progress;

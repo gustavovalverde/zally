@@ -253,7 +253,7 @@ The contract surface Zally publishes, grouped by domain. Each item is a guarante
 
 ### Sync and scanning (SYNC)
 
-- **SYNC-1**: Catch up to chain tip on `Wallet::sync(...)`.
+- **SYNC-1**: Catch up to chain tip on `Wallet::sync(...)`, which records the chain tip and scans one bounded chunk. `Wallet::scan_queued_range(...)` scans one bounded chunk of already-queued work; a caller draining a backlog calls `sync` once, then `scan_queued_range` until a run reports no blocks, then `sync` again. Only a `sync` reporting no blocks means the wallet reached the chain.
 - **SYNC-2**: Incremental sync emits `tracing` events with scan progress and per-pool note counts.
 - **SYNC-3**: Reorg handling: on continuity error, automatic rollback to the longest common prefix; emit `WalletEvent::ReorgDetected`.
 - **SYNC-4**: Configurable confirmation depth per receiver purpose (default 1 for non-coinbase, mandatory 100 for coinbase per ZIP-213).

@@ -7,9 +7,11 @@
 //! storage boundary alone translates those values into librustzcash scan types and updates the
 //! live wallet database.
 //!
-//! Successive calls advance through bounded chunks from the wallet's last fully scanned height.
-//! The exact predecessor tree artifact anchors each chunk, so work is proportional to the new
-//! scan range rather than the full chain height.
+//! A drain opens with a `Wallet::sync` that records the chain tip, walks the ranges that
+//! record queued through `Wallet::scan_queued_range` one bounded chunk per call, and closes
+//! with a `Wallet::sync` that records the tip again. The exact predecessor tree artifact
+//! anchors each chunk, so work is proportional to the new scan range rather than the full
+//! chain height.
 //!
 //! The long-lived [`SyncDriver`] wraps the loop in a self-healing lifecycle. Wallet chain
 //! state is disposable derived state: every fault is classified onto an escalating repair
@@ -641,6 +643,17 @@ enum SyncRunAttempt {
     Faulted { reason: String, repair: SyncRepair },
 }
 
+/// Whether this wakeup has already recorded the chain tip its scan queue is planned against.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ChainTipRecord {
+    /// An iteration committed blocks, which proves the record landed ahead of them; the next
+    /// iteration scans what the queue holds.
+    Current,
+    /// Nothing left below the record, nothing committed yet this wakeup, or a repair trimmed
+    /// the queue to the rewound frontier; the next iteration records the tip first.
+    Stale,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SyncWakeupExit {
     Reconciled,
@@ -803,11 +816,30 @@ async fn close_sync_driver(ctx: &DriverContext<'_>, state: &DriverState) {
     publish_transition(ctx.status_tx, closed, &DriverTransition::Closed);
 }
 
+/// Drains the scan queue for one wakeup, bounded by
+/// [`SyncDriverOptions::max_sync_iterations_per_wake_count`].
+///
+/// The first iteration records the chain tip, which queues every range between the wallet's
+/// frontier and the chain; the rest scan what that record planned. Re-recording the tip
+/// between chunks would re-queue a ten-block `Verify` range that outranks the bulk work, so
+/// a wallet more than `PRUNING_DEPTH` blocks behind would advance ten blocks per chunk
+/// forever. An iteration that committed blocks keeps the record even when it then faulted:
+/// nothing but a repair removes queued ranges, and a source that expires its epoch pin
+/// during every chunk's tail would otherwise re-queue that lookahead on every iteration.
+/// Repairs do return the record to [`ChainTipRecord::Stale`], because truncation trims the
+/// queue to the rewound frontier and only a fresh record re-queues the work above it.
+///
+/// Draining the queue is therefore not the same as reaching the chain: the queue drains
+/// against a tip the wakeup may have observed many chunks ago. Only an iteration that both
+/// recorded the tip and found nothing to scan ends the wakeup, so a caught-up report always
+/// carries a tip the wallet just read and the spend path never builds an expiry height
+/// against a tip the chain has passed.
 async fn run_sync_wakeup(
     ctx: &DriverContext<'_>,
     close_rx: &mut oneshot::Receiver<()>,
     state: &mut DriverState,
 ) -> SyncWakeupExit {
+    let mut chain_tip = ChainTipRecord::Stale;
     for _ in 0..ctx.options.max_sync_iterations_per_wake_count {
         if let Some(recovery) = &state.recovery
             && !recovery.dormant
@@ -822,6 +854,7 @@ async fn run_sync_wakeup(
                 _ = &mut *close_rx => return SyncWakeupExit::CloseRequested,
                 () = sleep(Duration::from_millis(backoff_ms)) => {}
             }
+            chain_tip = ChainTipRecord::Stale;
             if let Err(repair_error) = apply_repair(ctx, state).await {
                 let repair = repair_for(&repair_error);
                 record_fault(ctx, state, repair_error.to_string(), repair, None).await;
@@ -840,11 +873,13 @@ async fn run_sync_wakeup(
         let attempt = tokio::select! {
             biased;
             _ = &mut *close_rx => return SyncWakeupExit::CloseRequested,
-            attempt = run_one_sync(ctx.wallet, ctx.chain, ctx.options) => attempt,
+            attempt = run_one_sync(ctx.wallet, ctx.chain, ctx.options, chain_tip) => attempt,
         };
         match attempt {
             SyncRunAttempt::Completed(outcome) => {
-                if !complete_sync(ctx, state, outcome).await {
+                let recorded_tip = chain_tip == ChainTipRecord::Stale;
+                chain_tip = chain_tip_after_scan(outcome);
+                if !complete_sync(ctx, state, outcome, recorded_tip).await {
                     return SyncWakeupExit::Reconciled;
                 }
             }
@@ -856,6 +891,7 @@ async fn run_sync_wakeup(
                     .ok()
                     .and_then(|status| status.scanned_height);
                 let blocks_advanced = height_delta(scanned_before, scanned_after);
+                chain_tip = chain_tip_after_fault(chain_tip, blocks_advanced);
                 if is_slow_progress(repair, blocks_advanced) {
                     note_slow_progress(ctx, state, reason, blocks_advanced, scanned_after).await;
                 } else {
@@ -876,11 +912,12 @@ async fn complete_sync(
     ctx: &DriverContext<'_>,
     state: &mut DriverState,
     outcome: SyncOutcome,
+    recorded_tip: bool,
 ) -> bool {
     let recovered = state.settle_recovery(Some(outcome.scanned_to_height));
     state.last_outcome = Some(outcome);
     state.last_fault = None;
-    let should_continue = should_continue_syncing(outcome);
+    let should_continue = should_continue_syncing(outcome, recorded_tip);
     let phase = if should_continue {
         SyncDriverPhase::Syncing
     } else {
@@ -943,6 +980,33 @@ fn height_delta(before: Option<BlockHeight>, after: Option<BlockHeight>) -> u32 
 /// repair would scan the next chunk on top of the corrupt state.
 const fn is_slow_progress(repair: SyncRepair, blocks_advanced: u32) -> bool {
     matches!(repair, SyncRepair::Retry) && blocks_advanced > 0
+}
+
+/// Whether a completed iteration leaves this wakeup's chain-tip record standing.
+///
+/// A chunk of blocks leaves the rest of the queue below the same record. A drained queue
+/// leaves nothing below it, so the next iteration records again and either finds blocks the
+/// chain added during the drain or reports caught up against a tip it just read.
+const fn chain_tip_after_scan(outcome: SyncOutcome) -> ChainTipRecord {
+    if outcome.block_count > 0 {
+        ChainTipRecord::Current
+    } else {
+        ChainTipRecord::Stale
+    }
+}
+
+/// Whether a faulted iteration leaves this wakeup's chain-tip record standing.
+///
+/// Committed blocks prove the record landed ahead of them, and nothing but a repair removes
+/// queued ranges. A source that expires its epoch pin during every chunk's tail would
+/// otherwise re-record on every iteration, re-queueing the `Verify` lookahead each time and
+/// capping a far-behind wallet at ten blocks per chunk.
+const fn chain_tip_after_fault(recorded: ChainTipRecord, blocks_advanced: u32) -> ChainTipRecord {
+    if blocks_advanced > 0 {
+        ChainTipRecord::Current
+    } else {
+        recorded
+    }
 }
 
 /// Folds a fault into the recovery ladder and publishes the resulting transition.
@@ -1182,13 +1246,15 @@ async fn run_one_sync(
     wallet: &Wallet,
     chain: &dyn ChainSource,
     options: SyncDriverOptions,
+    chain_tip: ChainTipRecord,
 ) -> SyncRunAttempt {
-    match timeout(
-        Duration::from_secs(options.sync_timeout_seconds),
-        wallet.sync(chain),
-    )
-    .await
-    {
+    let attempt = async {
+        match chain_tip {
+            ChainTipRecord::Stale => wallet.sync(chain).await,
+            ChainTipRecord::Current => wallet.scan_queued_range(chain).await,
+        }
+    };
+    match timeout(Duration::from_secs(options.sync_timeout_seconds), attempt).await {
         Ok(Ok(outcome)) => SyncRunAttempt::Completed(outcome),
         Ok(Err(error)) => SyncRunAttempt::Faulted {
             reason: error.to_string(),
@@ -1203,10 +1269,13 @@ async fn run_one_sync(
 
 /// Whether the driver should run another sync iteration in this wakeup.
 ///
-/// A cycle that scanned a chunk (`block_count > 0`) leaves more scan-queue work; a
-/// caught-up cycle reports none and stops the loop until the next chain event or poll.
-const fn should_continue_syncing(outcome: SyncOutcome) -> bool {
-    outcome.block_count > 0
+/// A cycle that scanned a chunk (`block_count > 0`) leaves more scan-queue work. A cycle
+/// that scanned none has drained the queue, which only means caught up when that same cycle
+/// recorded the tip the queue was planned against; a drained
+/// [`Wallet::scan_queued_range`] proves nothing about blocks mined since the record, so the
+/// wakeup records once more before it stops.
+const fn should_continue_syncing(outcome: SyncOutcome, recorded_tip: bool) -> bool {
+    outcome.block_count > 0 || !recorded_tip
 }
 
 /// Builds a snapshot from the live wallet status, falling back to the previously published
@@ -1441,17 +1510,28 @@ async fn next_chain_event_envelope(
 }
 
 impl Wallet {
-    /// Advances the wallet by one bounded scan step toward the current epoch's visible tip.
+    /// Records the current chain tip, then advances the wallet by one bounded scan step
+    /// toward the pinned epoch's visible tip.
     ///
-    /// Each call primes commitment-tree subtree roots, calls `update_chain_tip` with the live
-    /// tip, then scans the highest-priority range `suggest_scan_ranges` returns (chunked to
-    /// `MAX_BLOCKS_PER_SYNC`). The `SyncDriver` loops until the scan queue drains. Subtree
-    /// roots let the wallet witness a note from its subtree root without scanning every block,
-    /// so spendability does not require a full linear scan; transaction expiry heights are
-    /// computed against the live tip. Reorg safety comes from the spend-time confirmation
-    /// depth (ZIP 315); scan-time divergences (`ChainReorgDetected`,
-    /// `CommitmentTreeConflict`, [`WalletError::TreeRootsDiverged`]) surface as errors that
-    /// the [`SyncDriver`] repairs by rewinding or rebuilding derived state.
+    /// Recording the tip is what plans work: it queues the ranges between the wallet's
+    /// scanned frontier and the chain, and it sets the tip that transaction expiry heights
+    /// are computed against. The step then primes commitment-tree subtree roots and scans
+    /// the highest-priority range `suggest_scan_ranges` returns, chunked to
+    /// `MAX_BLOCKS_PER_SYNC`. Subtree roots let the wallet witness a note from its subtree
+    /// root without scanning every block, so spendability does not require a full linear
+    /// scan.
+    ///
+    /// A caller draining a backlog calls this once and then [`Wallet::scan_queued_range`]
+    /// until a run reports no blocks: re-recording the tip between chunks re-queues a
+    /// tip-adjacent `Verify` range that outranks the bulk work and caps every chunk at ten
+    /// blocks. It then calls this once more, because only a run that recorded the tip and
+    /// found nothing to scan proves the wallet reached the chain. The [`SyncDriver`] drains
+    /// that way.
+    ///
+    /// Reorg safety comes from the spend-time confirmation depth (ZIP 315); scan-time
+    /// divergences (`ChainReorgDetected`, `CommitmentTreeConflict`,
+    /// [`WalletError::TreeRootsDiverged`]) surface as errors that the [`SyncDriver`] repairs
+    /// by rewinding or rebuilding derived state.
     ///
     /// Fails closed on network mismatch. Emits `ScanProgress` events at the start and end of
     /// the run; per-block events are emitted by the storage scanner.
@@ -1459,11 +1539,51 @@ impl Wallet {
     /// `requires_operator` on network mismatch. `retryable` on transient chain-source
     /// failures.
     pub async fn sync(&self, chain: &dyn ChainSource) -> Result<SyncOutcome, WalletError> {
+        self.run_scan_attempt("sync.attempt", || self.sync_inner(chain))
+            .await
+    }
+
+    /// Advances the wallet by one bounded scan step through work the scan queue already
+    /// holds, leaving the recorded chain tip alone.
+    ///
+    /// Companion to [`Wallet::sync`] for draining a backlog: the queue holds every range
+    /// between the frontier and the tip recorded by the preceding `sync`, so successive
+    /// calls walk it in `MAX_BLOCKS_PER_SYNC` chunks. A run that reports no blocks means the
+    /// queue is drained at or below that recorded tip, which the chain may have passed
+    /// during the drain. It is not a caught-up report and callers must not treat it as one:
+    /// resume with [`Wallet::sync`] to record the tip again and learn about newer blocks.
+    ///
+    /// `requires_operator` on network mismatch. `retryable` on transient chain-source
+    /// failures.
+    pub async fn scan_queued_range(
+        &self,
+        chain: &dyn ChainSource,
+    ) -> Result<SyncOutcome, WalletError> {
+        self.run_scan_attempt("sync.scan_queued_range", || {
+            self.scan_queued_range_inner(chain)
+        })
+        .await
+    }
+
+    /// Runs one breaker-guarded scan attempt and retires the broadcasts it aged out.
+    ///
+    /// One attempt is one unit of breaker accounting: splitting the chain-tip read into its
+    /// own guarded call would record a success for every attempt whose scan then failed,
+    /// and the failure streak would never reach the threshold.
+    async fn run_scan_attempt<F, Fut>(
+        &self,
+        operation_label: &'static str,
+        attempt: F,
+    ) -> Result<SyncOutcome, WalletError>
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = Result<SyncOutcome, WalletError>>,
+    {
         let outcome = with_breaker_and_retry(
             &self.inner.circuit_breaker,
             self.retry_policy(),
-            "sync.attempt",
-            || self.sync_inner(chain),
+            operation_label,
+            attempt,
             std::convert::identity,
         )
         .await?;
@@ -1482,21 +1602,45 @@ impl Wallet {
     }
 
     async fn sync_inner(&self, chain: &dyn ChainSource) -> Result<SyncOutcome, WalletError> {
+        let chain_epoch = self.pin_chain_epoch(chain).await?;
+        let visible_tip = chain_epoch.visible_tip().height;
+        self.inner.storage.update_chain_tip(visible_tip).await?;
+        self.inner
+            .storage
+            .record_chain_tips(visible_tip, chain_epoch.settled_tip().height)
+            .await?;
+        self.scan_one_range(chain, chain_epoch).await
+    }
+
+    async fn scan_queued_range_inner(
+        &self,
+        chain: &dyn ChainSource,
+    ) -> Result<SyncOutcome, WalletError> {
+        let chain_epoch = self.pin_chain_epoch(chain).await?;
+        self.scan_one_range(chain, chain_epoch).await
+    }
+
+    /// Pins one source epoch, failing closed when the source serves another network.
+    async fn pin_chain_epoch(
+        &self,
+        chain: &dyn ChainSource,
+    ) -> Result<zally_chain::ChainEpoch, WalletError> {
         if chain.network() != self.network() {
             return Err(WalletError::NetworkMismatch {
                 storage: self.network(),
                 requested: chain.network(),
             });
         }
-        let chain_epoch = chain.current_epoch().await?;
+        Ok(chain.current_epoch().await?)
+    }
+
+    async fn scan_one_range(
+        &self,
+        chain: &dyn ChainSource,
+        chain_epoch: zally_chain::ChainEpoch,
+    ) -> Result<SyncOutcome, WalletError> {
         let visible_tip = chain_epoch.visible_tip().height;
         let settled_tip = chain_epoch.settled_tip().height;
-        self.inner.storage.update_chain_tip(visible_tip).await?;
-        self.inner
-            .storage
-            .record_chain_tips(visible_tip, settled_tip)
-            .await?;
-
         let Some((scan_start, scan_end, priority)) = self
             .plan_scan_range(chain, chain_epoch, visible_tip)
             .await?
@@ -1546,9 +1690,10 @@ impl Wallet {
 
     /// Resolves the next scan range at or below the visible tip.
     ///
-    /// `sync_inner` updates the wallet database with the same visible tip used here. Keeping the
-    /// upstream chain tip and scan frontier aligned prevents an unscanned settlement-window gap
-    /// from making notes in an incomplete commitment-tree shard appear unspendable.
+    /// The queue is planned against the tip [`Wallet::sync`] records, and every range is
+    /// clamped to the visible tip pinned here. Keeping the upstream chain tip and scan
+    /// frontier aligned prevents an unscanned settlement-window gap from making notes in an
+    /// incomplete commitment-tree shard appear unspendable.
     async fn plan_scan_range(
         &self,
         chain: &dyn ChainSource,
@@ -2506,6 +2651,67 @@ mod tests {
         assert_eq!(height_delta(Some(BlockHeight::from(74_000)), None), 0);
         assert!(is_slow_progress(SyncRepair::Retry, 1_000));
         assert!(!is_slow_progress(SyncRepair::Retry, 0));
+    }
+
+    fn outcome_scanning(block_count: u64) -> SyncOutcome {
+        SyncOutcome {
+            scanned_from_height: BlockHeight::from(74_000),
+            scanned_to_height: BlockHeight::from(75_000),
+            block_count,
+            transparent_utxo_count: 0,
+            completed_at_ms: 0,
+        }
+    }
+
+    #[test]
+    fn only_a_recording_iteration_may_report_the_wallet_caught_up() {
+        assert!(
+            !should_continue_syncing(outcome_scanning(0), true),
+            "a recorded tip with nothing left below it is the caught-up report"
+        );
+        assert!(
+            should_continue_syncing(outcome_scanning(0), false),
+            "a drained queue under a tip recorded chunks ago says nothing about the chain now"
+        );
+        assert!(should_continue_syncing(outcome_scanning(1_000), true));
+        assert!(should_continue_syncing(outcome_scanning(1_000), false));
+    }
+
+    #[test]
+    fn a_drained_queue_sends_the_next_iteration_back_to_the_chain_tip() {
+        assert_eq!(
+            chain_tip_after_scan(outcome_scanning(1_000)),
+            ChainTipRecord::Current,
+            "the rest of the queue sits below the same record"
+        );
+        assert_eq!(
+            chain_tip_after_scan(outcome_scanning(0)),
+            ChainTipRecord::Stale,
+            "an empty queue leaves nothing below the record to scan"
+        );
+    }
+
+    #[test]
+    fn a_committed_chunk_keeps_the_chain_tip_record_through_its_fault() {
+        assert_eq!(
+            chain_tip_after_fault(ChainTipRecord::Stale, 1_000),
+            ChainTipRecord::Current,
+            "a chunk that committed blocks proves the record landed ahead of them"
+        );
+        assert_eq!(
+            chain_tip_after_fault(ChainTipRecord::Current, 1_000),
+            ChainTipRecord::Current
+        );
+        assert_eq!(
+            chain_tip_after_fault(ChainTipRecord::Stale, 0),
+            ChainTipRecord::Stale,
+            "an attempt that committed nothing proves nothing about the record"
+        );
+        assert_eq!(
+            chain_tip_after_fault(ChainTipRecord::Current, 0),
+            ChainTipRecord::Current,
+            "a fault removes no queued range, so a standing record still stands"
+        );
     }
 
     #[test]
