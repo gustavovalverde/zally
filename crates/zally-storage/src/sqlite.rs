@@ -37,7 +37,8 @@ use zcash_client_backend::data_api::wallet::{
     input_selection::{GreedyInputSelector, SpendPolicy},
 };
 use zcash_client_backend::data_api::{
-    Account, AccountBirthday, WalletCommitmentTrees, WalletRead, WalletWrite,
+    Account, AccountBirthday, MaxSpendMode, TargetValue, WalletCommitmentTrees, WalletRead,
+    WalletWrite,
 };
 use zcash_client_backend::fees::{DustOutputPolicy, StandardFeeRule, standard};
 use zcash_client_backend::proto::compact_formats::{
@@ -1818,35 +1819,43 @@ impl WalletStorage for Sqlite {
         self.with_db_and_ledger(move |db, ledger| {
             let account_uuid = resolve_account_uuid(db, network, account_id)?;
             let account_uuid_bytes = account_uuid.expose_uuid().as_bytes().to_vec();
+            let visible_tip = find_visible_tip_on(ledger)?;
+            let proposal_target_height =
+                visible_tip.map_or(0_u32, |height| height.as_u32().saturating_add(1));
+            let proposal_target = zcash_client_backend::data_api::wallet::TargetHeight::from(
+                zcash_protocol::consensus::BlockHeight::from(proposal_target_height),
+            );
+            let spendable_notes =
+                zcash_client_backend::data_api::InputSource::select_spendable_notes(
+                    db,
+                    account_uuid,
+                    TargetValue::AllFunds(MaxSpendMode::MaxSpendable),
+                    &[
+                        zcash_protocol::ShieldedPool::Sapling,
+                        zcash_protocol::ShieldedPool::Orchard,
+                        zcash_protocol::ShieldedPool::Ironwood,
+                    ],
+                    proposal_target,
+                    ConfirmationsPolicy::default(),
+                    &[],
+                )
+                .map_err(|err| StorageError::SqliteFailed {
+                    reason: format!("account balance spendable-note selection failed: {err}"),
+                    posture: FailurePosture::NotRetryable,
+                })?;
+            let spendable_rows = shielded_note_rows(&spendable_notes)?;
+            let spendable_by_pool = spendable_shielded_value_by_pool(&spendable_rows);
 
             let summary = db
                 .get_wallet_summary(ConfirmationsPolicy::default())
                 .map_err(|e| map_sqlite_error(&e))?;
-            let (sapling_zat, orchard_zat, ironwood_zat, transparent_mature_zat) = summary
+            let transparent_mature_zat = summary
                 .as_ref()
                 .and_then(|s| s.account_balances().get(&account_uuid))
-                .map_or(
-                    (
-                        Zatoshis::zero(),
-                        Zatoshis::zero(),
-                        Zatoshis::zero(),
-                        Zatoshis::zero(),
-                    ),
-                    |balance| {
-                        (
-                            upstream_to_zally_zatoshis(balance.sapling_balance().spendable_value()),
-                            upstream_to_zally_zatoshis(balance.orchard_balance().spendable_value()),
-                            upstream_to_zally_zatoshis(
-                                balance.ironwood_balance().spendable_value(),
-                            ),
-                            upstream_to_zally_zatoshis(
-                                balance.unshielded_balance().spendable_value(),
-                            ),
-                        )
-                    },
-                );
+                .map_or_else(Zatoshis::zero, |balance| {
+                    upstream_to_zally_zatoshis(balance.unshielded_balance().spendable_value())
+                });
 
-            let visible_tip = find_visible_tip_on(ledger)?;
             // ZIP-213 maturity uses `chain_tip + 1` per `zcash_client_backend`'s convention so
             // an output mined at H is considered mature once the chain tip reaches H+99
             // (confirmations = 100). On a fresh wallet with no observed tip the maturity
@@ -1870,9 +1879,9 @@ impl WalletStorage for Sqlite {
             )?;
 
             Ok(crate::AccountBalanceRow {
-                sapling_zat,
-                orchard_zat,
-                ironwood_zat,
+                sapling_zat: spendable_by_pool.sapling,
+                orchard_zat: spendable_by_pool.orchard,
+                ironwood_zat: spendable_by_pool.ironwood,
                 transparent_mature_zat,
                 transparent_immature_zat,
                 as_of_height: visible_tip,
@@ -1908,62 +1917,41 @@ impl WalletStorage for Sqlite {
                 posture: FailurePosture::NotRetryable,
             })?;
 
-            let mut rows = Vec::new();
-            for note in received.sapling() {
-                let Some(mined_height) = note.mined_height() else {
-                    continue;
-                };
-                let value_zat = Zatoshis::try_from(note.note().value().inner()).map_err(|_| {
-                    StorageError::RowValueOutOfRange {
-                        column: "sapling_received_notes.value",
-                        raw: note.note().value().inner().to_string(),
-                    }
-                })?;
-                rows.push(crate::wallet::UnspentShieldedNoteRow {
-                    protocol: zcash_protocol::ShieldedPool::Sapling,
-                    value_zat,
-                    tx_id: zally_core::TxId::from_bytes(*note.txid().as_ref()),
-                    output_index: u32::from(note.output_index()),
-                    mined_height: BlockHeight::from(u32::from(mined_height)),
-                });
-            }
-            for note in received.orchard() {
-                let Some(mined_height) = note.mined_height() else {
-                    continue;
-                };
-                let value_zat = Zatoshis::try_from(note.note().value().inner()).map_err(|_| {
-                    StorageError::RowValueOutOfRange {
-                        column: "orchard_received_notes.value",
-                        raw: note.note().value().inner().to_string(),
-                    }
-                })?;
-                rows.push(crate::wallet::UnspentShieldedNoteRow {
-                    protocol: zcash_protocol::ShieldedPool::Orchard,
-                    value_zat,
-                    tx_id: zally_core::TxId::from_bytes(*note.txid().as_ref()),
-                    output_index: u32::from(note.output_index()),
-                    mined_height: BlockHeight::from(u32::from(mined_height)),
-                });
-            }
-            for note in received.ironwood() {
-                let Some(mined_height) = note.mined_height() else {
-                    continue;
-                };
-                let value_zat = Zatoshis::try_from(note.note().value().inner()).map_err(|_| {
-                    StorageError::RowValueOutOfRange {
-                        column: "ironwood_received_notes.value",
-                        raw: note.note().value().inner().to_string(),
-                    }
-                })?;
-                rows.push(crate::wallet::UnspentShieldedNoteRow {
-                    protocol: zcash_protocol::ShieldedPool::Ironwood,
-                    value_zat,
-                    tx_id: zally_core::TxId::from_bytes(*note.txid().as_ref()),
-                    output_index: u32::from(note.output_index()),
-                    mined_height: BlockHeight::from(u32::from(mined_height)),
-                });
-            }
-            Ok(rows)
+            shielded_note_rows(&received)
+        })
+        .await
+    }
+
+    async fn list_spendable_shielded_notes(
+        &self,
+        account_id: AccountId,
+        target_height: BlockHeight,
+    ) -> Result<Vec<crate::wallet::UnspentShieldedNoteRow>, StorageError> {
+        let network = self.options.network;
+        let target = zcash_client_backend::data_api::wallet::TargetHeight::from(
+            zcash_protocol::consensus::BlockHeight::from(target_height.as_u32()),
+        );
+        self.with_db(move |db| {
+            let account_uuid = resolve_account_uuid(db, network, account_id)?;
+            let received = zcash_client_backend::data_api::InputSource::select_spendable_notes(
+                db,
+                account_uuid,
+                TargetValue::AllFunds(MaxSpendMode::MaxSpendable),
+                &[
+                    zcash_protocol::ShieldedPool::Sapling,
+                    zcash_protocol::ShieldedPool::Orchard,
+                    zcash_protocol::ShieldedPool::Ironwood,
+                ],
+                target,
+                ConfirmationsPolicy::default(),
+                &[],
+            )
+            .map_err(|err| StorageError::SqliteFailed {
+                reason: format!("select_spendable_notes failed: {err}"),
+                posture: FailurePosture::NotRetryable,
+            })?;
+
+            shielded_note_rows(&received)
         })
         .await
     }
@@ -3362,6 +3350,94 @@ fn decode_row_zatoshis(stored: i64, column: &'static str) -> Result<Zatoshis, St
         column,
         raw: positive.to_string(),
     })
+}
+
+fn shielded_note_rows(
+    received: &zcash_client_backend::data_api::ReceivedNotes<zcash_client_sqlite::ReceivedNoteId>,
+) -> Result<Vec<crate::wallet::UnspentShieldedNoteRow>, StorageError> {
+    let mut rows = Vec::new();
+    for note in received.sapling() {
+        let Some(mined_height) = note.mined_height() else {
+            continue;
+        };
+        let value_zat = Zatoshis::try_from(note.note().value().inner()).map_err(|_| {
+            StorageError::RowValueOutOfRange {
+                column: "sapling_received_notes.value",
+                raw: note.note().value().inner().to_string(),
+            }
+        })?;
+        rows.push(crate::wallet::UnspentShieldedNoteRow {
+            protocol: zcash_protocol::ShieldedPool::Sapling,
+            value_zat,
+            tx_id: zally_core::TxId::from_bytes(*note.txid().as_ref()),
+            output_index: u32::from(note.output_index()),
+            mined_height: BlockHeight::from(u32::from(mined_height)),
+        });
+    }
+    for note in received.orchard() {
+        let Some(mined_height) = note.mined_height() else {
+            continue;
+        };
+        let value_zat = Zatoshis::try_from(note.note().value().inner()).map_err(|_| {
+            StorageError::RowValueOutOfRange {
+                column: "orchard_received_notes.value",
+                raw: note.note().value().inner().to_string(),
+            }
+        })?;
+        rows.push(crate::wallet::UnspentShieldedNoteRow {
+            protocol: zcash_protocol::ShieldedPool::Orchard,
+            value_zat,
+            tx_id: zally_core::TxId::from_bytes(*note.txid().as_ref()),
+            output_index: u32::from(note.output_index()),
+            mined_height: BlockHeight::from(u32::from(mined_height)),
+        });
+    }
+    for note in received.ironwood() {
+        let Some(mined_height) = note.mined_height() else {
+            continue;
+        };
+        let value_zat = Zatoshis::try_from(note.note().value().inner()).map_err(|_| {
+            StorageError::RowValueOutOfRange {
+                column: "ironwood_received_notes.value",
+                raw: note.note().value().inner().to_string(),
+            }
+        })?;
+        rows.push(crate::wallet::UnspentShieldedNoteRow {
+            protocol: zcash_protocol::ShieldedPool::Ironwood,
+            value_zat,
+            tx_id: zally_core::TxId::from_bytes(*note.txid().as_ref()),
+            output_index: u32::from(note.output_index()),
+            mined_height: BlockHeight::from(u32::from(mined_height)),
+        });
+    }
+    Ok(rows)
+}
+
+struct SpendableShieldedValueByPool {
+    sapling: Zatoshis,
+    orchard: Zatoshis,
+    ironwood: Zatoshis,
+}
+
+fn spendable_shielded_value_by_pool(
+    notes: &[crate::wallet::UnspentShieldedNoteRow],
+) -> SpendableShieldedValueByPool {
+    let mut sapling = 0_u64;
+    let mut orchard = 0_u64;
+    let mut ironwood = 0_u64;
+    for note in notes {
+        let destination = match note.protocol {
+            zcash_protocol::ShieldedPool::Sapling => &mut sapling,
+            zcash_protocol::ShieldedPool::Orchard => &mut orchard,
+            zcash_protocol::ShieldedPool::Ironwood => &mut ironwood,
+        };
+        *destination = destination.saturating_add(note.value_zat.as_u64());
+    }
+    SpendableShieldedValueByPool {
+        sapling: Zatoshis::try_from(sapling).unwrap_or(Zatoshis::zero()),
+        orchard: Zatoshis::try_from(orchard).unwrap_or(Zatoshis::zero()),
+        ironwood: Zatoshis::try_from(ironwood).unwrap_or(Zatoshis::zero()),
+    }
 }
 
 /// Reads the visible tip from `ext_zally_chain_tips` through `ledger` and decodes it into a typed

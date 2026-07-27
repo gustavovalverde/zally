@@ -366,34 +366,25 @@ impl Wallet {
 
     /// Returns the wallet's spendable view for the next dispense.
     ///
-    /// Equal to the sum of the account's spendable Sapling, Orchard, and Ironwood balances minus
-    /// every active dispense reservation persisted in storage. Locked transparent UTXOs
-    /// are already excluded from the shielded balances at the librustzcash boundary, so
-    /// they need no extra subtraction here. The result is what the next call to
-    /// [`Wallet::reserve_for_dispense`] is allowed to lock.
+    /// Equal to the value of shielded notes that the default ZIP 315 proposal selector can
+    /// spend in the next block, minus every active dispense reservation persisted in storage.
+    /// Using the proposal selector keeps readiness aligned with confirmation, witness, and
+    /// anchor eligibility. The result is what the next call to [`Wallet::reserve_for_dispense`]
+    /// is allowed to lock.
     ///
     /// `requires_operator` on unknown account; `retryable` on transient storage I/O.
     pub async fn spendable_for_next_dispense(
         &self,
         account_id: AccountId,
     ) -> Result<Zatoshis, WalletError> {
-        let balance_row = self
-            .inner
-            .storage
-            .get_account_balance(account_id)
-            .await
-            .map_err(WalletError::from)?;
+        let candidate_notes = self.spendable_notes_for_next_dispense(account_id).await?;
         let reserved = self
             .inner
             .storage
             .sum_active_dispense_reserved_zat(account_id)
             .await
             .map_err(WalletError::from)?;
-        let shielded_spendable = balance_row
-            .sapling_zat
-            .as_u64()
-            .saturating_add(balance_row.orchard_zat.as_u64())
-            .saturating_add(balance_row.ironwood_zat.as_u64());
+        let shielded_spendable = sum_unspent_note_value(&candidate_notes);
         let remaining = shielded_spendable.saturating_sub(reserved.as_u64());
         Ok(Zatoshis::try_from(remaining).unwrap_or(Zatoshis::zero()))
     }
@@ -454,18 +445,15 @@ impl Wallet {
             });
         }
 
-        let visible_tip = self
+        let candidate_notes = self.spendable_notes_for_next_dispense(account_id).await?;
+        let reserved = self
             .inner
             .storage
-            .find_visible_tip()
-            .await?
-            .unwrap_or_else(|| BlockHeight::from(0));
-        let candidate_notes = self
-            .inner
-            .storage
-            .list_unspent_shielded_notes(account_id, visible_tip)
+            .sum_active_dispense_reserved_zat(account_id)
             .await?;
-        let spendable = self.spendable_for_next_dispense(account_id).await?;
+        let gross_spendable = sum_unspent_note_value(&candidate_notes);
+        let spendable = Zatoshis::try_from(gross_spendable.saturating_sub(reserved.as_u64()))
+            .unwrap_or(Zatoshis::zero());
         if amount_zat.as_u64() > spendable.as_u64() {
             return Err(WalletError::InsufficientBalance {
                 requested_zat: amount_zat,
@@ -482,7 +470,8 @@ impl Wallet {
             idempotency_key: idempotency_key.clone(),
             account_id,
             amount_zat,
-            spendable_for_check_zat: spendable,
+            spendable_for_check_zat: Zatoshis::try_from(gross_spendable)
+                .unwrap_or(Zatoshis::zero()),
             locked_notes: locked_notes.clone(),
             reserved_at_ms,
         };
@@ -502,6 +491,21 @@ impl Wallet {
             locked_notes_summary: summary,
             available_after_release_zat: spendable,
         })
+    }
+
+    async fn spendable_notes_for_next_dispense(
+        &self,
+        account_id: AccountId,
+    ) -> Result<Vec<zally_storage::UnspentShieldedNoteRow>, WalletError> {
+        let next_block_height = self.inner.storage.find_visible_tip().await?.map_or_else(
+            || BlockHeight::from(0),
+            |tip| BlockHeight::from(tip.as_u32().saturating_add(1)),
+        );
+        self.inner
+            .storage
+            .list_spendable_shielded_notes(account_id, next_block_height)
+            .await
+            .map_err(WalletError::from)
     }
 
     /// Releases a previously-recorded reservation without spending it.
@@ -839,6 +843,12 @@ fn summarize_locked_notes(notes: &[zally_storage::HeldNote]) -> LockedNotesSumma
         note_count,
         Zatoshis::try_from(total).unwrap_or(Zatoshis::zero()),
     )
+}
+
+fn sum_unspent_note_value(notes: &[zally_storage::UnspentShieldedNoteRow]) -> u64 {
+    notes.iter().fold(0_u64, |total, note| {
+        total.saturating_add(note.value_zat.as_u64())
+    })
 }
 
 /// Greedy selection of unspent notes whose cumulative value covers `amount_zat`.

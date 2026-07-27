@@ -41,6 +41,14 @@ async fn list_unspent_shielded_notes_round_trip_empty_account() -> Result<(), Te
         rows.is_empty(),
         "fresh account must have no unspent notes, got {rows:?}"
     );
+
+    let spendable = storage
+        .list_spendable_shielded_notes(account_id, BlockHeight::from(101))
+        .await?;
+    assert!(
+        spendable.is_empty(),
+        "fresh account must have no proposal-eligible notes, got {spendable:?}"
+    );
     Ok(())
 }
 
@@ -69,6 +77,14 @@ async fn list_unspent_shielded_notes_fails_closed_for_unknown_account() -> Resul
     assert!(
         matches!(outcome, Err(StorageError::AccountNotFound)),
         "an id that does not name the wallet's account must fail closed: {outcome:?}"
+    );
+
+    let spendable_outcome = storage
+        .list_spendable_shielded_notes(unknown, BlockHeight::from(101))
+        .await;
+    assert!(
+        matches!(spendable_outcome, Err(StorageError::AccountNotFound)),
+        "proposal-eligible lookup must fail closed for an unknown account: {spendable_outcome:?}"
     );
     Ok(())
 }

@@ -238,7 +238,7 @@ impl PreparedTransaction {
 pub struct UnspentShieldedNoteRow {
     /// Pool this note lives on.
     pub protocol: zcash_protocol::ShieldedPool,
-    /// Spendable value in this note.
+    /// Unspent value in this note.
     pub value_zat: Zatoshis,
     /// Transaction that created the note.
     pub tx_id: TxId,
@@ -796,6 +796,21 @@ pub trait WalletStorage: Send + Sync + 'static {
     ///
     /// `not_retryable` on unknown account or schema errors; `retryable` on transient I/O.
     async fn list_unspent_shielded_notes(
+        &self,
+        account_id: AccountId,
+        target_height: BlockHeight,
+    ) -> Result<Vec<UnspentShieldedNoteRow>, StorageError>;
+
+    /// Returns every shielded note that the default ZIP 315 proposal policy can select for
+    /// `account_id` in a transaction targeting `target_height` (typically the current chain
+    /// tip plus one).
+    ///
+    /// Unlike [`Self::list_unspent_shielded_notes`], this applies the proposal selector's
+    /// confirmation, witness, and anchor eligibility checks. Callers use this method when an
+    /// amount advertised as spendable must also be immediately reservable and executable.
+    ///
+    /// `not_retryable` on unknown account or schema errors; `retryable` on transient I/O.
+    async fn list_spendable_shielded_notes(
         &self,
         account_id: AccountId,
         target_height: BlockHeight,

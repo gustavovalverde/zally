@@ -12,9 +12,10 @@ use zally_core::{BlockHeight, Zatoshis};
 /// One per-pool balance snapshot for a single account, anchored to the wallet's last
 /// persisted visible tip.
 ///
-/// Sapling, Orchard, and Ironwood values report the upstream spendable totals reported by
-/// `WalletRead::get_wallet_summary` (notes whose witnesses are computable and whose
-/// confirmation depth is met).
+/// Sapling, Orchard, and Ironwood values report notes accepted by the same default ZIP 315
+/// selector used for transaction proposals. This includes confirmation, witness, and anchor
+/// eligibility, so a value reported as spendable is usable by a proposal targeting the next
+/// block.
 ///
 /// Transparent values split by ZIP-213 coinbase maturity: coinbase outputs need 100
 /// confirmations before they become spendable; everything else is spendable on the first

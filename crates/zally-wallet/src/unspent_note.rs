@@ -3,11 +3,13 @@
 use zally_chain::ShieldedPool;
 use zally_core::{BlockHeight, TxId, Zatoshis};
 
-/// An unspent Sapling or Orchard note owned by a wallet account.
+/// An unspent Sapling, Orchard, or Ironwood note owned by a wallet account.
 ///
 /// Returned by [`crate::Wallet::list_unspent_shielded_notes`]. Operators use this view as a
-/// snapshot of spendable shielded inputs for an account: balance dashboards, observation
-/// channels (e.g., donation observers), and reservation logic before a custody flow.
+/// snapshot of shielded inputs for an account: balance dashboards and observation channels
+/// (for example, donation observers). A listed note can still be too shallow or otherwise
+/// ineligible for the next transaction proposal; use
+/// [`crate::Wallet::spendable_for_next_dispense`] for reservation readiness.
 ///
 /// The `confirmations` field is computed against the wallet's persisted visible tip at
 /// the moment of the call. Operators that need a fresher number should call
