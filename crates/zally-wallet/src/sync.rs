@@ -1056,8 +1056,8 @@ const fn backoff_for(policy: SyncRecoveryPolicy, consecutive_faults: u32) -> u64
 /// The named arms pin the cures the posture cannot express: commitment-tree conflicts,
 /// scan-time reorg divergences, and proven tree-root divergence rewind below the
 /// divergence. Every other error derives its repair from [`WalletError::posture`]:
-/// transient faults retry, operator dead ends park (the literal
-/// [`FailurePosture::RequiresOperator`] definition), and the rest rewind: the ladder
+/// transient faults and expired source boundaries retry, operator dead ends park (the
+/// literal [`FailurePosture::RequiresOperator`] definition), and the rest rewind: the ladder
 /// escalates to a rebuild when rewinding does not cure, which is the self-healing default
 /// for unknown corruption.
 fn repair_for(error: &WalletError) -> SyncRepair {
@@ -1078,7 +1078,7 @@ fn repair_for(error: &WalletError) -> SyncRepair {
         )
         | WalletError::TreeRootsDiverged { .. } => SyncRepair::Rewind,
         other => match other.posture() {
-            FailurePosture::Retryable => SyncRepair::Retry,
+            FailurePosture::Retryable | FailurePosture::Restartable => SyncRepair::Retry,
             FailurePosture::RequiresOperator => SyncRepair::Park,
             _ => SyncRepair::Rewind,
         },
@@ -1761,11 +1761,15 @@ impl Wallet {
             });
         }
 
-        let transparent_utxo_count = self.sync_transparent_utxos(chain, chain_epoch).await?;
+        let transparent_utxo_count = self
+            .sync_transparent_utxos(chain, chain_epoch)
+            .await
+            .inspect_err(|err| note_unverified_tree_roots(outcome.scanned_to_height, err))?;
 
         if let Some(diverged_height) = self
             .verify_tree_roots(chain, chain_epoch, outcome.scanned_to_height)
-            .await?
+            .await
+            .inspect_err(|err| note_unverified_tree_roots(outcome.scanned_to_height, err))?
         {
             return Err(WalletError::TreeRootsDiverged {
                 height: diverged_height,
@@ -1823,6 +1827,7 @@ impl Wallet {
                     target: "zally::sync",
                     event = "wallet_tree_root_check_skipped",
                     height = height.as_u32(),
+                    reason = "wallet_trees_empty",
                     "wallet commitment trees are empty"
                 );
                 Ok(None)
@@ -1901,6 +1906,25 @@ impl Wallet {
             .record_transparent_utxos(transparent_utxo_rows)
             .await?)
     }
+}
+
+/// Names a committed scan chunk whose commitment-tree roots were never compared.
+///
+/// A source that rotates its epoch faster than one chunk takes to scan expires the pin before
+/// the comparison runs, on every attempt. Those attempts keep their blocks and publish only
+/// slow progress, so a wallet can catch up across a whole chain with no root ever verified.
+/// Failures of every other posture already reach the operator as a driver fault.
+fn note_unverified_tree_roots(scanned_to: BlockHeight, error: &WalletError) {
+    if error.posture() != FailurePosture::Restartable {
+        return;
+    }
+    tracing::warn!(
+        target: "zally::sync",
+        event = "wallet_tree_root_check_skipped",
+        height = scanned_to.as_u32(),
+        reason = "chain_epoch_expired",
+        "committed a scan chunk without verifying its commitment-tree roots"
+    );
 }
 
 fn validate_transparent_utxo_batches(

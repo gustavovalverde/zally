@@ -1,11 +1,9 @@
 //! Faults on iterations that advanced the wallet's scanned height reset the repair ladder
 //! only for environment faults; state faults keep their repair regardless of progress.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
-use tracing::Subscriber;
-use tracing_subscriber::layer::SubscriberExt;
 use zally_chain::{ChainSource, ChainSourceError};
 use zally_core::BlockHeight;
 use zally_testkit::MockChainSource;
@@ -15,7 +13,8 @@ use zally_wallet::{
 };
 
 use super::fixtures::{
-    SnapshotWaitError, TestWalletError, TestWalletFixture, create_test_wallet, wait_for_snapshot,
+    SnapshotWaitError, TestWalletError, TestWalletFixture, capture_sync_events, create_test_wallet,
+    wait_for_snapshot,
 };
 
 fn fast_recovery_policy() -> SyncRecoveryPolicy {
@@ -34,11 +33,7 @@ async fn fault_with_scan_progress_resets_the_ladder() -> Result<(), TestError> {
     let network = wallet.network();
     wallet.set_retry_policy(RetryPolicy::none());
 
-    let events: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-    let subscriber = tracing_subscriber::registry().with(CaptureLayer {
-        events: Arc::clone(&events),
-    });
-    let _default_guard = tracing::subscriber::set_default(subscriber);
+    let (_capture_guard, sync_events) = capture_sync_events();
 
     let chain = Arc::new(MockChainSource::new(network));
     let chain_handle = chain.handle();
@@ -67,21 +62,16 @@ async fn fault_with_scan_progress_resets_the_ladder() -> Result<(), TestError> {
     assert_eq!(healthy.last_fault, None);
     assert_eq!(chain_handle.failures_consumed(), 1);
 
-    let captured = events.lock().map_err(|_| TestError::Mutex)?.clone();
     assert!(
-        captured
-            .iter()
-            .any(|e| e.contains("wallet_sync_slow_progress")),
+        sync_events.contains("wallet_sync_slow_progress"),
         "the faulted iteration that advanced the scan must publish slow progress"
     );
     assert!(
-        !captured.iter().any(|e| e.contains("wallet_sync_fault")),
+        !sync_events.contains("wallet_sync_fault"),
         "a fault with scan progress must not strike the ladder"
     );
     assert!(
-        !captured
-            .iter()
-            .any(|e| e.contains("wallet_sync_repair_started")),
+        !sync_events.contains("wallet_sync_repair_started"),
         "no repair may run for a fault with scan progress"
     );
 
@@ -160,44 +150,6 @@ async fn state_fault_with_scan_progress_still_engages_the_ladder() -> Result<(),
     Ok(())
 }
 
-struct CaptureLayer {
-    events: Arc<Mutex<Vec<String>>>,
-}
-
-impl<S: Subscriber> tracing_subscriber::Layer<S> for CaptureLayer {
-    fn on_event(
-        &self,
-        event: &tracing::Event<'_>,
-        _ctx: tracing_subscriber::layer::Context<'_, S>,
-    ) {
-        if event.metadata().target() != "zally::sync" {
-            return;
-        }
-        let mut buf = String::new();
-        let mut visitor = StringVisitor { buf: &mut buf };
-        event.record(&mut visitor);
-        if let Ok(mut guard) = self.events.lock() {
-            guard.push(buf);
-        }
-    }
-}
-
-struct StringVisitor<'a> {
-    buf: &'a mut String,
-}
-
-impl tracing::field::Visit for StringVisitor<'_> {
-    fn record_debug(&mut self, field: &tracing::field::Field, field_value: &dyn std::fmt::Debug) {
-        use std::fmt::Write;
-        let _ = write!(self.buf, "{}={:?} ", field.name(), field_value);
-    }
-
-    fn record_str(&mut self, field: &tracing::field::Field, field_value: &str) {
-        use std::fmt::Write;
-        let _ = write!(self.buf, "{}={} ", field.name(), field_value);
-    }
-}
-
 #[derive(Debug, thiserror::Error)]
 enum TestError {
     #[error("test wallet error: {0}")]
@@ -208,6 +160,4 @@ enum TestError {
     SnapshotWait(#[from] SnapshotWaitError),
     #[error("timed out waiting for wallet event")]
     EventTimeout,
-    #[error("events mutex poisoned")]
-    Mutex,
 }

@@ -5,9 +5,13 @@
 //! intervention, or no retry at all. The helper [`with_retry`] consults the posture and
 //! gives up on the first non-retryable error.
 //!
-//! The wallet's circuit breaker only trips on [`FailurePosture::Retryable`] failures:
-//! consecutive operator-action or caller-bug failures are not symptoms of a flaky backend
-//! and must not pollute the breaker counter.
+//! The wallet's circuit breaker counts [`FailurePosture::Retryable`] failures and nothing
+//! else. Operator-action, caller-bug, and expired-boundary failures leave it exactly as they
+//! found it: none of them is a symptom of a flaky backend, and none of them is evidence that a
+//! flaky backend recovered. A source that rotates its chain epoch once per block returns
+//! [`FailurePosture::Restartable`] on every attempt that outlives one block, so counting those
+//! would park a wallet whose only problem is that it is behind, and crediting them would let a
+//! genuinely broken source clear its own half-open probe once per block.
 
 use std::future::Future;
 use std::time::Duration;
@@ -125,11 +129,13 @@ const fn bool_to_posture(is_retryable: bool) -> FailurePosture {
     }
 }
 
-/// Retries `operation` up to `policy.max_attempts` times when `operation` returns a
-/// [`FailurePosture::Retryable`] error.
+/// Retries `operation` up to `policy.max_attempts` times when `operation` returns an error
+/// whose posture allows a retry.
 ///
-/// Non-retryable and operator-action errors surface immediately; the policy never sleeps
-/// after the final attempt. `operation_label` is recorded in tracing breadcrumbs so
+/// A [`FailurePosture::Restartable`] error only clears once `operation` re-acquires the
+/// source boundary it pins, so pass a closure that starts the bounded operation from
+/// scratch. Non-retryable and operator-action errors surface immediately; the policy never
+/// sleeps after the final attempt. `operation_label` is recorded in tracing breadcrumbs so
 /// operators can diagnose retry storms by call site.
 ///
 /// # Errors
@@ -160,10 +166,11 @@ where
                     target: "zally::retry",
                     event = "retry_attempt",
                     op = operation_label,
+                    posture = err.failure_posture().label(),
                     attempts,
                     delay_ms,
                     reason = %err,
-                    "transient failure; backing off and retrying"
+                    "boundary failure; backing off before the next attempt"
                 );
                 sleep(Duration::from_millis(u64::from(delay_ms))).await;
                 let next = u64::from(delay_ms)
@@ -178,11 +185,12 @@ where
 
 /// Wraps [`with_retry`] with a [`CircuitBreaker`] check.
 ///
-/// Returns [`WalletError::CircuitBroken`] immediately when the breaker is open. On call
-/// completion, records success or failure on the breaker so subsequent calls reflect the
-/// new state. The breaker only counts [`FailurePosture::Retryable`] failures: operator-
-/// action and caller-bug failures must not trip the breaker since they are not symptoms of
-/// a flaky backend.
+/// Returns [`WalletError::CircuitBroken`] immediately when the breaker is open. A call that
+/// completes records success. A failure whose posture reports
+/// [`FailurePosture::trips_circuit_breaker`] records failure. Every other failure records
+/// nothing at all, which is the only outcome that both keeps a closed breaker off its
+/// threshold and leaves a half-open probe undecided: a half-open probe asks whether the source
+/// can finish a unit of work, and only a completed call answers it.
 ///
 /// # Errors
 ///
@@ -212,10 +220,8 @@ where
             Ok(outcome)
         }
         Err(err) => {
-            if err.failure_posture().allows_retry() {
+            if err.failure_posture().trips_circuit_breaker() {
                 breaker.record_failure();
-            } else {
-                breaker.record_success();
             }
             Err(lift_err(err))
         }
@@ -227,6 +233,8 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU32, Ordering};
+
+    use crate::circuit_breaker::{CircuitBreakerConfig, CircuitBreakerState};
 
     #[derive(Debug, thiserror::Error)]
     enum FakeError {
@@ -348,5 +356,101 @@ mod tests {
         .await;
         assert!(matches!(outcome, Err(FakeError::Retryable(_))));
         assert_eq!(counter.load(Ordering::SeqCst), 3);
+    }
+
+    /// A breaker whose cooldown has already elapsed, so the next `allow_call` probes.
+    fn breaker_ready_to_probe() -> CircuitBreaker {
+        let breaker = CircuitBreaker::new(CircuitBreakerConfig {
+            failure_threshold: 1,
+            cooldown: Duration::ZERO,
+        });
+        breaker.record_failure();
+        breaker
+    }
+
+    /// Runs one breaker-wrapped call that fails with `make_error`.
+    async fn fail_one_call(
+        breaker: &CircuitBreaker,
+        make_error: impl Fn() -> ChainSourceError + Send + Sync,
+    ) {
+        let outcome: Result<(), WalletError> = with_breaker_and_retry(
+            breaker,
+            RetryPolicy::none(),
+            "test",
+            || async { Err::<(), _>(make_error()) },
+            WalletError::ChainSource,
+        )
+        .await;
+        assert!(outcome.is_err(), "the call must surface its failure");
+    }
+
+    #[tokio::test]
+    async fn half_open_probe_that_expires_a_boundary_stays_undecided() {
+        let breaker = breaker_ready_to_probe();
+        fail_one_call(&breaker, || ChainSourceError::ChainEpochPinUnavailable).await;
+        assert!(
+            matches!(breaker.state(), CircuitBreakerState::HalfOpen),
+            "an expired epoch pin says nothing about a broken source, so the probe must stand, got {:?}",
+            breaker.state()
+        );
+    }
+
+    #[tokio::test]
+    async fn half_open_probe_that_hits_an_operator_dead_end_stays_undecided() {
+        let breaker = breaker_ready_to_probe();
+        fail_one_call(&breaker, || ChainSourceError::CapabilitiesUnavailable {
+            capabilities: vec!["wallet.compact_block.range.v1".to_owned()],
+        })
+        .await;
+        assert!(
+            matches!(breaker.state(), CircuitBreakerState::HalfOpen),
+            "a missing capability says nothing about a broken source, so the probe must stand, got {:?}",
+            breaker.state()
+        );
+    }
+
+    #[tokio::test]
+    async fn half_open_probe_that_completes_closes_the_breaker() {
+        let breaker = breaker_ready_to_probe();
+        let outcome: Result<u32, WalletError> = with_breaker_and_retry(
+            &breaker,
+            RetryPolicy::none(),
+            "test",
+            || async { Ok::<_, ChainSourceError>(1) },
+            WalletError::ChainSource,
+        )
+        .await;
+        assert!(matches!(outcome, Ok(1)));
+        assert!(matches!(
+            breaker.state(),
+            CircuitBreakerState::Closed {
+                consecutive_failures: 0
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn an_expired_boundary_neither_advances_nor_clears_the_failure_streak() {
+        let breaker = CircuitBreaker::new(CircuitBreakerConfig {
+            failure_threshold: 5,
+            cooldown: Duration::ZERO,
+        });
+        for _ in 0..2_u32 {
+            fail_one_call(&breaker, || ChainSourceError::Unavailable {
+                reason: "flaky".to_owned(),
+            })
+            .await;
+        }
+        fail_one_call(&breaker, || ChainSourceError::ChainEpochPinUnavailable).await;
+        assert!(
+            matches!(
+                breaker.state(),
+                CircuitBreakerState::Closed {
+                    consecutive_failures: 2
+                }
+            ),
+            "a rotation must neither count toward the threshold nor absolve the streak, got {:?}",
+            breaker.state()
+        );
     }
 }

@@ -4,10 +4,15 @@
 //! and a sqlite wallet store, a regtest mock chain source, and a fresh wallet rooted at
 //! birthday height 1. `create_test_wallet` lifts this boilerplate out of every test so the
 //! tests focus on the behaviour they assert. `wait_for_snapshot` lifts the driver-snapshot
-//! polling shared by the sync-driver tests.
+//! polling shared by the sync-driver tests, and `capture_sync_events` lifts the `zally::sync`
+//! tracing capture those tests assert lifecycle transitions against.
 
+use std::sync::Arc;
 use std::time::Duration;
 
+use parking_lot::Mutex;
+use tracing::subscriber::DefaultGuard;
+use tracing_subscriber::layer::SubscriberExt as _;
 use zally_core::{BlockHeight, Network};
 use zally_keys::{AgeFileSealing, AgeFileSealingOptions};
 use zally_storage::{Sqlite, SqliteOptions};
@@ -87,4 +92,57 @@ pub(crate) enum SnapshotWaitError {
     StreamClosed,
     #[error("timed out waiting for sync snapshot")]
     Timeout,
+}
+
+/// Records every `zally::sync` tracing event for as long as the returned guard is held.
+pub(crate) fn capture_sync_events() -> (DefaultGuard, SyncEventLog) {
+    let log = SyncEventLog(Arc::new(Mutex::new(Vec::new())));
+    let subscriber = tracing_subscriber::registry().with(CaptureLayer { log: log.clone() });
+    (tracing::subscriber::set_default(subscriber), log)
+}
+
+/// Rendered `zally::sync` events captured by [`capture_sync_events`].
+#[derive(Clone)]
+pub(crate) struct SyncEventLog(Arc<Mutex<Vec<String>>>);
+
+impl SyncEventLog {
+    /// Whether any captured event rendering contains `needle`.
+    pub(crate) fn contains(&self, needle: &str) -> bool {
+        self.0.lock().iter().any(|event| event.contains(needle))
+    }
+}
+
+struct CaptureLayer {
+    log: SyncEventLog,
+}
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CaptureLayer {
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        if event.metadata().target() != "zally::sync" {
+            return;
+        }
+        let mut rendered = String::new();
+        event.record(&mut StringVisitor { buf: &mut rendered });
+        self.log.0.lock().push(rendered);
+    }
+}
+
+struct StringVisitor<'a> {
+    buf: &'a mut String,
+}
+
+impl tracing::field::Visit for StringVisitor<'_> {
+    fn record_debug(&mut self, field: &tracing::field::Field, field_value: &dyn std::fmt::Debug) {
+        use std::fmt::Write as _;
+        let _ = write!(self.buf, "{}={:?} ", field.name(), field_value);
+    }
+
+    fn record_str(&mut self, field: &tracing::field::Field, field_value: &str) {
+        use std::fmt::Write as _;
+        let _ = write!(self.buf, "{}={} ", field.name(), field_value);
+    }
 }

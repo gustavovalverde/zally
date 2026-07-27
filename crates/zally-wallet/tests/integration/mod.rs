@@ -34,6 +34,7 @@ mod sync_driver_slow_progress;
 mod sync_network_mismatch;
 mod sync_retries_retryable_chain_failures;
 mod sync_skips_tree_root_check_for_empty_pools;
+mod sync_survives_epoch_rotation;
 mod to_uri_round_trips_through_propose;
 #[cfg(feature = "unsafe_plaintext_seed")]
 mod unsafe_plaintext_seed_warns;

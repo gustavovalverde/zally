@@ -4,13 +4,16 @@ Zally public errors are typed, posture-classified, and part of the public API. N
 
 ## Failure Posture
 
-Every chain-source and wallet error exposes a `posture()` method returning a [`FailurePosture`](../../crates/zally-chain/src/error.rs) value drawn from this three-class taxonomy. See [ADR-0002](../adrs/0002-source-failure-posture.md) for the architectural contract.
+Every chain-source and wallet error exposes a `posture()` method returning a [`FailurePosture`](../../crates/zally-core/src/failure_posture.rs) value drawn from this four-class taxonomy. See [ADR-0002](../adrs/0002-source-failure-posture.md) for the architectural contract.
 
 | Posture | Meaning | Wallet behaviour |
 |---------|---------|------------------|
 | `retryable` | The same call with the same arguments may succeed later. | `with_retry` retries with backoff; `CircuitBreaker` counts consecutive failures and trips at threshold. |
-| `requires_operator` | An operator must repair configuration, storage, or runtime state. | Surface immediately; do not retry; do not trip the breaker. |
-| `not_retryable` | The caller must change input or state before retrying. | Surface immediately; do not retry; do not trip the breaker. |
+| `restartable` | The pinned source boundary expired; the same call with the same arguments can never succeed. | `with_retry` re-invokes an operation that re-acquires the boundary; the breaker is left untouched. |
+| `requires_operator` | An operator must repair configuration, storage, or runtime state. | Surface immediately; do not retry; leave the breaker untouched. |
+| `not_retryable` | The caller must change input or state before retrying. | Surface immediately; do not retry; leave the breaker untouched. |
+
+Only `retryable` moves the breaker's failure counter, and only a call that completed closes a half-open probe. A failure in any other class leaves the breaker exactly as it found it: it neither advances the counter, nor clears a streak, nor decides a probe.
 
 ## WalletError
 
@@ -48,8 +51,8 @@ Every chain-source and wallet error exposes a `posture()` method returning a [`F
 | `NetworkMismatch` | `requires_operator` | The source serves a different network than the caller asked for. |
 | `CapabilitiesUnavailable` | `requires_operator` | The endpoint does not advertise every capability required for event-driven native sync. |
 | `ContractRevisionUnsupported` | `requires_operator` | The endpoint contract revision is older than revision 2. |
-| `ChainEpochPinUnavailable` | `retryable` | The pinned epoch expired; restart the wallet sync against a fresh epoch. |
-| `ChainEventCursorExpired` | `retryable` | Reconcile the wallet against a fresh epoch, then subscribe from the earliest retained event. |
+| `ChainEpochPinUnavailable` | `restartable` | The pinned epoch expired; restart the wallet sync against a fresh epoch. |
+| `ChainEventCursorExpired` | `restartable` | Reconcile the wallet against a fresh epoch, then subscribe from the earliest retained event. |
 | `MalformedCompactBlock` | `requires_operator` | The source returned bytes that did not decode; investigate the upstream version. |
 | `CompactBlockStreamOrder` | `requires_operator` | A compact-block range was incomplete, duplicated, or out of order. |
 | `TreeStateAnchorHeightMismatch` | `requires_operator` | A tree-state artifact did not match the exact requested anchor height. |

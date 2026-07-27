@@ -252,9 +252,11 @@ impl WalletError {
         }
     }
 
-    /// Convenience: `true` when the same call may succeed on retry.
+    /// Convenience: `true` when the operation may be issued again.
     ///
-    /// Equivalent to `self.posture().allows_retry()`.
+    /// Equivalent to `self.posture().allows_retry()`, including the
+    /// [`FailurePosture::Restartable`] case, where the caller must re-acquire its source
+    /// boundary first.
     #[must_use]
     pub fn is_retryable(&self) -> bool {
         self.posture().allows_retry()
