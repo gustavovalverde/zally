@@ -46,6 +46,7 @@ struct MockState {
     transparent_utxo_failures: Vec<ChainSourceError>,
     subtree_failures: Vec<ChainSourceError>,
     compact_failures: Vec<ChainSourceError>,
+    tree_state_failure_heights: Vec<u32>,
     failures_consumed: u32,
     acquired_epoch_ids: Vec<u64>,
     artifact_epoch_ids: Vec<u64>,
@@ -74,6 +75,7 @@ impl MockChainSource {
                 transparent_utxo_failures: Vec::new(),
                 subtree_failures: Vec::new(),
                 compact_failures: Vec::new(),
+                tree_state_failure_heights: Vec::new(),
                 failures_consumed: 0,
                 acquired_epoch_ids: Vec::new(),
                 artifact_epoch_ids: Vec::new(),
@@ -240,6 +242,17 @@ impl MockChainSourceHandle {
             .push(ChainSourceError::ChainEpochPinUnavailable);
     }
 
+    /// Expires the current epoch during the next tree-state read at `block_height`.
+    ///
+    /// Keyed on the height because one scan cycle reads two tree states: the anchor below
+    /// its range, then the one it compares its roots against.
+    pub fn expire_epoch_on_tree_state_at(&self, block_height: BlockHeight) {
+        self.state
+            .lock()
+            .tree_state_failure_heights
+            .push(block_height.as_u32());
+    }
+
     /// Epoch IDs returned by `current_epoch`, in call order.
     #[must_use]
     pub fn acquired_epoch_ids(&self) -> Vec<u64> {
@@ -401,10 +414,21 @@ impl ChainSource for MockChainSource {
         chain_epoch: ChainEpoch,
         block_height: BlockHeight,
     ) -> Result<TreeStateArtifact, ChainSourceError> {
-        self.state
-            .lock()
-            .artifact_epoch_ids
-            .push(chain_epoch.id().value());
+        {
+            let mut guard = self.state.lock();
+            guard.artifact_epoch_ids.push(chain_epoch.id().value());
+            if let Some(index) = guard
+                .tree_state_failure_heights
+                .iter()
+                .position(|height| *height == block_height.as_u32())
+            {
+                guard.tree_state_failure_heights.remove(index);
+                guard.epoch_id = guard.epoch_id.saturating_add(1);
+                guard.failures_consumed = guard.failures_consumed.saturating_add(1);
+                drop(guard);
+                return Err(ChainSourceError::ChainEpochPinUnavailable);
+            }
+        }
         let (network, served_tree_state) = {
             self.validate_epoch(chain_epoch)?;
             let guard = self.state.lock();

@@ -83,6 +83,27 @@ pub struct SyncOutcome {
     pub completed_at_ms: u64,
 }
 
+/// The wallet's most recent checked observation of the chain.
+///
+/// An attempt earns one by writing what it read under its pinned epoch into the wallet
+/// database and comparing the resulting commitment-tree roots against the chain. That pairing
+/// is what a consumer gating spends can rely on, measuring age from [`Self::observed_at_ms`]
+/// and distance from [`SyncSnapshot::lag_blocks`]: the wallet read the chain first-hand, and
+/// the tree it will anchor a spend to agrees with it.
+///
+/// An attempt that commits nothing earns nothing. Neither does one whose chunk outran the
+/// comparison, nor one whose fault classifies onto a state-repair rung: its blocks sit on a
+/// view the wallet has just been told to distrust.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[non_exhaustive]
+pub struct SyncObservation {
+    /// Highest block height the wallet had committed when the observation was taken.
+    pub scanned_to_height: BlockHeight,
+    /// Unix milliseconds when the observation was taken.
+    pub observed_at_ms: u64,
+}
+
 /// Self-healing policy for the [`SyncDriver`] repair ladder.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -347,8 +368,8 @@ pub struct SyncSnapshot {
     pub settled_tip_height: Option<BlockHeight>,
     /// Number of blocks between `scanned_height` and `visible_tip_height`, if known.
     pub lag_blocks: Option<u32>,
-    /// Most recent completed [`Wallet::sync`] run summary.
-    pub last_outcome: Option<SyncOutcome>,
+    /// Most recent chain state the wallet committed and checked, and when.
+    pub last_observation: Option<SyncObservation>,
     /// Most recent fault; `None` while healthy.
     pub last_fault: Option<SyncFault>,
     /// Unix milliseconds when this snapshot was published.
@@ -365,7 +386,7 @@ impl SyncSnapshot {
             visible_tip_height: None,
             settled_tip_height: None,
             lag_blocks: None,
-            last_outcome: None,
+            last_observation: None,
             last_fault: None,
             published_at_ms: current_unix_ms(),
         }
@@ -374,7 +395,7 @@ impl SyncSnapshot {
     fn from_wallet_status(
         phase: SyncDriverPhase,
         wallet_status: &WalletStatus,
-        last_outcome: Option<SyncOutcome>,
+        last_observation: Option<SyncObservation>,
         last_fault: Option<SyncFault>,
     ) -> Self {
         Self {
@@ -385,7 +406,7 @@ impl SyncSnapshot {
             visible_tip_height: wallet_status.visible_tip_height,
             settled_tip_height: wallet_status.settled_tip_height,
             lag_blocks: wallet_status.lag_blocks,
-            last_outcome,
+            last_observation,
             last_fault,
             published_at_ms: current_unix_ms(),
         }
@@ -515,7 +536,7 @@ struct DriverContext<'a> {
 
 #[derive(Default)]
 struct DriverState {
-    last_outcome: Option<SyncOutcome>,
+    last_observation: Option<SyncObservation>,
     last_fault: Option<SyncFault>,
     recovery: Option<RecoveryState>,
     cursor_recovery_pending: bool,
@@ -567,6 +588,51 @@ impl DriverState {
         } else {
             self.recovery.take()
         }
+    }
+
+    /// Records a completed run as the wallet's latest chain observation.
+    ///
+    /// A run that scanned a chunk compared that chunk's commitment-tree roots against the
+    /// chain before it returned. A run that scanned nothing compared nothing, so it re-dates
+    /// the observation only up to a height the wallet has already checked; otherwise a
+    /// caught-up cycle would launder an unchecked chunk into fresh agreement it never
+    /// established.
+    fn observe_completed_run(&mut self, outcome: SyncOutcome) {
+        if outcome.block_count == 0 && !self.has_checked(outcome.scanned_to_height) {
+            return;
+        }
+        self.last_observation = Some(SyncObservation {
+            scanned_to_height: outcome.scanned_to_height,
+            observed_at_ms: outcome.completed_at_ms,
+        });
+    }
+
+    /// Records a faulted attempt's committed chunk as the wallet's latest chain observation.
+    ///
+    /// The wallet holds blocks it fetched under a pinned epoch and wrote through
+    /// `scan_blocks`, and the fault landed after that write on a rung that says nothing about
+    /// the wallet's state. Against a source that expires its pin inside every chunk's tail
+    /// this is the only observation the driver ever produces.
+    ///
+    /// A chunk whose roots went uncompared is not one: its blocks are committed, but nothing
+    /// has checked them against the chain, and a divergence the wallet never detected would
+    /// read as fresh.
+    fn observe_committed_chunk(&mut self, committed: CommittedChunk, frontier: ScanFrontier) {
+        let (CommittedChunk::Checked, ScanFrontier::At(scanned_to_height)) = (committed, frontier)
+        else {
+            return;
+        };
+        self.last_observation = Some(SyncObservation {
+            scanned_to_height,
+            observed_at_ms: current_unix_ms(),
+        });
+    }
+
+    /// Whether the wallet has compared its committed state against the chain at or above
+    /// `height`.
+    fn has_checked(&self, height: BlockHeight) -> bool {
+        self.last_observation
+            .is_some_and(|observation| observation.scanned_to_height >= height)
     }
 }
 
@@ -640,7 +706,51 @@ struct ParkedAt {
 
 enum SyncRunAttempt {
     Completed(SyncOutcome),
-    Faulted { reason: String, repair: SyncRepair },
+    Faulted {
+        reason: String,
+        repair: SyncRepair,
+        committed: CommittedChunk,
+    },
+}
+
+/// Whether an attempt's committed blocks carry a comparison against the chain.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CommittedChunk {
+    /// The attempt committed a chunk and compared its commitment-tree roots against the
+    /// chain first, or committed nothing at all.
+    Checked,
+    /// The attempt committed a chunk and the comparison never ran.
+    Unchecked,
+}
+
+/// The wallet's persisted scan frontier at one point in time.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ScanFrontier {
+    /// Highest block height the wallet has committed.
+    At(BlockHeight),
+    /// The wallet has committed no blocks.
+    Empty,
+    /// The status read failed, so the driver cannot say where the frontier sits.
+    Unknown,
+}
+
+impl ScanFrontier {
+    /// Block the frontier reached, `None` when the driver could not read it. A wallet that
+    /// has committed nothing sits below every block.
+    fn reached(self) -> Option<u32> {
+        match self {
+            Self::At(height) => Some(height.as_u32()),
+            Self::Empty => Some(0),
+            Self::Unknown => None,
+        }
+    }
+
+    const fn height(self) -> Option<BlockHeight> {
+        match self {
+            Self::At(height) => Some(height),
+            Self::Empty | Self::Unknown => None,
+        }
+    }
 }
 
 /// Whether this wakeup has already recorded the chain tip its scan queue is planned against.
@@ -861,13 +971,15 @@ async fn run_sync_wakeup(
                 continue;
             }
         }
-        let scanned_before = tokio::select! {
+        let frontier_before = tokio::select! {
             biased;
             _ = &mut *close_rx => return SyncWakeupExit::CloseRequested,
-            snapshot = build_snapshot(ctx, SyncDriverPhase::Syncing, state) => {
-                let scanned_before = snapshot.scanned_height;
+            wallet_status = ctx.wallet.status_snapshot() => {
+                let wallet_status = wallet_status.ok();
+                let snapshot =
+                    snapshot_for(ctx, SyncDriverPhase::Syncing, state, wallet_status.as_ref());
                 publish_snapshot(ctx.status_tx, snapshot);
-                scanned_before
+                scan_frontier(wallet_status.as_ref())
             }
         };
         let attempt = tokio::select! {
@@ -883,19 +995,27 @@ async fn run_sync_wakeup(
                     return SyncWakeupExit::Reconciled;
                 }
             }
-            SyncRunAttempt::Faulted { reason, repair } => {
-                let scanned_after = ctx
-                    .wallet
-                    .status_snapshot()
-                    .await
-                    .ok()
-                    .and_then(|status| status.scanned_height);
-                let blocks_advanced = height_delta(scanned_before, scanned_after);
+            SyncRunAttempt::Faulted {
+                reason,
+                repair,
+                committed,
+            } => {
+                let frontier_after =
+                    scan_frontier(ctx.wallet.status_snapshot().await.ok().as_ref());
+                let blocks_advanced = height_delta(frontier_before, frontier_after);
                 chain_tip = chain_tip_after_fault(chain_tip, blocks_advanced);
                 if is_slow_progress(repair, blocks_advanced) {
-                    note_slow_progress(ctx, state, reason, blocks_advanced, scanned_after).await;
+                    state.observe_committed_chunk(committed, frontier_after);
+                    note_slow_progress(
+                        ctx,
+                        state,
+                        reason,
+                        blocks_advanced,
+                        frontier_after.height(),
+                    )
+                    .await;
                 } else {
-                    record_fault(ctx, state, reason, repair, scanned_after).await;
+                    record_fault(ctx, state, reason, repair, frontier_after.height()).await;
                 }
             }
         }
@@ -915,7 +1035,7 @@ async fn complete_sync(
     recorded_tip: bool,
 ) -> bool {
     let recovered = state.settle_recovery(Some(outcome.scanned_to_height));
-    state.last_outcome = Some(outcome);
+    state.observe_completed_run(outcome);
     state.last_fault = None;
     let should_continue = should_continue_syncing(outcome, recorded_tip);
     let phase = if should_continue {
@@ -965,12 +1085,25 @@ async fn note_slow_progress(
     );
 }
 
-/// Blocks the wallet's scanned height advanced between two reads, treating an absent height
-/// as zero.
-fn height_delta(before: Option<BlockHeight>, after: Option<BlockHeight>) -> u32 {
-    let before = before.map_or(0, BlockHeight::as_u32);
-    let after = after.map_or(0, BlockHeight::as_u32);
-    after.saturating_sub(before)
+/// Reads the wallet's persisted scan frontier out of a wallet-status read.
+fn scan_frontier(wallet_status: Option<&WalletStatus>) -> ScanFrontier {
+    wallet_status.map_or(ScanFrontier::Unknown, |status| {
+        status
+            .scanned_height
+            .map_or(ScanFrontier::Empty, ScanFrontier::At)
+    })
+}
+
+/// Blocks the wallet's persisted scan frontier advanced between two reads.
+///
+/// A frontier the driver could not read yields zero. It is not progress the driver may
+/// claim, and standing in the last published height for it would credit an attempt that
+/// committed nothing with every block the wallet had ever scanned.
+fn height_delta(before: ScanFrontier, after: ScanFrontier) -> u32 {
+    match (before.reached(), after.reached()) {
+        (Some(before), Some(after)) => after.saturating_sub(before),
+        _ => 0,
+    }
 }
 
 /// Whether a faulted iteration counts as slow progress instead of a ladder strike.
@@ -1123,8 +1256,14 @@ const fn backoff_for(policy: SyncRecoveryPolicy, consecutive_faults: u32) -> u64
 /// transient faults and expired source boundaries retry, operator dead ends park (the
 /// literal [`FailurePosture::RequiresOperator`] definition), and the rest rewind: the ladder
 /// escalates to a rebuild when rewinding does not cure, which is the self-healing default
-/// for unknown corruption.
+/// for unknown corruption. An unverified chunk classifies on whatever stopped its
+/// comparison.
 fn repair_for(error: &WalletError) -> SyncRepair {
+    let error = if let WalletError::UnverifiedScanChunk { source, .. } = error {
+        source.as_ref()
+    } else {
+        error
+    };
     #[allow(
         clippy::wildcard_enum_match_arm,
         reason = "the named arms pin the cures that posture cannot express; every other \
@@ -1176,7 +1315,7 @@ async fn apply_repair(ctx: &DriverContext<'_>, state: &mut DriverState) -> Resul
         let snapshot = SyncSnapshot::from_wallet_status(
             phase,
             &wallet_status,
-            state.last_outcome,
+            state.last_observation,
             state.last_fault.clone(),
         );
         (snapshot, rewind_to_height)
@@ -1259,11 +1398,23 @@ async fn run_one_sync(
         Ok(Err(error)) => SyncRunAttempt::Faulted {
             reason: error.to_string(),
             repair: repair_for(&error),
+            committed: committed_chunk_for(&error),
         },
+        // A deadline can cut between a chunk reaching storage and the comparison checking it.
         Err(_elapsed) => SyncRunAttempt::Faulted {
             reason: format!("sync exceeded {} seconds", options.sync_timeout_seconds),
             repair: SyncRepair::Retry,
+            committed: CommittedChunk::Unchecked,
         },
+    }
+}
+
+/// Whether a faulted attempt left the wallet holding blocks it never compared to the chain.
+const fn committed_chunk_for(error: &WalletError) -> CommittedChunk {
+    if matches!(error, WalletError::UnverifiedScanChunk { .. }) {
+        CommittedChunk::Unchecked
+    } else {
+        CommittedChunk::Checked
     }
 }
 
@@ -1278,28 +1429,36 @@ const fn should_continue_syncing(outcome: SyncOutcome, recorded_tip: bool) -> bo
     outcome.block_count > 0 || !recorded_tip
 }
 
-/// Builds a snapshot from the live wallet status, falling back to the previously published
-/// snapshot when the status read fails (the driver must keep publishing regardless).
 async fn build_snapshot(
     ctx: &DriverContext<'_>,
     phase: SyncDriverPhase,
     state: &DriverState,
 ) -> SyncSnapshot {
-    match ctx.wallet.status_snapshot().await {
-        Ok(wallet_status) => SyncSnapshot::from_wallet_status(
-            phase,
-            &wallet_status,
-            state.last_outcome,
-            state.last_fault.clone(),
-        ),
-        Err(_status_unavailable) => {
-            let mut snapshot = ctx.status_tx.borrow().clone();
-            snapshot.phase = phase;
-            snapshot.last_outcome = state.last_outcome;
-            snapshot.last_fault.clone_from(&state.last_fault);
-            snapshot
-        }
-    }
+    let wallet_status = ctx.wallet.status_snapshot().await.ok();
+    snapshot_for(ctx, phase, state, wallet_status.as_ref())
+}
+
+/// Builds a snapshot from a wallet-status read, falling back to the previously published
+/// snapshot when the read failed (the driver must keep publishing regardless).
+fn snapshot_for(
+    ctx: &DriverContext<'_>,
+    phase: SyncDriverPhase,
+    state: &DriverState,
+    wallet_status: Option<&WalletStatus>,
+) -> SyncSnapshot {
+    let Some(wallet_status) = wallet_status else {
+        let mut snapshot = ctx.status_tx.borrow().clone();
+        snapshot.phase = phase;
+        snapshot.last_observation = state.last_observation;
+        snapshot.last_fault.clone_from(&state.last_fault);
+        return snapshot;
+    };
+    SyncSnapshot::from_wallet_status(
+        phase,
+        wallet_status,
+        state.last_observation,
+        state.last_fault.clone(),
+    )
 }
 
 /// Records a chain-event stream interruption and applies bounded reconnect backoff.
@@ -1865,6 +2024,21 @@ impl Wallet {
             .scan_blocks(ScanRequest::new(blocks, scanned_from, from_state))
             .await?;
 
+        // The only detector for a corrupt tree runs ahead of every read that can outlive the
+        // epoch pin.
+        if let Some(diverged_height) = self
+            .verify_tree_roots(chain, chain_epoch, outcome.scanned_to_height)
+            .await
+            .map_err(|error| WalletError::UnverifiedScanChunk {
+                scanned_to: outcome.scanned_to_height,
+                source: Box::new(error),
+            })?
+        {
+            return Err(WalletError::TreeRootsDiverged {
+                height: diverged_height,
+            });
+        }
+
         let newly_confirmed = self
             .inner
             .storage
@@ -1906,20 +2080,7 @@ impl Wallet {
             });
         }
 
-        let transparent_utxo_count = self
-            .sync_transparent_utxos(chain, chain_epoch)
-            .await
-            .inspect_err(|err| note_unverified_tree_roots(outcome.scanned_to_height, err))?;
-
-        if let Some(diverged_height) = self
-            .verify_tree_roots(chain, chain_epoch, outcome.scanned_to_height)
-            .await
-            .inspect_err(|err| note_unverified_tree_roots(outcome.scanned_to_height, err))?
-        {
-            return Err(WalletError::TreeRootsDiverged {
-                height: diverged_height,
-            });
-        }
+        let transparent_utxo_count = self.sync_transparent_utxos(chain, chain_epoch).await?;
 
         self.publish_event(WalletEvent::ScanProgress {
             scanned_height: outcome.scanned_to_height,
@@ -2051,25 +2212,6 @@ impl Wallet {
             .record_transparent_utxos(transparent_utxo_rows)
             .await?)
     }
-}
-
-/// Names a committed scan chunk whose commitment-tree roots were never compared.
-///
-/// A source that rotates its epoch faster than one chunk takes to scan expires the pin before
-/// the comparison runs, on every attempt. Those attempts keep their blocks and publish only
-/// slow progress, so a wallet can catch up across a whole chain with no root ever verified.
-/// Failures of every other posture already reach the operator as a driver fault.
-fn note_unverified_tree_roots(scanned_to: BlockHeight, error: &WalletError) {
-    if error.posture() != FailurePosture::Restartable {
-        return;
-    }
-    tracing::warn!(
-        target: "zally::sync",
-        event = "wallet_tree_root_check_skipped",
-        height = scanned_to.as_u32(),
-        reason = "chain_epoch_expired",
-        "committed a scan chunk without verifying its commitment-tree roots"
-    );
 }
 
 fn validate_transparent_utxo_batches(
@@ -2635,20 +2777,18 @@ mod tests {
     fn faulted_iteration_with_progress_is_not_a_ladder_strike() {
         assert_eq!(
             height_delta(
-                Some(BlockHeight::from(73_000)),
-                Some(BlockHeight::from(74_000)),
+                ScanFrontier::At(BlockHeight::from(73_000)),
+                ScanFrontier::At(BlockHeight::from(74_000)),
             ),
             1_000
         );
-        assert_eq!(height_delta(None, Some(BlockHeight::from(1_000))), 1_000);
         assert_eq!(
             height_delta(
-                Some(BlockHeight::from(74_000)),
-                Some(BlockHeight::from(74_000)),
+                ScanFrontier::At(BlockHeight::from(74_000)),
+                ScanFrontier::At(BlockHeight::from(74_000)),
             ),
             0
         );
-        assert_eq!(height_delta(Some(BlockHeight::from(74_000)), None), 0);
         assert!(is_slow_progress(SyncRepair::Retry, 1_000));
         assert!(!is_slow_progress(SyncRepair::Retry, 0));
     }
@@ -2875,5 +3015,106 @@ mod tests {
             "a corruption fault in the streak must permit the rewind rung"
         );
         assert_eq!(ladder.last().map(|(rung, _)| *rung), Some(SyncRepair::Park));
+    }
+
+    fn caught_up_outcome(at_height: u32) -> SyncOutcome {
+        SyncOutcome {
+            scanned_from_height: BlockHeight::from(at_height),
+            scanned_to_height: BlockHeight::from(at_height),
+            block_count: 0,
+            transparent_utxo_count: 0,
+            completed_at_ms: 1,
+        }
+    }
+
+    #[test]
+    fn an_unreadable_frontier_is_never_progress() {
+        assert_eq!(
+            height_delta(
+                ScanFrontier::Unknown,
+                ScanFrontier::At(BlockHeight::from(4_202_991))
+            ),
+            0
+        );
+        assert_eq!(
+            height_delta(
+                ScanFrontier::At(BlockHeight::from(4_202_991)),
+                ScanFrontier::Unknown
+            ),
+            0
+        );
+        assert_eq!(
+            height_delta(
+                ScanFrontier::Empty,
+                ScanFrontier::At(BlockHeight::from(4_202_991))
+            ),
+            4_202_991,
+            "a wallet that had committed nothing did commit this chunk"
+        );
+        assert_eq!(
+            height_delta(
+                ScanFrontier::At(BlockHeight::from(10)),
+                ScanFrontier::At(BlockHeight::from(15))
+            ),
+            5
+        );
+    }
+
+    #[test]
+    fn an_unchecked_chunk_publishes_no_observation() {
+        let mut state = DriverState::default();
+        state.observe_committed_chunk(
+            CommittedChunk::Unchecked,
+            ScanFrontier::At(BlockHeight::from(50)),
+        );
+        assert_eq!(state.last_observation, None);
+
+        state.observe_committed_chunk(
+            CommittedChunk::Checked,
+            ScanFrontier::At(BlockHeight::from(50)),
+        );
+        assert_eq!(
+            state.last_observation.map(|o| o.scanned_to_height),
+            Some(BlockHeight::from(50))
+        );
+    }
+
+    #[test]
+    fn a_caught_up_run_re_dates_only_a_checked_height() {
+        let mut state = DriverState::default();
+        state.observe_completed_run(caught_up_outcome(50));
+        assert_eq!(
+            state.last_observation, None,
+            "nothing has compared the state this run reports as caught up"
+        );
+
+        state.observe_committed_chunk(
+            CommittedChunk::Checked,
+            ScanFrontier::At(BlockHeight::from(50)),
+        );
+        state.observe_completed_run(caught_up_outcome(50));
+        assert_eq!(
+            state.last_observation.map(|o| o.observed_at_ms),
+            Some(1),
+            "the caught-up run re-dates a height the wallet has checked"
+        );
+    }
+
+    #[test]
+    fn an_unverified_chunk_classifies_on_what_stopped_its_comparison() {
+        let error = WalletError::UnverifiedScanChunk {
+            scanned_to: BlockHeight::from(50),
+            source: Box::new(WalletError::ChainSource(
+                ChainSourceError::ChainEpochPinUnavailable,
+            )),
+        };
+        assert_eq!(repair_for(&error), SyncRepair::Retry);
+        assert_eq!(committed_chunk_for(&error), CommittedChunk::Unchecked);
+
+        let diverged = WalletError::TreeRootsDiverged {
+            height: BlockHeight::from(50),
+        };
+        assert_eq!(repair_for(&diverged), SyncRepair::Rewind);
+        assert_eq!(committed_chunk_for(&diverged), CommittedChunk::Checked);
     }
 }

@@ -134,8 +134,12 @@ async fn wallet_far_behind_converges_across_repeated_epoch_rotations() -> Result
         "epoch rotation must never park the driver"
     );
     assert!(
-        sync_events.contains("reason=chain_epoch_expired"),
-        "a catch-up that never reached the tree-root comparison must say so"
+        sync_events.contains("reason=wallet_trees_empty"),
+        "the tree-root comparison must run on the near side of the rotation"
+    );
+    assert!(
+        caught_up.last_observation.is_some(),
+        "a chunk compared against the chain before the pin expired is an observation"
     );
 
     handle.close().await?;

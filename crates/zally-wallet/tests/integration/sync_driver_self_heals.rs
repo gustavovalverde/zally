@@ -89,7 +89,7 @@ async fn fault_ladder_escalates_through_rewind_to_rescan_then_recovers() -> Resu
     assert!(saw_rewind, "the ladder must pass through the rewind rung");
     assert!(saw_rescan, "the ladder must reach the rescan rung");
     assert_eq!(healthy.last_fault, None);
-    assert!(healthy.last_outcome.is_some());
+    assert!(healthy.last_observation.is_some());
     assert_eq!(chain_handle.failures_consumed(), 3);
 
     let reset_observed = tokio::time::timeout(Duration::from_secs(2), async {

@@ -33,6 +33,7 @@ mod sync_driver_follows_chain;
 mod sync_driver_self_heals;
 mod sync_driver_slow_progress;
 mod sync_network_mismatch;
+mod sync_observes_committed_progress;
 mod sync_retries_retryable_chain_failures;
 mod sync_skips_tree_root_check_for_empty_pools;
 mod sync_survives_epoch_rotation;

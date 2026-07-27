@@ -207,6 +207,26 @@ pub enum WalletError {
         height: BlockHeight,
     },
 
+    /// A scan chunk reached storage and the wallet never compared its commitment-tree roots
+    /// against the chain.
+    ///
+    /// The blocks stand: nothing about them is known to be wrong, and the wallet keeps them.
+    /// What the wallet cannot say is that they agree with the chain, so a consumer gating
+    /// spends on sync freshness must not date its freshness from this chunk.
+    ///
+    /// Posture: inherited from the failure that stopped the comparison.
+    #[error(
+        "committed a scan chunk to height {scanned_to:?} without comparing its \
+         commitment-tree roots: {source}"
+    )]
+    UnverifiedScanChunk {
+        /// Highest block height the chunk committed.
+        scanned_to: BlockHeight,
+        /// Failure that stopped the comparison.
+        #[source]
+        source: Box<Self>,
+    },
+
     /// The sync-driver task panicked. Surfaced only by [`crate::SyncHandle::close`]; the
     /// driver task never fails while its handle is alive.
     ///
@@ -233,6 +253,7 @@ impl WalletError {
             Self::ChainSource(e) => e.posture(),
             Self::Submitter(e) => e.posture(),
             Self::CircuitBroken { .. } => FailurePosture::Retryable,
+            Self::UnverifiedScanChunk { source, .. } => source.posture(),
             Self::NetworkMismatch { .. }
             | Self::NoSealedSeed
             | Self::AccountNotFound
@@ -352,6 +373,12 @@ mod tests {
             WalletError::TreeRootsDiverged {
                 height: BlockHeight::from(12),
             },
+            WalletError::UnverifiedScanChunk {
+                scanned_to: BlockHeight::from(13),
+                source: Box::new(WalletError::ChainSource(
+                    ChainSourceError::ChainEpochPinUnavailable,
+                )),
+            },
             WalletError::SyncDriverFailed { reason: "x".into() },
         ];
         for e in variants {
@@ -404,6 +431,18 @@ mod tests {
         };
         assert_eq!(err.posture(), FailurePosture::RequiresOperator);
         assert!(!err.is_retryable());
+    }
+
+    #[test]
+    fn unverified_scan_chunk_inherits_its_source_posture() {
+        let err = WalletError::UnverifiedScanChunk {
+            scanned_to: BlockHeight::from(9),
+            source: Box::new(WalletError::ChainSource(
+                ChainSourceError::ChainEpochPinUnavailable,
+            )),
+        };
+        assert_eq!(err.posture(), FailurePosture::Restartable);
+        assert!(err.is_retryable());
     }
 
     #[test]

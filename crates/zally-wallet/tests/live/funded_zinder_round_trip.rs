@@ -194,7 +194,13 @@ impl FundedZinderRoundTrip {
         self.miner
             .generate_blocks(TRANSPARENT_FUNDING_CONFIRMATION_BLOCKS)?;
         let funded_height = self.miner.visible_tip_height()?;
-        wait_until_transparent_utxo_at_tip(&mut self.sync_snapshots, funded_height).await?;
+        wait_until_transparent_utxo_at_tip(
+            &mut self.sync_snapshots,
+            &self.wallet,
+            self.account_id,
+            funded_height,
+        )
+        .await?;
         Ok(funding_tx_id)
     }
 
@@ -474,6 +480,8 @@ async fn wait_until_at_tip_at_or_above(
 
 async fn wait_until_transparent_utxo_at_tip(
     snapshots: &mut SyncSnapshotStream,
+    wallet: &Wallet,
+    account_id: AccountId,
     min_tip_height: BlockHeight,
 ) -> Result<(), TestError> {
     // Maturing the funding output to COINBASE_MATURITY means the wallet must scan
@@ -487,10 +495,11 @@ async fn wait_until_transparent_utxo_at_tip(
                 SyncStatus::AtTip { visible_tip_height }
                     if visible_tip_height.as_u32() >= min_tip_height.as_u32()
             );
-            let has_transparent_utxo = snapshot
-                .last_outcome
-                .is_some_and(|outcome| outcome.transparent_utxo_count > 0);
-            if is_at_target_tip && has_transparent_utxo {
+            if !is_at_target_tip {
+                continue;
+            }
+            let balance = wallet.get_account_balance(account_id).await?;
+            if balance.transparent_zat() > Zatoshis::zero() {
                 return Ok(());
             }
         }
