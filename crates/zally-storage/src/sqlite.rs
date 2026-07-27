@@ -21,7 +21,7 @@ use sapling::Node as SaplingNode;
 use secrecy::{ExposeSecret as _, SecretVec};
 use shardtree::ShardTree;
 use shardtree::error::{InsertionError, QueryError, ShardTreeError};
-use shardtree::store::ShardStore;
+use shardtree::store::{Checkpoint, ShardStore};
 use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
 use zally_core::{
@@ -989,6 +989,7 @@ impl WalletStorage for Sqlite {
                     source_pool,
                 )?
             };
+            ensure_proposal_anchors(db, &proposal)?;
 
             let txids = zcash_client_backend::data_api::wallet::create_proposed_transactions::<
                 Db,
@@ -1079,6 +1080,7 @@ impl WalletStorage for Sqlite {
                 )
                 .map_err(|err| classify_proposal_build_error(&err))?
             };
+            ensure_proposal_anchors(db, &proposal)?;
 
             let txids = zcash_client_backend::data_api::wallet::create_proposed_transactions::<
                 Db,
@@ -1133,6 +1135,7 @@ impl WalletStorage for Sqlite {
                 memo_bytes,
                 source_pool,
             )?;
+            ensure_proposal_anchors(db, &proposal)?;
 
             let pczt = zcash_client_backend::data_api::wallet::create_pczt_from_proposal::<
                 Db,
@@ -2905,6 +2908,82 @@ where
     }
 }
 
+/// Installs a checkpoint at every scanned anchor a proposal may require.
+///
+/// `put_blocks` retains checkpoints at note-commitment positions, so a long
+/// scan can omit the exact confirmations-policy anchor when that block adds no
+/// commitments. Output-only shielded bundles still carry an anchor. The
+/// wallet's per-block metadata records the canonical tree size at every scanned
+/// height, which determines the checkpoint position without inventing state.
+fn ensure_proposal_anchors<FeeRuleT, NoteRef>(
+    db: &mut Db,
+    proposal: &zcash_client_backend::proposal::Proposal<FeeRuleT, NoteRef>,
+) -> Result<(), StorageError> {
+    let policy_anchor = proposal
+        .confirmations_policy()
+        .anchor_height(proposal.min_target_height());
+    for step in proposal.steps().iter() {
+        let anchor_height = step.anchor_height().unwrap_or(policy_anchor);
+        let metadata = db
+            .block_metadata(anchor_height)
+            .map_err(|err| map_sqlite_error(&err))?
+            .ok_or_else(|| StorageError::SqliteFailed {
+                reason: format!(
+                    "proposal anchor block metadata is unavailable at height {anchor_height}"
+                ),
+                posture: FailurePosture::NotRetryable,
+            })?;
+        db.with_sapling_tree_mut(|tree| {
+            if let Some(tree_size) = metadata.sapling_tree_size() {
+                ensure_proposal_tree_checkpoint(tree, anchor_height, tree_size)
+                    .map_err(SqliteClientError::from)?;
+            }
+            Ok::<(), SqliteClientError>(())
+        })
+        .map_err(|err| map_sqlite_error(&err))?;
+        db.with_orchard_tree_mut(|tree| {
+            if let Some(tree_size) = metadata.orchard_tree_size() {
+                ensure_proposal_tree_checkpoint(tree, anchor_height, tree_size)
+                    .map_err(SqliteClientError::from)?;
+            }
+            Ok::<(), SqliteClientError>(())
+        })
+        .map_err(|err| map_sqlite_error(&err))?;
+        db.with_ironwood_tree_mut(|tree| {
+            if let Some(tree_size) = metadata.ironwood_tree_size() {
+                ensure_proposal_tree_checkpoint(tree, anchor_height, tree_size)
+                    .map_err(SqliteClientError::from)?;
+            }
+            Ok::<(), SqliteClientError>(())
+        })
+        .map_err(|err| map_sqlite_error(&err))?;
+    }
+    Ok(())
+}
+
+fn ensure_proposal_tree_checkpoint<H, C, S, const DEPTH: u8, const SHARD_HEIGHT: u8>(
+    tree: &mut ShardTree<S, DEPTH, SHARD_HEIGHT>,
+    checkpoint_id: C,
+    tree_size: u32,
+) -> Result<(), ShardTreeError<S::Error>>
+where
+    H: incrementalmerkletree::Hashable + Clone + PartialEq,
+    C: Clone + std::fmt::Debug + Ord,
+    S: ShardStore<H = H, CheckpointId = C>,
+{
+    if tree.root_at_checkpoint_id(&checkpoint_id)?.is_none() {
+        let checkpoint = tree_size
+            .checked_sub(1)
+            .map_or_else(Checkpoint::tree_empty, |position| {
+                Checkpoint::at_position(incrementalmerkletree::Position::from(u64::from(position)))
+            });
+        tree.store_mut()
+            .add_checkpoint(checkpoint_id, checkpoint)
+            .map_err(ShardTreeError::Storage)?;
+    }
+    Ok(())
+}
+
 /// Computes the deterministic [`AccountId`] for a UFVK.
 ///
 /// The id is the UUID v5 of the network-encoded UFVK under
@@ -3892,5 +3971,46 @@ mod tests {
             100,
             "untrusted confirmations must equal Zcash's COINBASE_MATURITY (100) so the SQL clause target_height - mined_height >= :min_confirmations rejects any immature coinbase even when the per-row tx_index filter is unreliable"
         );
+    }
+
+    #[test]
+    fn output_only_bundle_can_anchor_an_empty_pool()
+    -> Result<(), ShardTreeError<std::convert::Infallible>> {
+        use shardtree::store::memory::MemoryShardStore;
+
+        let mut tree: ShardTree<MemoryShardStore<SaplingNode, u32>, 4, 3> =
+            ShardTree::new(MemoryShardStore::empty(), 100);
+        let anchor_height = 27;
+        assert_eq!(tree.root_at_checkpoint_id(&anchor_height)?, None);
+
+        ensure_proposal_tree_checkpoint(&mut tree, anchor_height, 0)?;
+
+        assert!(
+            tree.root_at_checkpoint_id(&anchor_height)?.is_some(),
+            "an empty pool needs its canonical empty root at the proposal anchor height"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn output_only_bundle_can_anchor_a_non_empty_pool()
+    -> Result<(), ShardTreeError<std::convert::Infallible>> {
+        use incrementalmerkletree::Hashable as _;
+        use incrementalmerkletree::Retention;
+        use shardtree::store::memory::MemoryShardStore;
+
+        let mut tree: ShardTree<MemoryShardStore<SaplingNode, u32>, 4, 3> =
+            ShardTree::new(MemoryShardStore::empty(), 100);
+        tree.append(SaplingNode::empty_leaf(), Retention::Ephemeral)?;
+        let anchor_height = 27;
+        assert_eq!(tree.root_at_checkpoint_id(&anchor_height)?, None);
+
+        ensure_proposal_tree_checkpoint(&mut tree, anchor_height, 1)?;
+
+        assert!(
+            tree.root_at_checkpoint_id(&anchor_height)?.is_some(),
+            "a scanned non-empty pool needs a checkpoint at the proposal anchor height"
+        );
+        Ok(())
     }
 }

@@ -10,7 +10,7 @@
 //! result back. Remote construction records the expected network; each response-bearing
 //! call validates the authenticated chain epoch against it before exposing facts to Zally.
 
-use std::collections::BTreeSet;
+use std::collections::HashSet;
 use std::num::NonZeroU32;
 use std::sync::Arc;
 
@@ -23,16 +23,11 @@ use zally_core::{
 };
 use zcash_protocol::consensus::{NetworkUpgrade, Parameters as _};
 use zinder_client::{
-    ChainEvent as ZinderChainEvent, ChainEventCursor as ZinderChainEventCursor,
+    Capability, ChainEvent as ZinderChainEvent, ChainEventCursor as ZinderChainEventCursor,
     ChainEventCursorRecovery as ZinderChainEventCursorRecovery,
     ChainEventEnvelope as ZinderChainEventEnvelope, EndpointBackedIndex,
     EventStreamStart as ZinderEventStreamStart, RemoteChainIndex, RemoteOpenOptions,
-    TransparentAddressUnspentOutputsQuery, WALLET_ADDRESS_TRANSPARENT_UNSPENT_OUTPUTS_V1,
-    WALLET_EVENTS_CHAIN_V1, WALLET_READ_COMPACT_BLOCK_IRONWOOD_V2,
-    WALLET_READ_COMPACT_BLOCK_RANGE_V2, WALLET_READ_SERVER_INFO_V2,
-    WALLET_READ_SETTLED_TIP_BLOCK_V1, WALLET_READ_SUBTREE_ROOTS_IN_RANGE_V1,
-    WALLET_READ_SUBTREE_ROOTS_IRONWOOD_V1, WALLET_READ_TRANSACTION_BY_ID_V2,
-    WALLET_READ_TREE_STATE_AT_HEIGHT_V2, WALLET_READ_VISIBLE_TIP_BLOCK_V1,
+    TransparentAddressUnspentOutputsQuery,
 };
 use zinder_core::{
     BlockHeight as ZinderBlockHeight, BlockHeightRange as ZinderBlockHeightRange,
@@ -52,21 +47,20 @@ use crate::source::{
 };
 
 const DEFAULT_SUBTREE_PAGE_SIZE: u32 = 256;
-const REQUIRED_SYNC_CAPABILITIES: [&str; 10] = [
-    WALLET_READ_SERVER_INFO_V2,
-    WALLET_READ_VISIBLE_TIP_BLOCK_V1,
-    WALLET_READ_SETTLED_TIP_BLOCK_V1,
-    WALLET_READ_COMPACT_BLOCK_RANGE_V2,
-    WALLET_READ_COMPACT_BLOCK_IRONWOOD_V2,
-    WALLET_READ_TREE_STATE_AT_HEIGHT_V2,
-    WALLET_READ_SUBTREE_ROOTS_IN_RANGE_V1,
-    WALLET_READ_SUBTREE_ROOTS_IRONWOOD_V1,
-    WALLET_ADDRESS_TRANSPARENT_UNSPENT_OUTPUTS_V1,
-    WALLET_EVENTS_CHAIN_V1,
+const REQUIRED_SYNC_CAPABILITIES: [Capability; 10] = [
+    Capability::ServerInfo,
+    Capability::VisibleTipBlock,
+    Capability::SettledTipBlock,
+    Capability::CompactBlockRange,
+    Capability::CompactBlockIronwood,
+    Capability::TreeState,
+    Capability::SubtreeRoots,
+    Capability::SubtreeRootsIronwood,
+    Capability::TransparentAddressUnspentOutputs,
+    Capability::ChainEvents,
 ];
-const MINIMUM_CONTRACT_REVISION: u32 = 2;
 
-pub(crate) type ZinderCapabilitySet = BTreeSet<String>;
+pub(crate) type ZinderCapabilitySet = HashSet<Capability>;
 
 /// Options for connecting [`ZinderChainSource`] to a remote `zinder-query` endpoint.
 #[derive(Clone, Debug)]
@@ -143,7 +137,7 @@ impl ZinderChainSource {
         )
     }
 
-    async fn ensure_capabilities(&self, required: &[&str]) -> Result<(), ChainSourceError> {
+    async fn ensure_capabilities(&self, required: &[Capability]) -> Result<(), ChainSourceError> {
         let capabilities = self
             .capabilities
             .get_or_try_init(|| async {
@@ -152,24 +146,19 @@ impl ZinderChainSource {
                     .server_info()
                     .await
                     .map_err(Self::map_indexer_error)?;
-                let common = descriptor
-                    .common
-                    .ok_or(ChainSourceError::UnsupportedResponse {
-                        response: "WalletServerInfo.common",
-                    })?;
-                if common.contract_revision < MINIMUM_CONTRACT_REVISION {
+                if descriptor.contract_revision < zinder_client::MIN_SUPPORTED_CONTRACT_REVISION {
                     return Err(ChainSourceError::ContractRevisionUnsupported {
-                        minimum_revision: MINIMUM_CONTRACT_REVISION,
-                        actual_revision: common.contract_revision,
+                        minimum_revision: zinder_client::MIN_SUPPORTED_CONTRACT_REVISION,
+                        actual_revision: descriptor.contract_revision,
                     });
                 }
-                Ok::<_, ChainSourceError>(common.capabilities.into_iter().collect())
+                Ok::<_, ChainSourceError>(descriptor.capabilities.into_iter().collect())
             })
             .await?;
         let missing_capabilities = required
             .iter()
-            .filter(|capability| !capabilities.contains(**capability))
-            .map(|capability| (*capability).to_owned())
+            .filter(|capability| !capabilities.contains(*capability))
+            .map(|capability| capability.as_str().to_owned())
             .collect::<Vec<_>>();
         if missing_capabilities.is_empty() {
             Ok(())
@@ -306,8 +295,7 @@ impl ChainSource for ZinderChainSource {
     }
 
     async fn transaction_status(&self, tx_id: TxId) -> Result<TransactionStatus, ChainSourceError> {
-        self.ensure_capabilities(&[WALLET_READ_TRANSACTION_BY_ID_V2])
-            .await?;
+        self.ensure_capabilities(&[Capability::Transaction]).await?;
         let zinder_id = ZinderTransactionId::from_bytes(*tx_id.as_bytes());
         let status = self.inner.transaction_by_id(zinder_id, None).await?;
         #[allow(
@@ -335,7 +323,7 @@ impl ChainSource for ZinderChainSource {
         chain_epoch: ChainEpoch,
         script_pub_key_bytes: &[u8],
     ) -> Result<Vec<TransparentUtxo>, ChainSourceError> {
-        self.ensure_capabilities(&[WALLET_ADDRESS_TRANSPARENT_UNSPENT_OUTPUTS_V1])
+        self.ensure_capabilities(&[Capability::TransparentAddressUnspentOutputs])
             .await?;
         let epoch = self.pinned_epoch(chain_epoch)?;
         let address_script_hash =
@@ -384,7 +372,7 @@ impl ChainSource for ZinderChainSource {
         &self,
         start: ChainEventStreamStart,
     ) -> Result<ChainEventEnvelopeStream, ChainSourceError> {
-        self.ensure_capabilities(&[WALLET_EVENTS_CHAIN_V1]).await?;
+        self.ensure_capabilities(&[Capability::ChainEvents]).await?;
         let inner = self.inner.clone();
         let zinder_start = match start {
             ChainEventStreamStart::AfterCursor(cursor) => ZinderEventStreamStart::AfterCursor(

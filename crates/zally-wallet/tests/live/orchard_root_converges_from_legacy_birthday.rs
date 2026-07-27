@@ -34,7 +34,10 @@ fn max_sync_iterations(target: u32) -> u32 {
 async fn orchard_root_converges_from_legacy_birthday() -> Result<(), TestError> {
     let _guard = init();
     require_live()?;
-    let network = require_testnet()?;
+    let network = require_network()?;
+    if network != Network::Testnet {
+        return Ok(());
+    }
     let endpoint = require_zinder_endpoint()?;
     let chain = ZinderChainSource::connect_remote(ZinderRemoteOptions { endpoint, network })?;
 
@@ -218,17 +221,6 @@ async fn chain_frontier_at(
     Ok(storage.tree_state_roots(tree_state).await?)
 }
 
-#[allow(
-    clippy::wildcard_enum_match_arm,
-    reason = "non_exhaustive Network maps every non-testnet variant to the same gate error"
-)]
-fn require_testnet() -> Result<Network, TestError> {
-    match require_network()? {
-        Network::Testnet => Ok(Network::Testnet),
-        _ => Err(TestError::TestnetRequired),
-    }
-}
-
 fn hex_or_empty(root: Option<[u8; 32]>) -> String {
     root.map_or_else(String::new, hex::encode)
 }
@@ -245,8 +237,6 @@ enum TestError {
     Chain(#[from] zally_chain::ChainSourceError),
     #[error("storage error: {0}")]
     Storage(#[from] zally_storage::StorageError),
-    #[error("this regression probe requires ZALLY_NETWORK=testnet")]
-    TestnetRequired,
     #[error("sync faulted at iteration {iteration}: {source}")]
     SyncFaulted {
         iteration: u32,

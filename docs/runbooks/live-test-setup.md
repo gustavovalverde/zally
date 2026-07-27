@@ -24,7 +24,7 @@ The repo defines two nextest profiles:
 
 ## Regtest (recommended for local iteration)
 
-1. Bring up or reuse a Zebra regtest node. The local `z3` sidecar stack exposes JSON-RPC on `127.0.0.1:39232`.
+1. Bring up or reuse a Zebra regtest node. The local Z3 stack exposes JSON-RPC on `127.0.0.1:29232`.
 2. Bring up or reuse a `zinder-ingest` + `zinder-query` pair for that node. See [Bringing up a zinder-backed chain source](#bringing-up-a-zinder-backed-chain-source).
 3. Verify readiness:
 
@@ -77,7 +77,7 @@ Pre-requisites:
 
 ### Regtest
 
-The `z3_regtest_sidecar_zebra` container exposes regtest JSON-RPC on `127.0.0.1:39232` with `zebra:zebra` basic auth.
+The `z3-regtest-zebra-1` container exposes regtest JSON-RPC on `127.0.0.1:29232` with `zebra:zebra` basic auth.
 
 A minimal `.tmp/regtest.toml` for `zinder-ingest`:
 
@@ -87,7 +87,7 @@ name = "zcash-regtest"
 
 [node]
 source = "zebra-json-rpc"
-json_rpc_addr = "http://127.0.0.1:39232"
+json_rpc_addr = "http://127.0.0.1:29232"
 
 [node.auth]
 method = "basic"
@@ -135,7 +135,7 @@ cargo run --release -p zinder-query --bin zinder-query -- \
   --ingest-control-addr http://127.0.0.1:9100 \
   --listen-addr 127.0.0.1:9102 \
   --ops-listen-addr 127.0.0.1:9106 \
-  --node-json-rpc-addr http://127.0.0.1:39232
+  --node-json-rpc-addr http://127.0.0.1:29232
 ```
 
 Verify Zally connects:
@@ -149,10 +149,10 @@ Expected output: `live_zinder_tip_observed tip_height=<N>` then `live_zinder_syn
 
 ### Testnet
 
-The `z3_zebra` container is testnet on `127.0.0.1:18232` with cookie auth. Refresh the cookie before each session:
+The `z3-testnet-zebra-1` container is testnet on `127.0.0.1:18232` with cookie auth. Refresh the cookie before each session:
 
 ```sh
-COOKIE_FULL=$(docker exec z3_zebra cat /var/run/auth/.cookie)
+COOKIE_FULL=$(docker run --rm -v z3-testnet-cookie:/auth:ro alpine cat /auth/.cookie)
 COOKIE_PW="${COOKIE_FULL##*:}"
 sed -i.bak "s|^password = .*|password = \"$COOKIE_PW\"|" \
   .tmp/testnet/config/zinder-ingest.toml
@@ -222,7 +222,7 @@ period that applies to a fresh Sapling regtest chain.
 ZALLY_TEST_LIVE=1 \
   ZALLY_NETWORK=regtest \
   ZINDER_ENDPOINT=http://127.0.0.1:9102 \
-  ZALLY_TEST_NODE_JSON_RPC_ADDR=http://127.0.0.1:39232/ \
+  ZALLY_TEST_NODE_JSON_RPC_ADDR=http://127.0.0.1:29232/ \
   cargo nextest run --profile=ci-live --features zinder --run-ignored=all \
     -p zally-wallet funded_wallet_syncs_sends_and_submits_pczt_with_zinder
 ```
@@ -239,7 +239,7 @@ Optional amount overrides:
 
 | Network | Zebra RPC | ingest control | projector control | ingest ops | query gRPC | query ops |
 |---------|-----------|----------------|-------------------|------------|------------|-----------|
-| regtest | 39232     | 9100           | 9101              | 9105       | 9102       | 9106      |
+| regtest | 29232     | 9100           | 9101              | 9105       | 9102       | 9106      |
 | testnet | 18232     | 9201           | 9202              | 9205       | 9203       | 9206      |
 
 ### Operator notes

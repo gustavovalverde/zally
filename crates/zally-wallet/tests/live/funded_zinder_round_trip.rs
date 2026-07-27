@@ -59,6 +59,9 @@ const SHIELDED_SPEND_CONFIRMATION_BLOCKS: u32 = 10;
 async fn funded_wallet_syncs_sends_and_submits_pczt_with_zinder() -> Result<(), TestError> {
     let _guard = init();
     require_live()?;
+    if !matches!(require_network()?, Network::Regtest(_)) {
+        return Ok(());
+    }
 
     let mut round_trip = FundedZinderRoundTrip::open().await?;
     let funding_tx_id = round_trip.submit_transparent_funding().await?;
@@ -77,6 +80,9 @@ async fn funded_wallet_syncs_sends_and_submits_pczt_with_zinder() -> Result<(), 
 async fn shielding_excludes_pending_broadcast_inputs() -> Result<(), TestError> {
     let _guard = init();
     require_live()?;
+    if !matches!(require_network()?, Network::Regtest(_)) {
+        return Ok(());
+    }
 
     let mut round_trip = FundedZinderRoundTrip::open().await?;
     let _funding_tx_id = round_trip.submit_transparent_funding().await?;
@@ -613,7 +619,7 @@ impl JsonRpcClient {
     fn from_node_env() -> Result<Self, TestError> {
         Ok(Self {
             json_rpc_addr: env::var(NODE_JSON_RPC_ADDR_ENV)
-                .unwrap_or_else(|_| "http://127.0.0.1:39232/".to_owned()),
+                .unwrap_or_else(|_| "http://127.0.0.1:29232/".to_owned()),
             rpc_auth: optional_node_auth()?,
         })
     }

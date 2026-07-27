@@ -70,7 +70,7 @@ T3 tests use real local infrastructure and are ignored by default. The funded Zi
 
 Optional overrides:
 
-- `ZALLY_TEST_NODE_JSON_RPC_ADDR` (defaults to `http://127.0.0.1:39232/`)
+- `ZALLY_TEST_NODE_JSON_RPC_ADDR` (defaults to `http://127.0.0.1:29232/`)
 - `ZALLY_TEST_NODE_RPC_USER` and `ZALLY_TEST_NODE_RPC_PASSWORD` when the node requires basic auth
 - `ZALLY_TEST_SHIELDING_THRESHOLD_ZAT` (defaults to `1000000`)
 - `ZALLY_TEST_SEND_ZAT` (defaults to `10000`)

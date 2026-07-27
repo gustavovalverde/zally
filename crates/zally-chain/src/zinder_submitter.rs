@@ -4,8 +4,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use zally_core::{Network, TxId};
-use zinder_client::EndpointBackedIndex;
-use zinder_client::{WALLET_BROADCAST_TRANSACTION_V1, WALLET_READ_SERVER_INFO_V2};
+use zinder_client::{Capability, EndpointBackedIndex};
 use zinder_core::{RawTransactionBytes, TransactionBroadcastOutcome};
 
 use crate::error::SubmitterError;
@@ -66,28 +65,23 @@ impl Submitter for ZinderSubmitter {
             .capabilities
             .get_or_try_init(|| async {
                 let descriptor = self.inner.server_info().await?;
-                let common = descriptor.common.ok_or_else(|| {
-                    zinder_client::IndexerError::MalformedResponse {
-                        field: "info.common",
-                        reason: "field is missing".to_owned(),
-                    }
-                })?;
-                if common.contract_revision < 2 {
+                if descriptor.contract_revision < zinder_client::MIN_SUPPORTED_CONTRACT_REVISION {
                     return Err(zinder_client::IndexerError::FailedPrecondition {
                         reason: format!(
-                            "wallet contract revision {} is older than required revision 2",
-                            common.contract_revision
+                            "wallet contract revision {} is older than required revision {}",
+                            descriptor.contract_revision,
+                            zinder_client::MIN_SUPPORTED_CONTRACT_REVISION
                         ),
                     });
                 }
-                Ok::<_, zinder_client::IndexerError>(common.capabilities.into_iter().collect())
+                Ok::<_, zinder_client::IndexerError>(descriptor.capabilities.into_iter().collect())
             })
             .await?;
-        let required = [WALLET_READ_SERVER_INFO_V2, WALLET_BROADCAST_TRANSACTION_V1];
+        let required = [Capability::ServerInfo, Capability::Broadcast];
         let missing_capabilities = required
             .into_iter()
-            .filter(|capability| !capabilities.contains(*capability))
-            .map(str::to_owned)
+            .filter(|capability| !capabilities.contains(capability))
+            .map(|capability| capability.as_str().to_owned())
             .collect::<Vec<_>>();
         if !missing_capabilities.is_empty() {
             return Err(SubmitterError::CapabilitiesUnavailable {
