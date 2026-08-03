@@ -39,8 +39,10 @@ async fn fault_with_scan_progress_resets_the_ladder() -> Result<(), TestError> {
     let chain_handle = chain.handle();
     chain_handle.serve_compact_blocks();
     chain_handle.advance_tip(BlockHeight::from(50));
-    chain_handle.fail_transparent_utxos_next(1, || ChainSourceError::Unavailable {
-        reason: "synthetic stall after the scan committed".into(),
+    chain_handle.fail_tree_state_at_next(BlockHeight::from(50), 1, || {
+        ChainSourceError::Unavailable {
+            reason: "synthetic stall after the scan committed".into(),
+        }
     });
 
     let driver = SyncDriver::new(
@@ -96,9 +98,11 @@ async fn state_fault_with_scan_progress_still_engages_the_ladder() -> Result<(),
 
     let mut wallet_events = wallet.observe();
     chain_handle.advance_tip(BlockHeight::from(60));
-    chain_handle.fail_transparent_utxos_next(1, || ChainSourceError::BlockHeightBelowFloor {
-        requested_height: BlockHeight::from(1),
-        earliest_height: BlockHeight::from(2),
+    chain_handle.fail_tree_state_at_next(BlockHeight::from(60), 1, || {
+        ChainSourceError::BlockHeightBelowFloor {
+            requested_height: BlockHeight::from(1),
+            earliest_height: BlockHeight::from(2),
+        }
     });
 
     let driver = SyncDriver::new(

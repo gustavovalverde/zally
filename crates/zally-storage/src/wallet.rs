@@ -517,16 +517,24 @@ pub trait WalletStorage: Send + Sync + 'static {
     async fn list_transparent_receivers(&self)
     -> Result<Vec<TransparentReceiverRow>, StorageError>;
 
-    /// Records transparent UTXOs discovered from a chain source.
+    /// Records transparent UTXOs discovered from a chain source, batching every row into one
+    /// `SQLite` transaction.
     ///
-    /// Wraps `WalletWrite::put_received_transparent_utxo`. The operation is idempotent at
-    /// the upstream wallet database boundary: recording a UTXO that already exists returns
-    /// success without duplicating spendable funds.
+    /// Wraps `WalletWrite::put_received_transparent_utxo` inside `WalletDb::transactionally`.
+    /// The operation is idempotent at the upstream wallet database boundary: recording a UTXO
+    /// that already exists returns success without duplicating spendable funds.
     ///
-    /// `not_retryable` on malformed output scripts or schema errors; `retryable` on
-    /// transient I/O.
+    /// `min_scanned_height`, when set, guards the whole batch against a reorg rewind landing
+    /// between the caller's chain read and this write: the guard and the write share one
+    /// transaction, so the write is rejected with [`StorageError::ScanFrontierReceded`] unless
+    /// the wallet's `fully_scanned_height` is still at or above `min_scanned_height` at write
+    /// time. Pass `None` when the caller holds no scan-frontier floor to protect.
+    ///
+    /// `not_retryable` on malformed output scripts or schema errors; `restartable` on a
+    /// receded scan frontier; `retryable` on transient I/O.
     async fn record_transparent_utxos(
         &self,
+        min_scanned_height: Option<BlockHeight>,
         utxos: Vec<TransparentUtxoRow>,
     ) -> Result<u64, StorageError>;
 

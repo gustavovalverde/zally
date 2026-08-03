@@ -32,16 +32,17 @@ use tokio_stream::wrappers::WatchStream;
 use zally_chain::{
     BlockHeightRange, ChainEventCursorRecovery, ChainEventEnvelope, ChainEventEnvelopeStream,
     ChainEventStreamStart, ChainSource, ChainSourceError, FailurePosture, ShieldedPool,
-    SubtreeIndex, TransparentUtxo,
+    SubtreeIndex,
 };
 use zally_core::{BlockHeight, CompactBlockArtifact, Network, TreeStateArtifact};
-use zally_storage::{ScanRequest, StorageError, TransparentReceiverRow, TransparentUtxoRow};
+use zally_storage::{ScanRequest, StorageError};
 use zcash_client_backend::data_api::scanning::ScanPriority;
 
 use crate::error::WalletError;
 use crate::event::WalletEvent;
 use crate::retry::with_breaker_and_retry;
 use crate::status::{SyncStatus, WalletStatus};
+use crate::transparent_utxo_refresh::run_transparent_utxo_refresh_driver;
 use crate::wallet::{Wallet, current_unix_ms};
 
 /// Maximum compact blocks scanned in one `Wallet::sync` call. A suggested range larger than
@@ -77,8 +78,6 @@ pub struct SyncOutcome {
     pub scanned_to_height: BlockHeight,
     /// Number of blocks scanned during this run.
     pub block_count: u64,
-    /// Number of transparent UTXOs refreshed during this run.
-    pub transparent_utxo_count: u64,
     /// Unix milliseconds when this run completed.
     pub completed_at_ms: u64,
 }
@@ -112,6 +111,18 @@ pub struct SyncRecoveryPolicy {
     /// Consecutive faults at one ladder rung before the driver escalates to the next rung.
     /// Within [`SyncRepair::Rewind`] the same counter walks the rewind depth ladder.
     pub escalate_after_faults: u32,
+    /// Consecutive faults tolerated at [`SyncRepair::Retry`] before escalating, when every
+    /// fault since entering that rung classified as [`FailurePosture::Restartable`].
+    ///
+    /// A source that rotates its chain epoch answers precisely and is serving; the pin
+    /// expiring under a running attempt is not evidence of backend trouble
+    /// ([`FailurePosture::Restartable`]'s own contract). Escalating a healthy wallet to
+    /// [`SyncRepair::Park`] on a short streak of rotations wedges it for no cause the ladder
+    /// can cure, so this threshold is looser than [`Self::escalate_after_faults`]. A single
+    /// fault that is not [`FailurePosture::Restartable`] falls back to the stricter
+    /// threshold immediately: a rotation streak says nothing protective about a genuinely
+    /// unreachable or misbehaving source.
+    pub restartable_escalate_after_faults: u32,
     /// Rebuilds from the birthday attempted before the driver parks.
     pub max_rescan_attempts: u32,
     /// Backoff before the first faulted re-attempt, in milliseconds. Doubles per
@@ -130,6 +141,18 @@ impl SyncRecoveryPolicy {
     pub const fn with_escalate_after_faults(self, escalate_after_faults: u32) -> Self {
         Self {
             escalate_after_faults,
+            ..self
+        }
+    }
+
+    /// Returns the policy with `restartable_escalate_after_faults` replaced.
+    #[must_use]
+    pub const fn with_restartable_escalate_after_faults(
+        self,
+        restartable_escalate_after_faults: u32,
+    ) -> Self {
+        Self {
+            restartable_escalate_after_faults,
             ..self
         }
     }
@@ -174,6 +197,7 @@ impl SyncRecoveryPolicy {
         let fault_backoff_initial_ms = self.fault_backoff_initial_ms.max(1);
         Self {
             escalate_after_faults: self.escalate_after_faults.max(1),
+            restartable_escalate_after_faults: self.restartable_escalate_after_faults.max(1),
             max_rescan_attempts: self.max_rescan_attempts.max(1),
             fault_backoff_initial_ms,
             fault_backoff_cap_ms: self.fault_backoff_cap_ms.max(fault_backoff_initial_ms),
@@ -186,6 +210,7 @@ impl Default for SyncRecoveryPolicy {
     fn default() -> Self {
         Self {
             escalate_after_faults: 3,
+            restartable_escalate_after_faults: 10,
             max_rescan_attempts: 2,
             fault_backoff_initial_ms: 1_000,
             fault_backoff_cap_ms: 60_000,
@@ -207,6 +232,19 @@ pub struct SyncDriverOptions {
     pub sync_timeout_seconds: u64,
     /// Self-healing policy for the driver's repair ladder.
     pub recovery: SyncRecoveryPolicy,
+    /// Minimum milliseconds between [`Wallet::refresh_transparent_utxos`] attempts.
+    ///
+    /// The refresh runs on its own loop, decoupled from the block-scan cadence above: a slow
+    /// walk paces itself by its own duration, and this floor only prevents busy-looping when
+    /// the walk returns quickly (an empty receiver list, or a source with no new UTXOs).
+    pub transparent_utxo_refresh_interval_ms: u64,
+    /// Maximum seconds one [`Wallet::refresh_transparent_utxos`] attempt may run before the
+    /// refresh loop treats it as faulted and moves on to the next tick.
+    ///
+    /// Bounds a hung chain read the same way [`Self::sync_timeout_seconds`] bounds a hung
+    /// scan attempt: without this, a source that never returns wedges the refresh loop
+    /// silently forever, since the loop has no repair ladder of its own to notice.
+    pub transparent_utxo_refresh_timeout_seconds: u64,
 }
 
 impl SyncDriverOptions {
@@ -246,12 +284,40 @@ impl SyncDriverOptions {
         Self { recovery, ..self }
     }
 
+    /// Returns options with `transparent_utxo_refresh_interval_ms` replaced.
+    #[must_use]
+    pub const fn with_transparent_utxo_refresh_interval_ms(
+        self,
+        transparent_utxo_refresh_interval_ms: u64,
+    ) -> Self {
+        Self {
+            transparent_utxo_refresh_interval_ms,
+            ..self
+        }
+    }
+
+    /// Returns options with `transparent_utxo_refresh_timeout_seconds` replaced.
+    #[must_use]
+    pub const fn with_transparent_utxo_refresh_timeout_seconds(
+        self,
+        transparent_utxo_refresh_timeout_seconds: u64,
+    ) -> Self {
+        Self {
+            transparent_utxo_refresh_timeout_seconds,
+            ..self
+        }
+    }
+
     fn normalized(self) -> Self {
         Self {
             poll_interval_ms: self.poll_interval_ms.max(1),
             max_sync_iterations_per_wake_count: self.max_sync_iterations_per_wake_count.max(1),
             sync_timeout_seconds: self.sync_timeout_seconds.max(1),
             recovery: self.recovery.normalized(),
+            transparent_utxo_refresh_interval_ms: self.transparent_utxo_refresh_interval_ms.max(1),
+            transparent_utxo_refresh_timeout_seconds: self
+                .transparent_utxo_refresh_timeout_seconds
+                .max(1),
         }
     }
 }
@@ -263,6 +329,8 @@ impl Default for SyncDriverOptions {
             max_sync_iterations_per_wake_count: 1_000,
             sync_timeout_seconds: 120,
             recovery: SyncRecoveryPolicy::default(),
+            transparent_utxo_refresh_interval_ms: 5_000,
+            transparent_utxo_refresh_timeout_seconds: 120,
         }
     }
 }
@@ -470,10 +538,25 @@ impl SyncDriver {
     }
 
     /// Starts continuous wallet sync and returns a handle for observation and shutdown.
+    ///
+    /// Alongside the block-scan loop this spawns a second, independent loop that refreshes
+    /// transparent UTXOs on [`SyncDriverOptions::transparent_utxo_refresh_interval_ms`]'s
+    /// cadence. The two loops share the wallet and chain source but never share an attempt:
+    /// a slow or faulted refresh never blocks a scan iteration, and neither loop's epoch pin
+    /// or retry ladder affects the other's.
     #[must_use]
     pub fn sync_continuously(self) -> SyncHandle {
         let (close_tx, close_rx) = oneshot::channel();
         let (status_tx, status_rx) = watch::channel(SyncSnapshot::starting(self.wallet.network()));
+        let (transparent_utxo_refresh_close_tx, transparent_utxo_refresh_close_rx) =
+            oneshot::channel();
+        let transparent_utxo_refresh_join = tokio::spawn(run_transparent_utxo_refresh_driver(
+            self.wallet.clone(),
+            Arc::clone(&self.chain),
+            self.options.transparent_utxo_refresh_interval_ms,
+            self.options.transparent_utxo_refresh_timeout_seconds,
+            transparent_utxo_refresh_close_rx,
+        ));
         let join = tokio::spawn(run_sync_driver(
             self.wallet,
             self.chain,
@@ -485,6 +568,8 @@ impl SyncDriver {
             close_tx: Some(close_tx),
             join,
             status_rx,
+            transparent_utxo_refresh_close_tx: Some(transparent_utxo_refresh_close_tx),
+            transparent_utxo_refresh_join,
         }
     }
 }
@@ -494,6 +579,8 @@ pub struct SyncHandle {
     close_tx: Option<oneshot::Sender<()>>,
     join: JoinHandle<()>,
     status_rx: watch::Receiver<SyncSnapshot>,
+    transparent_utxo_refresh_close_tx: Option<oneshot::Sender<()>>,
+    transparent_utxo_refresh_join: JoinHandle<()>,
 }
 
 impl SyncHandle {
@@ -509,21 +596,30 @@ impl SyncHandle {
         SyncSnapshotStream::from_watch(self.status_rx.clone())
     }
 
-    /// Requests shutdown and waits for the driver task to close.
+    /// Requests shutdown and waits for both driver tasks to close.
     ///
-    /// The driver task never fails on its own, so the only close-time error is
-    /// [`WalletError::SyncDriverFailed`] from a panic inside the driver task.
+    /// Neither driver task fails on its own, so the only close-time error is
+    /// [`WalletError::SyncDriverFailed`] from a panic inside one of them.
     pub async fn close(mut self) -> Result<(), WalletError> {
         if let Some(close_tx) = self.close_tx.take() {
             let _ = close_tx.send(());
         }
-        match self.join.await {
-            Ok(()) => Ok(()),
-            Err(join_error) if join_error.is_panic() => Err(WalletError::SyncDriverFailed {
-                reason: join_error.to_string(),
-            }),
-            Err(_cancelled) => Ok(()),
+        if let Some(close_tx) = self.transparent_utxo_refresh_close_tx.take() {
+            let _ = close_tx.send(());
         }
+        let sync_result = join_driver_task(self.join).await;
+        let refresh_result = join_driver_task(self.transparent_utxo_refresh_join).await;
+        sync_result.and(refresh_result)
+    }
+}
+
+async fn join_driver_task(join: JoinHandle<()>) -> Result<(), WalletError> {
+    match join.await {
+        Ok(()) => Ok(()),
+        Err(join_error) if join_error.is_panic() => Err(WalletError::SyncDriverFailed {
+            reason: join_error.to_string(),
+        }),
+        Err(_cancelled) => Ok(()),
     }
 }
 
@@ -652,6 +748,9 @@ struct RecoveryState {
     /// A dormant recovery no longer applies repairs or backoff; it survives completed
     /// syncs below `fault_height` purely as ladder memory and is woken by the next fault.
     dormant: bool,
+    /// Whether every fault folded into the current [`SyncRepair::Retry`] rung classified as
+    /// [`FailurePosture::Restartable`]. Stale once the rung escalates past `Retry`.
+    rung_all_restartable: bool,
 }
 
 impl RecoveryState {
@@ -667,17 +766,29 @@ impl RecoveryState {
             parked: None,
             fault_height: None,
             dormant: false,
+            rung_all_restartable: true,
         }
     }
 
     /// Folds one classified fault into the ladder, escalating the rung when the current rung
     /// has exhausted its attempts. Returns the rung transition when one occurred.
+    ///
+    /// `restartable` marks a fault whose posture is [`FailurePosture::Restartable`]; it
+    /// widens the escalation threshold at [`SyncRepair::Retry`] as long as every fault at
+    /// that rung has carried the same posture (see
+    /// [`SyncRecoveryPolicy::restartable_escalate_after_faults`]).
     fn fold_fault(
         &mut self,
         classified: SyncRepair,
+        restartable: bool,
         policy: SyncRecoveryPolicy,
     ) -> Option<(SyncRepair, SyncRepair)> {
         self.max_classified = self.max_classified.max(classified);
+        if classified > self.rung {
+            self.rung_all_restartable = restartable;
+        } else if classified == self.rung {
+            self.rung_all_restartable = self.rung_all_restartable && restartable;
+        }
         let escalation = if classified > self.rung {
             self.rung = classified;
             self.attempts_at_rung = 0;
@@ -685,7 +796,9 @@ impl RecoveryState {
                 self.rewind_depth_index = 0;
             }
             None
-        } else if self.attempts_at_rung >= escalation_threshold(self.rung, policy) {
+        } else if self.attempts_at_rung
+            >= escalation_threshold(self.rung, self.rung_all_restartable, policy)
+        {
             let from_repair = self.rung;
             escalate(self);
             Some((from_repair, self.rung))
@@ -707,10 +820,29 @@ struct ParkedAt {
 enum SyncRunAttempt {
     Completed(SyncOutcome),
     Faulted {
-        reason: String,
-        repair: SyncRepair,
+        fault: ClassifiedFault,
         committed: CommittedChunk,
     },
+}
+
+/// A fault's rendered reason bundled with its ladder classification.
+///
+/// `restartable` marks a fault whose posture is [`FailurePosture::Restartable`]; see
+/// [`RecoveryState::fold_fault`] for how it widens the escalation threshold.
+struct ClassifiedFault {
+    reason: String,
+    repair: SyncRepair,
+    restartable: bool,
+}
+
+impl ClassifiedFault {
+    fn from_error(error: &WalletError) -> Self {
+        Self {
+            reason: error.to_string(),
+            repair: repair_for(error),
+            restartable: is_restartable_fault(error),
+        }
+    }
 }
 
 /// Whether an attempt's committed blocks carry a comparison against the chain.
@@ -966,8 +1098,7 @@ async fn run_sync_wakeup(
             }
             chain_tip = ChainTipRecord::Stale;
             if let Err(repair_error) = apply_repair(ctx, state).await {
-                let repair = repair_for(&repair_error);
-                record_fault(ctx, state, repair_error.to_string(), repair, None).await;
+                record_fault(ctx, state, ClassifiedFault::from_error(&repair_error), None).await;
                 continue;
             }
         }
@@ -995,27 +1126,23 @@ async fn run_sync_wakeup(
                     return SyncWakeupExit::Reconciled;
                 }
             }
-            SyncRunAttempt::Faulted {
-                reason,
-                repair,
-                committed,
-            } => {
+            SyncRunAttempt::Faulted { fault, committed } => {
                 let frontier_after =
                     scan_frontier(ctx.wallet.status_snapshot().await.ok().as_ref());
                 let blocks_advanced = height_delta(frontier_before, frontier_after);
                 chain_tip = chain_tip_after_fault(chain_tip, blocks_advanced);
-                if is_slow_progress(repair, blocks_advanced) {
+                if is_slow_progress(fault.repair, blocks_advanced) {
                     state.observe_committed_chunk(committed, frontier_after);
                     note_slow_progress(
                         ctx,
                         state,
-                        reason,
+                        fault.reason,
                         blocks_advanced,
                         frontier_after.height(),
                     )
                     .await;
                 } else {
-                    record_fault(ctx, state, reason, repair, frontier_after.height()).await;
+                    record_fault(ctx, state, fault, frontier_after.height()).await;
                 }
             }
         }
@@ -1152,15 +1279,14 @@ const fn chain_tip_after_fault(recorded: ChainTipRecord, blocks_advanced: u32) -
 async fn record_fault(
     ctx: &DriverContext<'_>,
     state: &mut DriverState,
-    reason: String,
-    classified: SyncRepair,
+    classified: ClassifiedFault,
     fault_height: Option<BlockHeight>,
 ) {
     let now = current_unix_ms();
     let policy = ctx.options.recovery;
     let recovery = state
         .recovery
-        .get_or_insert_with(|| RecoveryState::entering(classified, now));
+        .get_or_insert_with(|| RecoveryState::entering(classified.repair, now));
     recovery.dormant = false;
     if let Some(height) = fault_height {
         // Rewinds lower the scanned height, so a fault observed after one must not lower
@@ -1171,9 +1297,9 @@ async fn record_fault(
                 .map_or(height, |prior| prior.max(height)),
         );
     }
-    let escalation = recovery.fold_fault(classified, policy);
+    let escalation = recovery.fold_fault(classified.repair, classified.restartable, policy);
     let fault = SyncFault {
-        reason,
+        reason: classified.reason,
         repair: recovery.rung,
         occurred_at_ms: now,
         consecutive_faults: recovery.consecutive_faults,
@@ -1228,9 +1354,14 @@ fn escalate(recovery: &mut RecoveryState) {
     recovery.attempts_at_rung = 0;
 }
 
-const fn escalation_threshold(rung: SyncRepair, policy: SyncRecoveryPolicy) -> u32 {
+const fn escalation_threshold(
+    rung: SyncRepair,
+    rung_all_restartable: bool,
+    policy: SyncRecoveryPolicy,
+) -> u32 {
     match rung {
         SyncRepair::RescanFromBirthday => policy.max_rescan_attempts,
+        SyncRepair::Retry if rung_all_restartable => policy.restartable_escalate_after_faults,
         SyncRepair::Retry | SyncRepair::Rewind | SyncRepair::Park => policy.escalate_after_faults,
     }
 }
@@ -1396,14 +1527,18 @@ async fn run_one_sync(
     match timeout(Duration::from_secs(options.sync_timeout_seconds), attempt).await {
         Ok(Ok(outcome)) => SyncRunAttempt::Completed(outcome),
         Ok(Err(error)) => SyncRunAttempt::Faulted {
-            reason: error.to_string(),
-            repair: repair_for(&error),
             committed: committed_chunk_for(&error),
+            fault: ClassifiedFault::from_error(&error),
         },
         // A deadline can cut between a chunk reaching storage and the comparison checking it.
+        // A stuck deadline is not the benign, self-healing shape of an expired boundary, so
+        // it does not earn the wider restartable threshold.
         Err(_elapsed) => SyncRunAttempt::Faulted {
-            reason: format!("sync exceeded {} seconds", options.sync_timeout_seconds),
-            repair: SyncRepair::Retry,
+            fault: ClassifiedFault {
+                reason: format!("sync exceeded {} seconds", options.sync_timeout_seconds),
+                repair: SyncRepair::Retry,
+                restartable: false,
+            },
             committed: CommittedChunk::Unchecked,
         },
     }
@@ -1416,6 +1551,16 @@ const fn committed_chunk_for(error: &WalletError) -> CommittedChunk {
     } else {
         CommittedChunk::Checked
     }
+}
+
+/// Whether a fault classifies as [`FailurePosture::Restartable`].
+///
+/// Only meaningful when [`repair_for`] classified the same error as [`SyncRepair::Retry`]:
+/// every named state-repair cure in [`repair_for`] always classifies to a higher rung
+/// regardless of posture, so this can only be `true` there when the fault is a rotated
+/// source boundary.
+fn is_restartable_fault(error: &WalletError) -> bool {
+    matches!(error.posture(), FailurePosture::Restartable)
 }
 
 /// Whether the driver should run another sync iteration in this wakeup.
@@ -1780,7 +1925,7 @@ impl Wallet {
     }
 
     /// Pins one source epoch, failing closed when the source serves another network.
-    async fn pin_chain_epoch(
+    pub(crate) async fn pin_chain_epoch(
         &self,
         chain: &dyn ChainSource,
     ) -> Result<zally_chain::ChainEpoch, WalletError> {
@@ -1804,8 +1949,7 @@ impl Wallet {
             .plan_scan_range(chain, chain_epoch, visible_tip)
             .await?
         else {
-            let transparent_utxo_count = self.sync_transparent_utxos(chain, chain_epoch).await?;
-            return Ok(self.emit_caught_up(visible_tip, transparent_utxo_count));
+            return Ok(self.emit_caught_up(visible_tip));
         };
         self.publish_event(WalletEvent::ScanProgress {
             scanned_height: scan_start,
@@ -1986,11 +2130,7 @@ impl Wallet {
         Ok(())
     }
 
-    fn emit_caught_up(
-        &self,
-        target_height: BlockHeight,
-        transparent_utxo_count: u64,
-    ) -> SyncOutcome {
+    fn emit_caught_up(&self, target_height: BlockHeight) -> SyncOutcome {
         self.publish_event(WalletEvent::ScanProgress {
             scanned_height: target_height,
             target_height,
@@ -1999,7 +2139,6 @@ impl Wallet {
             scanned_from_height: target_height,
             scanned_to_height: target_height,
             block_count: 0,
-            transparent_utxo_count,
             completed_at_ms: current_unix_ms(),
         }
     }
@@ -2080,8 +2219,6 @@ impl Wallet {
             });
         }
 
-        let transparent_utxo_count = self.sync_transparent_utxos(chain, chain_epoch).await?;
-
         self.publish_event(WalletEvent::ScanProgress {
             scanned_height: outcome.scanned_to_height,
             target_height,
@@ -2090,7 +2227,6 @@ impl Wallet {
             scanned_from_height: scanned_from,
             scanned_to_height: outcome.scanned_to_height,
             block_count,
-            transparent_utxo_count,
             completed_at_ms: current_unix_ms(),
         })
     }
@@ -2190,81 +2326,6 @@ impl Wallet {
             .await?;
         Ok(())
     }
-
-    async fn sync_transparent_utxos(
-        &self,
-        chain: &dyn ChainSource,
-        chain_epoch: zally_chain::ChainEpoch,
-    ) -> Result<u64, WalletError> {
-        let receivers = self.inner.storage.list_transparent_receivers().await?;
-        let mut receiver_batches = Vec::with_capacity(receivers.len());
-        for receiver in receivers {
-            let utxos = chain
-                .transparent_utxos(chain_epoch, &receiver.script_pub_key_bytes)
-                .await?;
-            receiver_batches.push((receiver, utxos));
-        }
-        let transparent_utxo_rows =
-            validate_transparent_utxo_batches(chain_epoch, receiver_batches)?;
-        Ok(self
-            .inner
-            .storage
-            .record_transparent_utxos(transparent_utxo_rows)
-            .await?)
-    }
-}
-
-fn validate_transparent_utxo_batches(
-    chain_epoch: zally_chain::ChainEpoch,
-    receiver_batches: Vec<(TransparentReceiverRow, Vec<TransparentUtxo>)>,
-) -> Result<Vec<TransparentUtxoRow>, WalletError> {
-    let mut outpoints = std::collections::HashSet::new();
-    let mut transparent_utxo_rows = Vec::new();
-    for (receiver, utxos) in receiver_batches {
-        for utxo in utxos {
-            if utxo.confirmed_at_height > chain_epoch.visible_tip().height {
-                return Err(WalletError::ChainSource(
-                    ChainSourceError::MalformedTransparentUtxoSet {
-                        reason: format!(
-                            "outpoint {}:{} is confirmed at {} above pinned visible tip {}",
-                            utxo.tx_id,
-                            utxo.output_index,
-                            utxo.confirmed_at_height,
-                            chain_epoch.visible_tip().height,
-                        ),
-                    },
-                ));
-            }
-            if !outpoints.insert((utxo.tx_id, utxo.output_index)) {
-                return Err(WalletError::ChainSource(
-                    ChainSourceError::MalformedTransparentUtxoSet {
-                        reason: format!(
-                            "outpoint {}:{} appears more than once",
-                            utxo.tx_id, utxo.output_index
-                        ),
-                    },
-                ));
-            }
-            if utxo.script_pub_key_bytes != receiver.script_pub_key_bytes {
-                return Err(WalletError::ChainSource(
-                    ChainSourceError::MalformedTransparentUtxoSet {
-                        reason: format!(
-                            "outpoint {}:{} script did not match wallet receiver for account {:?}",
-                            utxo.tx_id, utxo.output_index, receiver.account_id
-                        ),
-                    },
-                ));
-            }
-            transparent_utxo_rows.push(TransparentUtxoRow::new(
-                utxo.tx_id,
-                utxo.output_index,
-                utxo.value_zat,
-                utxo.confirmed_at_height,
-                utxo.script_pub_key_bytes,
-            ));
-        }
-    }
-    Ok(transparent_utxo_rows)
 }
 
 fn block_timestamp_index(blocks: &[CompactBlockArtifact]) -> HashMap<u32, u64> {
@@ -2500,78 +2561,6 @@ mod tests {
         }
     }
 
-    fn transparent_test_epoch() -> zally_chain::ChainEpoch {
-        let tip = zally_chain::BlockId {
-            height: BlockHeight::from(10),
-            hash: zally_core::BlockHash::from_bytes([10; 32]),
-        };
-        zally_chain::ChainEpoch::new(
-            zally_chain::ChainEpochId::new(1),
-            Network::regtest(),
-            tip,
-            tip,
-        )
-        .expect("test epoch is valid")
-    }
-
-    fn transparent_receiver(id: u128, script: &[u8]) -> TransparentReceiverRow {
-        TransparentReceiverRow::new(
-            zally_core::AccountId::from_uuid(uuid::Uuid::from_u128(id)),
-            script.to_vec(),
-        )
-    }
-
-    fn transparent_utxo(tx_byte: u8, script: &[u8], height: u32) -> TransparentUtxo {
-        TransparentUtxo {
-            tx_id: zally_core::TxId::from_bytes([tx_byte; 32]),
-            output_index: 0,
-            value_zat: zally_core::Zatoshis::try_from(1).unwrap_or(zally_core::Zatoshis::zero()),
-            confirmed_at_height: BlockHeight::from(height),
-            script_pub_key_bytes: script.to_vec(),
-        }
-    }
-
-    #[test]
-    fn later_malformed_receiver_yields_no_storage_batch() {
-        let result = validate_transparent_utxo_batches(
-            transparent_test_epoch(),
-            vec![
-                (
-                    transparent_receiver(1, &[1]),
-                    vec![transparent_utxo(1, &[1], 9)],
-                ),
-                (
-                    transparent_receiver(2, &[2]),
-                    vec![transparent_utxo(2, &[2], 11)],
-                ),
-            ],
-        );
-        assert!(matches!(
-            result,
-            Err(WalletError::ChainSource(
-                ChainSourceError::MalformedTransparentUtxoSet { .. }
-            ))
-        ));
-    }
-
-    #[test]
-    fn cross_receiver_duplicate_yields_no_storage_batch() {
-        let duplicate = transparent_utxo(1, &[1], 9);
-        let result = validate_transparent_utxo_batches(
-            transparent_test_epoch(),
-            vec![
-                (transparent_receiver(1, &[1]), vec![duplicate.clone()]),
-                (transparent_receiver(2, &[1]), vec![duplicate]),
-            ],
-        );
-        assert!(matches!(
-            result,
-            Err(WalletError::ChainSource(
-                ChainSourceError::MalformedTransparentUtxoSet { .. }
-            ))
-        ));
-    }
-
     #[test]
     fn subtree_roots_completing_above_the_scan_floor_are_deferred() {
         let roots = vec![
@@ -2755,9 +2744,12 @@ mod tests {
             .with_max_rescan_attempts(2)
     }
 
-    /// Drives the recovery ladder through a stream of classified faults, mirroring the
-    /// driver's record-then-apply interleaving, and records the `(rung, rewind_depth_index)`
-    /// after each fault.
+    /// Drives the recovery ladder through a stream of classified faults.
+    ///
+    /// Mirrors the driver's record-then-apply interleaving, and records the `(rung,
+    /// rewind_depth_index)` after each fault. Every fault is treated as non-restartable; see
+    /// `restartable_streak_gets_the_wider_threshold` for the restartable-specific ladder
+    /// behaviour.
     fn drive_ladder(
         classifieds: impl IntoIterator<Item = SyncRepair>,
         policy: SyncRecoveryPolicy,
@@ -2766,7 +2758,7 @@ mod tests {
         let mut ladder = Vec::new();
         for classified in classifieds {
             let recovery = recovery.get_or_insert_with(|| RecoveryState::entering(classified, 0));
-            recovery.fold_fault(classified, policy);
+            recovery.fold_fault(classified, false, policy);
             ladder.push((recovery.rung, recovery.rewind_depth_index));
             recovery.attempts_at_rung = recovery.attempts_at_rung.saturating_add(1);
         }
@@ -2798,7 +2790,6 @@ mod tests {
             scanned_from_height: BlockHeight::from(74_000),
             scanned_to_height: BlockHeight::from(75_000),
             block_count,
-            transparent_utxo_count: 0,
             completed_at_ms: 0,
         }
     }
@@ -2899,7 +2890,7 @@ mod tests {
                     .fault_height
                     .map_or(fault_height, |prior| prior.max(fault_height)),
             );
-            recovery.fold_fault(SyncRepair::Rewind, policy);
+            recovery.fold_fault(SyncRepair::Rewind, false, policy);
             recovery.attempts_at_rung = recovery.attempts_at_rung.saturating_add(1);
             rungs.push((recovery.rung, recovery.rewind_depth_index));
 
@@ -2969,6 +2960,46 @@ mod tests {
     }
 
     #[test]
+    fn restartable_streak_gets_the_wider_threshold() {
+        let policy = SyncRecoveryPolicy::default()
+            .with_escalate_after_faults(1)
+            .with_restartable_escalate_after_faults(3);
+        let mut recovery = RecoveryState::entering(SyncRepair::Retry, 0);
+        for _ in 0..3 {
+            let escalation = recovery.fold_fault(SyncRepair::Retry, true, policy);
+            assert_eq!(
+                escalation, None,
+                "a rotation streak below the wider threshold must not escalate"
+            );
+            recovery.attempts_at_rung = recovery.attempts_at_rung.saturating_add(1);
+        }
+        let escalation = recovery.fold_fault(SyncRepair::Retry, true, policy);
+        assert_eq!(
+            escalation,
+            Some((SyncRepair::Retry, SyncRepair::Park)),
+            "the streak must still escalate once it reaches the wider threshold"
+        );
+    }
+
+    #[test]
+    fn a_single_non_restartable_fault_reverts_to_the_strict_threshold() {
+        let policy = SyncRecoveryPolicy::default()
+            .with_escalate_after_faults(1)
+            .with_restartable_escalate_after_faults(10);
+        let mut recovery = RecoveryState::entering(SyncRepair::Retry, 0);
+        let escalation = recovery.fold_fault(SyncRepair::Retry, true, policy);
+        assert_eq!(escalation, None);
+        recovery.attempts_at_rung = recovery.attempts_at_rung.saturating_add(1);
+
+        let escalation = recovery.fold_fault(SyncRepair::Retry, false, policy);
+        assert_eq!(
+            escalation,
+            Some((SyncRepair::Retry, SyncRepair::Park)),
+            "a genuine retryable fault must not inherit the rotation streak's leniency"
+        );
+    }
+
+    #[test]
     fn escalate_from_retry_parks_unless_a_state_fault_was_seen() {
         let mut environment = RecoveryState::entering(SyncRepair::Retry, 0);
         escalate(&mut environment);
@@ -3022,7 +3053,6 @@ mod tests {
             scanned_from_height: BlockHeight::from(at_height),
             scanned_to_height: BlockHeight::from(at_height),
             block_count: 0,
-            transparent_utxo_count: 0,
             completed_at_ms: 1,
         }
     }

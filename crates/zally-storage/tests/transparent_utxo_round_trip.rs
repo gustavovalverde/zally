@@ -46,13 +46,16 @@ async fn transparent_utxo_round_trip_records_exposed_receiver() -> Result<(), Te
 
     storage.update_chain_tip(BlockHeight::from(10)).await?;
     let recorded_count = storage
-        .record_transparent_utxos(vec![TransparentUtxoRow::new(
-            TxId::from_bytes([0x11_u8; 32]),
-            0,
-            Zatoshis::try_from(50_000_u64).unwrap_or(Zatoshis::zero()),
-            BlockHeight::from(2),
-            expected_script,
-        )])
+        .record_transparent_utxos(
+            None,
+            vec![TransparentUtxoRow::new(
+                TxId::from_bytes([0x11_u8; 32]),
+                0,
+                Zatoshis::try_from(50_000_u64).unwrap_or(Zatoshis::zero()),
+                BlockHeight::from(2),
+                expected_script,
+            )],
+        )
         .await?;
     assert_eq!(recorded_count, 1);
     Ok(())

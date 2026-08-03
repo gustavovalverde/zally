@@ -14,8 +14,9 @@ use zally_core::{AccountId, BlockHeight, TxId};
 /// [`WalletEvent::TransactionConfirmed`] per newly confirmed wallet transaction; and one
 /// [`WalletEvent::ShieldedReceiveObserved`] per newly observed shielded note that the
 /// wallet owns. [`WalletEvent::DerivedStateReset`] marks a wallet database rebuild from
-/// seed and birthday. [`WalletEvent::Lagged`] is injected by the subscription stream when a
-/// consumer drops events; the sync loop never emits it directly.
+/// seed and birthday. [`WalletEvent::TransparentUtxoRefreshFaulted`] marks a faulted
+/// transparent-UTXO refresh attempt. [`WalletEvent::Lagged`] is injected by the subscription
+/// stream when a consumer drops events; the sync loop never emits it directly.
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[non_exhaustive]
@@ -82,6 +83,16 @@ pub enum WalletEvent {
         /// Account recreated in the fresh database. Equal to the prior id: account
         /// identity is key identity, not database identity.
         account_id: AccountId,
+    },
+    /// A [`crate::Wallet::refresh_transparent_utxos`] attempt run by the driver's own refresh
+    /// loop faulted, including a timed-out attempt. Emitted on every faulted attempt so a
+    /// host observes a stall as it happens rather than only in logs; `consecutive_failures`
+    /// tells the host whether this is an isolated blip or a sustained outage.
+    TransparentUtxoRefreshFaulted {
+        /// Consecutive faulted attempts up to and including this one.
+        consecutive_failures: u32,
+        /// Fault description safe for logs and status pages.
+        reason: String,
     },
     /// Consumer fell behind; `dropped_count` events were skipped before this notification.
     Lagged {

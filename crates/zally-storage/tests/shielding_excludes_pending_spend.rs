@@ -82,13 +82,16 @@ async fn shielding_does_not_reselect_an_input_spent_by_a_pending_transaction()
     let source_tx_id = TxId::from_bytes([0x11_u8; 32]);
     let utxo_amount = Zatoshis::try_from(1_000_000_u64).unwrap_or(Zatoshis::zero());
     storage
-        .record_transparent_utxos(vec![TransparentUtxoRow::new(
-            source_tx_id,
-            0,
-            utxo_amount,
-            mined_height,
-            script_pub_key_bytes,
-        )])
+        .record_transparent_utxos(
+            None,
+            vec![TransparentUtxoRow::new(
+                source_tx_id,
+                0,
+                utxo_amount,
+                mined_height,
+                script_pub_key_bytes,
+            )],
+        )
         .await?;
 
     let threshold = Zatoshis::try_from(1_000_u64).unwrap_or(Zatoshis::zero());

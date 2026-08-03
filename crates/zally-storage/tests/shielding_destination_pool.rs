@@ -102,13 +102,16 @@ async fn prepare_shielding(
         ))
         .await?;
     storage
-        .record_transparent_utxos(vec![TransparentUtxoRow::new(
-            TxId::from_bytes([0x33_u8; 32]),
-            0,
-            Zatoshis::try_from(1_000_000_u64).unwrap_or(Zatoshis::zero()),
-            BlockHeight::from(TRANSPARENT_MINED_HEIGHT),
-            script_pub_key_bytes,
-        )])
+        .record_transparent_utxos(
+            None,
+            vec![TransparentUtxoRow::new(
+                TxId::from_bytes([0x33_u8; 32]),
+                0,
+                Zatoshis::try_from(1_000_000_u64).unwrap_or(Zatoshis::zero()),
+                BlockHeight::from(TRANSPARENT_MINED_HEIGHT),
+                script_pub_key_bytes,
+            )],
+        )
         .await?;
 
     let threshold_zat = Zatoshis::try_from(1_000_u64).unwrap_or(Zatoshis::zero());

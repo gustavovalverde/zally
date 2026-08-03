@@ -708,17 +708,32 @@ impl WalletStorage for Sqlite {
 
     async fn record_transparent_utxos(
         &self,
+        min_scanned_height: Option<BlockHeight>,
         utxos: Vec<crate::wallet::TransparentUtxoRow>,
     ) -> Result<u64, StorageError> {
         self.with_db_mut(move |db| {
-            let mut recorded_count = 0_u64;
-            for utxo in utxos {
-                let output = transparent_utxo_row_to_output(utxo)?;
-                db.put_received_transparent_utxo(&output)
-                    .map_err(|e| map_sqlite_error(&e))?;
-                recorded_count = recorded_count.saturating_add(1);
+            if let Some(min_scanned_height) = min_scanned_height {
+                let scanned_height = db
+                    .get_wallet_summary(ConfirmationsPolicy::default())
+                    .map_err(|e| map_sqlite_error(&e))?
+                    .map(|summary| BlockHeight::from(u32::from(summary.fully_scanned_height())));
+                if scanned_height.is_none_or(|height| height < min_scanned_height) {
+                    return Err(StorageError::ScanFrontierReceded {
+                        min_scanned_height,
+                        observed: scanned_height,
+                    });
+                }
             }
-            Ok(recorded_count)
+            db.transactionally(|wdb| {
+                let mut recorded_count = 0_u64;
+                for utxo in utxos {
+                    let output = transparent_utxo_row_to_output(utxo)?;
+                    wdb.put_received_transparent_utxo(&output)
+                        .map_err(|e| map_sqlite_error(&e))?;
+                    recorded_count = recorded_count.saturating_add(1);
+                }
+                Ok(recorded_count)
+            })
         })
         .await
     }
@@ -3828,6 +3843,12 @@ fn map_sqlite_error<E: std::fmt::Display>(err: &E) -> StorageError {
         FailurePosture::NotRetryable
     };
     StorageError::SqliteFailed { reason, posture }
+}
+
+impl From<rusqlite::Error> for StorageError {
+    fn from(err: rusqlite::Error) -> Self {
+        map_sqlite_error(&err)
+    }
 }
 
 fn map_derivation_error(err: &KeyDerivationError) -> StorageError {

@@ -262,6 +262,25 @@ pub enum StorageError {
     /// existing reservation by request id and surface it idempotently.
     #[error("dispense reservation request id is already bound to a prior reservation")]
     HoldRequestConflict,
+
+    /// A guarded write's caller-supplied floor no longer holds: the wallet's
+    /// `fully_scanned_height` has receded below `min_scanned_height` since the caller observed
+    /// it, most likely because a reorg rewind landed between the caller's chain read and this
+    /// write.
+    ///
+    /// Posture: [`FailurePosture::Restartable`]; the pinned view the caller read under has
+    /// expired. Re-issuing the same write can never succeed; the caller re-observes the scan
+    /// frontier under a fresh chain-epoch pin and restarts the operation from it.
+    #[error(
+        "scan frontier receded below {min_scanned_height}; observed {observed:?}, \
+         a reorg rewind likely landed mid-write"
+    )]
+    ScanFrontierReceded {
+        /// Scan frontier the caller observed before issuing the write.
+        min_scanned_height: BlockHeight,
+        /// Scan frontier observed at write time, `None` for a fully-reset wallet.
+        observed: Option<BlockHeight>,
+    },
 }
 
 impl StorageError {
@@ -292,6 +311,7 @@ impl StorageError {
             Self::ChainReorgDetected { .. } | Self::BlockingTaskFailed { .. } => {
                 FailurePosture::Retryable
             }
+            Self::ScanFrontierReceded { .. } => FailurePosture::Restartable,
             Self::SqliteFailed { posture, .. } | Self::ProposalBuildFailed { posture, .. } => {
                 *posture
             }
@@ -361,6 +381,10 @@ mod tests {
             StorageError::ShieldedPoolUnsupported {
                 pool: zcash_protocol::ShieldedPool::Ironwood,
             },
+            StorageError::ScanFrontierReceded {
+                min_scanned_height: BlockHeight::from(10),
+                observed: Some(BlockHeight::from(5)),
+            },
         ];
         for e in variants {
             let _ = e.posture();
@@ -380,5 +404,15 @@ mod tests {
             posture: FailurePosture::RequiresOperator,
         };
         assert!(!permanent.is_retryable());
+    }
+
+    #[test]
+    fn scan_frontier_receded_is_restartable() {
+        let error = StorageError::ScanFrontierReceded {
+            min_scanned_height: BlockHeight::from(10),
+            observed: Some(BlockHeight::from(5)),
+        };
+        assert_eq!(error.posture(), FailurePosture::Restartable);
+        assert!(error.is_retryable());
     }
 }

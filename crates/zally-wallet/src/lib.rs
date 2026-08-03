@@ -17,6 +17,7 @@ mod retry;
 mod spend;
 mod status;
 mod sync;
+mod transparent_utxo_refresh;
 mod unspent_note;
 mod wallet;
 
@@ -42,6 +43,7 @@ pub use sync::{
     SyncDriver, SyncDriverOptions, SyncDriverPhase, SyncFault, SyncHandle, SyncObservation,
     SyncOutcome, SyncRecoveryPolicy, SyncRepair, SyncSnapshot, SyncSnapshotStream,
 };
+pub use transparent_utxo_refresh::TransparentUtxoRefreshOutcome;
 pub use unspent_note::UnspentShieldedNote;
 pub use wallet::{ReserveForDispensePlan, Wallet, WalletBuilder};
 pub use zcash_payment_disclosure::PaymentDisclosureProfile;

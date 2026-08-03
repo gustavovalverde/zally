@@ -47,6 +47,7 @@ struct MockState {
     subtree_failures: Vec<ChainSourceError>,
     compact_failures: Vec<ChainSourceError>,
     tree_state_failure_heights: Vec<u32>,
+    tree_state_error_queue: Vec<(u32, ChainSourceError)>,
     failures_consumed: u32,
     acquired_epoch_ids: Vec<u64>,
     artifact_epoch_ids: Vec<u64>,
@@ -76,6 +77,7 @@ impl MockChainSource {
                 subtree_failures: Vec::new(),
                 compact_failures: Vec::new(),
                 tree_state_failure_heights: Vec::new(),
+                tree_state_error_queue: Vec::new(),
                 failures_consumed: 0,
                 acquired_epoch_ids: Vec::new(),
                 artifact_epoch_ids: Vec::new(),
@@ -253,6 +255,24 @@ impl MockChainSourceHandle {
             .push(block_height.as_u32());
     }
 
+    /// Queues `count` consecutive failures for `tree_state_at` reads at `block_height`,
+    /// without rotating the mock's epoch. Mirrors [`Self::fail_transparent_utxos_next`] but
+    /// keyed on height, for injecting a fault after a scan chunk has already committed (the
+    /// tree-root comparison is the only chain read left in that window).
+    pub fn fail_tree_state_at_next(
+        &self,
+        block_height: BlockHeight,
+        count: u32,
+        mut produce_error: impl FnMut() -> ChainSourceError,
+    ) {
+        let mut guard = self.state.lock();
+        for _ in 0..count {
+            guard
+                .tree_state_error_queue
+                .push((block_height.as_u32(), produce_error()));
+        }
+    }
+
     /// Epoch IDs returned by `current_epoch`, in call order.
     #[must_use]
     pub fn acquired_epoch_ids(&self) -> Vec<u64> {
@@ -427,6 +447,16 @@ impl ChainSource for MockChainSource {
                 guard.failures_consumed = guard.failures_consumed.saturating_add(1);
                 drop(guard);
                 return Err(ChainSourceError::ChainEpochPinUnavailable);
+            }
+            if let Some(index) = guard
+                .tree_state_error_queue
+                .iter()
+                .position(|(height, _)| *height == block_height.as_u32())
+            {
+                let (_, error) = guard.tree_state_error_queue.remove(index);
+                guard.failures_consumed = guard.failures_consumed.saturating_add(1);
+                drop(guard);
+                return Err(error);
             }
         }
         let (network, served_tree_state) = {

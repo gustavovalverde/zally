@@ -1,11 +1,10 @@
 //! `SyncSnapshot::last_observation` follows checked scan progress, not clean run endings.
 //!
-//! Every path to a `SyncOutcome` passes through the transparent-UTXO refresh, so a source
-//! that never serves `transparent_utxos` makes clean completion unreachable: each attempt
-//! keeps the blocks it committed and then faults in the post-commit tail. That is the shape a
-//! Zinder deployment takes at the chain tip, where the epoch rotates once per block and the
-//! tail outlives the pin. The wallet still knows exactly which chain state it committed and
-//! when, and must report it.
+//! An attempt's blocks are committed by `WalletStorage::scan_blocks` before the wallet
+//! compares its commitment-tree roots against the chain, so a rotated epoch pin or any other
+//! fault can land on either side of that comparison. The wallet still knows exactly which
+//! chain state it committed and when, and must report it once the comparison has actually
+//! run.
 //!
 //! What it must not report is a chunk it never compared against the chain. The comparison is
 //! the wallet's only detector for a corrupt commitment tree, and a spend built on one is
@@ -14,7 +13,7 @@
 
 use std::sync::Arc;
 
-use zally_chain::{ChainSource, ChainSourceError};
+use zally_chain::ChainSource;
 use zally_core::BlockHeight;
 use zally_testkit::MockChainSource;
 use zally_wallet::{
@@ -22,59 +21,13 @@ use zally_wallet::{
 };
 
 use super::fixtures::{
-    SnapshotWaitError, TestWalletError, TestWalletFixture, capture_sync_events, create_test_wallet,
-    wait_for_snapshot,
+    SnapshotWaitError, TestWalletError, TestWalletFixture, create_test_wallet, wait_for_snapshot,
 };
 
 fn fast_recovery_policy() -> SyncRecoveryPolicy {
     SyncRecoveryPolicy::default()
         .with_fault_backoff_initial_ms(20)
         .with_fault_backoff_cap_ms(40)
-}
-
-#[tokio::test]
-async fn a_committed_chunk_publishes_its_observation_through_the_fault() -> Result<(), TestError> {
-    let TestWalletFixture {
-        temp: _temp,
-        wallet,
-        account_id: _account_id,
-    } = create_test_wallet().await?;
-    let network = wallet.network();
-    wallet.set_retry_policy(RetryPolicy::none());
-
-    let (_capture_guard, sync_events) = capture_sync_events();
-
-    let tip = BlockHeight::from(50);
-    let chain = Arc::new(MockChainSource::new(network));
-    let chain_handle = chain.handle();
-    chain_handle.serve_compact_blocks();
-    chain_handle.advance_tip(tip);
-    chain_handle.fail_transparent_utxos_next(1_024, || ChainSourceError::ChainEpochPinUnavailable);
-
-    let driver = SyncDriver::new(
-        wallet,
-        chain as Arc<dyn ChainSource>,
-        SyncDriverOptions::default()
-            .with_poll_interval_ms(25)
-            .with_recovery_policy(fast_recovery_policy()),
-    )?;
-    let handle = driver.sync_continuously();
-    let mut snapshots = handle.observe_status();
-
-    let observed = wait_for_snapshot(&mut snapshots, |snapshot| {
-        snapshot.last_observation.is_some()
-    })
-    .await?;
-    let observation = observed.last_observation.ok_or(TestError::NoObservation)?;
-    assert_eq!(observation.scanned_to_height, tip);
-    assert!(observation.observed_at_ms > 0);
-    assert!(
-        sync_events.contains("wallet_sync_slow_progress"),
-        "the observation must come from the chunk that committed and then faulted"
-    );
-
-    handle.close().await?;
-    Ok(())
 }
 
 #[tokio::test]
@@ -91,7 +44,10 @@ async fn an_attempt_that_commits_nothing_publishes_no_observation() -> Result<()
     let chain_handle = chain.handle();
     chain_handle.serve_compact_blocks();
     chain_handle.advance_tip(BlockHeight::from(50));
-    for _ in 0..10 {
+    // Comfortably above the restartable-fault threshold the ladder tolerates before
+    // parking (`SyncRecoveryPolicy::restartable_escalate_after_faults`, default 10; parking
+    // needs one fault past it).
+    for _ in 0..15 {
         chain_handle.expire_epoch_on_next_compact_read();
     }
 
@@ -172,6 +128,4 @@ enum TestError {
     Wallet(#[from] WalletError),
     #[error("snapshot wait failed: {0}")]
     SnapshotWait(#[from] SnapshotWaitError),
-    #[error("snapshot carried no observation")]
-    NoObservation,
 }
