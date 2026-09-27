@@ -194,7 +194,8 @@ async fn wallet_far_behind_converges_across_repeated_epoch_rotations() -> Result
 }
 
 #[tokio::test]
-async fn rotation_before_any_committed_block_still_reaches_park() -> Result<(), TestError> {
+async fn rotation_before_any_committed_block_retries_until_the_source_settles()
+-> Result<(), TestError> {
     let TestWalletFixture {
         temp: _temp,
         wallet,
@@ -203,13 +204,13 @@ async fn rotation_before_any_committed_block_still_reaches_park() -> Result<(), 
     let network = wallet.network();
     wallet.set_retry_policy(RetryPolicy::none());
 
+    let (_capture_guard, sync_events) = capture_sync_events();
+
+    let tip = BlockHeight::from(50);
     let chain = Arc::new(MockChainSource::new(network));
     let chain_handle = chain.handle();
     chain_handle.serve_compact_blocks();
-    chain_handle.advance_tip(BlockHeight::from(50));
-    // Comfortably above the restartable-fault threshold the ladder tolerates before
-    // parking (`SyncRecoveryPolicy::restartable_escalate_after_faults`, default 10; parking
-    // needs one fault past it).
+    chain_handle.advance_tip(tip);
     for _ in 0..15 {
         chain_handle.expire_epoch_on_next_compact_read();
     }
@@ -228,16 +229,30 @@ async fn rotation_before_any_committed_block_still_reaches_park() -> Result<(), 
     let handle = driver.sync_continuously();
     let mut snapshots = handle.observe_status();
 
+    let mut saw_parked = false;
     wait_for_snapshot(&mut snapshots, |snapshot| {
-        matches!(snapshot.phase, SyncDriverPhase::Parked { .. })
+        saw_parked |= matches!(snapshot.phase, SyncDriverPhase::Parked { .. });
+        snapshot.scanned_height == Some(tip)
     })
     .await?;
+    assert!(
+        sync_events.contains("wallet_sync_fault"),
+        "each rotation that committed nothing must strike the retry rung"
+    );
+    assert!(
+        !sync_events.contains("wallet_sync_repair_escalated"),
+        "a rotation streak must never escalate past the retry rung"
+    );
+    assert!(
+        !saw_parked && !sync_events.contains("wallet_sync_parked"),
+        "a rotation streak must never park the driver"
+    );
     assert!(
         matches!(
             wallet.circuit_breaker_state(),
             CircuitBreakerState::Closed { .. }
         ),
-        "the ladder must park on its own without the breaker opening, got {:?}",
+        "rotations must never open the breaker, got {:?}",
         wallet.circuit_breaker_state()
     );
 

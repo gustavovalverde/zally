@@ -16,9 +16,7 @@ use std::sync::Arc;
 use zally_chain::ChainSource;
 use zally_core::BlockHeight;
 use zally_testkit::MockChainSource;
-use zally_wallet::{
-    RetryPolicy, SyncDriver, SyncDriverOptions, SyncDriverPhase, SyncRecoveryPolicy, WalletError,
-};
+use zally_wallet::{RetryPolicy, SyncDriver, SyncDriverOptions, SyncRecoveryPolicy, WalletError};
 
 use super::fixtures::{
     SnapshotWaitError, TestWalletError, TestWalletFixture, create_test_wallet, wait_for_snapshot,
@@ -44,9 +42,6 @@ async fn an_attempt_that_commits_nothing_publishes_no_observation() -> Result<()
     let chain_handle = chain.handle();
     chain_handle.serve_compact_blocks();
     chain_handle.advance_tip(BlockHeight::from(50));
-    // Comfortably above the restartable-fault threshold the ladder tolerates before
-    // parking (`SyncRecoveryPolicy::restartable_escalate_after_faults`, default 10; parking
-    // needs one fault past it).
     for _ in 0..15 {
         chain_handle.expire_epoch_on_next_compact_read();
     }
@@ -61,16 +56,19 @@ async fn an_attempt_that_commits_nothing_publishes_no_observation() -> Result<()
     let handle = driver.sync_continuously();
     let mut snapshots = handle.observe_status();
 
-    let parked = wait_for_snapshot(&mut snapshots, |snapshot| {
-        matches!(snapshot.phase, SyncDriverPhase::Parked { .. })
+    let faulted = wait_for_snapshot(&mut snapshots, |snapshot| {
+        snapshot
+            .last_fault
+            .as_ref()
+            .is_some_and(|fault| fault.consecutive_faults >= 10)
     })
     .await?;
     assert_eq!(
-        parked.scanned_height, None,
+        faulted.scanned_height, None,
         "the pin expired before any block reached storage"
     );
     assert_eq!(
-        parked.last_observation, None,
+        faulted.last_observation, None,
         "an attempt that committed nothing observed nothing"
     );
 

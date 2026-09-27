@@ -108,21 +108,13 @@ pub struct SyncObservation {
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[non_exhaustive]
 pub struct SyncRecoveryPolicy {
-    /// Consecutive faults at one ladder rung before the driver escalates to the next rung.
-    /// Within [`SyncRepair::Rewind`] the same counter walks the rewind depth ladder.
-    pub escalate_after_faults: u32,
-    /// Consecutive faults tolerated at [`SyncRepair::Retry`] before escalating, when every
-    /// fault since entering that rung classified as [`FailurePosture::Restartable`].
+    /// Consecutive faults at a [`SyncRepair::Rewind`] rung before the driver escalates to the
+    /// next rung; the same counter walks the rewind depth ladder.
     ///
-    /// A source that rotates its chain epoch answers precisely and is serving; the pin
-    /// expiring under a running attempt is not evidence of backend trouble
-    /// ([`FailurePosture::Restartable`]'s own contract). Escalating a healthy wallet to
-    /// [`SyncRepair::Park`] on a short streak of rotations wedges it for no cause the ladder
-    /// can cure, so this threshold is looser than [`Self::escalate_after_faults`]. A single
-    /// fault that is not [`FailurePosture::Restartable`] falls back to the stricter
-    /// threshold immediately: a rotation streak says nothing protective about a genuinely
-    /// unreachable or misbehaving source.
-    pub restartable_escalate_after_faults: u32,
+    /// [`SyncRepair::Retry`] never escalates: a streak of environment faults has no state
+    /// cause, so the driver keeps retrying under the capped fault backoff until the source
+    /// answers again.
+    pub escalate_after_faults: u32,
     /// Rebuilds from the birthday attempted before the driver parks.
     pub max_rescan_attempts: u32,
     /// Backoff before the first faulted re-attempt, in milliseconds. Doubles per
@@ -141,18 +133,6 @@ impl SyncRecoveryPolicy {
     pub const fn with_escalate_after_faults(self, escalate_after_faults: u32) -> Self {
         Self {
             escalate_after_faults,
-            ..self
-        }
-    }
-
-    /// Returns the policy with `restartable_escalate_after_faults` replaced.
-    #[must_use]
-    pub const fn with_restartable_escalate_after_faults(
-        self,
-        restartable_escalate_after_faults: u32,
-    ) -> Self {
-        Self {
-            restartable_escalate_after_faults,
             ..self
         }
     }
@@ -197,7 +177,6 @@ impl SyncRecoveryPolicy {
         let fault_backoff_initial_ms = self.fault_backoff_initial_ms.max(1);
         Self {
             escalate_after_faults: self.escalate_after_faults.max(1),
-            restartable_escalate_after_faults: self.restartable_escalate_after_faults.max(1),
             max_rescan_attempts: self.max_rescan_attempts.max(1),
             fault_backoff_initial_ms,
             fault_backoff_cap_ms: self.fault_backoff_cap_ms.max(fault_backoff_initial_ms),
@@ -210,7 +189,6 @@ impl Default for SyncRecoveryPolicy {
     fn default() -> Self {
         Self {
             escalate_after_faults: 3,
-            restartable_escalate_after_faults: 10,
             max_rescan_attempts: 2,
             fault_backoff_initial_ms: 1_000,
             fault_backoff_cap_ms: 60_000,
@@ -734,7 +712,6 @@ impl DriverState {
 
 struct RecoveryState {
     rung: SyncRepair,
-    max_classified: SyncRepair,
     attempts_at_rung: u32,
     rewind_depth_index: usize,
     consecutive_faults: u32,
@@ -748,16 +725,12 @@ struct RecoveryState {
     /// A dormant recovery no longer applies repairs or backoff; it survives completed
     /// syncs below `fault_height` purely as ladder memory and is woken by the next fault.
     dormant: bool,
-    /// Whether every fault folded into the current [`SyncRepair::Retry`] rung classified as
-    /// [`FailurePosture::Restartable`]. Stale once the rung escalates past `Retry`.
-    rung_all_restartable: bool,
 }
 
 impl RecoveryState {
     const fn entering(rung: SyncRepair, now_ms: u64) -> Self {
         Self {
             rung,
-            max_classified: rung,
             attempts_at_rung: 0,
             rewind_depth_index: 0,
             consecutive_faults: 0,
@@ -766,29 +739,16 @@ impl RecoveryState {
             parked: None,
             fault_height: None,
             dormant: false,
-            rung_all_restartable: true,
         }
     }
 
     /// Folds one classified fault into the ladder, escalating the rung when the current rung
     /// has exhausted its attempts. Returns the rung transition when one occurred.
-    ///
-    /// `restartable` marks a fault whose posture is [`FailurePosture::Restartable`]; it
-    /// widens the escalation threshold at [`SyncRepair::Retry`] as long as every fault at
-    /// that rung has carried the same posture (see
-    /// [`SyncRecoveryPolicy::restartable_escalate_after_faults`]).
     fn fold_fault(
         &mut self,
         classified: SyncRepair,
-        restartable: bool,
         policy: SyncRecoveryPolicy,
     ) -> Option<(SyncRepair, SyncRepair)> {
-        self.max_classified = self.max_classified.max(classified);
-        if classified > self.rung {
-            self.rung_all_restartable = restartable;
-        } else if classified == self.rung {
-            self.rung_all_restartable = self.rung_all_restartable && restartable;
-        }
         let escalation = if classified > self.rung {
             self.rung = classified;
             self.attempts_at_rung = 0;
@@ -796,8 +756,8 @@ impl RecoveryState {
                 self.rewind_depth_index = 0;
             }
             None
-        } else if self.attempts_at_rung
-            >= escalation_threshold(self.rung, self.rung_all_restartable, policy)
+        } else if escalation_threshold(self.rung, policy)
+            .is_some_and(|threshold| self.attempts_at_rung >= threshold)
         {
             let from_repair = self.rung;
             escalate(self);
@@ -826,13 +786,9 @@ enum SyncRunAttempt {
 }
 
 /// A fault's rendered reason bundled with its ladder classification.
-///
-/// `restartable` marks a fault whose posture is [`FailurePosture::Restartable`]; see
-/// [`RecoveryState::fold_fault`] for how it widens the escalation threshold.
 struct ClassifiedFault {
     reason: String,
     repair: SyncRepair,
-    restartable: bool,
 }
 
 impl ClassifiedFault {
@@ -840,7 +796,6 @@ impl ClassifiedFault {
         Self {
             reason: error.to_string(),
             repair: repair_for(error),
-            restartable: is_restartable_fault(error),
         }
     }
 }
@@ -1272,7 +1227,8 @@ const fn chain_tip_after_fault(recorded: ChainTipRecord, blocks_advanced: u32) -
 /// Folds a fault into the recovery ladder and publishes the resulting transition.
 ///
 /// The entry rung is the maximum of the current rung and the fault's classification; the
-/// ladder never de-escalates within one degraded episode. Once the current rung has been
+/// ladder never de-escalates within one degraded episode. [`SyncRepair::Retry`] holds until
+/// a sync completes or a state fault lifts the rung. Once a state-repair rung has been
 /// applied [`SyncRecoveryPolicy::escalate_after_faults`] times without a completed sync
 /// (rebuilds use [`SyncRecoveryPolicy::max_rescan_attempts`]), the next fault escalates one
 /// rung.
@@ -1297,7 +1253,7 @@ async fn record_fault(
                 .map_or(height, |prior| prior.max(height)),
         );
     }
-    let escalation = recovery.fold_fault(classified.repair, classified.restartable, policy);
+    let escalation = recovery.fold_fault(classified.repair, policy);
     let fault = SyncFault {
         reason: classified.reason,
         repair: recovery.rung,
@@ -1331,16 +1287,6 @@ async fn record_fault(
 
 fn escalate(recovery: &mut RecoveryState) {
     match recovery.rung {
-        SyncRepair::Retry => {
-            // A slow or unreachable upstream is not cured by rewinding or rebuilding; only a
-            // classified state fault earns a state repair.
-            if recovery.max_classified >= SyncRepair::Rewind {
-                recovery.rung = SyncRepair::Rewind;
-                recovery.rewind_depth_index = 0;
-            } else {
-                recovery.rung = SyncRepair::Park;
-            }
-        }
         SyncRepair::Rewind => {
             if recovery.rewind_depth_index + 1 < REWIND_LADDER_BLOCKS.len() {
                 recovery.rewind_depth_index += 1;
@@ -1349,20 +1295,17 @@ fn escalate(recovery: &mut RecoveryState) {
             }
         }
         SyncRepair::RescanFromBirthday => recovery.rung = SyncRepair::Park,
-        SyncRepair::Park => {}
+        SyncRepair::Retry | SyncRepair::Park => {}
     }
     recovery.attempts_at_rung = 0;
 }
 
-const fn escalation_threshold(
-    rung: SyncRepair,
-    rung_all_restartable: bool,
-    policy: SyncRecoveryPolicy,
-) -> u32 {
+/// `None` for [`SyncRepair::Retry`], which holds until the source answers again.
+const fn escalation_threshold(rung: SyncRepair, policy: SyncRecoveryPolicy) -> Option<u32> {
     match rung {
-        SyncRepair::RescanFromBirthday => policy.max_rescan_attempts,
-        SyncRepair::Retry if rung_all_restartable => policy.restartable_escalate_after_faults,
-        SyncRepair::Retry | SyncRepair::Rewind | SyncRepair::Park => policy.escalate_after_faults,
+        SyncRepair::Retry => None,
+        SyncRepair::RescanFromBirthday => Some(policy.max_rescan_attempts),
+        SyncRepair::Rewind | SyncRepair::Park => Some(policy.escalate_after_faults),
     }
 }
 
@@ -1531,13 +1474,10 @@ async fn run_one_sync(
             fault: ClassifiedFault::from_error(&error),
         },
         // A deadline can cut between a chunk reaching storage and the comparison checking it.
-        // A stuck deadline is not the benign, self-healing shape of an expired boundary, so
-        // it does not earn the wider restartable threshold.
         Err(_elapsed) => SyncRunAttempt::Faulted {
             fault: ClassifiedFault {
                 reason: format!("sync exceeded {} seconds", options.sync_timeout_seconds),
                 repair: SyncRepair::Retry,
-                restartable: false,
             },
             committed: CommittedChunk::Unchecked,
         },
@@ -1551,16 +1491,6 @@ const fn committed_chunk_for(error: &WalletError) -> CommittedChunk {
     } else {
         CommittedChunk::Checked
     }
-}
-
-/// Whether a fault classifies as [`FailurePosture::Restartable`].
-///
-/// Only meaningful when [`repair_for`] classified the same error as [`SyncRepair::Retry`]:
-/// every named state-repair cure in [`repair_for`] always classifies to a higher rung
-/// regardless of posture, so this can only be `true` there when the fault is a rotated
-/// source boundary.
-fn is_restartable_fault(error: &WalletError) -> bool {
-    matches!(error.posture(), FailurePosture::Restartable)
 }
 
 /// Whether the driver should run another sync iteration in this wakeup.
@@ -2747,9 +2677,7 @@ mod tests {
     /// Drives the recovery ladder through a stream of classified faults.
     ///
     /// Mirrors the driver's record-then-apply interleaving, and records the `(rung,
-    /// rewind_depth_index)` after each fault. Every fault is treated as non-restartable; see
-    /// `restartable_streak_gets_the_wider_threshold` for the restartable-specific ladder
-    /// behaviour.
+    /// rewind_depth_index)` after each fault.
     fn drive_ladder(
         classifieds: impl IntoIterator<Item = SyncRepair>,
         policy: SyncRecoveryPolicy,
@@ -2758,7 +2686,7 @@ mod tests {
         let mut ladder = Vec::new();
         for classified in classifieds {
             let recovery = recovery.get_or_insert_with(|| RecoveryState::entering(classified, 0));
-            recovery.fold_fault(classified, false, policy);
+            recovery.fold_fault(classified, policy);
             ladder.push((recovery.rung, recovery.rewind_depth_index));
             recovery.attempts_at_rung = recovery.attempts_at_rung.saturating_add(1);
         }
@@ -2890,7 +2818,7 @@ mod tests {
                     .fault_height
                     .map_or(fault_height, |prior| prior.max(fault_height)),
             );
-            recovery.fold_fault(SyncRepair::Rewind, false, policy);
+            recovery.fold_fault(SyncRepair::Rewind, policy);
             recovery.attempts_at_rung = recovery.attempts_at_rung.saturating_add(1);
             rungs.push((recovery.rung, recovery.rewind_depth_index));
 
@@ -2947,69 +2875,36 @@ mod tests {
     }
 
     #[test]
-    fn environment_fault_streak_escalates_retry_to_park() {
-        let ladder = drive_ladder([SyncRepair::Retry, SyncRepair::Retry], one_strike_policy());
-        assert_eq!(ladder, vec![(SyncRepair::Retry, 0), (SyncRepair::Park, 0)]);
-        assert!(
-            !ladder.iter().any(|(rung, _)| matches!(
-                rung,
-                SyncRepair::Rewind | SyncRepair::RescanFromBirthday
-            )),
-            "an environment streak must never reach a state-repair rung"
-        );
-    }
-
-    #[test]
-    fn restartable_streak_gets_the_wider_threshold() {
-        let policy = SyncRecoveryPolicy::default()
-            .with_escalate_after_faults(1)
-            .with_restartable_escalate_after_faults(3);
+    fn environment_fault_streak_holds_at_retry_under_the_capped_backoff() {
+        let policy = one_strike_policy();
         let mut recovery = RecoveryState::entering(SyncRepair::Retry, 0);
-        for _ in 0..3 {
-            let escalation = recovery.fold_fault(SyncRepair::Retry, true, policy);
+        for _ in 0..50 {
+            let escalation = recovery.fold_fault(SyncRepair::Retry, policy);
             assert_eq!(
                 escalation, None,
-                "a rotation streak below the wider threshold must not escalate"
+                "an environment streak must never escalate"
             );
+            assert_eq!(recovery.rung, SyncRepair::Retry);
             recovery.attempts_at_rung = recovery.attempts_at_rung.saturating_add(1);
         }
-        let escalation = recovery.fold_fault(SyncRepair::Retry, true, policy);
-        assert_eq!(
-            escalation,
-            Some((SyncRepair::Retry, SyncRepair::Park)),
-            "the streak must still escalate once it reaches the wider threshold"
-        );
+        assert_eq!(recovery.consecutive_faults, 50);
+        assert_eq!(recovery.backoff_ms, policy.fault_backoff_cap_ms);
     }
 
     #[test]
-    fn a_single_non_restartable_fault_reverts_to_the_strict_threshold() {
-        let policy = SyncRecoveryPolicy::default()
-            .with_escalate_after_faults(1)
-            .with_restartable_escalate_after_faults(10);
-        let mut recovery = RecoveryState::entering(SyncRepair::Retry, 0);
-        let escalation = recovery.fold_fault(SyncRepair::Retry, true, policy);
-        assert_eq!(escalation, None);
-        recovery.attempts_at_rung = recovery.attempts_at_rung.saturating_add(1);
-
-        let escalation = recovery.fold_fault(SyncRepair::Retry, false, policy);
-        assert_eq!(
-            escalation,
-            Some((SyncRepair::Retry, SyncRepair::Park)),
-            "a genuine retryable fault must not inherit the rotation streak's leniency"
+    fn operator_fault_parks_immediately_even_mid_retry_streak() {
+        let ladder = drive_ladder(
+            [SyncRepair::Retry, SyncRepair::Retry, SyncRepair::Park],
+            one_strike_policy(),
         );
-    }
-
-    #[test]
-    fn escalate_from_retry_parks_unless_a_state_fault_was_seen() {
-        let mut environment = RecoveryState::entering(SyncRepair::Retry, 0);
-        escalate(&mut environment);
-        assert_eq!(environment.rung, SyncRepair::Park);
-
-        let mut with_state_fault = RecoveryState::entering(SyncRepair::Retry, 0);
-        with_state_fault.max_classified = SyncRepair::Rewind;
-        escalate(&mut with_state_fault);
-        assert_eq!(with_state_fault.rung, SyncRepair::Rewind);
-        assert_eq!(with_state_fault.rewind_depth_index, 0);
+        assert_eq!(
+            ladder,
+            vec![
+                (SyncRepair::Retry, 0),
+                (SyncRepair::Retry, 0),
+                (SyncRepair::Park, 0)
+            ]
+        );
     }
 
     #[test]
