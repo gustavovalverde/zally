@@ -259,7 +259,7 @@ The contract surface Zally publishes, grouped by domain. Each item is a guarante
 - **SYNC-3**: Reorg handling: on continuity error, automatic rollback to the longest common prefix; emit `WalletEvent::ReorgDetected`.
 - **SYNC-4**: Configurable confirmation depth per receiver purpose (default 1 for non-coinbase, mandatory 100 for coinbase per ZIP-213).
 - **SYNC-5**: `WalletEvent` async stream for `ShieldedReceiveObserved`, `TransactionConfirmed`, `ReorgDetected`, `ScanProgress`.
-- **SYNC-6**: `SyncDriver` performs one immediate catch-up, then starts wallet sync only for delivered chain events or explicit expired-cursor reconciliation. Timer ticks are limited to bounded reconnect, backoff, park, and reprobe work.
+- **SYNC-6**: `SyncDriver` performs one immediate catch-up, then starts wallet sync only for delivered chain events or explicit expired-cursor reconciliation. Timer ticks are limited to bounded stream reconnect, backoff, and scan-park reprobe work. Stream-open failures never park the driver; the first successful reopen after a failure streak triggers one catch-up sync.
 - **SYNC-7**: `Wallet::status_snapshot() -> WalletStatus` reports `SyncStatus`, scan height, observed tip, lag, subscriber count, and circuit-breaker state.
 - **SYNC-8**: `Wallet::open_or_create_account(...) -> (Wallet, AccountId)` opens the sealed-seed account or creates it on a fresh storage volume.
 - **SYNC-9**: `Wallet::sync(...)` refreshes wallet-owned transparent UTXOs through `ChainSource::transparent_utxos` because compact blocks do not expose transparent receive details.

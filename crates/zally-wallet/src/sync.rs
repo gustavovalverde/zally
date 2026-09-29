@@ -354,8 +354,8 @@ pub struct SyncFault {
     pub repair: SyncRepair,
     /// Unix milliseconds when the fault was observed.
     pub occurred_at_ms: u64,
-    /// Consecutive ladder faults up to and including this one. `0` when the fault did not
-    /// enter the ladder (chain-event stream interruptions; polling keeps sync healthy).
+    /// Consecutive faults in the current streak up to and including this one: scan-ladder
+    /// faults, or failed chain-event stream opens and mid-stream errors (which never escalate).
     pub consecutive_faults: u32,
 }
 
@@ -373,6 +373,9 @@ pub enum SyncDriverPhase {
     Waiting,
     /// Degraded and self-healing: the driver observed a fault and applies `repair` before
     /// the next sync attempt.
+    ///
+    /// Not a freshness signal: while the chain-event stream is down no sync runs, so
+    /// `last_observation` ages out.
     Recovering {
         /// Repair rung the driver applies before the next attempt.
         repair: SyncRepair,
@@ -613,27 +616,9 @@ struct DriverState {
     last_observation: Option<SyncObservation>,
     last_fault: Option<SyncFault>,
     recovery: Option<RecoveryState>,
-    cursor_recovery_pending: bool,
+    catch_up_pending: bool,
     stream_consecutive_faults: u32,
     stream_next_attempt_at_ms: u64,
-    stream_reprobe: StreamReprobe,
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-enum StreamReprobe {
-    #[default]
-    Inactive,
-    ParkedWithoutDeadline,
-    At(u64),
-}
-
-impl StreamReprobe {
-    const fn deadline(self) -> Option<u64> {
-        match self {
-            Self::At(deadline) => Some(deadline),
-            Self::Inactive | Self::ParkedWithoutDeadline => None,
-        }
-    }
 }
 
 impl DriverState {
@@ -930,18 +915,24 @@ async fn run_sync_driver(
                 return close_sync_driver(&ctx, &state).await;
             }
             _ = poll.tick() => {
-                should_sync = handle_poll_tick(
-                    &ctx,
-                    &mut state,
-                    &mut chain_events,
-                    &mut chain_events_start,
-                )
-                .await;
+                tokio::select! {
+                    _ = &mut close_rx => {
+                        return close_sync_driver(&ctx, &state).await;
+                    }
+                    wake = handle_poll_tick(
+                        &ctx,
+                        &mut state,
+                        &mut chain_events,
+                        &mut chain_events_start,
+                    ) => should_sync = wake,
+                }
             }
             chain_event = next_chain_event_envelope(&mut chain_events) => {
                 match chain_event {
                     Some(Ok(envelope)) => {
                         chain_events_start = ChainEventStreamStart::AfterCursor(envelope.cursor);
+                        state.stream_consecutive_faults = 0;
+                        state.stream_next_attempt_at_ms = 0;
                         should_sync = state.parked().is_none();
                     }
                     Some(Err(err)) => {
@@ -987,23 +978,10 @@ async fn handle_poll_tick(
         publish_snapshot(ctx.status_tx, refreshed);
         return false;
     }
-    if chain_events.is_none() {
-        let now = current_unix_ms();
-        match state.stream_reprobe {
-            StreamReprobe::ParkedWithoutDeadline => return false,
-            StreamReprobe::At(deadline) if now < deadline => return false,
-            StreamReprobe::At(_) => {
-                state.stream_reprobe = StreamReprobe::Inactive;
-                state.stream_consecutive_faults = 0;
-                state.stream_next_attempt_at_ms = 0;
-            }
-            StreamReprobe::Inactive => {}
-        }
-        if now >= state.stream_next_attempt_at_ms {
-            *chain_events = open_chain_events(ctx, state, start).await;
-        }
+    if chain_events.is_none() && current_unix_ms() >= state.stream_next_attempt_at_ms {
+        *chain_events = open_chain_events(ctx, state, start).await;
     }
-    std::mem::take(&mut state.cursor_recovery_pending)
+    std::mem::take(&mut state.catch_up_pending)
 }
 
 async fn close_sync_driver(ctx: &DriverContext<'_>, state: &DriverState) {
@@ -1546,38 +1524,17 @@ async fn record_stream_fault(
     state.stream_consecutive_faults = state.stream_consecutive_faults.saturating_add(1);
     let backoff_ms = backoff_for(ctx.options.recovery, state.stream_consecutive_faults);
     state.stream_next_attempt_at_ms = now.saturating_add(backoff_ms);
-    let should_park = state.stream_consecutive_faults >= ctx.options.recovery.escalate_after_faults;
-    if should_park {
-        state.stream_reprobe = ctx
-            .options
-            .recovery
-            .park_reprobe_ms
-            .map_or(StreamReprobe::ParkedWithoutDeadline, |hold_ms| {
-                StreamReprobe::At(now.saturating_add(hold_ms))
-            });
-    }
     let fault = SyncFault {
         reason: error.to_string(),
-        repair: if should_park {
-            SyncRepair::Park
-        } else {
-            SyncRepair::Retry
-        },
+        repair: SyncRepair::Retry,
         occurred_at_ms: now,
         consecutive_faults: state.stream_consecutive_faults,
     };
     state.last_fault = Some(fault);
-    let phase = if should_park {
-        SyncDriverPhase::Parked {
-            since_ms: now,
-            reprobe_at_ms: state.stream_reprobe.deadline(),
-        }
-    } else {
-        SyncDriverPhase::Recovering {
-            repair: SyncRepair::Retry,
-            attempt: state.stream_consecutive_faults,
-            next_attempt_at_ms: state.stream_next_attempt_at_ms,
-        }
+    let phase = SyncDriverPhase::Recovering {
+        repair: SyncRepair::Retry,
+        attempt: state.stream_consecutive_faults,
+        next_attempt_at_ms: state.stream_next_attempt_at_ms,
     };
     let snapshot = build_snapshot(ctx, phase, state).await;
     publish_snapshot(ctx.status_tx, snapshot);
@@ -1703,10 +1660,8 @@ async fn open_chain_events(
     match ctx.chain.chain_event_envelopes(start.clone()).await {
         Ok(stream) => {
             let recovered_stream = state.stream_consecutive_faults > 0;
-            state.stream_consecutive_faults = 0;
-            state.stream_next_attempt_at_ms = 0;
-            state.stream_reprobe = StreamReprobe::Inactive;
             if recovered_stream {
+                state.catch_up_pending = true;
                 state.last_fault = None;
                 let snapshot = build_snapshot(ctx, SyncDriverPhase::Waiting, state).await;
                 publish_snapshot(ctx.status_tx, snapshot);
@@ -1715,7 +1670,7 @@ async fn open_chain_events(
         }
         Err(err) if is_expired_cursor(&err) => {
             *start = ChainEventStreamStart::EarliestRetained;
-            state.cursor_recovery_pending = true;
+            state.catch_up_pending = true;
             None
         }
         Err(err) => {
