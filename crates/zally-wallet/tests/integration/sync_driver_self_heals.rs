@@ -3,6 +3,7 @@
 //! the handle is alive.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -120,7 +121,7 @@ async fn park_reprobes_and_rearms_the_ladder() -> Result<(), TestError> {
     } = create_test_wallet().await?;
     let network = wallet.network();
 
-    let chain = Arc::new(ShiftingNetworkChain::new(network));
+    let chain = Arc::new(ScriptedChain::new(network));
     let driver = SyncDriver::new(
         wallet,
         Arc::clone(&chain) as Arc<dyn ChainSource>,
@@ -183,6 +184,158 @@ async fn park_reprobes_and_rearms_the_ladder() -> Result<(), TestError> {
 }
 
 #[tokio::test]
+async fn stream_open_failures_never_park_and_keep_reconnecting() -> Result<(), TestError> {
+    let TestWalletFixture {
+        temp: _temp,
+        wallet,
+        account_id: _account_id,
+    } = create_test_wallet().await?;
+    let network = wallet.network();
+
+    let chain = Arc::new(ScriptedChain::new(network));
+    chain.set_stream_available(false);
+    let backoff_cap_ms = 4;
+    let driver = SyncDriver::new(
+        wallet,
+        Arc::clone(&chain) as Arc<dyn ChainSource>,
+        SyncDriverOptions::default()
+            .with_poll_interval_ms(5)
+            .with_recovery_policy(
+                SyncRecoveryPolicy::default()
+                    .with_fault_backoff_initial_ms(1)
+                    .with_fault_backoff_cap_ms(backoff_cap_ms)
+                    .with_park_reprobe_ms(None),
+            ),
+    )?;
+    let handle = driver.sync_continuously();
+    let mut snapshots = handle.observe_status();
+
+    let mut saw_parked = false;
+    let streaking = wait_for_snapshot(&mut snapshots, |snapshot| {
+        saw_parked |= matches!(snapshot.phase, SyncDriverPhase::Parked { .. });
+        matches!(
+            snapshot.phase,
+            SyncDriverPhase::Recovering { attempt, .. } if attempt >= 12
+        )
+    })
+    .await?;
+    assert!(!saw_parked, "stream faults must never park the driver");
+    let SyncDriverPhase::Recovering {
+        repair,
+        next_attempt_at_ms,
+        ..
+    } = streaking.phase
+    else {
+        return Err(TestError::UnexpectedPhase);
+    };
+    assert_eq!(repair, SyncRepair::Retry);
+    assert!(
+        next_attempt_at_ms <= streaking.published_at_ms + backoff_cap_ms,
+        "reconnect backoff must stay within the cap"
+    );
+    assert_eq!(
+        streaking.last_fault.as_ref().map(|fault| fault.repair),
+        Some(SyncRepair::Retry)
+    );
+
+    let opens_before = chain.stream_open_count();
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert!(
+        chain.stream_open_count() > opens_before,
+        "the driver must keep reconnecting"
+    );
+    let latest = wait_for_snapshot(&mut snapshots, |_snapshot| true).await?;
+    assert!(!matches!(latest.phase, SyncDriverPhase::Parked { .. }));
+
+    handle.close().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn close_returns_promptly_while_a_stream_open_hangs() -> Result<(), TestError> {
+    let TestWalletFixture {
+        temp: _temp,
+        wallet,
+        account_id: _account_id,
+    } = create_test_wallet().await?;
+    let network = wallet.network();
+
+    let chain = Arc::new(ScriptedChain::new(network));
+    chain.set_stream_available(false);
+    chain.set_stream_open_hangs_after(1);
+    let driver = SyncDriver::new(
+        wallet,
+        Arc::clone(&chain) as Arc<dyn ChainSource>,
+        SyncDriverOptions::default().with_poll_interval_ms(10),
+    )?;
+    let handle = driver.sync_continuously();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while chain.stream_open_count() < 2 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .map_err(|_elapsed| TestError::CatchUpTimedOut)?;
+    tokio::time::timeout(Duration::from_millis(250), handle.close())
+        .await
+        .map_err(|_elapsed| TestError::CloseTimedOut)??;
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn stream_recovery_runs_catch_up_sync_without_a_new_block() -> Result<(), TestError> {
+    let TestWalletFixture {
+        temp: _temp,
+        wallet,
+        account_id: _account_id,
+    } = create_test_wallet().await?;
+    let network = wallet.network();
+
+    let chain = Arc::new(ScriptedChain::new(network));
+    chain.set_stream_available(false);
+    let driver = SyncDriver::new(
+        wallet,
+        Arc::clone(&chain) as Arc<dyn ChainSource>,
+        SyncDriverOptions::default()
+            .with_poll_interval_ms(10)
+            .with_recovery_policy(
+                SyncRecoveryPolicy::default()
+                    .with_fault_backoff_initial_ms(1)
+                    .with_fault_backoff_cap_ms(5),
+            ),
+    )?;
+    let handle = driver.sync_continuously();
+    let mut snapshots = handle.observe_status();
+
+    wait_for_snapshot(&mut snapshots, |snapshot| {
+        matches!(
+            snapshot.phase,
+            SyncDriverPhase::Recovering { attempt, .. } if attempt >= 4
+        )
+    })
+    .await?;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let syncs_before_recovery = chain.current_epoch_count();
+
+    chain.set_stream_available(true);
+    wait_for_snapshot(&mut snapshots, |snapshot| {
+        snapshot.phase == SyncDriverPhase::Waiting && snapshot.last_fault.is_none()
+    })
+    .await?;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while chain.current_epoch_count() <= syncs_before_recovery {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .map_err(|_elapsed| TestError::CatchUpTimedOut)?;
+
+    handle.close().await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn status_stream_keeps_yielding_while_parked_until_close() -> Result<(), TestError> {
     let TestWalletFixture {
         temp: _temp,
@@ -191,7 +344,7 @@ async fn status_stream_keeps_yielding_while_parked_until_close() -> Result<(), T
     } = create_test_wallet().await?;
     let network = wallet.network();
 
-    let chain = Arc::new(ShiftingNetworkChain::new(network));
+    let chain = Arc::new(ScriptedChain::new(network));
     let driver = SyncDriver::new(
         wallet,
         Arc::clone(&chain) as Arc<dyn ChainSource>,
@@ -267,35 +420,64 @@ async fn close_returns_promptly_during_fault_backoff() -> Result<(), TestError> 
     Ok(())
 }
 
-/// `ChainSource` whose reported network can be shifted after construction.
+/// `ChainSource` whose reported network can be shifted and whose chain-event stream can be
+/// made unavailable after construction.
 ///
-/// The driver's construction-time network check passes, then every sync fails with
-/// `WalletError::NetworkMismatch`: a parking dead end.
-struct ShiftingNetworkChain {
+/// Shifting the network makes every sync fail with `WalletError::NetworkMismatch` after the
+/// driver's construction-time check passes: a parking dead end. Making the stream
+/// unavailable fails every stream open while syncs keep succeeding.
+struct ScriptedChain {
     inner: MockChainSource,
     reported_network: Mutex<Network>,
+    is_stream_available: AtomicBool,
+    hanging_open_threshold: AtomicUsize,
+    stream_open_count: AtomicUsize,
+    current_epoch_count: AtomicUsize,
 }
 
-impl ShiftingNetworkChain {
+impl ScriptedChain {
     fn new(network: Network) -> Self {
         Self {
             inner: MockChainSource::new(network),
             reported_network: Mutex::new(network),
+            is_stream_available: AtomicBool::new(true),
+            hanging_open_threshold: AtomicUsize::new(usize::MAX),
+            stream_open_count: AtomicUsize::new(0),
+            current_epoch_count: AtomicUsize::new(0),
         }
     }
 
     fn report_network(&self, network: Network) {
         *self.reported_network.lock() = network;
     }
+
+    fn set_stream_available(&self, is_available: bool) {
+        self.is_stream_available
+            .store(is_available, Ordering::SeqCst);
+    }
+
+    fn set_stream_open_hangs_after(&self, open_count: usize) {
+        self.hanging_open_threshold
+            .store(open_count, Ordering::SeqCst);
+    }
+
+    fn stream_open_count(&self) -> usize {
+        self.stream_open_count.load(Ordering::SeqCst)
+    }
+
+    fn current_epoch_count(&self) -> usize {
+        self.current_epoch_count.load(Ordering::SeqCst)
+    }
 }
 
 #[async_trait]
-impl ChainSource for ShiftingNetworkChain {
+impl ChainSource for ScriptedChain {
     fn network(&self) -> Network {
         *self.reported_network.lock()
     }
 
     async fn current_epoch(&self) -> Result<ChainEpoch, ChainSourceError> {
+        self.current_epoch_count.fetch_add(1, Ordering::SeqCst);
         self.inner.current_epoch().await
     }
 
@@ -345,6 +527,15 @@ impl ChainSource for ShiftingNetworkChain {
         &self,
         start: ChainEventStreamStart,
     ) -> Result<ChainEventEnvelopeStream, ChainSourceError> {
+        let prior_opens = self.stream_open_count.fetch_add(1, Ordering::SeqCst);
+        if prior_opens >= self.hanging_open_threshold.load(Ordering::SeqCst) {
+            std::future::pending::<()>().await;
+        }
+        if !self.is_stream_available.load(Ordering::SeqCst) {
+            return Err(ChainSourceError::Unavailable {
+                reason: "synthetic chain-event stream outage".into(),
+            });
+        }
         self.inner.chain_event_envelopes(start).await
     }
 }
@@ -363,4 +554,6 @@ enum TestError {
     UnexpectedPhase,
     #[error("timed out waiting for sync driver close")]
     CloseTimedOut,
+    #[error("timed out waiting for the catch-up sync after stream recovery")]
+    CatchUpTimedOut,
 }
