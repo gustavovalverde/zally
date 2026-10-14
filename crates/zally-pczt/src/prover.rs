@@ -8,6 +8,7 @@
 use std::sync::OnceLock;
 
 use pczt::roles::{prover::Prover as UpstreamProver, updater::Updater};
+use rand::{rand_core::UnwrapErr, rngs::SysRng};
 use zally_core::Network;
 use zally_keys::SeedMaterial;
 use zcash_keys::keys::UnifiedSpendingKey;
@@ -71,7 +72,7 @@ impl Prover {
         let mut prover = UpstreamProver::new(pczt);
         if prover.requires_orchard_proof() {
             prover = prover
-                .create_orchard_proof(orchard_proving_key(consensus_branch_id)?)
+                .create_orchard_proof(UnwrapErr(SysRng), orchard_proving_key(consensus_branch_id)?)
                 .map_err(|err| PcztError::UpstreamFailed {
                     reason: format!("orchard proof creation failed: {err:?}"),
                     is_retryable: false,
@@ -79,7 +80,7 @@ impl Prover {
         }
         if prover.requires_ironwood_proof() {
             prover = prover
-                .create_ironwood_proof(ironwood_proving_key())
+                .create_ironwood_proof(UnwrapErr(SysRng), ironwood_proving_key())
                 .map_err(|err| PcztError::UpstreamFailed {
                     reason: format!("ironwood proof creation failed: {err:?}"),
                     is_retryable: false,
@@ -89,7 +90,7 @@ impl Prover {
             let sapling_prover =
                 LocalTxProver::with_default_location().ok_or(PcztError::ProverUnavailable)?;
             prover = prover
-                .create_sapling_proofs(&sapling_prover, &sapling_prover)
+                .create_sapling_proofs(UnwrapErr(SysRng), &sapling_prover, &sapling_prover)
                 .map_err(|err| PcztError::UpstreamFailed {
                     reason: format!("sapling proof creation failed: {err:?}"),
                     is_retryable: false,
@@ -119,7 +120,7 @@ fn add_sapling_proof_generation_keys(
             for index in spend_indices {
                 updater.update_spend_with(index, |mut spend_updater| {
                     spend_updater
-                        .set_proof_generation_key(usk.sapling().expsk.proof_generation_key())
+                        .set_proof_generation_key(usk.sapling().expsk().proof_generation_key())
                 })?;
             }
 

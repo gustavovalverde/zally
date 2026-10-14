@@ -9,7 +9,7 @@ use orchard::{
     },
 };
 use pasta_curves::pallas;
-use rand_core::{CryptoRng, RngCore};
+use rand_core::{CryptoRng, Rng};
 use redjubjub::{SigningKey, SpendAuth, VerificationKey};
 use sapling::{
     Anchor, MerklePath, PaymentAddress, ProofGenerationKey, Rseed,
@@ -304,7 +304,7 @@ pub fn prove_disclosure<SpendProverT, RngT>(
 ) -> Result<PaymentDisclosure, PaymentDisclosureProductionError>
 where
     SpendProverT: SpendProver,
-    RngT: RngCore + CryptoRng,
+    RngT: Rng + CryptoRng,
 {
     let PaymentDisclosurePlan {
         transaction_id,
@@ -316,7 +316,7 @@ where
     let expected_ak = SpendValidatingKey::from(ask);
     let mut unsigned_spends = Vec::with_capacity(sapling_spends.len());
     for spend in sapling_spends {
-        if spend.proof_generation_key.ak != expected_ak {
+        if spend.proof_generation_key.ak() != &expected_ak {
             return Err(
                 PaymentDisclosureProductionError::SpendAuthorizingKeyMismatch {
                     index: spend.index,
@@ -396,7 +396,7 @@ pub fn sign_ironwood_disclosure<RngT>(
     rng: &mut RngT,
 ) -> Result<PaymentDisclosure, PaymentDisclosureProductionError>
 where
-    RngT: RngCore + CryptoRng,
+    RngT: Rng + CryptoRng,
 {
     let IronwoodDisclosurePlan {
         transaction_id,
@@ -469,13 +469,13 @@ fn prove_sapling_spend<SpendProverT, RngT>(
 ) -> Result<UnsignedSaplingSpend, PaymentDisclosureProductionError>
 where
     SpendProverT: SpendProver,
-    RngT: RngCore + CryptoRng,
+    RngT: Rng + CryptoRng,
 {
     let alpha = jubjub::Fr::random(&mut *rng);
     let rcv = ValueCommitTrapdoor::random(&mut *rng);
     let note_amount = NoteValue::from_raw(spend.amount_zat);
     let cv = ValueCommitment::derive(note_amount, rcv.clone());
-    let rk = spend.proof_generation_key.ak.randomize(&alpha);
+    let rk = spend.proof_generation_key.ak().randomize(&alpha);
     let randomized_ask = ask.randomize(&alpha);
     if VerificationKey::from(&randomized_ask) != rk {
         return Err(
@@ -565,7 +565,8 @@ mod tests {
 
     #[test]
     fn spend_signature_binds_the_message_and_network() -> Result<(), Box<dyn std::error::Error>> {
-        let spending_key = ExtendedSpendingKey::master(&[7; 32]);
+        let spending_key =
+            ExtendedSpendingKey::master(&[7; 32]).ok_or("invalid fixture spending key")?;
         let (_, recipient) = spending_key.default_address();
         let node = Option::from(Node::from_bytes([0; 32])).ok_or("invalid fixture node")?;
         let witness = MerklePath::from_parts(vec![node; 32], Position::from(0))
@@ -579,7 +580,7 @@ mod tests {
                 recipient,
                 50_000,
                 Rseed::AfterZip212([9; 32]),
-                spending_key.expsk.proof_generation_key(),
+                spending_key.expsk().proof_generation_key(),
                 sapling::Anchor::from(sapling::Node::from_scalar(bls12_381::Scalar::from(11))),
                 witness,
             )],
@@ -587,7 +588,7 @@ mod tests {
         )?;
         let disclosure = prove_disclosure(
             plan,
-            &spending_key.expsk.ask,
+            spending_key.expsk().ask(),
             &MockSpendProver,
             &mut StdRng::from_seed([3; 32]),
         )?;

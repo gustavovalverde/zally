@@ -90,6 +90,11 @@ path = "examples/live-zinder-probe/main.rs"
 required-features = ["zinder"]
 
 [[example]]
+name = "readme-quickstart"
+path = "examples/readme-quickstart/main.rs"
+required-features = ["zinder"]
+
+[[example]]
 name = "e2e-ironwood-probe"
 path = "examples/e2e-ironwood-probe/main.rs"
 required-features = ["zinder"]

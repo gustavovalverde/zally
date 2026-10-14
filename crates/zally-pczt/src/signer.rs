@@ -7,7 +7,8 @@
 //! and calling `Signer::sign_transparent`.
 
 use pczt::roles::signer::{Error as UpstreamSignerError, Signer as UpstreamSigner};
-use secp256k1::{PublicKey, Secp256k1, SecretKey, SignOnly};
+use rand::{rand_core::UnwrapErr, rngs::SysRng};
+use secp256k1::{PublicKey, SecretKey};
 use zally_core::{Network, TransparentGapLimit};
 use zally_keys::SeedMaterial;
 use zcash_keys::keys::UnifiedSpendingKey;
@@ -113,10 +114,10 @@ fn sign_sapling_spends(
     usk: &UnifiedSpendingKey,
     spend_count: usize,
 ) -> Result<usize, PcztError> {
-    let ask = usk.sapling().expsk.ask.clone();
+    let ask = usk.sapling().expsk().ask().clone();
     let mut authorized = 0_usize;
     for index in 0..spend_count {
-        match signer.sign_sapling(index, &ask) {
+        match signer.sign_sapling(UnwrapErr(SysRng), index, &ask) {
             Ok(()) => authorized += 1,
             Err(UpstreamSignerError::SaplingSign(
                 sapling::pczt::SignerError::WrongSpendAuthorizingKey,
@@ -148,7 +149,7 @@ fn sign_orchard_spends(
     let ask = orchard::keys::SpendAuthorizingKey::from(&spending_key);
     let mut authorized = 0_usize;
     for index in 0..spend_count {
-        match signer.sign_orchard(index, &ask) {
+        match signer.sign_orchard(UnwrapErr(SysRng), index, &ask) {
             Ok(()) => authorized += 1,
             Err(UpstreamSignerError::OrchardSign(
                 orchard::pczt::SignerError::WrongSpendAuthorizingKey,
@@ -180,7 +181,7 @@ fn sign_ironwood_spends(
     let ask = orchard::keys::SpendAuthorizingKey::from(&spending_key);
     let mut authorized = 0_usize;
     for index in 0..spend_count {
-        match signer.sign_ironwood(index, &ask) {
+        match signer.sign_ironwood(UnwrapErr(SysRng), index, &ask) {
             Ok(()) => authorized += 1,
             Err(UpstreamSignerError::IronwoodSign(
                 orchard::pczt::SignerError::WrongSpendAuthorizingKey,
@@ -204,11 +205,10 @@ fn sign_transparent_spends(
     if script_pubkeys.is_empty() {
         return Ok(0);
     }
-    let secp = Secp256k1::signing_only();
     let candidates = derive_candidate_transparent_keys(account_sk)?;
     let mut authorized = 0_usize;
     for (index, script) in script_pubkeys.iter().enumerate() {
-        if let Some(sk) = match_script_to_key(&secp, script, &candidates) {
+        if let Some(sk) = match_script_to_key(script, &candidates) {
             signer
                 .sign_transparent(index, sk)
                 .map_err(|err| PcztError::UpstreamFailed {
@@ -242,12 +242,11 @@ fn derive_candidate_transparent_keys(
 }
 
 fn match_script_to_key<'a>(
-    secp: &Secp256k1<SignOnly>,
     script_pubkey: &[u8],
     candidates: &'a [SecretKey],
 ) -> Option<&'a SecretKey> {
     for sk in candidates {
-        let pubkey = PublicKey::from_secret_key(secp, sk);
+        let pubkey = PublicKey::from_secret_key(sk);
         let address = TransparentAddress::from_pubkey(&pubkey);
         if p2pkh_script_pubkey(&address).as_slice() == script_pubkey {
             return Some(sk);

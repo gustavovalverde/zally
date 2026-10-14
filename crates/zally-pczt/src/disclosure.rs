@@ -4,7 +4,7 @@ use pczt::roles::verifier::{
     OrchardError as PcztOrchardError, SaplingError as PcztSaplingError,
     TransparentError as PcztTransparentError, Verifier,
 };
-use rand::rngs::OsRng;
+use rand::{rand_core::UnwrapErr, rngs::SysRng};
 use zally_core::{FailurePosture, Network, PaymentRecipient, TxId, Zatoshis};
 use zally_keys::SeedMaterial;
 use zcash_keys::address::Address;
@@ -81,6 +81,7 @@ pub fn export_payment_disclosure(
             .map_err(|err| PaymentDisclosureExportError::KeyDerivationFailed {
                 reason: err.to_string(),
             })?;
+    let mut rng = UnwrapErr(SysRng);
     match plan.profile {
         PaymentDisclosureProfile::Zip311Draft1 => {
             let requested_recipient = Address::decode(&params, plan.recipient.encoded())
@@ -99,9 +100,9 @@ pub fn export_payment_disclosure(
             )?;
             prove_disclosure(
                 production_plan,
-                &spending_key.sapling().expsk.ask,
+                spending_key.sapling().expsk().ask(),
                 &prover,
-                &mut OsRng,
+                &mut rng,
             )
             .map_err(Into::into)
         }
@@ -132,7 +133,7 @@ pub fn export_payment_disclosure(
                 verified_source.ironwood_spends,
                 vec![verified_source.selected_output],
             )?;
-            sign_ironwood_disclosure(production_plan, &ask, &mut OsRng).map_err(Into::into)
+            sign_ironwood_disclosure(production_plan, &ask, &mut rng).map_err(Into::into)
         }
         _ => Err(PaymentDisclosureExportError::ProfileUnsupported),
     }
