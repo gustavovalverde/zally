@@ -143,10 +143,9 @@ pub enum ChainSourceError {
 
     /// The chain source returned a tree-state anchor at a height other than
     /// the one requested. The chain-source contract requires
-    /// `tree_state_at(h)` to land at exactly `h` (or a height within the
-    /// wallet's rewind cap that the wallet can realign to). This variant
-    /// fires when a custom chain source violates the cadence contract from
-    /// ADR-0005 and the wallet cannot recover.
+    /// `tree_state_at(h)` to land at exactly `h`. This variant fires when a
+    /// custom chain source violates the cadence contract from ADR-0005 and the
+    /// wallet cannot recover.
     ///
     /// Posture: [`FailurePosture::RequiresOperator`]. The operator must
     /// investigate the chain source: re-querying yields the same answer.

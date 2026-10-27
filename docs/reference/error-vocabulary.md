@@ -40,6 +40,7 @@ Only `retryable` moves the breaker's failure counter, and only a call that compl
 | `PaymentDisclosureExport` | Mirrors `PaymentDisclosureExportError` | A retained PCZT could not produce the requested disclosure profile. |
 | `PaymentDisclosureSourceMissing` | `not_retryable` | No finalized PCZT was retained for the transaction. |
 | `CircuitBroken` | `retryable` | The wallet IO circuit breaker is open. |
+| `ChainSourceHalted` | `retryable` | The sync driver found the chain source stopped following the chain, so new spends are refused; retry once the driver reports the source recovered. |
 | `SyncDriverFailed` | Carries `FailurePosture` | The sync driver failed outside a wallet operation. Cancellation surfaces `Retryable`; panic surfaces `RequiresOperator`. |
 
 ## ChainSourceError
@@ -54,6 +55,7 @@ Only `retryable` moves the breaker's failure counter, and only a call that compl
 | `ContractRevisionUnsupported` | `requires_operator` | The endpoint contract revision is older than revision 2. |
 | `ChainEpochPinUnavailable` | `restartable` | The pinned epoch expired; restart the wallet sync against a fresh epoch. |
 | `ChainEventCursorExpired` | `restartable` | Reconcile the wallet against a fresh epoch, then subscribe from the earliest retained event. |
+| `ChainEventCursorInvalid` | `not_retryable` | The source did not issue the resume cursor; discard it and subscribe from the earliest retained event. |
 | `MalformedCompactBlock` | `requires_operator` | The source returned bytes that did not decode; investigate the upstream version. |
 | `CompactBlockStreamOrder` | `requires_operator` | A compact-block range was incomplete, duplicated, or out of order. |
 | `TreeStateAnchorHeightMismatch` | `requires_operator` | A tree-state artifact did not match the exact requested anchor height. |

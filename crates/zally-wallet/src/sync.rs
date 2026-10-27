@@ -530,6 +530,13 @@ impl SyncSnapshotStream {
 /// falls back to polling, repeatedly calls [`Wallet::sync`] until the observed tip is
 /// reached, and publishes [`SyncSnapshot`] values.
 ///
+/// The driver records the cursor of every chain event it has applied and resumes after it,
+/// so a reorg announced while the host was stopped is applied on the next start. A
+/// `ChainReorged` event rewinds the wallet to its fork point before the next scan. Once
+/// caught up, the driver reconciles the payment ledger: it resubmits reverted withdrawals
+/// through the submitter given to [`SyncDriver::with_submitter`] and releases the
+/// idempotency keys of sent transactions that can no longer be mined.
+///
 /// The driver task is infallible while its handle is alive. Faults engage the escalating
 /// repair ladder ([`SyncRepair`]) instead of killing the task; the task exits only through
 /// [`SyncHandle::close`].
@@ -2125,7 +2132,8 @@ impl Wallet {
     ///
     /// Reorg safety comes from the spend-time confirmation depth (ZIP 315); scan-time
     /// divergences (`ChainReorgDetected`, `CommitmentTreeConflict`,
-    /// [`WalletError::TreeRootsDiverged`]) surface as errors that the [`SyncDriver`] repairs
+    /// [`WalletError::TreeRootsDiverged`]) surface as errors. The [`SyncDriver`] rewinds an
+    /// announced reorg at its fork point before scanning, and repairs any other divergence
     /// by rewinding or rebuilding derived state.
     ///
     /// Fails closed on network mismatch. Emits `ScanProgress` events at the start and end of
@@ -2387,13 +2395,13 @@ impl Wallet {
         Ok(())
     }
 
-    /// Rewinds the wallet's derived state to exactly `rewind_to` using the chain's tree
-    /// state at that height.
+    /// Rewinds the wallet's derived state to exactly `rewind_to`, at any depth, using the
+    /// chain's tree state at that height.
     ///
-    /// One rung of the sync driver's repair ladder: truncates below a divergence via
-    /// [`WalletStorage::revert_blocks_above`] (which lands the wallet at exactly the
-    /// target height) and publishes [`WalletEvent::ReorgDetected`] so hosts observe the
-    /// rollback. The next sync re-plans from the rewound frontier.
+    /// One rung of the sync driver's repair ladder for divergences no chain event
+    /// announced. It goes through [`Wallet::revert_to_height`], so the rewind reports what
+    /// left the chain and records the reverted broadcasts. The next sync re-plans from the
+    /// rewound frontier.
     pub(crate) async fn rewind_to_height(
         &self,
         chain: &dyn ChainSource,
