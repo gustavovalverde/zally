@@ -183,6 +183,10 @@ impl ZinderChainSource {
             } => ChainSourceError::ChainEventCursorExpired {
                 recovery: ChainEventCursorRecovery::EarliestRetained,
             },
+            zinder_client::IndexerError::RemoteFailure {
+                reason: zinder_client::ErrorReason::ChainEventCursorInvalid,
+                ..
+            } => ChainSourceError::ChainEventCursorInvalid,
             other => ChainSourceError::Indexer(other),
         }
     }
@@ -982,5 +986,27 @@ mod tests {
                 Err(ChainSourceError::NetworkMismatch { .. })
             ));
         }
+    }
+
+    #[test]
+    fn chain_event_cursor_rejections_map_to_typed_recoveries() {
+        assert!(matches!(
+            ZinderChainSource::map_indexer_error(zinder_client::IndexerError::RemoteFailure {
+                reason: zinder_client::ErrorReason::ChainEventCursorInvalid,
+                message: "cursor issued by another store".to_owned(),
+                retry_policy: zinder_client::RetryPolicy::ClientError,
+            }),
+            ChainSourceError::ChainEventCursorInvalid
+        ));
+        assert!(matches!(
+            ZinderChainSource::map_indexer_error(
+                zinder_client::IndexerError::ChainEventCursorExpired {
+                    recovery: ZinderChainEventCursorRecovery::EarliestRetained,
+                }
+            ),
+            ChainSourceError::ChainEventCursorExpired {
+                recovery: ChainEventCursorRecovery::EarliestRetained,
+            }
+        ));
     }
 }

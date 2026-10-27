@@ -121,6 +121,16 @@ pub enum ChainSourceError {
         recovery: crate::ChainEventCursorRecovery,
     },
 
+    /// The source does not recognize the resume cursor: it was issued by another store, for
+    /// another network, or is corrupt.
+    ///
+    /// Posture: [`FailurePosture::NotRetryable`] for the subscription that carried it. The
+    /// sync driver discards the cursor and subscribes from the earliest retained event;
+    /// scan-time continuity checks catch any reorg the discarded position would have
+    /// announced.
+    #[error("chain event cursor is not recognized by the source")]
+    ChainEventCursorInvalid,
+
     /// The source returned a protocol variant this Zally build does not understand.
     ///
     /// Posture: [`FailurePosture::RequiresOperator`]. Upgrade Zally before interpreting the
@@ -245,9 +255,9 @@ impl ChainSourceError {
             Self::ChainEpochPinUnavailable | Self::ChainEventCursorExpired { .. } => {
                 FailurePosture::Restartable
             }
-            Self::BlockHeightBelowFloor { .. } | Self::BlockHeightAboveVisibleTip { .. } => {
-                FailurePosture::NotRetryable
-            }
+            Self::BlockHeightBelowFloor { .. }
+            | Self::BlockHeightAboveVisibleTip { .. }
+            | Self::ChainEventCursorInvalid => FailurePosture::NotRetryable,
             Self::NetworkMismatch { .. }
             | Self::CapabilitiesUnavailable { .. }
             | Self::ContractRevisionUnsupported { .. }
@@ -393,6 +403,10 @@ mod tests {
                     recovery: crate::ChainEventCursorRecovery::EarliestRetained,
                 },
                 FailurePosture::Restartable,
+            ),
+            (
+                ChainSourceError::ChainEventCursorInvalid,
+                FailurePosture::NotRetryable,
             ),
             (
                 ChainSourceError::CapabilitiesUnavailable {
