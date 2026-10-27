@@ -154,6 +154,28 @@ async fn rc4_wallet_keeps_its_account_identity() -> Result<(), TestError> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rc4_idempotency_ledger_gains_the_unmineable_state() -> Result<(), TestError> {
+    let (storage, _account_id, _temp) = open_fixture_copy().await?;
+    let key = zally_core::IdempotencyKey::try_from("rc4-payout").map_err(|_| TestError::Fixture)?;
+    let unmineable = TxId::from_bytes([0x5c_u8; 32]);
+    let replacement = TxId::from_bytes([0x5d_u8; 32]);
+    storage
+        .record_idempotent_submission(key.clone(), unmineable)
+        .await?;
+    storage
+        .record_unmineable_transaction(unmineable, BlockHeight::from(4_009_999))
+        .await?;
+    storage
+        .record_idempotent_submission(key.clone(), replacement)
+        .await?;
+    assert_eq!(
+        storage.find_idempotent_submission(&key).await?,
+        Some(replacement)
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn rc4_wallet_keeps_its_exposed_addresses() -> Result<(), TestError> {
     let (storage, account_id, _temp) = open_fixture_copy().await?;
     let params = Network::Testnet.to_parameters();

@@ -1,5 +1,7 @@
-//! Regression: `Wallet::get_pending_transparent_inputs` reflects rows recorded directly via
-//! storage, honours the configured inflight window, and clears on confirmation.
+//! Regression: `Wallet::get_pending_transparent_inputs` reflects rows recorded via storage.
+//!
+//! It flags rows older than the configured window as stale and keeps every row that the chain
+//! has not settled, however old.
 
 use zally_chain::ChainSource as _;
 use zally_core::{BlockHeight, OutPoint, TxId, Zatoshis};
@@ -70,11 +72,13 @@ async fn get_pending_transparent_inputs_reports_recorded_rows() -> Result<(), Te
     assert_eq!(entry.broadcast_at_ms, now_ms);
     assert_eq!(entry.broadcast_at_height, Some(BlockHeight::from(42)));
     assert_eq!(entry.value_zat.as_u64(), 12_345);
+    assert!(!entry.is_stale);
     Ok(())
 }
 
 #[tokio::test]
-async fn get_pending_transparent_inputs_drops_rows_outside_window() -> Result<(), TestError> {
+async fn get_pending_transparent_inputs_flags_rows_outside_window_as_stale() -> Result<(), TestError>
+{
     let options = WalletOptions::default().with_pending_broadcast_window_ms(60_000);
     let TestWalletFixture {
         temp,
@@ -100,15 +104,14 @@ async fn get_pending_transparent_inputs_drops_rows_outside_window() -> Result<()
         .await?;
 
     let snapshot = wallet.get_pending_transparent_inputs(account_id).await?;
-    assert!(
-        snapshot.inputs.is_empty(),
-        "stale rows must fall outside the window"
-    );
+    assert_eq!(snapshot.inputs.len(), 1, "stale rows stay in the snapshot");
+    assert!(snapshot.inputs[0].is_stale);
     Ok(())
 }
 
 #[tokio::test]
-async fn sync_clears_expired_pending_broadcast_rows() -> Result<(), TestError> {
+async fn sync_keeps_old_pending_broadcast_rows_the_chain_has_not_settled() -> Result<(), TestError>
+{
     let options = WalletOptions::default().with_pending_broadcast_window_ms(60_000);
     let TestWalletFixture {
         temp,
@@ -143,9 +146,9 @@ async fn sync_clears_expired_pending_broadcast_rows() -> Result<(), TestError> {
     let _ = chain.current_epoch().await;
 
     let after_sync = storage.list_pending_broadcast_inputs(account_id, 0).await?;
-    assert!(
-        after_sync.is_empty(),
-        "sync must drop expired rows via clear_expired_pending_broadcast_inputs"
+    assert_eq!(
+        after_sync, direct_rows,
+        "wall-clock age never retires a pending broadcast"
     );
     Ok(())
 }

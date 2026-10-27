@@ -54,6 +54,7 @@ The custody example [`crates/zally-wallet/examples/custody-with-pczt/main.rs`](.
 | `PcztError::CombineConflict` | Quorum members signed different proposals. | Rebuild from a single canonical proposal. |
 | `PcztError::NotFinalized` | Extractor called before proving or signing completed. | Check the prove, sign, and combine steps ran successfully. |
 | `SubmitterError::NodeUnavailable { is_retryable: true }` | Node down. | Retry; idempotency is preserved by the persisted `tx_id`. |
+| `WalletError::TransactionUnmineable` | The PCZT expired, or was created for a consensus branch the chain has left, such as before NU7 activated. The wallet released its inputs. | Build a new PCZT with `Wallet::propose_pczt`; signing the old one again cannot repair it. If any copy of the old PCZT was extracted and broadcast elsewhere, confirm it was not mined before sending again. |
 
 ## Operator checklist
 

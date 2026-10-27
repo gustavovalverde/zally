@@ -137,7 +137,8 @@ pub enum WalletError {
     ///
     /// Signatures commit to the consensus branch, so signing it again cannot repair it:
     /// recreate it from a new proposal. Before returning, the wallet released the inputs it
-    /// held for a PCZT it created.
+    /// held for a PCZT it created. For a PCZT, the verdict assumes this wallet is its sole
+    /// broadcaster; a copy broadcast elsewhere may already be mined.
     ///
     /// Posture: [`FailurePosture::NotRetryable`].
     #[error("transaction can never be mined ({reason}); recreate it, do not sign it again")]

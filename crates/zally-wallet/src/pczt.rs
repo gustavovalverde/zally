@@ -6,6 +6,11 @@
 //! `Wallet::extract_pczt` extracts a finalized PCZT and persists the transaction
 //! in the wallet DB. `Wallet::extract_and_submit_pczt` additionally broadcasts it
 //! via the supplied `Submitter`.
+//!
+//! Each role refuses a PCZT that can never be mined, such as one created before a network
+//! upgrade activated, and releases its inputs. That verdict is safe only while this wallet is
+//! the PCZT's sole broadcaster: a copy extracted and broadcast elsewhere may already be mined,
+//! and recreating its payment would pay twice.
 
 use zally_chain::Submitter;
 use zally_core::{BlockHeight, Network, TxId};
@@ -58,6 +63,7 @@ impl Wallet {
     /// A PCZT that can never be mined, such as one created before a network upgrade that has
     /// since activated, fails with [`WalletError::TransactionUnmineable`] before the seed is
     /// unsealed, and the inputs held for it are released.
+    /// The verdict is safe only while this wallet is the PCZT's sole broadcaster.
     ///
     /// `not_retryable` on no-matching-keys, an unmineable PCZT, or upstream signer error;
     /// `retryable` on transient sealing I/O.
@@ -85,6 +91,7 @@ impl Wallet {
     ///
     /// A PCZT that can never be mined fails with [`WalletError::TransactionUnmineable`]
     /// before any proof is created, and the inputs held for it are released.
+    /// The verdict is safe only while this wallet is the PCZT's sole broadcaster.
     ///
     /// `requires_operator` on missing Sapling proving parameters; `not_retryable` on
     /// malformed PCZT contents or an unmineable PCZT; `retryable` on transient sealing I/O.
@@ -147,6 +154,7 @@ impl Wallet {
     ///
     /// A PCZT that can never be mined fails with [`WalletError::TransactionUnmineable`]
     /// before its transaction is stored, and the inputs held for it are released.
+    /// The verdict is safe only while this wallet is the PCZT's sole broadcaster.
     ///
     /// `not_retryable` on malformed, incomplete, or unmineable PCZTs; `requires_operator` when
     /// Sapling verifying parameters are unavailable; `retryable` on transient storage I/O.
@@ -171,6 +179,7 @@ impl Wallet {
     ///
     /// A PCZT that can never be mined fails with [`WalletError::TransactionUnmineable`]
     /// before its transaction is stored or submitted, and the inputs held for it are released.
+    /// The verdict is safe only while this wallet is the PCZT's sole broadcaster.
     ///
     /// `not_retryable` on malformed or unmineable PCZTs, missing prover params, or submitter
     /// rejection; `retryable` on transient submitter or storage I/O.

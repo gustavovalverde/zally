@@ -16,6 +16,7 @@ use crate::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig, CircuitBreake
 use crate::error::WalletError;
 use crate::event::{WalletEvent, WalletEventStream};
 use crate::hold::{Hold, LockedNotesSummary};
+use crate::idempotency_key_locks::IdempotencyKeyLocks;
 use crate::options::WalletOptions;
 use crate::retry::RetryPolicy;
 use crate::sync::fetch_prior_chain_state;
@@ -42,6 +43,7 @@ pub(crate) struct WalletInner {
     pub(crate) retry_policy: Mutex<RetryPolicy>,
     pub(crate) circuit_breaker: CircuitBreaker,
     pub(crate) options: WalletOptions,
+    pub(crate) idempotency_key_locks: IdempotencyKeyLocks,
 }
 
 impl Wallet {
@@ -224,11 +226,14 @@ impl Wallet {
             .collect())
     }
 
-    /// Returns the snapshot of transparent outpoints recorded for recent wallet-owned
-    /// broadcasts that have not yet been observed mined.
+    /// Returns the snapshot of transparent outpoints recorded for wallet-owned broadcasts whose
+    /// fate the chain has not settled.
     ///
-    /// The snapshot honours [`WalletOptions::pending_broadcast_window_ms`]: entries whose
-    /// `broadcast_at_ms` falls outside the window is excluded from this operator read view.
+    /// An entry stays until [`Wallet::sync`] sees its broadcast mined at a settled height, or
+    /// judges it unmineable and reports it through
+    /// [`WalletEvent::PendingBroadcastUnmineable`]. An entry broadcast longer ago than
+    /// [`WalletOptions::pending_broadcast_window_ms`] is flagged
+    /// [`is_stale`](crate::PendingTransparentInput::is_stale), never dropped.
     /// librustzcash's lock, persisted-spend, and transaction-expiry state independently
     /// determines whether an outpoint is eligible for selection.
     ///
@@ -237,12 +242,12 @@ impl Wallet {
         &self,
         account_id: AccountId,
     ) -> Result<crate::pending_transparent_inputs::PendingTransparentInputs, WalletError> {
-        let after_at_ms =
+        let stale_before_ms =
             current_unix_ms().saturating_sub(self.inner.options.pending_broadcast_window_ms);
         let rows = self
             .inner
             .storage
-            .list_pending_broadcast_inputs(account_id, after_at_ms)
+            .list_pending_broadcast_inputs(account_id, 0)
             .await
             .map_err(WalletError::from)?;
         let as_of_height = self
@@ -253,7 +258,7 @@ impl Wallet {
             .map_err(WalletError::from)?;
         let inputs = rows
             .into_iter()
-            .map(translate_pending_broadcast_input)
+            .map(|row| translate_pending_broadcast_input(row, stale_before_ms))
             .collect();
         Ok(
             crate::pending_transparent_inputs::PendingTransparentInputs {
@@ -748,6 +753,7 @@ where
         retry_policy: Mutex::new(RetryPolicy::default()),
         circuit_breaker: CircuitBreaker::new(CircuitBreakerConfig::default()),
         options,
+        idempotency_key_locks: IdempotencyKeyLocks::default(),
     });
     Wallet { inner }
 }
@@ -882,6 +888,7 @@ fn select_locked_notes(
 
 fn translate_pending_broadcast_input(
     row: zally_storage::PendingBroadcastInputRow,
+    stale_before_ms: u64,
 ) -> crate::pending_transparent_inputs::PendingTransparentInput {
     crate::pending_transparent_inputs::PendingTransparentInput {
         outpoint: row.outpoint,
@@ -889,6 +896,7 @@ fn translate_pending_broadcast_input(
         broadcast_tx_id: row.broadcast_tx_id,
         broadcast_at_ms: row.broadcast_at_ms,
         broadcast_at_height: row.broadcast_at_height,
+        is_stale: row.broadcast_at_ms < stale_before_ms,
     }
 }
 

@@ -355,6 +355,13 @@ impl Wallet {
     /// transaction bytes through the supplied `Submitter`. Returns the first txid; multi-step
     /// proposals submit each step in order and return the first.
     ///
+    /// `plan.idempotency` makes the send idempotent. A key that already names a transaction
+    /// returns that transaction instead of building another, while the transaction is pending
+    /// or mined. Once [`Wallet::sync`] judges it unmineable and reports
+    /// [`WalletEvent::PendingBroadcastUnmineable`](crate::WalletEvent::PendingBroadcastUnmineable),
+    /// the same key builds one replacement. Sends that share a key through one wallet handle
+    /// run one at a time, so concurrent retries return the same transaction.
+    ///
     /// `not_retryable` on validation failure, insufficient balance, or missing prover
     /// params; `retryable` on transient submitter failures.
     #[allow(
@@ -375,6 +382,11 @@ impl Wallet {
             });
         }
 
+        let _key_guard = self
+            .inner
+            .idempotency_key_locks
+            .lock(&plan.idempotency)
+            .await;
         if let Some(prior_tx_id) = self
             .inner
             .storage
@@ -527,6 +539,13 @@ impl Wallet {
     /// caller should run [`Wallet::sync`] first so transparent UTXOs have been refreshed from
     /// the configured [`zally_chain::ChainSource`].
     ///
+    /// `plan.idempotency` makes the send idempotent. A key that already names a transaction
+    /// returns that transaction instead of building another, while the transaction is pending
+    /// or mined. Once [`Wallet::sync`] judges it unmineable and reports
+    /// [`WalletEvent::PendingBroadcastUnmineable`](crate::WalletEvent::PendingBroadcastUnmineable),
+    /// the same key builds one replacement. Sends that share a key through one wallet handle
+    /// run one at a time, so concurrent retries return the same transaction.
+    ///
     /// `not_retryable` on insufficient transparent funds or missing prover params;
     /// `retryable` on transient submitter failures.
     pub async fn shield_transparent_funds(
@@ -541,6 +560,11 @@ impl Wallet {
             });
         }
 
+        let _key_guard = self
+            .inner
+            .idempotency_key_locks
+            .lock(&plan.idempotency)
+            .await;
         if let Some(prior_tx_id) = self
             .inner
             .storage

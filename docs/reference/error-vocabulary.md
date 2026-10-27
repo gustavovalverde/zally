@@ -34,7 +34,7 @@ Only `retryable` moves the breaker's failure counter, and only a call that compl
 | `PaymentRequestParseFailed` | `not_retryable` | ZIP-321 URI parsing failed. |
 | `ProposalRejected` | Follows `ProposalRejectionKind` | The proposal or its transaction could not be built; `kind` says why. |
 | `SubmissionRejected` | `not_retryable` | The node rejected the submitted transaction. |
-| `TransactionUnmineable` | `not_retryable` | A PCZT can never be mined, so it was refused before signing, proving, or extraction and its inputs were released; `reason` is the `UnmineableReason`. Recreate it; signing it again cannot repair it. |
+| `TransactionUnmineable` | `not_retryable` | A PCZT can never be mined, so it was refused before signing, proving, or extraction and its inputs were released; `reason` is the `UnmineableReason`. Recreate it; signing it again cannot repair it. The verdict assumes the wallet is the PCZT's sole broadcaster. |
 | `SubmittedTransactionIdMismatch` | `requires_operator` | A success-kind submitter response returned a transaction ID different from the submitted transaction bytes. |
 | `Pczt` | Mirrors `PcztError` | A PCZT role failed. |
 | `PaymentDisclosureExport` | Mirrors `PaymentDisclosureExportError` | A retained PCZT could not produce the requested disclosure profile. |
@@ -83,7 +83,7 @@ Only `retryable` moves the breaker's failure counter, and only a call that compl
 
 ## UnmineableReason
 
-Returned by `TransactionHeader::check_mineable` and carried by `WalletError::TransactionUnmineable`. Every reason means the same thing to the caller: recreate the transaction from a new proposal.
+Returned by `TransactionHeader::check_mineable` and carried by `WalletError::TransactionUnmineable`. Every reason means the same thing to the caller: recreate the transaction from a new proposal. When `Wallet::sync` reaches the same verdict for a pending broadcast, it reports `WalletEvent::PendingBroadcastUnmineable` instead of an error, and the broadcast's idempotency key then builds the replacement.
 
 | Reason | Meaning |
 |--------|---------|
@@ -103,7 +103,7 @@ Returned by `TransactionHeader::check_mineable` and carried by `WalletError::Tra
 | `BlockingTaskFailed` | `retryable` | A blocking storage task was cancelled or panicked. |
 | `KeyDerivationFailed` | `not_retryable` | Deterministic key derivation failed inside storage. |
 | `ProverUnavailable` | `requires_operator` | Sapling proving parameters are missing from the configured paths or the platform-default location. |
-| `IdempotencyKeyConflict` | `not_retryable` | A send idempotency key already maps to a different transaction. |
+| `IdempotencyKeyConflict` | `not_retryable` | A send idempotency key already maps to a different transaction that can still be mined. A key whose transaction was recorded as unmineable is rebound instead. |
 | `FinalizedPcztConflict` | `not_retryable` | A transaction ID is already bound to different finalized PCZT bytes. |
 | `PcztLockOwnerMissing` | `not_retryable` | A PCZT supplied for abandonment was not created by this Zally storage and lacks its owner-scoped recovery token. |
 | `PcztLockOwnerMalformed` | `not_retryable` | A PCZT carries a Zally lock-owner field that is not exactly 32 bytes. |

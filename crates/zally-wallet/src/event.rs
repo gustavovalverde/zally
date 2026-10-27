@@ -97,9 +97,11 @@ pub enum WalletEvent {
         /// Fault description safe for logs and status pages.
         reason: String,
     },
-    /// A wallet-owned broadcast can never be mined, and the wallet dropped the pending inputs
-    /// it recorded for it. librustzcash keeps those inputs out of new proposals until the
-    /// broadcast's expiry height passes.
+    /// A wallet-owned broadcast can never be mined. Emitted once per broadcast.
+    ///
+    /// The wallet dropped the pending inputs it recorded for it, and the idempotency key that
+    /// produced it now builds a replacement on its next send. librustzcash keeps the
+    /// broadcast's inputs out of new proposals until its expiry height passes.
     ///
     /// The broadcast expired, or it was signed for a consensus branch or with a version that
     /// the chain no longer accepts, for example because a network upgrade activated while it
