@@ -2,8 +2,8 @@
 
 use async_trait::async_trait;
 use zally_core::{
-    AccountId, BlockHeight, CompactBlockArtifact, HoldId, IdempotencyKey, Network, OutPoint,
-    TreeStateArtifact, TxId, Zatoshis,
+    AccountId, BlockHash, BlockHeight, CompactBlockArtifact, HoldId, IdempotencyKey, Network,
+    OutPoint, TreeStateArtifact, TxId, Zatoshis,
 };
 
 /// The storage backend behind a wallet handle.
@@ -38,6 +38,7 @@ use crate::error::StorageError;
 use crate::exposed_address_row::ExposedAddressRow;
 use crate::hold_row::{HeldNote, HoldRow};
 use crate::pending_broadcast_input_row::PendingBroadcastInputRow;
+use crate::reverted_broadcast_row::RevertedBroadcastRow;
 
 /// Request body for [`WalletStorage::scan_blocks`].
 ///
@@ -435,6 +436,16 @@ pub struct PendingBroadcastTransaction {
     pub mined_height: Option<BlockHeight>,
 }
 
+/// Wallet activity a [`WalletStorage::revert_blocks_above`] call un-mined.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[non_exhaustive]
+pub struct RevertedBlocks {
+    /// Shielded notes received in a reverted block, each with the height it was mined at.
+    pub receives: Vec<ReceivedShieldedNoteRow>,
+    /// Wallet transactions mined in a reverted block, with the height each was mined at.
+    pub transactions: Vec<(TxId, BlockHeight)>,
+}
+
 /// Trait abstracting the wallet database.
 ///
 /// Every implementation returns [`StorageError`]; backends with a native error type translate
@@ -467,18 +478,20 @@ pub trait WalletStorage: Send + Sync + 'static {
         prior_chain_state: TreeStateArtifact,
     ) -> Result<AccountId, StorageError>;
 
-    /// Deletes the wallet database and recreates it with a fresh account for `seed`,
-    /// anchored at `prior_chain_state`, in one atomic storage operation.
+    /// Rebuilds the wallet database with a fresh account for `seed`, anchored at
+    /// `prior_chain_state`, and keeps the payment ledger.
     ///
     /// The deepest rung of the sync driver's repair ladder: wallet chain state is
     /// disposable derived state, so when it can no longer be reconciled with the chain
     /// (for example a note commitment tree conflict that a bounded rewind cannot clear)
     /// the repair is to rebuild from the birthday.
     ///
-    /// This discards ALL wallet-local state, including the zally ledger: send idempotency
-    /// records, holds, and pending broadcasts are gone. Derived chain state is rebuilt by
-    /// rescan; the ledger is not. Hosts that need cross-rebuild idempotency must keep
-    /// their own ledger.
+    /// Every piece of derived chain state starts fresh: scanned blocks, notes, commitment
+    /// trees, the scan queue, recorded chain tips, and the transactions the wallet knew.
+    /// The payment ledger survives: send idempotency records, holds, finalized PCZTs,
+    /// pending PCZT and broadcast inputs, reverted broadcasts awaiting reconciliation, and
+    /// the chain-event cursor. The replacement is built beside the live database and
+    /// swapped in only once complete, so a failure leaves the prior wallet in place.
     ///
     /// The returned [`AccountId`] equals the one the discarded database held for the same
     /// seed: account identity is key identity, not database identity.
@@ -942,22 +955,81 @@ pub trait WalletStorage: Send + Sync + 'static {
         account_id: AccountId,
     ) -> Result<AccountBalanceRow, StorageError>;
 
-    /// Truncates the wallet precisely to the supplied chain state, inserting that frontier
-    /// as a checkpoint at its exact height and rewinding to it.
+    /// Rewinds the wallet to exactly `chain_state`'s height because the blocks above it left
+    /// the chain.
     ///
-    /// Wraps `WalletWrite::truncate_to_chain_state`. It lands the wallet at exactly
-    /// `chain_state.block_height()` (rather than snapping down to the nearest existing wallet
-    /// checkpoint), so reorg recovery does not re-open a gap below the rewind target. The
-    /// caller fetches the chain state for the rewind height from the chain source. The
-    /// librustzcash backend bounds a valid rewind at the `COINBASE_MATURITY` window (100
-    /// blocks); a deeper target fails `NotRetryable` and the caller surfaces it to the
-    /// operator.
+    /// Wraps `WalletWrite::truncate_to_chain_state`, which lands the wallet at exactly
+    /// `chain_state.block_height()` at any depth: when the target lies below the oldest
+    /// retained checkpoint it inserts the supplied frontier as a new checkpoint first. The
+    /// caller fetches the chain state for the target from the chain source.
     ///
-    /// `not_retryable` on schema errors; `retryable` on transient I/O.
-    async fn truncate_to_chain_state(
+    /// The same database transaction records every wallet-sent transaction mined above the
+    /// target in the reverted-broadcast ledger ([`Self::list_reverted_broadcasts`]) and, when
+    /// `applied_cursor` is supplied, records it as the chain-event cursor. A crash therefore
+    /// keeps either the prior wallet and cursor or every effect of the rewind.
+    ///
+    /// Returns the receives and transactions the truncation un-mined. Un-mined receives
+    /// leave [`Self::list_shielded_receives_for_account`] until a scan mines them again.
+    ///
+    /// `not_retryable` on commitment-tree or schema errors; `retryable` on transient I/O.
+    async fn revert_blocks_above(
         &self,
         chain_state: TreeStateArtifact,
+        applied_cursor: Option<Vec<u8>>,
+    ) -> Result<RevertedBlocks, StorageError>;
+
+    /// Returns the highest block height the wallet has scanned, including blocks above a gap
+    /// that [`Self::fully_scanned_height`] still waits on.
+    ///
+    /// `not_retryable` on schema errors; `retryable` on transient I/O.
+    async fn find_highest_scanned_height(&self) -> Result<Option<BlockHeight>, StorageError>;
+
+    /// Returns the hash of the block the wallet scanned at `height`, or `None` when the
+    /// wallet holds no block there.
+    ///
+    /// `not_retryable` on schema errors; `retryable` on transient I/O.
+    async fn find_scanned_block_hash(
+        &self,
+        height: BlockHeight,
+    ) -> Result<Option<BlockHash>, StorageError>;
+
+    /// Returns the opaque chain-event cursor recorded after the most recently applied chain
+    /// event, if any.
+    ///
+    /// `not_retryable` on schema errors; `retryable` on transient I/O.
+    async fn find_chain_event_cursor(&self) -> Result<Option<Vec<u8>>, StorageError>;
+
+    /// Records `cursor_bytes` as the position after the most recently applied chain event.
+    ///
+    /// `not_retryable` on schema errors; `retryable` on transient I/O.
+    async fn record_chain_event_cursor(&self, cursor_bytes: Vec<u8>) -> Result<(), StorageError>;
+
+    /// Forgets the recorded chain-event cursor.
+    ///
+    /// `not_retryable` on schema errors; `retryable` on transient I/O.
+    async fn clear_chain_event_cursor(&self) -> Result<(), StorageError>;
+
+    /// Returns every wallet-sent transaction a rewind removed from the chain that is not yet
+    /// reconciled, oldest reversion first.
+    ///
+    /// `not_retryable` on schema errors; `retryable` on transient I/O.
+    async fn list_reverted_broadcasts(&self) -> Result<Vec<RevertedBroadcastRow>, StorageError>;
+
+    /// Records that the reverted broadcast `tx_id` was submitted again at
+    /// `resubmitted_at_ms`.
+    ///
+    /// `not_retryable` on schema errors; `retryable` on transient I/O.
+    async fn record_reverted_broadcast_resubmitted(
+        &self,
+        tx_id: TxId,
+        resubmitted_at_ms: u64,
     ) -> Result<(), StorageError>;
+
+    /// Removes the reverted broadcast `tx_id` and its pending-broadcast input rows once it
+    /// is mined again or has expired.
+    ///
+    /// `not_retryable` on schema errors; `retryable` on transient I/O.
+    async fn clear_reverted_broadcast(&self, tx_id: TxId) -> Result<(), StorageError>;
 
     /// Returns every Sapling, Orchard, and Ironwood note received in the inclusive height range
     /// `[from_height, to_height]`, regardless of current spent state.

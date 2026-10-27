@@ -25,9 +25,9 @@ use shardtree::store::{Checkpoint, ShardStore};
 use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
 use zally_core::{
-    AccountId, BlockHeight, CompactBlockArtifact, CompactShieldedAction, CompactTransaction,
-    FailurePosture, HoldId, IdempotencyKey, Network, NetworkParameters, TransparentGapLimit,
-    TreeStateArtifact, TxId, Zatoshis,
+    AccountId, BlockHash, BlockHeight, CompactBlockArtifact, CompactShieldedAction,
+    CompactTransaction, FailurePosture, HoldId, IdempotencyKey, Network, NetworkParameters,
+    TransparentGapLimit, TreeStateArtifact, TxId, Zatoshis,
 };
 use zally_keys::{KeyDerivationError, SeedMaterial, derive_ufvk};
 use zcash_address::unified::Revision;
@@ -393,6 +393,18 @@ impl Sqlite {
         .await
     }
 
+    async fn with_db_mut_and_ledger<F, T>(&self, work: F) -> Result<T, StorageError>
+    where
+        F: FnOnce(&mut Db, &rusqlite::Connection) -> Result<T, StorageError> + Send + 'static,
+        T: Send + 'static,
+    {
+        self.dispatch(move |state, _options| match state {
+            WalletDbState::NotOpened => Err(StorageError::NotOpened),
+            WalletDbState::Opened { db, ledger } => work(db.as_mut(), ledger.as_ref()),
+        })
+        .await
+    }
+
     async fn with_db_and_ledger<F, T>(&self, work: F) -> Result<T, StorageError>
     where
         F: FnOnce(&Db, &rusqlite::Connection) -> Result<T, StorageError> + Send + 'static,
@@ -441,7 +453,14 @@ fn run_wallet_db_actor(options: &SqliteOptions, mut request_rx: mpsc::Receiver<D
 fn open_wallet_db(
     options: &SqliteOptions,
 ) -> Result<(Box<Db>, Box<rusqlite::Connection>), StorageError> {
-    if let Some(parent) = options.db_path.parent() {
+    open_wallet_db_at(options, &options.db_path)
+}
+
+fn open_wallet_db_at(
+    options: &SqliteOptions,
+    db_path: &Path,
+) -> Result<(Box<Db>, Box<rusqlite::Connection>), StorageError> {
+    if let Some(parent) = db_path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| StorageError::SqliteFailed {
             reason: format!("could not create database directory: {e}"),
             posture: FailurePosture::NotRetryable,
@@ -453,7 +472,7 @@ fn open_wallet_db(
         options.gap_limit.internal,
         options.gap_limit.ephemeral,
     );
-    let mut db = WalletDb::for_path(&options.db_path, params, storage_clock(), storage_os_rng())
+    let mut db = WalletDb::for_path(db_path, params, storage_clock(), storage_os_rng())
         .map_err(|e| StorageError::SqliteFailed {
             reason: e.to_string(),
             posture: FailurePosture::NotRetryable,
@@ -465,7 +484,7 @@ fn open_wallet_db(
             reason: e.to_string(),
         })?;
 
-    let ledger = open_extension_ledger(&options.db_path)?;
+    let ledger = open_extension_ledger(db_path)?;
 
     Ok((Box::new(db), Box::new(ledger)))
 }
@@ -531,7 +550,20 @@ fn open_extension_ledger(db_path: &Path) -> Result<rusqlite::Connection, Storage
                  WHERE finalized_tx_id IS NULL AND released_at_ms IS NULL; \
              CREATE INDEX IF NOT EXISTS idx_holds_account_active \
                  ON ext_zally_holds(account_id) \
-                 WHERE finalized_tx_id IS NULL AND released_at_ms IS NULL;",
+                 WHERE finalized_tx_id IS NULL AND released_at_ms IS NULL; \
+             CREATE TABLE IF NOT EXISTS ext_zally_chain_event_cursor (\
+                 id INTEGER PRIMARY KEY CHECK (id = 0),\
+                 cursor_bytes BLOB NOT NULL,\
+                 recorded_at_ms INTEGER NOT NULL\
+             ); \
+             CREATE TABLE IF NOT EXISTS ext_zally_reverted_broadcasts (\
+                 tx_id_bytes BLOB PRIMARY KEY NOT NULL,\
+                 raw_tx_bytes BLOB NOT NULL,\
+                 expiry_height INTEGER NOT NULL,\
+                 reverted_from_height INTEGER NOT NULL,\
+                 recorded_at_ms INTEGER NOT NULL,\
+                 resubmitted_at_ms INTEGER\
+             );",
         )
         .map_err(|e| StorageError::SqliteFailed {
             reason: format!("ext_zally schema init failed: {e}"),
@@ -568,27 +600,158 @@ fn add_idempotency_unmineable_column(ledger: &rusqlite::Connection) -> Result<()
     Ok(())
 }
 
-/// Removes the wallet database file plus its `-wal` and `-shm` siblings. The zally
-/// ledger tables live in the same file, so this discards them as well.
-fn remove_wallet_db_files(db_path: &Path) -> Result<(), StorageError> {
-    for suffix in ["", "-wal", "-shm"] {
-        let mut os_path = db_path.as_os_str().to_owned();
-        os_path.push(suffix);
-        let path = PathBuf::from(os_path);
-        match std::fs::remove_file(&path) {
-            Ok(()) => {}
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-            Err(err) => {
-                return Err(StorageError::SqliteFailed {
-                    reason: format!(
-                        "could not delete wallet database file '{}': {err}",
-                        path.display()
-                    ),
-                    posture: FailurePosture::Retryable,
-                });
-            }
-        }
+/// Ledger tables a wallet rebuild carries into the replacement database.
+///
+/// `ext_zally_chain_tips` is absent on purpose: chain tips are derived state that the next
+/// sync records again against the rebuilt scan queue.
+const LEDGER_TABLES_KEPT_ACROSS_REBUILD: [&str; 7] = [
+    "ext_zally_idempotency",
+    "ext_zally_finalized_pczts",
+    "ext_zally_pending_pczt_inputs",
+    "ext_zally_pending_broadcast_inputs",
+    "ext_zally_holds",
+    "ext_zally_chain_event_cursor",
+    "ext_zally_reverted_broadcasts",
+];
+
+/// Suffix of the sibling file a wallet rebuild writes before it replaces the live database.
+const REBUILD_FILE_SUFFIX: &str = ".rebuild";
+
+/// Sidecar suffixes `SQLite` may keep next to a database file.
+///
+/// A rollback journal or WAL left next to a replaced database would be replayed into its
+/// replacement, so every sidecar goes with the file it belongs to.
+const DATABASE_SIDECAR_SUFFIXES: [&str; 3] = ["-journal", "-wal", "-shm"];
+
+fn sibling_path(db_path: &Path, suffix: &str) -> PathBuf {
+    let mut os_path = db_path.as_os_str().to_owned();
+    os_path.push(suffix);
+    PathBuf::from(os_path)
+}
+
+fn remove_database_file(path: &Path) -> Result<(), StorageError> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(StorageError::SqliteFailed {
+            reason: format!(
+                "could not delete wallet database file '{}': {err}",
+                path.display()
+            ),
+            posture: FailurePosture::Retryable,
+        }),
     }
+}
+
+fn remove_database_sidecars(db_path: &Path) -> Result<(), StorageError> {
+    for suffix in DATABASE_SIDECAR_SUFFIXES {
+        remove_database_file(&sibling_path(db_path, suffix))?;
+    }
+    Ok(())
+}
+
+/// Rebuilds the wallet database with a fresh account in a sibling file, carries the payment
+/// ledger into it, and swaps it in place of the live file.
+///
+/// The live file stays untouched until the replacement is complete, so a failure or crash
+/// before the swap leaves the prior wallet and its ledger as they were. The caller closes
+/// every connection to the live file first.
+fn rebuild_database_with_ledger(
+    options: &SqliteOptions,
+    secret: &SecretVec<u8>,
+    prior_chain_state: ChainState,
+) -> Result<AccountId, StorageError> {
+    let rebuild_path = sibling_path(&options.db_path, REBUILD_FILE_SUFFIX);
+    remove_database_file(&rebuild_path)?;
+    remove_database_sidecars(&rebuild_path)?;
+    let account_id = {
+        let (mut db, ledger) = open_wallet_db_at(options, &rebuild_path)?;
+        let account_id = create_account_on(
+            &mut db,
+            options.network,
+            &options.account_name,
+            secret,
+            prior_chain_state,
+        )?;
+        carry_ledger_rows(&ledger, &options.db_path)?;
+        account_id
+    };
+    remove_database_sidecars(&options.db_path)?;
+    std::fs::rename(&rebuild_path, &options.db_path).map_err(|err| StorageError::SqliteFailed {
+        reason: format!(
+            "could not replace wallet database '{}' with its rebuild: {err}",
+            options.db_path.display()
+        ),
+        posture: FailurePosture::Retryable,
+    })?;
+    remove_database_sidecars(&rebuild_path)?;
+    Ok(account_id)
+}
+
+/// Columns `table` has in both the rebuilt and the prior database, comma-separated.
+///
+/// A prior ledger can predate a column added since; naming the shared columns keeps the copy
+/// independent of column order and lets the new column take its default.
+fn shared_ledger_columns(
+    connection: &rusqlite::Connection,
+    table: &str,
+) -> Result<String, rusqlite::Error> {
+    let column_names = |schema: &str| -> Result<Vec<String>, rusqlite::Error> {
+        let mut statement = connection.prepare("SELECT name FROM pragma_table_info(?1, ?2)")?;
+        let names = statement
+            .query_map([table, schema], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(names)
+    };
+    let prior_columns = column_names("prior")?;
+    Ok(column_names("main")?
+        .into_iter()
+        .filter(|column| prior_columns.contains(column))
+        .collect::<Vec<_>>()
+        .join(", "))
+}
+
+/// Copies every ledger row the rebuild keeps from the database at `prior_path` into the
+/// database `ledger` is connected to, in one transaction.
+fn carry_ledger_rows(ledger: &rusqlite::Connection, prior_path: &Path) -> Result<(), StorageError> {
+    if !prior_path.exists() {
+        return Ok(());
+    }
+    let prior_path_text = prior_path
+        .to_str()
+        .ok_or_else(|| StorageError::SqliteFailed {
+            reason: format!(
+                "wallet database path '{}' is not valid UTF-8",
+                prior_path.display()
+            ),
+            posture: FailurePosture::RequiresOperator,
+        })?;
+    let ledger_failure = |err: rusqlite::Error| StorageError::SqliteFailed {
+        reason: format!("carrying the ledger into the rebuilt wallet failed: {err}"),
+        posture: FailurePosture::NotRetryable,
+    };
+    ledger
+        .execute("ATTACH DATABASE ?1 AS prior", [prior_path_text])
+        .map_err(ledger_failure)?;
+    let copied = (|| {
+        let transaction = ledger.unchecked_transaction()?;
+        for table in LEDGER_TABLES_KEPT_ACROSS_REBUILD {
+            let columns = shared_ledger_columns(&transaction, table)?;
+            if columns.is_empty() {
+                continue;
+            }
+            transaction.execute(
+                &format!(
+                    "INSERT INTO main.{table} ({columns}) SELECT {columns} FROM prior.{table}"
+                ),
+                [],
+            )?;
+        }
+        transaction.commit()
+    })();
+    let detached = ledger.execute("DETACH DATABASE prior", []);
+    copied.map_err(ledger_failure)?;
+    detached.map_err(ledger_failure)?;
     Ok(())
 }
 
@@ -631,27 +794,22 @@ impl WalletStorage for Sqlite {
         seed: &SeedMaterial,
         prior_chain_state: TreeStateArtifact,
     ) -> Result<AccountId, StorageError> {
-        let network = self.options.network;
-        let prior_chain_state = tree_state_to_upstream(prior_chain_state, network)?;
+        let prior_chain_state = tree_state_to_upstream(prior_chain_state, self.options.network)?;
         let secret = SecretVec::new(seed.expose_secret().to_vec());
 
         self.dispatch(move |state, options| {
             *state = WalletDbState::NotOpened;
-            remove_wallet_db_files(&options.db_path)?;
-            let (mut db, ledger) = open_wallet_db(options)?;
-            let account_id = create_account_on(
-                &mut db,
-                network,
-                &options.account_name,
-                &secret,
-                prior_chain_state,
-            )?;
-            *state = WalletDbState::Opened { db, ledger };
+            let rebuilt = rebuild_database_with_ledger(options, &secret, prior_chain_state);
+            match open_wallet_db(options) {
+                Ok((db, ledger)) => *state = WalletDbState::Opened { db, ledger },
+                Err(reopen_error) => return Err(rebuilt.err().unwrap_or(reopen_error)),
+            }
+            let account_id = rebuilt?;
             tracing::warn!(
                 target: "zally::storage",
                 event = "wallet_db_recreated",
                 account_id = %account_id.as_uuid(),
-                "wallet database deleted and rebuilt with a fresh account"
+                "wallet database rebuilt with a fresh account; payment ledger kept"
             );
             Ok(account_id)
         })
@@ -923,18 +1081,220 @@ impl WalletStorage for Sqlite {
         .await
     }
 
-    async fn truncate_to_chain_state(
+    async fn revert_blocks_above(
         &self,
         chain_state: TreeStateArtifact,
-    ) -> Result<(), StorageError> {
-        let chain_state = tree_state_to_upstream(chain_state, self.options.network)?;
-        self.with_db_mut(move |db| {
-            WalletWrite::truncate_to_chain_state(db, chain_state).map_err(|err| {
-                StorageError::SqliteFailed {
-                    reason: format!("truncate_to_chain_state failed: {err}"),
-                    posture: FailurePosture::NotRetryable,
+        applied_cursor: Option<Vec<u8>>,
+    ) -> Result<crate::wallet::RevertedBlocks, StorageError> {
+        let network = self.options.network;
+        let chain_state = tree_state_to_upstream(chain_state, network)?;
+        self.with_db_mut_and_ledger(move |db, ledger| {
+            let target = chain_state.block_height();
+            let first_reverted = BlockHeight::from(u32::from(target).saturating_add(1));
+            let highest = BlockHeight::from(u32::MAX);
+            let (account_id, account_uuid) = resolve_account(db, network)?;
+            let receives = query_received_shielded_notes_in_range(
+                ledger,
+                first_reverted,
+                highest,
+                account_uuid,
+                account_id,
+            )?;
+            let transactions = query_wallet_tx_ids_mined_in_range(ledger, first_reverted, highest)?;
+            let recorded_at_ms = current_unix_ms_for_ledger();
+            db.transactionally_with_extension(|wdb, ext| {
+                ext.execute(
+                    "INSERT INTO ext_zally_reverted_broadcasts \
+                         (tx_id_bytes, raw_tx_bytes, expiry_height, reverted_from_height, \
+                          recorded_at_ms, resubmitted_at_ms) \
+                     SELECT txid, raw, IFNULL(expiry_height, 0), mined_height, ?2, NULL \
+                     FROM transactions \
+                     WHERE created IS NOT NULL AND raw IS NOT NULL AND mined_height > ?1 \
+                     ON CONFLICT (tx_id_bytes) DO UPDATE SET \
+                         reverted_from_height = excluded.reverted_from_height, \
+                         recorded_at_ms = excluded.recorded_at_ms, \
+                         resubmitted_at_ms = NULL",
+                    rusqlite::params![u32::from(target), recorded_at_ms],
+                )?;
+                WalletWrite::truncate_to_chain_state(wdb, chain_state)?;
+                if let Some(cursor_bytes) = applied_cursor.as_deref() {
+                    ext.execute(
+                        CHAIN_EVENT_CURSOR_UPSERT_SQL,
+                        rusqlite::params![cursor_bytes, recorded_at_ms],
+                    )?;
                 }
+                Ok::<_, SqliteClientError>(())
             })
+            .map_err(|err| StorageError::SqliteFailed {
+                reason: format!("revert_blocks_above failed: {err}"),
+                posture: FailurePosture::NotRetryable,
+            })?;
+            Ok(crate::wallet::RevertedBlocks {
+                receives,
+                transactions,
+            })
+        })
+        .await
+    }
+
+    async fn find_highest_scanned_height(&self) -> Result<Option<BlockHeight>, StorageError> {
+        self.with_db(move |db| {
+            let scanned = WalletRead::block_max_scanned(db).map_err(|e| map_sqlite_error(&e))?;
+            Ok(scanned.map(|metadata| BlockHeight::from(u32::from(metadata.block_height()))))
+        })
+        .await
+    }
+
+    async fn find_scanned_block_hash(
+        &self,
+        height: BlockHeight,
+    ) -> Result<Option<BlockHash>, StorageError> {
+        let target = zcash_protocol::consensus::BlockHeight::from(height.as_u32());
+        self.with_db(move |db| {
+            let hash = WalletRead::get_block_hash(db, target).map_err(|e| map_sqlite_error(&e))?;
+            Ok(hash.map(|hash| BlockHash::from_bytes(hash.0)))
+        })
+        .await
+    }
+
+    async fn find_chain_event_cursor(&self) -> Result<Option<Vec<u8>>, StorageError> {
+        self.with_ledger(move |conn| {
+            conn.query_row(
+                "SELECT cursor_bytes FROM ext_zally_chain_event_cursor WHERE id = 0",
+                [],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .optional()
+            .map_err(|err| StorageError::SqliteFailed {
+                reason: format!("ext_zally_chain_event_cursor lookup failed: {err}"),
+                posture: FailurePosture::NotRetryable,
+            })
+        })
+        .await
+    }
+
+    async fn record_chain_event_cursor(&self, cursor_bytes: Vec<u8>) -> Result<(), StorageError> {
+        let recorded_at_ms = current_unix_ms_for_ledger();
+        self.with_ledger(move |conn| {
+            conn.execute(
+                CHAIN_EVENT_CURSOR_UPSERT_SQL,
+                rusqlite::params![cursor_bytes, recorded_at_ms],
+            )
+            .map(|_| ())
+            .map_err(|err| StorageError::SqliteFailed {
+                reason: format!("ext_zally_chain_event_cursor upsert failed: {err}"),
+                posture: FailurePosture::NotRetryable,
+            })
+        })
+        .await
+    }
+
+    async fn clear_chain_event_cursor(&self) -> Result<(), StorageError> {
+        self.with_ledger(move |conn| {
+            conn.execute("DELETE FROM ext_zally_chain_event_cursor", [])
+                .map(|_| ())
+                .map_err(|err| StorageError::SqliteFailed {
+                    reason: format!("ext_zally_chain_event_cursor delete failed: {err}"),
+                    posture: FailurePosture::NotRetryable,
+                })
+        })
+        .await
+    }
+
+    async fn list_reverted_broadcasts(
+        &self,
+    ) -> Result<Vec<crate::RevertedBroadcastRow>, StorageError> {
+        self.with_ledger(move |conn| {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT r.tx_id_bytes, r.raw_tx_bytes, r.expiry_height, \
+                            r.reverted_from_height, t.mined_height, r.resubmitted_at_ms \
+                     FROM ext_zally_reverted_broadcasts r \
+                     LEFT JOIN transactions t ON t.txid = r.tx_id_bytes \
+                     ORDER BY r.recorded_at_ms ASC, r.tx_id_bytes ASC",
+                )
+                .map_err(|err| map_sqlite_error(&err))?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, Vec<u8>>(0)?,
+                        row.get::<_, Vec<u8>>(1)?,
+                        row.get::<_, u32>(2)?,
+                        row.get::<_, u32>(3)?,
+                        row.get::<_, Option<u32>>(4)?,
+                        row.get::<_, Option<i64>>(5)?,
+                    ))
+                })
+                .map_err(|err| map_sqlite_error(&err))?;
+            let mut reverted = Vec::new();
+            for row in rows {
+                let (
+                    tx_id_bytes,
+                    raw_tx_bytes,
+                    expiry_height,
+                    reverted_from_height,
+                    mined_height,
+                    resubmitted_at_ms,
+                ) = row.map_err(|err| StorageError::SqliteFailed {
+                    reason: format!("ext_zally_reverted_broadcasts row decode failed: {err}"),
+                    posture: FailurePosture::NotRetryable,
+                })?;
+                reverted.push(crate::RevertedBroadcastRow {
+                    tx_id: decode_txid_bytes(
+                        tx_id_bytes,
+                        "ext_zally_reverted_broadcasts.tx_id_bytes",
+                    )?,
+                    raw_tx_bytes,
+                    expiry_height: BlockHeight::from(expiry_height),
+                    reverted_from_height: BlockHeight::from(reverted_from_height),
+                    mined_height: mined_height.map(BlockHeight::from),
+                    resubmitted_at_ms: resubmitted_at_ms
+                        .map(|at_ms| {
+                            u64::try_from(at_ms).map_err(|_| StorageError::RowValueOutOfRange {
+                                column: "ext_zally_reverted_broadcasts.resubmitted_at_ms",
+                                raw: at_ms.to_string(),
+                            })
+                        })
+                        .transpose()?,
+                });
+            }
+            Ok(reverted)
+        })
+        .await
+    }
+
+    async fn record_reverted_broadcast_resubmitted(
+        &self,
+        tx_id: TxId,
+        resubmitted_at_ms: u64,
+    ) -> Result<(), StorageError> {
+        let resubmitted_at_ms = clamp_unsigned_to_i64(resubmitted_at_ms);
+        self.with_ledger(move |conn| {
+            conn.execute(
+                "UPDATE ext_zally_reverted_broadcasts SET resubmitted_at_ms = ?2 \
+                 WHERE tx_id_bytes = ?1",
+                rusqlite::params![tx_id.as_bytes().as_slice(), resubmitted_at_ms],
+            )
+            .map(|_| ())
+            .map_err(|err| map_sqlite_error(&err))
+        })
+        .await
+    }
+
+    async fn clear_reverted_broadcast(&self, tx_id: TxId) -> Result<(), StorageError> {
+        self.with_ledger(move |conn| {
+            let transaction = conn
+                .unchecked_transaction()
+                .map_err(|err| map_sqlite_error(&err))?;
+            for statement in [
+                "DELETE FROM ext_zally_reverted_broadcasts WHERE tx_id_bytes = ?1",
+                "DELETE FROM ext_zally_pending_broadcast_inputs WHERE broadcast_tx_id = ?1",
+            ] {
+                transaction
+                    .execute(statement, [tx_id.as_bytes().as_slice()])
+                    .map_err(|err| map_sqlite_error(&err))?;
+            }
+            transaction.commit().map_err(|err| map_sqlite_error(&err))
         })
         .await
     }
@@ -1515,57 +1875,8 @@ impl WalletStorage for Sqlite {
         start: BlockHeight,
         end: BlockHeight,
     ) -> Result<Vec<(TxId, BlockHeight)>, StorageError> {
-        let start_h = i64::from(start.as_u32());
-        let end_h = i64::from(end.as_u32());
-        self.with_ledger(move |conn| {
-            let mut stmt = conn
-                .prepare(
-                    "SELECT txid, mined_height FROM transactions \
-                     WHERE mined_height BETWEEN ?1 AND ?2 \
-                     ORDER BY mined_height ASC, id_tx ASC",
-                )
-                .map_err(|err| StorageError::SqliteFailed {
-                    reason: format!("transactions range query prepare failed: {err}"),
-                    posture: FailurePosture::NotRetryable,
-                })?;
-            let rows = stmt
-                .query_map([start_h, end_h], |row| {
-                    let txid_bytes: Vec<u8> = row.get(0)?;
-                    let mined_height: i64 = row.get(1)?;
-                    Ok((txid_bytes, mined_height))
-                })
-                .map_err(|err| StorageError::SqliteFailed {
-                    reason: format!("transactions range query failed: {err}"),
-                    posture: FailurePosture::NotRetryable,
-                })?;
-            let mut entries = Vec::new();
-            for row in rows {
-                let (txid_bytes, mined_height) = row.map_err(|err| StorageError::SqliteFailed {
-                    reason: format!("transactions row decode failed: {err}"),
-                    posture: FailurePosture::NotRetryable,
-                })?;
-                let array: [u8; 32] =
-                    txid_bytes
-                        .try_into()
-                        .map_err(|raw: Vec<u8>| StorageError::SqliteFailed {
-                            reason: format!(
-                                "transactions.txid had wrong byte length: {}",
-                                raw.len()
-                            ),
-                            posture: FailurePosture::NotRetryable,
-                        })?;
-                let height =
-                    u32::try_from(mined_height).map_err(|_| StorageError::SqliteFailed {
-                        reason: format!(
-                            "transactions.mined_height out of u32 range: {mined_height}"
-                        ),
-                        posture: FailurePosture::NotRetryable,
-                    })?;
-                entries.push((TxId::from_bytes(array), BlockHeight::from(height)));
-            }
-            Ok(entries)
-        })
-        .await
+        self.with_ledger(move |conn| query_wallet_tx_ids_mined_in_range(conn, start, end))
+            .await
     }
 
     async fn find_visible_tip(&self) -> Result<Option<BlockHeight>, StorageError> {
@@ -2239,23 +2550,15 @@ impl WalletStorage for Sqlite {
         to_height: BlockHeight,
     ) -> Result<Vec<crate::wallet::ReceivedShieldedNoteRow>, StorageError> {
         let network = self.options.network;
-        let from_h = i64::from(from_height.as_u32());
-        let to_h = i64::from(to_height.as_u32());
         self.with_db_and_ledger(move |db, conn| {
             let (account_id, account_uuid) = resolve_account(db, network)?;
-            let mut stmt = conn
-                .prepare(RECEIVED_SHIELDED_NOTES_IN_RANGE_SQL)
-                .map_err(|err| StorageError::SqliteFailed {
-                    reason: format!("received_shielded_notes prepare failed: {err}"),
-                    posture: FailurePosture::NotRetryable,
-                })?;
-            let mapped = stmt
-                .query_map([from_h, to_h], decode_received_shielded_note_row)
-                .map_err(|err| StorageError::SqliteFailed {
-                    reason: format!("received_shielded_notes query failed: {err}"),
-                    posture: FailurePosture::NotRetryable,
-                })?;
-            collect_received_shielded_note_rows(mapped, account_uuid, account_id)
+            query_received_shielded_notes_in_range(
+                conn,
+                from_height,
+                to_height,
+                account_uuid,
+                account_id,
+            )
         })
         .await
     }
@@ -2732,6 +3035,70 @@ fn pending_pczt_lock_owner(pczt: &pczt::Pczt) -> Result<Option<LockOwner>, Stora
 /// Bound to one outpoint per execution. The whole batch runs inside one transaction with a
 /// reused prepared statement so a 620-input shielding sweep takes one parse+plan round
 /// instead of 620.
+fn query_wallet_tx_ids_mined_in_range(
+    conn: &rusqlite::Connection,
+    start: BlockHeight,
+    end: BlockHeight,
+) -> Result<Vec<(TxId, BlockHeight)>, StorageError> {
+    let start_h = i64::from(start.as_u32());
+    let end_h = i64::from(end.as_u32());
+    let mut stmt = conn
+        .prepare(
+            "SELECT txid, mined_height FROM transactions \
+                 WHERE mined_height BETWEEN ?1 AND ?2 \
+                 ORDER BY mined_height ASC, id_tx ASC",
+        )
+        .map_err(|err| StorageError::SqliteFailed {
+            reason: format!("transactions range query prepare failed: {err}"),
+            posture: FailurePosture::NotRetryable,
+        })?;
+    let rows = stmt
+        .query_map([start_h, end_h], |row| {
+            let txid_bytes: Vec<u8> = row.get(0)?;
+            let mined_height: i64 = row.get(1)?;
+            Ok((txid_bytes, mined_height))
+        })
+        .map_err(|err| StorageError::SqliteFailed {
+            reason: format!("transactions range query failed: {err}"),
+            posture: FailurePosture::NotRetryable,
+        })?;
+    let mut entries = Vec::new();
+    for row in rows {
+        let (txid_bytes, mined_height) = row.map_err(|err| StorageError::SqliteFailed {
+            reason: format!("transactions row decode failed: {err}"),
+            posture: FailurePosture::NotRetryable,
+        })?;
+        let array: [u8; 32] =
+            txid_bytes
+                .try_into()
+                .map_err(|raw: Vec<u8>| StorageError::SqliteFailed {
+                    reason: format!("transactions.txid had wrong byte length: {}", raw.len()),
+                    posture: FailurePosture::NotRetryable,
+                })?;
+        let height = u32::try_from(mined_height).map_err(|_| StorageError::SqliteFailed {
+            reason: format!("transactions.mined_height out of u32 range: {mined_height}"),
+            posture: FailurePosture::NotRetryable,
+        })?;
+        entries.push((TxId::from_bytes(array), BlockHeight::from(height)));
+    }
+    Ok(entries)
+}
+
+const CHAIN_EVENT_CURSOR_UPSERT_SQL: &str = "\
+    INSERT INTO ext_zally_chain_event_cursor (id, cursor_bytes, recorded_at_ms) \
+    VALUES (0, ?1, ?2) \
+    ON CONFLICT (id) DO UPDATE SET \
+        cursor_bytes = excluded.cursor_bytes, \
+        recorded_at_ms = excluded.recorded_at_ms";
+
+fn current_unix_ms_for_ledger() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0_i64, |elapsed| {
+            i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX)
+        })
+}
+
 const PENDING_BROADCAST_INPUT_UPSERT_SQL: &str = "\
     INSERT INTO ext_zally_pending_broadcast_inputs \
         (broadcast_tx_id, outpoint_tx_id, outpoint_index, value_zat, \
@@ -2913,6 +3280,30 @@ fn decode_received_shielded_note_row(
         row.get(7)?,
         row.get(8)?,
     ))
+}
+
+fn query_received_shielded_notes_in_range(
+    conn: &rusqlite::Connection,
+    from_height: BlockHeight,
+    to_height: BlockHeight,
+    account_uuid: AccountUuid,
+    account_id: AccountId,
+) -> Result<Vec<crate::wallet::ReceivedShieldedNoteRow>, StorageError> {
+    let from_h = i64::from(from_height.as_u32());
+    let to_h = i64::from(to_height.as_u32());
+    let mut stmt = conn
+        .prepare(RECEIVED_SHIELDED_NOTES_IN_RANGE_SQL)
+        .map_err(|err| StorageError::SqliteFailed {
+            reason: format!("received_shielded_notes prepare failed: {err}"),
+            posture: FailurePosture::NotRetryable,
+        })?;
+    let mapped = stmt
+        .query_map([from_h, to_h], decode_received_shielded_note_row)
+        .map_err(|err| StorageError::SqliteFailed {
+            reason: format!("received_shielded_notes query failed: {err}"),
+            posture: FailurePosture::NotRetryable,
+        })?;
+    collect_received_shielded_note_rows(mapped, account_uuid, account_id)
 }
 
 /// Decodes received-note rows, stamping each with the wallet's deterministic

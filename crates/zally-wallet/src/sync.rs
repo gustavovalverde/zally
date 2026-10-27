@@ -1985,7 +1985,7 @@ impl Wallet {
     /// state at that height.
     ///
     /// One rung of the sync driver's repair ladder: truncates below a divergence via
-    /// [`WalletStorage::truncate_to_chain_state`] (which lands the wallet at exactly the
+    /// [`WalletStorage::revert_blocks_above`] (which lands the wallet at exactly the
     /// target height) and publishes [`WalletEvent::ReorgDetected`] so hosts observe the
     /// rollback. The next sync re-plans from the rewound frontier.
     pub(crate) async fn rewind_to_height(
@@ -1997,7 +1997,7 @@ impl Wallet {
         let chain_state = chain_state_at(chain, chain_epoch, rewind_to).await?;
         self.inner
             .storage
-            .truncate_to_chain_state(chain_state)
+            .revert_blocks_above(chain_state, None)
             .await?;
         self.publish_event(WalletEvent::ReorgDetected {
             rolled_back_to_height: rewind_to,

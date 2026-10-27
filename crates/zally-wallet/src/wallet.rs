@@ -121,16 +121,16 @@ impl Wallet {
         *self.inner.retry_policy.lock() = policy;
     }
 
-    /// Discards the wallet database and rebuilds it from the sealed seed at the account
-    /// birthday.
+    /// Rebuilds the wallet's derived chain state from the sealed seed at the account
+    /// birthday, keeping the payment ledger.
     ///
     /// The deepest repair rung of the sync driver: wallet chain state is disposable derived
     /// state, so when it can no longer be reconciled with the chain the wallet rebuilds it
     /// from first principles. Reads the birthday before any destructive step, then
     /// recreates the database with a fresh account for the unsealed seed and publishes
-    /// [`WalletEvent::DerivedStateReset`] so hosts observe the rebuild. The ledger (send
-    /// idempotency records, holds, pending broadcasts) is dropped with the database; chain
-    /// state rebuilds by rescan.
+    /// [`WalletEvent::DerivedStateReset`] so hosts observe the rebuild. Chain state rebuilds
+    /// by rescan. The payment ledger survives: send idempotency records, holds, finalized
+    /// PCZTs, pending broadcasts, reverted broadcasts, and the chain-event cursor.
     ///
     /// The storage layer derives the [`AccountId`] deterministically from the seed, so the
     /// account id does not change across the rebuild; handles holding the prior id keep

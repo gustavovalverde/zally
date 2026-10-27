@@ -158,12 +158,10 @@ pub enum StorageError {
     /// hash does not match the wallet's stored view at `at_height`.
     ///
     /// Posture: [`FailurePosture::Retryable`]. The wallet scans to the live chain tip, so a
-    /// divergence at `at_height` is an ordinary reorg of the head. The caller catches this and
-    /// rewinds precisely below the orphan via `WalletStorage::truncate_to_chain_state`, then
-    /// re-runs sync. The librustzcash rewind cap (100 blocks = `COINBASE_MATURITY`) bounds how
-    /// far the truncate can go; if the divergence is deeper than the cap, the truncate call
-    /// surfaces a separate `NotRetryable` storage failure and the operator must reset the
-    /// wallet.
+    /// divergence at `at_height` is an ordinary reorg of the head. A reorg the chain source
+    /// announced is rewound at its fork point before the next scan; one it did not announce
+    /// reaches the sync driver's repair ladder, which rewinds below the orphan via
+    /// `WalletStorage::revert_blocks_above` and re-runs sync. The rewind works at any depth.
     #[error(
         "chain reorg detected at height {at_height}; wallet must roll back to {} and re-sync",
         at_height.as_u32().saturating_sub(1)

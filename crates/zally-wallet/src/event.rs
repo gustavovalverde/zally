@@ -79,9 +79,9 @@ pub enum WalletEvent {
         /// account, across Sapling, Orchard, Ironwood, or transparent pools.
         spent_our_inputs: bool,
     },
-    /// The wallet discarded and recreated its database from the seed and the account
-    /// birthday. The ledger and holds were dropped with the database; chain state rebuilds
-    /// by rescan.
+    /// The wallet rebuilt its derived chain state from the seed and the account birthday.
+    /// Chain state rebuilds by rescan; the payment ledger, including idempotency records
+    /// and holds, survives.
     DerivedStateReset {
         /// Account recreated in the fresh database. Equal to the prior id: account
         /// identity is key identity, not database identity.
