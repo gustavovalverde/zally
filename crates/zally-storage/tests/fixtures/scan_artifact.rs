@@ -7,6 +7,9 @@
     reason = "each integration-test crate uses a different subset of shared fixture conversions"
 )]
 
+use std::path::{Path, PathBuf};
+
+use prost::Message as _;
 use zally_core::{
     BlockHash, BlockHeight, CompactBlockArtifact, CompactChainMetadata, CompactSaplingOutput,
     CompactSaplingSpend, CompactShieldedAction, CompactTransaction, CompactTransparentInput,
@@ -14,6 +17,84 @@ use zally_core::{
 };
 use zcash_client_backend::proto::compact_formats::{CompactBlock, CompactTx};
 use zcash_client_backend::proto::service::TreeState;
+
+/// Error loading a checked-in Testnet fixture.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum FixtureError {
+    #[error("fixture io error: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("fixture json error: {0}")]
+    Json(#[from] serde_json::Error),
+    #[error("fixture proto error: {0}")]
+    Proto(#[from] prost::DecodeError),
+    #[error("fixture is malformed: {0}")]
+    Malformed(String),
+}
+
+pub(crate) fn fixtures_dir() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")
+}
+
+/// Reads the checked-in `z_gettreestate` response for Testnet `height`.
+pub(crate) fn testnet_chain_state_at(height: u32) -> Result<TreeStateArtifact, FixtureError> {
+    let text = std::fs::read_to_string(fixtures_dir().join(format!("treestate_{height}.json")))?;
+    let json: serde_json::Value = serde_json::from_str(&text)?;
+    let rpc_result = &json["result"];
+    let field = |name: &str| FixtureError::Malformed(format!("missing {name} at {height}"));
+    let tree_hex = |pool: &str| {
+        rpc_result[pool]["commitments"]["finalState"]
+            .as_str()
+            .map(str::to_owned)
+            .ok_or_else(|| field(pool))
+    };
+    let tree_state = TreeState {
+        network: "test".to_owned(),
+        height: rpc_result["height"]
+            .as_u64()
+            .ok_or_else(|| field("height"))?,
+        hash: rpc_result["hash"]
+            .as_str()
+            .ok_or_else(|| field("hash"))?
+            .to_owned(),
+        time: rpc_result["time"]
+            .as_u64()
+            .and_then(|time| u32::try_from(time).ok())
+            .ok_or_else(|| field("time"))?,
+        sapling_tree: tree_hex("sapling")?,
+        orchard_tree: tree_hex("orchard")?,
+        ironwood_tree: String::new(),
+    };
+    Ok(tree_state_from_upstream(Network::Testnet, tree_state))
+}
+
+/// Reads the checked-in Testnet compact blocks in `from_height..=to_height`.
+///
+/// The fixture holds blocks 4009900-4009999 as length-framed (u32 big-endian)
+/// `CompactBlock` protos.
+pub(crate) fn testnet_compact_blocks(
+    from_height: u64,
+    to_height: u64,
+) -> Result<Vec<CompactBlockArtifact>, FixtureError> {
+    let framed = std::fs::read(fixtures_dir().join("compact_blocks_4009900_4009999.bin"))?;
+    let truncated = || FixtureError::Malformed("truncated block frame".to_owned());
+    let mut blocks = Vec::new();
+    let mut at = 0_usize;
+    while at < framed.len() {
+        let header: [u8; 4] = framed
+            .get(at..at + 4)
+            .and_then(|slice| slice.try_into().ok())
+            .ok_or_else(truncated)?;
+        at += 4;
+        let frame_len = usize::try_from(u32::from_be_bytes(header)).map_err(|_| truncated())?;
+        let body = framed.get(at..at + frame_len).ok_or_else(truncated)?;
+        at += frame_len;
+        let block = CompactBlock::decode(body)?;
+        if (from_height..=to_height).contains(&block.height) {
+            blocks.push(compact_block_from_upstream(block));
+        }
+    }
+    Ok(blocks)
+}
 
 pub(crate) fn genesis_tree_state(
     network: Network,

@@ -2623,6 +2623,10 @@ const PENDING_BROADCAST_INPUT_UPSERT_SQL: &str = "\
 /// shape, decoding the diversifier index, and projecting to [`ExposedAddressRow`] happens
 /// in Rust so the SQL stays portable across `zcash_client_sqlite` migrations.
 ///
+/// Rows without a diversifier index are imported standalone transparent addresses
+/// (`key_scope = -1`), which `zcash_client_sqlite` marks exposed when they receive funds.
+/// They were never derived, so they have no place in derivation order.
+///
 /// [`ExposedAddressRow`]: crate::ExposedAddressRow
 const EXPOSED_ADDRESSES_SQL: &str = "\
     SELECT a.address, a.diversifier_index_be, a.exposed_at_height \
@@ -2630,6 +2634,7 @@ const EXPOSED_ADDRESSES_SQL: &str = "\
     JOIN accounts ac ON ac.id = a.account_id \
     WHERE ac.uuid = ?1 \
       AND a.exposed_at_height IS NOT NULL \
+      AND a.diversifier_index_be IS NOT NULL \
     ORDER BY a.exposed_at_height ASC, a.diversifier_index_be ASC";
 
 /// Aggregate of unmatured wallet-owned coinbase transparent value at one target height.
