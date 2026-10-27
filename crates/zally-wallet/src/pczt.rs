@@ -44,6 +44,7 @@ impl Wallet {
         target_expiry_height: Option<BlockHeight>,
     ) -> Result<PcztBytes, WalletError> {
         validate_proposal_plan(&plan, self.network())?;
+        self.ensure_source_following()?;
         let raw = self
             .inner
             .storage
@@ -189,6 +190,7 @@ impl Wallet {
         submitter: &dyn Submitter,
     ) -> Result<SendOutcome, WalletError> {
         validate_pczt_network(pczt.network(), self.network())?;
+        self.ensure_source_following()?;
         if submitter.network() != self.network() {
             return Err(WalletError::NetworkMismatch {
                 storage: self.network(),

@@ -489,14 +489,9 @@ fn open_wallet_db_at(
     Ok((Box::new(db), Box::new(ledger)))
 }
 
-fn open_extension_ledger(db_path: &Path) -> Result<rusqlite::Connection, StorageError> {
-    let ledger = rusqlite::Connection::open(db_path).map_err(|e| StorageError::SqliteFailed {
-        reason: format!("ledger connection open failed: {e}"),
-        posture: FailurePosture::NotRetryable,
-    })?;
-    ledger
-        .execute_batch(
-            "CREATE TABLE IF NOT EXISTS ext_zally_idempotency (\
+/// Zally's payment-ledger schema, created beside the `zcash_client_sqlite` schema in the
+/// wallet database file.
+const LEDGER_SCHEMA_SQL: &str = "CREATE TABLE IF NOT EXISTS ext_zally_idempotency (\
                  idempotency_key TEXT PRIMARY KEY NOT NULL,\
                  tx_id_bytes BLOB NOT NULL,\
                  recorded_at_unix INTEGER NOT NULL,\
@@ -556,6 +551,13 @@ fn open_extension_ledger(db_path: &Path) -> Result<rusqlite::Connection, Storage
                  cursor_bytes BLOB NOT NULL,\
                  recorded_at_ms INTEGER NOT NULL\
              ); \
+             CREATE TABLE IF NOT EXISTS ext_zally_retired_submissions (\
+                 idempotency_key TEXT NOT NULL,\
+                 tx_id_bytes BLOB NOT NULL,\
+                 expiry_height INTEGER NOT NULL,\
+                 retired_at_ms INTEGER NOT NULL,\
+                 PRIMARY KEY (idempotency_key, tx_id_bytes)\
+             ); \
              CREATE TABLE IF NOT EXISTS ext_zally_reverted_broadcasts (\
                  tx_id_bytes BLOB PRIMARY KEY NOT NULL,\
                  raw_tx_bytes BLOB NOT NULL,\
@@ -563,8 +565,15 @@ fn open_extension_ledger(db_path: &Path) -> Result<rusqlite::Connection, Storage
                  reverted_from_height INTEGER NOT NULL,\
                  recorded_at_ms INTEGER NOT NULL,\
                  resubmitted_at_ms INTEGER\
-             );",
-        )
+             );";
+
+fn open_extension_ledger(db_path: &Path) -> Result<rusqlite::Connection, StorageError> {
+    let ledger = rusqlite::Connection::open(db_path).map_err(|e| StorageError::SqliteFailed {
+        reason: format!("ledger connection open failed: {e}"),
+        posture: FailurePosture::NotRetryable,
+    })?;
+    ledger
+        .execute_batch(LEDGER_SCHEMA_SQL)
         .map_err(|e| StorageError::SqliteFailed {
             reason: format!("ext_zally schema init failed: {e}"),
             posture: FailurePosture::NotRetryable,
@@ -604,8 +613,9 @@ fn add_idempotency_unmineable_column(ledger: &rusqlite::Connection) -> Result<()
 ///
 /// `ext_zally_chain_tips` is absent on purpose: chain tips are derived state that the next
 /// sync records again against the rebuilt scan queue.
-const LEDGER_TABLES_KEPT_ACROSS_REBUILD: [&str; 7] = [
+const LEDGER_TABLES_KEPT_ACROSS_REBUILD: [&str; 8] = [
     "ext_zally_idempotency",
+    "ext_zally_retired_submissions",
     "ext_zally_finalized_pczts",
     "ext_zally_pending_pczt_inputs",
     "ext_zally_pending_broadcast_inputs",
@@ -1277,6 +1287,55 @@ impl WalletStorage for Sqlite {
             )
             .map(|_| ())
             .map_err(|err| map_sqlite_error(&err))
+        })
+        .await
+    }
+
+    async fn retire_expired_submissions(
+        &self,
+        final_height: BlockHeight,
+        retired_at_ms: u64,
+    ) -> Result<Vec<(TxId, BlockHeight)>, StorageError> {
+        let retired_at_ms = clamp_unsigned_to_i64(retired_at_ms);
+        self.with_ledger(move |conn| {
+            let transaction = conn
+                .unchecked_transaction()
+                .map_err(|err| map_sqlite_error(&err))?;
+            let expired = {
+                let mut stmt = transaction
+                    .prepare(EXPIRED_SUBMISSIONS_SQL)
+                    .map_err(|err| map_sqlite_error(&err))?;
+                let rows = stmt
+                    .query_map([final_height.as_u32()], |row| {
+                        Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, u32>(1)?))
+                    })
+                    .map_err(|err| map_sqlite_error(&err))?;
+                rows.collect::<Result<Vec<_>, _>>()
+                    .map_err(|err| map_sqlite_error(&err))?
+            };
+            let mut retired = Vec::with_capacity(expired.len());
+            for (tx_id_bytes, expiry_height) in expired {
+                transaction
+                    .execute(
+                        "INSERT OR IGNORE INTO ext_zally_retired_submissions \
+                             (idempotency_key, tx_id_bytes, expiry_height, retired_at_ms) \
+                         SELECT idempotency_key, tx_id_bytes, ?2, ?3 \
+                         FROM ext_zally_idempotency WHERE tx_id_bytes = ?1",
+                        rusqlite::params![tx_id_bytes, expiry_height, retired_at_ms],
+                    )
+                    .map_err(|err| map_sqlite_error(&err))?;
+                for statement in EXPIRED_SUBMISSION_CLEANUP_STATEMENTS {
+                    transaction
+                        .execute(statement, [tx_id_bytes.as_slice()])
+                        .map_err(|err| map_sqlite_error(&err))?;
+                }
+                retired.push((
+                    decode_txid_bytes(tx_id_bytes, "ext_zally_idempotency.tx_id_bytes")?,
+                    BlockHeight::from(expiry_height),
+                ));
+            }
+            transaction.commit().map_err(|err| map_sqlite_error(&err))?;
+            Ok(retired)
         })
         .await
     }
@@ -3083,6 +3142,31 @@ fn query_wallet_tx_ids_mined_in_range(
     }
     Ok(entries)
 }
+
+/// Wallet-sent transactions never mined at or below an expiry height at or below `?1`.
+///
+/// A reverted broadcast carries its own expiry, so a rebuild that discarded the transaction
+/// row still retires it.
+const EXPIRED_SUBMISSIONS_SQL: &str = "\
+    SELECT tx_id_bytes, MIN(expiry_height) FROM ( \
+        SELECT r.tx_id_bytes AS tx_id_bytes, r.expiry_height AS expiry_height \
+        FROM ext_zally_reverted_broadcasts r \
+        LEFT JOIN transactions t ON t.txid = r.tx_id_bytes \
+        WHERE t.mined_height IS NULL AND r.expiry_height > 0 AND r.expiry_height <= ?1 \
+        UNION ALL \
+        SELECT t.txid, t.expiry_height \
+        FROM ext_zally_idempotency i \
+        JOIN transactions t ON t.txid = i.tx_id_bytes \
+        WHERE t.created IS NOT NULL AND t.mined_height IS NULL \
+          AND t.expiry_height > 0 AND t.expiry_height <= ?1 \
+    ) GROUP BY tx_id_bytes";
+
+/// Rows an expired submission leaves behind once its idempotency keys are retired.
+const EXPIRED_SUBMISSION_CLEANUP_STATEMENTS: [&str; 3] = [
+    "DELETE FROM ext_zally_idempotency WHERE tx_id_bytes = ?1",
+    "DELETE FROM ext_zally_reverted_broadcasts WHERE tx_id_bytes = ?1",
+    "DELETE FROM ext_zally_pending_broadcast_inputs WHERE broadcast_tx_id = ?1",
+];
 
 const CHAIN_EVENT_CURSOR_UPSERT_SQL: &str = "\
     INSERT INTO ext_zally_chain_event_cursor (id, cursor_bytes, recorded_at_ms) \

@@ -291,6 +291,37 @@ impl MockChainSourceHandle {
         }
     }
 
+    /// Advances the visible tip to `visible_tip` and the settled tip to `settled_tip` on the
+    /// current branch, and announces the commit. Leaves the mock unchanged and returns
+    /// `false` when `settled_tip > visible_tip`.
+    #[must_use]
+    pub fn commit_tips(&self, visible_tip: BlockHeight, settled_tip: BlockHeight) -> bool {
+        let committed = {
+            let mut guard = self.state.lock();
+            if settled_tip > visible_tip {
+                return false;
+            }
+            let prior_tip = guard.visible_tip_height;
+            guard.visible_tip_height = visible_tip;
+            guard.settled_tip_height = settled_tip;
+            guard.epoch_id = guard.epoch_id.saturating_add(1);
+            let chain_epoch = chain_epoch_from_state(&guard);
+            drop(guard);
+            BlockHeightRange::new(
+                BlockHeight::from(prior_tip.as_u32().saturating_add(1)),
+                visible_tip,
+            )
+            .map(|block_range| ChainEpochCommitted {
+                chain_epoch,
+                block_range,
+            })
+        };
+        if let Some(committed) = committed {
+            self.publish(ChainEvent::ChainCommitted { committed });
+        }
+        true
+    }
+
     /// Sets a coherent visible/settled pair without emitting a chain event.
     ///
     /// Returns `false` and leaves the mock unchanged when `settled_tip > visible_tip`.

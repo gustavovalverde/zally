@@ -255,6 +255,18 @@ pub enum WalletError {
         source: Box<Self>,
     },
 
+    /// The chain source stopped following the chain, so the wallet refuses new spends: a
+    /// transaction built against a frozen branch could pay from funds the chain no longer
+    /// holds.
+    ///
+    /// Posture: [`FailurePosture::Retryable`]: retry once the sync driver reports the source
+    /// recovered.
+    #[error("chain source halted; new spends are refused: {cause}")]
+    ChainSourceHalted {
+        /// Why the source halted.
+        cause: crate::SourceHalt,
+    },
+
     /// The sync-driver task panicked. Surfaced only by [`crate::SyncHandle::close`]; the
     /// driver task never fails while its handle is alive.
     ///
@@ -280,7 +292,9 @@ impl WalletError {
             Self::PaymentDisclosureExport(e) => e.posture(),
             Self::ChainSource(e) => e.posture(),
             Self::Submitter(e) => e.posture(),
-            Self::CircuitBroken { .. } => FailurePosture::Retryable,
+            Self::CircuitBroken { .. } | Self::ChainSourceHalted { .. } => {
+                FailurePosture::Retryable
+            }
             Self::UnverifiedScanChunk { source, .. } => source.posture(),
             Self::ProposalRejected { kind, .. } => kind.posture(),
             Self::NetworkMismatch { .. }
@@ -424,12 +438,29 @@ mod tests {
                     ChainSourceError::ChainEpochPinUnavailable,
                 )),
             },
+            WalletError::ChainSourceHalted {
+                cause: crate::SourceHalt::VisibleTipStalled {
+                    visible_tip_height: BlockHeight::from(14),
+                    unchanged_since_ms: 0,
+                },
+            },
             WalletError::SyncDriverFailed { reason: "x".into() },
         ];
         for e in variants {
             let _ = e.posture();
             let _ = e.is_retryable();
         }
+    }
+
+    #[test]
+    fn a_halted_source_refuses_spends_until_it_recovers() {
+        let err = WalletError::ChainSourceHalted {
+            cause: crate::SourceHalt::VisibleTipStalled {
+                visible_tip_height: BlockHeight::from(14),
+                unchanged_since_ms: 0,
+            },
+        };
+        assert_eq!(err.posture(), FailurePosture::Retryable);
     }
 
     #[test]

@@ -10,13 +10,21 @@ use zally_core::{AccountId, BlockHeight, TxId};
 /// Push notification from the wallet's sync loop.
 ///
 /// Every `Wallet::sync` run emits [`WalletEvent::ScanProgress`] at the start and end of
-/// the run; [`WalletEvent::ReorgDetected`] when the upstream chain rolls back; one
-/// [`WalletEvent::TransactionConfirmed`] per newly confirmed wallet transaction; and one
-/// [`WalletEvent::ShieldedReceiveObserved`] per newly observed shielded note that the
-/// wallet owns. [`WalletEvent::DerivedStateReset`] marks a wallet database rebuild from
-/// seed and birthday. [`WalletEvent::TransparentUtxoRefreshFaulted`] marks a faulted
-/// transparent-UTXO refresh attempt. [`WalletEvent::PendingBroadcastUnmineable`] names a
-/// broadcast to recreate. [`WalletEvent::Lagged`] is injected by the subscription
+/// the run; one [`WalletEvent::TransactionConfirmed`] per newly confirmed wallet
+/// transaction; and one [`WalletEvent::ShieldedReceiveObserved`] per newly observed shielded
+/// note that the wallet owns.
+///
+/// A rewind emits [`WalletEvent::ReorgDetected`], then one
+/// [`WalletEvent::TransactionReverted`] per wallet transaction and one
+/// [`WalletEvent::ShieldedReceiveReverted`] per received note that left the chain. A reverted
+/// transaction later produces [`WalletEvent::TransactionConfirmed`] again when the
+/// replacement chain mines it. Any sent transaction the settled chain passes the expiry
+/// height of without mining it produces [`WalletEvent::TransactionExpired`].
+///
+/// [`WalletEvent::DerivedStateReset`] marks a wallet database rebuild from seed and birthday.
+/// [`WalletEvent::TransparentUtxoRefreshFaulted`] marks a faulted transparent-UTXO refresh
+/// attempt. [`WalletEvent::PendingBroadcastUnmineable`] names a broadcast to recreate.
+/// [`WalletEvent::Lagged`] is injected by the subscription
 /// stream when a consumer drops events; the sync loop never emits it directly.
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -29,13 +37,37 @@ pub enum WalletEvent {
         /// Tip the wallet is catching up to.
         target_height: BlockHeight,
     },
-    /// A reorg rolled the wallet back; chain integration emits this when the upstream chain
-    /// source signals a reorg over the wallet's scan range.
+    /// A reorg rolled the wallet back: the chain source announced it, or a scan found the
+    /// wallet's blocks no longer chain onto the source's.
     ReorgDetected {
         /// Height the wallet's scan progress was rolled back to.
         rolled_back_to_height: BlockHeight,
-        /// New visible tip after the reorg.
+        /// Settled tip of the chain epoch the rewind read its fork-point state from.
         new_settled_tip_height: BlockHeight,
+    },
+    /// A wallet transaction mined at `mined_height` left the chain in a rewind.
+    ///
+    /// The counterpart of [`Self::TransactionConfirmed`]. A transaction the wallet sent is
+    /// submitted again while it can still be mined; the replacement chain either confirms it
+    /// again or lets it expire.
+    TransactionReverted {
+        /// Reverted transaction identifier.
+        tx_id: TxId,
+        /// Height the transaction was mined at before the rewind.
+        mined_height: BlockHeight,
+    },
+    /// A transaction the wallet sent can no longer be mined: the settled chain passed its
+    /// expiry height without it.
+    ///
+    /// Its payment did not happen and the wallet spends its inputs again. The wallet
+    /// releases the send's idempotency key at the same moment, so retrying the request with
+    /// the same key creates a replacement payment. Until this event, a retry with the key
+    /// returns this transaction, so a payment that can still be mined is never paid twice.
+    TransactionExpired {
+        /// Expired transaction identifier.
+        tx_id: TxId,
+        /// Last height at which the transaction could have been mined.
+        expiry_height: BlockHeight,
     },
     /// A transaction belonging to the wallet was confirmed at `confirmed_at_height`.
     TransactionConfirmed {
@@ -78,6 +110,26 @@ pub enum WalletEvent {
         /// The producing transaction spent at least one input owned by the receiving
         /// account, across Sapling, Orchard, Ironwood, or transparent pools.
         spent_our_inputs: bool,
+    },
+    /// A shielded note previously reported by [`Self::ShieldedReceiveObserved`] left the
+    /// chain in a rewind.
+    ///
+    /// A host that credited the receive must hold or reverse the credit. If the replacement
+    /// chain mines the producing transaction again, the wallet reports the note again with
+    /// [`Self::ShieldedReceiveObserved`].
+    ShieldedReceiveReverted {
+        /// Account that owned the received note.
+        account_id: AccountId,
+        /// Transaction the note was created in.
+        tx_id: TxId,
+        /// Output index of the note within its transaction's bundle.
+        output_index: u32,
+        /// Note value.
+        value_zat: zally_core::Zatoshis,
+        /// Height the note was mined at before the rewind.
+        mined_height: BlockHeight,
+        /// Shielded pool the note was created on.
+        pool: ShieldedPool,
     },
     /// The wallet rebuilt its derived chain state from the seed and the account birthday.
     /// Chain state rebuilds by rescan; the payment ledger, including idempotency records

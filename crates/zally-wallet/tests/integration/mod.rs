@@ -5,6 +5,11 @@
     reason = "fixture helpers are consumed test-by-test; not every test uses every helper"
 )]
 mod fixtures;
+#[allow(
+    dead_code,
+    reason = "reorg fixture helpers are consumed test-by-test; not every test uses every helper"
+)]
+mod reorg_fixtures;
 
 mod capabilities_reports;
 mod circuit_breaker_opens_after_threshold;
@@ -32,6 +37,7 @@ mod send_payment_short_circuits_on_known_idempotency_key;
 mod sync_catches_up_to_tip;
 mod sync_drains_bulk_ranges;
 mod sync_driver_follows_chain;
+mod sync_driver_rewinds_to_fork_point;
 mod sync_driver_self_heals;
 mod sync_driver_slow_progress;
 mod sync_network_mismatch;

@@ -375,6 +375,7 @@ impl Wallet {
         validate_recipient_network(&plan.recipient, self.network())?;
         validate_memo_against_recipient(plan.memo.as_ref(), &plan.recipient)?;
         validate_non_zero(plan.amount_zat)?;
+        self.ensure_source_following()?;
         if plan.submitter.network() != self.network() {
             return Err(WalletError::NetworkMismatch {
                 storage: self.network(),
@@ -553,6 +554,7 @@ impl Wallet {
         plan: ShieldTransparentPlan<'_>,
     ) -> Result<SendOutcome, WalletError> {
         validate_non_zero(plan.shielding_threshold_zat)?;
+        self.ensure_source_following()?;
         if plan.submitter.network() != self.network() {
             return Err(WalletError::NetworkMismatch {
                 storage: self.network(),

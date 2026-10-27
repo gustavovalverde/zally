@@ -19,6 +19,7 @@ use crate::hold::{Hold, LockedNotesSummary};
 use crate::idempotency_key_locks::IdempotencyKeyLocks;
 use crate::options::WalletOptions;
 use crate::retry::RetryPolicy;
+use crate::source_halt::SourceHalt;
 use crate::sync::fetch_prior_chain_state;
 
 const EVENT_CHANNEL_CAPACITY: usize = 1024;
@@ -44,6 +45,8 @@ pub(crate) struct WalletInner {
     pub(crate) circuit_breaker: CircuitBreaker,
     pub(crate) options: WalletOptions,
     pub(crate) idempotency_key_locks: IdempotencyKeyLocks,
+    /// Set by the sync driver while the chain source has stopped following the chain.
+    pub(crate) source_halt: Mutex<Option<SourceHalt>>,
 }
 
 impl Wallet {
@@ -568,6 +571,18 @@ impl Wallet {
         let _ = self.inner.event_tx.send(event);
     }
 
+    pub(crate) fn set_source_halt(&self, cause: Option<SourceHalt>) {
+        *self.inner.source_halt.lock() = cause;
+    }
+
+    /// Refuses a new spend while the sync driver reports the chain source halted.
+    pub(crate) fn ensure_source_following(&self) -> Result<(), WalletError> {
+        let source_halt = *self.inner.source_halt.lock();
+        source_halt.map_or(Ok(()), |cause| {
+            Err(WalletError::ChainSourceHalted { cause })
+        })
+    }
+
     /// Returns the number of subscribers currently attached to [`Wallet::observe`].
     pub(crate) fn observer_count(&self) -> u32 {
         u32::try_from(self.inner.event_tx.receiver_count()).unwrap_or(u32::MAX)
@@ -754,6 +769,7 @@ where
         circuit_breaker: CircuitBreaker::new(CircuitBreakerConfig::default()),
         options,
         idempotency_key_locks: IdempotencyKeyLocks::default(),
+        source_halt: Mutex::new(None),
     });
     Wallet { inner }
 }

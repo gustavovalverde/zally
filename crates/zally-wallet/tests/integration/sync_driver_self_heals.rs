@@ -46,7 +46,7 @@ async fn fault_ladder_escalates_through_rewind_to_rescan_then_recovers() -> Resu
     let chain = Arc::new(MockChainSource::new(network));
     let chain_handle = chain.handle();
     chain_handle.advance_tip(BlockHeight::from(40));
-    chain_handle.fail_current_epoch_next(3, || ChainSourceError::BlockHeightBelowFloor {
+    chain_handle.fail_current_epoch_next(4, || ChainSourceError::BlockHeightBelowFloor {
         requested_height: BlockHeight::from(10),
         earliest_height: BlockHeight::from(20),
     });
@@ -91,7 +91,7 @@ async fn fault_ladder_escalates_through_rewind_to_rescan_then_recovers() -> Resu
     assert!(saw_rescan, "the ladder must reach the rescan rung");
     assert_eq!(healthy.last_fault, None);
     assert!(healthy.last_observation.is_some());
-    assert_eq!(chain_handle.failures_consumed(), 3);
+    assert_eq!(chain_handle.failures_consumed(), 4);
 
     let reset_observed = tokio::time::timeout(Duration::from_secs(2), async {
         while let Some(event) = wallet_events.next().await {
