@@ -15,7 +15,8 @@ use zally_core::{AccountId, BlockHeight, TxId};
 /// [`WalletEvent::ShieldedReceiveObserved`] per newly observed shielded note that the
 /// wallet owns. [`WalletEvent::DerivedStateReset`] marks a wallet database rebuild from
 /// seed and birthday. [`WalletEvent::TransparentUtxoRefreshFaulted`] marks a faulted
-/// transparent-UTXO refresh attempt. [`WalletEvent::Lagged`] is injected by the subscription
+/// transparent-UTXO refresh attempt. [`WalletEvent::PendingBroadcastUnmineable`] names a
+/// broadcast to recreate. [`WalletEvent::Lagged`] is injected by the subscription
 /// stream when a consumer drops events; the sync loop never emits it directly.
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -94,6 +95,22 @@ pub enum WalletEvent {
         /// Consecutive faulted attempts up to and including this one.
         consecutive_failures: u32,
         /// Fault description safe for logs and status pages.
+        reason: String,
+    },
+    /// A wallet-owned broadcast can never be mined, and the wallet dropped the pending inputs
+    /// it recorded for it. librustzcash keeps those inputs out of new proposals until the
+    /// broadcast's expiry height passes.
+    ///
+    /// The broadcast expired, or it was signed for a consensus branch or with a version that
+    /// the chain no longer accepts, for example because a network upgrade activated while it
+    /// was pending. Signatures commit to the consensus branch, so signing it again cannot
+    /// repair it: recreate the payment from a new proposal. The wallet judges this only from
+    /// blocks it has scanned at or below the settled tip, so a reorg within the chain
+    /// source's bound cannot bring the broadcast back.
+    PendingBroadcastUnmineable {
+        /// Transaction that can never be mined.
+        tx_id: TxId,
+        /// Why it can never be mined.
         reason: String,
     },
     /// Consumer fell behind; `dropped_count` events were skipped before this notification.

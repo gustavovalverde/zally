@@ -1,6 +1,6 @@
 //! Operator-facing wallet error.
 
-use zally_chain::{ChainSourceError, FailurePosture, SubmitterError};
+use zally_chain::{ChainSourceError, FailurePosture, SubmitterError, UnmineableReason};
 use zally_core::{BlockHeight, Network, TxId, Zatoshis};
 use zally_keys::{KeyDerivationError, SealingError};
 use zally_pczt::{PaymentDisclosureExportError, PcztError};
@@ -129,6 +129,21 @@ pub enum WalletError {
         reason: zally_chain::RejectionReason,
         /// Operator-facing detail describing the rejection.
         detail: String,
+    },
+
+    /// The transaction or PCZT can never be mined: it expired, or it was signed for a
+    /// consensus branch or with a version that the next block does not accept, for example
+    /// because a network upgrade activated after it was created.
+    ///
+    /// Signatures commit to the consensus branch, so signing it again cannot repair it:
+    /// recreate it from a new proposal. Before returning, the wallet released the inputs it
+    /// held for a PCZT it created.
+    ///
+    /// Posture: [`FailurePosture::NotRetryable`].
+    #[error("transaction can never be mined ({reason}); recreate it, do not sign it again")]
+    TransactionUnmineable {
+        /// Why the transaction can never be mined.
+        reason: UnmineableReason,
     },
 
     /// A success-kind submitter response named a transaction other than the bytes submitted.
@@ -279,6 +294,7 @@ impl WalletError {
             | Self::InsufficientBalance { .. }
             | Self::PaymentRequestParseFailed { .. }
             | Self::SubmissionRejected { .. }
+            | Self::TransactionUnmineable { .. }
             | Self::PaymentDisclosureSourceMissing { .. }
             | Self::TargetExpiryStale { .. }
             | Self::TreeRootsDiverged { .. } => FailurePosture::NotRetryable,
@@ -373,6 +389,12 @@ mod tests {
             WalletError::SubmissionRejected {
                 reason: zally_chain::RejectionReason::Unknown,
                 detail: "x".into(),
+            },
+            WalletError::TransactionUnmineable {
+                reason: UnmineableReason::Expired {
+                    expiry_height: BlockHeight::from(10),
+                    next_height: BlockHeight::from(11),
+                },
             },
             WalletError::SubmittedTransactionIdMismatch {
                 expected: TxId::from_bytes([1; 32]),

@@ -6,19 +6,26 @@
 //! transaction in a compact block, and then creates (storage `create_pczt`), proves
 //! (`Prover`), signs (`Signer`), and extracts (storage `extract_and_store_pczt`, the
 //! wallet's extraction path) a payment PCZT spending the note.
+//!
+//! On a chain where NU7 activates after the PCZT is created, the PCZT is bound to the NU6.3
+//! branch, and the wallet refuses it once NU7 is the next block, releasing the note it held.
 
 use orchard::tree::MerkleHashOrchard;
 use tempfile::TempDir;
+use zally_chain::UnmineableReason;
 use zally_core::{
     BlockHash, BlockHeight, CompactBlockArtifact, CompactChainMetadata, CompactShieldedAction,
-    CompactTransaction, CompactTransparentInput, Network, TreeStateArtifact, TxId, Zatoshis,
+    CompactTransaction, CompactTransparentInput, Network, PaymentRecipient, TreeStateArtifact,
+    TxId, Zatoshis,
 };
-use zally_keys::SeedMaterial;
+use zally_keys::{SealingError, SeedMaterial, SeedSealing as _};
 use zally_pczt::{PcztBytes, PcztError, Prover, Signer};
 use zally_storage::{
     ProposalPaymentRequest, ScanRequest, ShieldTransparentRequest, Sqlite, SqliteOptions,
     StorageError, TransparentUtxoRow, WalletStorage,
 };
+use zally_testkit::InMemorySealing;
+use zally_wallet::{ProposalPlan, Wallet, WalletError};
 use zcash_client_backend::proto::compact_formats::CompactOrchardAction;
 use zcash_primitives::transaction::builder::default_tx_expiry_delta;
 use zcash_primitives::transaction::{Transaction, TxVersion};
@@ -40,7 +47,7 @@ const PAYMENT_ZAT: u64 = 100_000;
 /// `z_gettreestate` encoding of an empty commitment-tree frontier.
 const EMPTY_FRONTIER: [u8; 3] = [0, 0, 0];
 
-fn regtest_with_nu7_from_height_one() -> Network {
+fn regtest_with_nu7_at(nu7_activation_height: u32) -> Network {
     let height_one = Some(zcash_protocol::consensus::BlockHeight::from_u32(1));
     Network::Regtest(LocalNetwork {
         overwinter: height_one,
@@ -53,7 +60,9 @@ fn regtest_with_nu7_from_height_one() -> Network {
         nu6_1: height_one,
         nu6_2: height_one,
         nu6_3: height_one,
-        nu7: height_one,
+        nu7: Some(zcash_protocol::consensus::BlockHeight::from_u32(
+            nu7_activation_height,
+        )),
     })
 }
 
@@ -232,15 +241,26 @@ fn ironwood_frontier_bytes(transaction: &Transaction) -> Result<Vec<u8>, TestErr
     Ok(bytes)
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn pczt_at_nu7_round_trips_through_prover_signer_and_extractor() -> Result<(), TestError> {
-    let network = regtest_with_nu7_from_height_one();
-    let temp = TempDir::new()?;
-    let seed = SeedMaterial::from_raw_bytes(vec![0x5a; 32])
-        .map_err(|err| TestError::fixture(err.to_string()))?;
-    let (storage, account_id) = open_wallet(network, &temp, &seed).await?;
+/// A wallet that owns one spendable Ironwood note and has scanned to
+/// [`PCZT_CHAIN_TIP_HEIGHT`].
+struct IronwoodNoteWallet {
+    storage: Sqlite,
+    account_id: zally_core::AccountId,
+    /// Tree state at [`PCZT_CHAIN_TIP_HEIGHT`], for scanning the blocks above it.
+    tip_tree_state: TreeStateArtifact,
+    ironwood_tree_size: u32,
+}
 
-    let shielding = shield_into_ironwood(&storage, account_id, &seed).await?;
+/// Shields a transparent UTXO into an Ironwood note mined at [`NOTE_MINED_HEIGHT`] and scans
+/// to [`PCZT_CHAIN_TIP_HEIGHT`].
+async fn wallet_with_ironwood_note(
+    network: Network,
+    temp: &TempDir,
+    seed: &SeedMaterial,
+) -> Result<IronwoodNoteWallet, TestError> {
+    let (storage, account_id) = open_wallet(network, temp, seed).await?;
+
+    let shielding = shield_into_ironwood(&storage, account_id, seed).await?;
     let compact = compact_shielding(&shielding)?;
     let ironwood_tree_size = u32::try_from(compact.ironwood_actions.len())
         .map_err(|_| TestError::fixture("action count overflows u32"))?;
@@ -259,8 +279,9 @@ async fn pczt_at_nu7_round_trips_through_prover_signer_and_extractor() -> Result
             empty_tree_state(network, EMPTY_CHAIN_TIP_HEIGHT),
         ))
         .await?;
+    let ironwood_frontier = ironwood_frontier_bytes(&shielding)?;
     let mut anchor_state = empty_tree_state(network, ANCHOR_HEIGHT);
-    anchor_state.ironwood_final_state_bytes = ironwood_frontier_bytes(&shielding)?;
+    anchor_state.ironwood_final_state_bytes = ironwood_frontier.clone();
     storage
         .scan_blocks(ScanRequest::new(
             empty_blocks(ANCHOR_HEIGHT + 1..=PCZT_CHAIN_TIP_HEIGHT).collect(),
@@ -268,6 +289,27 @@ async fn pczt_at_nu7_round_trips_through_prover_signer_and_extractor() -> Result
             anchor_state,
         ))
         .await?;
+    let mut tip_tree_state = empty_tree_state(network, PCZT_CHAIN_TIP_HEIGHT);
+    tip_tree_state.ironwood_final_state_bytes = ironwood_frontier;
+    Ok(IronwoodNoteWallet {
+        storage,
+        account_id,
+        tip_tree_state,
+        ironwood_tree_size,
+    })
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pczt_at_nu7_round_trips_through_prover_signer_and_extractor() -> Result<(), TestError> {
+    let network = regtest_with_nu7_at(1);
+    let temp = TempDir::new()?;
+    let seed = SeedMaterial::from_raw_bytes(vec![0x5a; 32])
+        .map_err(|err| TestError::fixture(err.to_string()))?;
+    let IronwoodNoteWallet {
+        storage,
+        account_id,
+        ..
+    } = wallet_with_ironwood_note(network, &temp, &seed).await?;
 
     let recipient = storage
         .derive_next_address(account_id)
@@ -298,6 +340,107 @@ async fn pczt_at_nu7_round_trips_through_prover_signer_and_extractor() -> Result
     Ok(())
 }
 
+/// NU7 activation height for the chain on which a PCZT is created just before NU7.
+const LATE_NU7_ACTIVATION_HEIGHT: u32 = PCZT_CHAIN_TIP_HEIGHT + 3;
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pczt_created_before_nu7_is_refused_once_nu7_is_next_and_releases_its_note()
+-> Result<(), TestError> {
+    let network = regtest_with_nu7_at(LATE_NU7_ACTIVATION_HEIGHT);
+    let temp = TempDir::new()?;
+    let seed = SeedMaterial::from_raw_bytes(vec![0x5a; 32])
+        .map_err(|err| TestError::fixture(err.to_string()))?;
+    let IronwoodNoteWallet {
+        storage,
+        account_id,
+        tip_tree_state,
+        ironwood_tree_size,
+    } = wallet_with_ironwood_note(network, &temp, &seed).await?;
+    let tip = BlockHeight::from(PCZT_CHAIN_TIP_HEIGHT);
+    storage.record_chain_tips(tip, tip).await?;
+    let sealing = InMemorySealing::new();
+    sealing.seal_seed(&seed).await?;
+    let (wallet, _) = Wallet::builder(network, sealing, storage.clone())
+        .open()
+        .await?;
+    let payment = ProposalPlan::conventional(
+        account_id,
+        PaymentRecipient::UnifiedAddress {
+            encoded: storage
+                .derive_next_address(account_id)
+                .await?
+                .encode(&network.to_parameters()),
+            network,
+        },
+        zatoshis(PAYMENT_ZAT)?,
+        None,
+    );
+
+    // Created, proved, and signed while the next block is still an NU6.3 block.
+    let created = wallet.propose_pczt(payment.clone(), None).await?;
+    assert_eq!(
+        *created.parse()?.global().consensus_branch_id(),
+        u32::from(BranchId::Nu6_3)
+    );
+    let signed = wallet
+        .sign_pczt(&wallet.prove_pczt(&created).await?)
+        .await?;
+    assert!(
+        wallet.propose_pczt(payment.clone(), None).await.is_err(),
+        "the PCZT holds the wallet's only note"
+    );
+
+    // The chain reaches the last NU6.3 block, so the next block is an NU7 block.
+    let stale_tip = LATE_NU7_ACTIVATION_HEIGHT - 1;
+    storage
+        .update_chain_tip(BlockHeight::from(stale_tip))
+        .await?;
+    storage
+        .scan_blocks(ScanRequest::new(
+            (PCZT_CHAIN_TIP_HEIGHT + 1..=stale_tip)
+                .map(|height| block(height, Vec::new(), ironwood_tree_size))
+                .collect(),
+            BlockHeight::from(PCZT_CHAIN_TIP_HEIGHT + 1),
+            tip_tree_state,
+        ))
+        .await?;
+    let stale_tip = BlockHeight::from(stale_tip);
+    storage.record_chain_tips(stale_tip, stale_tip).await?;
+
+    let crossed = Some(UnmineableReason::ConsensusBranchMismatch {
+        signed_branch_id: BranchId::Nu6_3,
+        next_branch_id: BranchId::Nu7,
+    });
+    assert_eq!(
+        unmineable_reason(&wallet.extract_pczt(&signed).await),
+        crossed,
+        "extraction refuses the stale PCZT before storing its transaction"
+    );
+    assert_eq!(
+        unmineable_reason(&wallet.prove_pczt(&created).await),
+        crossed
+    );
+    assert_eq!(
+        unmineable_reason(&wallet.sign_pczt(&created).await),
+        crossed
+    );
+
+    let recreated = wallet.propose_pczt(payment, None).await?;
+    assert_eq!(
+        *recreated.parse()?.global().consensus_branch_id(),
+        u32::from(BranchId::Nu7),
+        "the released note funds a PCZT for the NU7 branch"
+    );
+    Ok(())
+}
+
+fn unmineable_reason<T>(outcome: &Result<T, WalletError>) -> Option<UnmineableReason> {
+    match outcome {
+        Err(WalletError::TransactionUnmineable { reason }) => Some(*reason),
+        _ => None,
+    }
+}
+
 fn zatoshis(zat: u64) -> Result<Zatoshis, TestError> {
     Zatoshis::try_from(zat).map_err(|err| TestError::fixture(err.to_string()))
 }
@@ -316,6 +459,10 @@ enum TestError {
     Storage(#[from] StorageError),
     #[error("PCZT error: {0}")]
     Pczt(#[from] PcztError),
+    #[error("sealing error: {0}")]
+    Sealing(#[from] SealingError),
+    #[error("wallet error: {0}")]
+    Wallet(#[from] WalletError),
     #[error("fixture error: {0}")]
     Fixture(String),
 }

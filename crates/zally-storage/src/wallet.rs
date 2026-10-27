@@ -422,6 +422,18 @@ pub struct PendingBroadcastRecord {
     pub inputs: Vec<(OutPoint, zally_core::Zatoshis)>,
 }
 
+/// A wallet-owned transaction with pending-broadcast inputs recorded that the wallet has not
+/// observed mined.
+///
+/// Returned by [`WalletStorage::list_pending_broadcast_transactions`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingBroadcastTransaction {
+    /// Identifier of the broadcast transaction.
+    pub broadcast_tx_id: TxId,
+    /// Serialized transaction as the wallet stored it.
+    pub raw_bytes: Vec<u8>,
+}
+
 /// Trait abstracting the wallet database.
 ///
 /// Every implementation returns [`StorageError`]; backends with a native error type translate
@@ -870,6 +882,17 @@ pub trait WalletStorage: Send + Sync + 'static {
         account_id: AccountId,
         after_at_ms: u64,
     ) -> Result<Vec<PendingBroadcastInputRow>, StorageError>;
+
+    /// Returns every transaction that still has pending-broadcast rows and that the wallet has
+    /// not observed mined, with the bytes the wallet stored for it, ordered by transaction ID.
+    ///
+    /// Lets the wallet judge whether such a broadcast can still be mined. A transaction whose
+    /// bytes the wallet does not hold is omitted.
+    ///
+    /// `not_retryable` on schema errors; `retryable` on transient I/O.
+    async fn list_pending_broadcast_transactions(
+        &self,
+    ) -> Result<Vec<PendingBroadcastTransaction>, StorageError>;
 
     /// Drops every pending-broadcast row whose `broadcast_tx_id` appears in `tx_ids`.
     ///

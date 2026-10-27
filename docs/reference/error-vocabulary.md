@@ -34,6 +34,7 @@ Only `retryable` moves the breaker's failure counter, and only a call that compl
 | `PaymentRequestParseFailed` | `not_retryable` | ZIP-321 URI parsing failed. |
 | `ProposalRejected` | Follows `ProposalRejectionKind` | The proposal or its transaction could not be built; `kind` says why. |
 | `SubmissionRejected` | `not_retryable` | The node rejected the submitted transaction. |
+| `TransactionUnmineable` | `not_retryable` | A PCZT can never be mined, so it was refused before signing, proving, or extraction and its inputs were released; `reason` is the `UnmineableReason`. Recreate it; signing it again cannot repair it. |
 | `SubmittedTransactionIdMismatch` | `requires_operator` | A success-kind submitter response returned a transaction ID different from the submitted transaction bytes. |
 | `Pczt` | Mirrors `PcztError` | A PCZT role failed. |
 | `PaymentDisclosureExport` | Mirrors `PaymentDisclosureExportError` | A retained PCZT could not produce the requested disclosure profile. |
@@ -79,6 +80,16 @@ Only `retryable` moves the breaker's failure counter, and only a call that compl
 | Variant | Posture | Meaning |
 |---------|---------|---------|
 | `Read` | `not_retryable` | Serialized transaction bytes could not be decoded. |
+
+## UnmineableReason
+
+Returned by `TransactionHeader::check_mineable` and carried by `WalletError::TransactionUnmineable`. Every reason means the same thing to the caller: recreate the transaction from a new proposal.
+
+| Reason | Meaning |
+|--------|---------|
+| `Expired` | The next block is above the transaction's expiry height. |
+| `ConsensusBranchMismatch` | The transaction commits to a consensus branch the chain has left, for example NU6.3 once NU7 is active. |
+| `VersionNotAccepted` | The next block's consensus branch rejects the transaction version, such as v4 once NU7 is active (ZIP 2003). |
 
 ## StorageError
 

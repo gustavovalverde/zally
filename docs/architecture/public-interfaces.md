@@ -121,6 +121,8 @@ A name must survive a change of its implementation.
 | `ChainEventEnvelope` | `zally-chain` | Cursor-bound chain event consumed by sync drivers. |
 | `Submitter` | `zally-chain` | Trait for transaction broadcast. |
 | `TransactionParseError` | `zally-chain` | Typed rejection of malformed serialized transaction bytes at the chain-plane boundary. |
+| `TransactionHeader` | `zally-chain` | Version, consensus branch, and expiry height of a serialized transaction or a PCZT. `check_mineable` says whether any block after a given tip can still include it. |
+| `UnmineableReason` | `zally-chain` | Why a transaction can never be mined: `Expired`, `ConsensusBranchMismatch`, or `VersionNotAccepted`. Carried by `WalletError::TransactionUnmineable`. |
 | `SeedSealing` | `zally-keys` | Trait for at-rest seed encryption. |
 | `WalletCapabilities` | `zally-wallet` | Runtime descriptor of supported features (ZIP coverage, PCZT version, sealing impl). |
 
@@ -255,6 +257,7 @@ Unified Address strings are encoded at ZIP-316 Revision 0 when Revision 0 can re
 - **CHAIN-4**: `ChainEventCursor` is opaque Zally vocabulary. Backend cursor types never cross the public Zally API.
 - **CHAIN-5**: A chain-event subscription states its start position explicitly through `ChainEventStreamStart` (`AfterCursor` | `EarliestRetained` | `LiveTail`); there is no implicit empty-cursor default.
 - **CHAIN-6**: `parse_transaction_expiry_height` parses a serialized transaction through the same librustzcash family as the chain plane and returns its `BlockHeight` without pulling a storage backend into the caller.
+- **CHAIN-7**: `parse_transaction_header` returns a transaction's `TransactionHeader`, and `TransactionHeader::from_pczt_global` builds one from a PCZT's global fields. `TransactionHeader::check_mineable(network, tip_height)` judges the block after the tip with `BranchId::for_height` and `TxVersion::valid_in_branch`: it rejects a transaction that expired, that commits to a consensus branch the chain has left, or whose version the branch no longer accepts. A transaction committed to a branch that activates later is not rejected.
 
 ### Sync and scanning (SYNC)
 
@@ -267,6 +270,7 @@ Unified Address strings are encoded at ZIP-316 Revision 0 when Revision 0 can re
 - **SYNC-7**: `Wallet::status_snapshot() -> WalletStatus` reports `SyncStatus`, scan height, observed tip, lag, subscriber count, and circuit-breaker state.
 - **SYNC-8**: `Wallet::open_or_create_account(...) -> (Wallet, AccountId)` opens the sealed-seed account or creates it on a fresh storage volume.
 - **SYNC-9**: `Wallet::sync(...)` refreshes wallet-owned transparent UTXOs through `ChainSource::transparent_utxos` because compact blocks do not expose transparent receive details.
+- **SYNC-10**: Each `Wallet::sync` and `Wallet::scan_queued_range` judges every pending broadcast with CHAIN-7 at the lower of the fully scanned height and the settled tip, so a broadcast that an unscanned block, or a reorg within the chain source's bound, could still mine is never reported. A broadcast that can never be mined, such as one signed for NU6.3 while NU7 activated, loses its pending-broadcast rows and is reported once through `WalletEvent::PendingBroadcastUnmineable`; the host recreates the payment. librustzcash keeps excluding the transaction's inputs from selection until its expiry height passes.
 
 ### Spending (SPEND)
 
@@ -294,6 +298,7 @@ Unified Address strings are encoded at ZIP-316 Revision 0 when Revision 0 can re
 - **PCZT-7**: Wallet runtimes that return `SignedPayload` for Zcash x402 exact set `format = pczt-v2-extractable` and put extractor-ready ZIP-374 PCZT bytes in `bytes`; facilitators never need wallet private keys to verify, extract, and broadcast.
 - **PCZT-8**: Successful finalized-PCZT extraction retains the exact PCZT bytes by transaction ID before submission. The retained bytes are privacy-sensitive disclosure source material: they are never logged, identical writes are idempotent, and conflicting bytes fail closed.
 - **PCZT-9**: Every Zally-created PCZT carries an opaque, non-secret librustzcash lock-owner token while Zally retains the exact selected output references in its wallet ledger. `Wallet::abandon_pczt(&pczt)` releases only that artifact's inputs and is idempotent; successful extraction deletes the lifecycle row after upstream transaction storage clears the locks. If an async caller is cancelled before accepting a newly created PCZT, the storage actor performs the same owner-scoped release.
+- **PCZT-10**: `Wallet::prove_pczt`, `Wallet::sign_pczt`, `Wallet::extract_pczt`, and `Wallet::extract_and_submit_pczt` judge the PCZT with CHAIN-7 at the wallet's recorded visible tip before touching the seed or storing a transaction. A PCZT that can never be mined, such as one created before NU7 activated, fails with `WalletError::TransactionUnmineable` after its inputs are released as by `Wallet::abandon_pczt`; signing it again cannot repair it, so the caller recreates it.
 
 ### Payment disclosures (DISCLOSURE)
 

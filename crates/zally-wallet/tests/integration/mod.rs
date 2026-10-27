@@ -22,6 +22,7 @@ mod nu7_pczt_round_trip;
 mod observe_emits_scan_progress;
 mod open_or_create_account_round_trip;
 mod open_without_seal_returns_no_sealed_seed;
+mod pending_broadcast_across_nu7_is_released;
 mod pending_transparent_inputs_round_trip;
 mod propose_rejects_memo_on_transparent;
 mod propose_rejects_network_mismatch;

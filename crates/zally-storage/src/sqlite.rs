@@ -1833,6 +1833,48 @@ impl WalletStorage for Sqlite {
         .await
     }
 
+    async fn list_pending_broadcast_transactions(
+        &self,
+    ) -> Result<Vec<crate::PendingBroadcastTransaction>, StorageError> {
+        self.with_ledger(|conn| {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT t.txid, t.raw FROM transactions t \
+                     WHERE t.mined_height IS NULL AND t.raw IS NOT NULL \
+                       AND t.txid IN (SELECT broadcast_tx_id \
+                                      FROM ext_zally_pending_broadcast_inputs) \
+                     ORDER BY t.txid ASC",
+                )
+                .map_err(|err| StorageError::SqliteFailed {
+                    reason: format!("pending-broadcast-transactions prepare failed: {err}"),
+                    posture: FailurePosture::NotRetryable,
+                })?;
+            let rows = stmt
+                .query_map([], |row| {
+                    let txid_bytes: Vec<u8> = row.get(0)?;
+                    let raw_bytes: Vec<u8> = row.get(1)?;
+                    Ok((txid_bytes, raw_bytes))
+                })
+                .map_err(|err| StorageError::SqliteFailed {
+                    reason: format!("pending-broadcast-transactions query failed: {err}"),
+                    posture: FailurePosture::NotRetryable,
+                })?;
+            let mut transactions = Vec::new();
+            for row in rows {
+                let (txid_bytes, raw_bytes) = row.map_err(|err| StorageError::SqliteFailed {
+                    reason: format!("pending-broadcast-transactions row decode failed: {err}"),
+                    posture: FailurePosture::NotRetryable,
+                })?;
+                transactions.push(crate::PendingBroadcastTransaction {
+                    broadcast_tx_id: decode_txid_bytes(txid_bytes, "transactions.txid")?,
+                    raw_bytes,
+                });
+            }
+            Ok(transactions)
+        })
+        .await
+    }
+
     async fn clear_pending_broadcast_inputs_for_mined(
         &self,
         tx_ids: &[TxId],

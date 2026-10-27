@@ -18,8 +18,8 @@ pub use pending_broadcast_input_row::PendingBroadcastInputRow;
 pub use proposal_rejection_kind::{ProposalRejectionKind, ShieldedBlockLimit};
 pub use sqlite::{Sqlite, SqliteOptions};
 pub use wallet::{
-    ChainTips, CommitmentTreeRoots, HoldRecord, PendingBroadcastRecord, PreparedTransaction,
-    ProposalPaymentRequest, ProposalSummary, ReceivedShieldedNoteRow, ScanRequest, ScanResult,
-    ShieldTransparentRequest, StorageKind, TransparentReceiverRow, TransparentUtxoRow,
-    UnspentShieldedNoteRow, WalletStorage,
+    ChainTips, CommitmentTreeRoots, HoldRecord, PendingBroadcastRecord,
+    PendingBroadcastTransaction, PreparedTransaction, ProposalPaymentRequest, ProposalSummary,
+    ReceivedShieldedNoteRow, ScanRequest, ScanResult, ShieldTransparentRequest, StorageKind,
+    TransparentReceiverRow, TransparentUtxoRow, UnspentShieldedNoteRow, WalletStorage,
 };

@@ -18,6 +18,7 @@ mod spend;
 mod status;
 mod sync;
 mod transparent_utxo_refresh;
+mod unmineable_transactions;
 mod unspent_note;
 mod wallet;
 

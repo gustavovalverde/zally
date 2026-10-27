@@ -1754,7 +1754,8 @@ impl Wallet {
         .await
     }
 
-    /// Runs one breaker-guarded scan attempt and retires the broadcasts it aged out.
+    /// Runs one breaker-guarded scan attempt and retires the broadcasts it aged out or that
+    /// can never be mined.
     ///
     /// One attempt is one unit of breaker accounting: splitting the chain-tip read into its
     /// own guarded call would record a success for every attempt whose scan then failed,
@@ -1777,6 +1778,7 @@ impl Wallet {
         )
         .await?;
         self.retire_expired_pending_broadcasts().await?;
+        self.retire_unmineable_pending_broadcasts().await?;
         Ok(outcome)
     }
 
