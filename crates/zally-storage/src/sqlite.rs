@@ -35,7 +35,9 @@ use zcash_client_backend::data_api::chain::{ChainState, CommitmentTreeRoot};
 use zcash_client_backend::data_api::scanning::ScanRange;
 use zcash_client_backend::data_api::wallet::{
     ConfirmationsPolicy, LockRequest, SpendingKeys,
-    input_selection::{GreedyInputSelector, LockFilter, LockedInputPolicy, SpendPolicy},
+    input_selection::{
+        GreedyInputSelector, GreedyInputSelectorError, LockFilter, LockedInputPolicy, SpendPolicy,
+    },
 };
 use zcash_client_backend::data_api::{
     Account, AccountBirthday, MaxSpendMode, OutputLockStore, TargetValue, WalletCommitmentTrees,
@@ -66,6 +68,7 @@ use zcash_protocol::{PoolType, ShieldedPool};
 use zcash_transparent::address::Script;
 use zcash_transparent::bundle::{OutPoint as UpstreamOutPoint, TxOut};
 
+use crate::ProposalRejectionKind;
 use crate::error::StorageError;
 use crate::wallet::{ChainTips, WalletStorage};
 
@@ -3586,48 +3589,143 @@ pub(crate) fn coinbase_safe_shielding_policy() -> ConfirmationsPolicy {
         .expect("trusted=3 <= untrusted=100 satisfies the policy invariant")
 }
 
-/// Classifies a proposal-build error into a typed [`StorageError`] variant.
+/// Classifies a librustzcash proposal or transaction-construction error.
 ///
-/// Distinguishes insufficient funds from other build failures so the wallet boundary does
-/// not have to string-match the error display. Takes the error by `Debug` rather than
-/// `Display` because the upstream `data_api::error::Error<...>` does not implement
-/// `Display` over its `NoteRef` generic.
-pub(crate) fn classify_proposal_build_error<E: std::fmt::Debug>(err: &E) -> StorageError {
-    let reason = format!("{err:?}");
-    if GREEDY_SELECTOR_CONTRACT_VIOLATIONS
-        .iter()
-        .any(|variant| reason.contains(variant))
-    {
-        return StorageError::ProposalBuildFailed {
-            reason,
-            posture: FailurePosture::RequiresOperator,
-        };
+/// Matches the upstream error variants rather than their text, so a new upstream variant
+/// falls through to [`ProposalRejectionKind::Other`] instead of being misread. The reason
+/// keeps the upstream `Debug` rendering, because `data_api::error::Error` implements
+/// `Display` only for a `Display` note reference.
+pub(crate) fn classify_proposal_build_error<E: ProposalFailure>(err: &E) -> StorageError {
+    StorageError::ProposalRejected {
+        kind: err.rejection_kind(),
+        reason: format!("{err:?}"),
     }
-    if reason.contains("InsufficientFunds {") {
-        return StorageError::InsufficientFunds {
-            required_zat: Zatoshis::zero(),
-            available_zat: Zatoshis::zero(),
-        };
-    }
-    let posture = if reason.contains("InputsLocked") {
-        FailurePosture::Retryable
-    } else {
-        FailurePosture::NotRetryable
-    };
-    StorageError::ProposalBuildFailed { reason, posture }
 }
 
-/// `GreedyInputSelectorError` variants that report a broken upstream contract.
-///
-/// Since `zcash_client_backend` 0.25 these replace the `InsufficientFunds` results the
-/// selector used to return with more value available than required. They describe a
-/// defect in the wallet database or change strategy, not a balance the caller can top up.
-const GREEDY_SELECTOR_CONTRACT_VIOLATIONS: [&str; 4] = [
-    "RequirementCovered",
-    "DustInputsNotGiven",
-    "ExcludedNoteSelected",
-    "UnrequestedPoolSelected",
-];
+/// An upstream error raised while proposing or building a transaction.
+pub(crate) trait ProposalFailure: std::fmt::Debug {
+    /// Why the proposal was rejected.
+    fn rejection_kind(&self) -> ProposalRejectionKind;
+}
+
+/// `Infallible` has no values, so this is never called.
+impl ProposalFailure for std::convert::Infallible {
+    fn rejection_kind(&self) -> ProposalRejectionKind {
+        ProposalRejectionKind::Other
+    }
+}
+
+impl<DataSourceErrT, CommitmentTreeErrT, SelectionErrT, FeeErrT, ChangeErrT, NoteRefT>
+    ProposalFailure
+    for zcash_client_backend::data_api::error::Error<
+        DataSourceErrT,
+        CommitmentTreeErrT,
+        SelectionErrT,
+        FeeErrT,
+        ChangeErrT,
+        NoteRefT,
+    >
+where
+    DataSourceErrT: std::fmt::Debug,
+    CommitmentTreeErrT: std::fmt::Debug,
+    SelectionErrT: ProposalFailure,
+    FeeErrT: std::fmt::Debug,
+    ChangeErrT: std::fmt::Debug,
+    NoteRefT: std::fmt::Debug,
+{
+    fn rejection_kind(&self) -> ProposalRejectionKind {
+        #[allow(
+            clippy::wildcard_enum_match_arm,
+            reason = "the error is non_exhaustive; variants without a typed kind are Other"
+        )]
+        match self {
+            Self::InsufficientFunds {
+                available,
+                required,
+            } => insufficient_funds(*required, *available),
+            Self::NoteSelection(selection) => selection.rejection_kind(),
+            Self::Change(change) => change_rejection_kind(change),
+            Self::Proposal(proposal) => proposal_rejection_kind(proposal),
+            Self::ExpiryHeightConflictsWithCanonicalCrossing { requested } => {
+                ProposalRejectionKind::ExpiryConflictsWithCanonicalCrossing {
+                    requested_expiry_height: BlockHeight::from(u32::from(*requested)),
+                }
+            }
+            Self::RecipientAddressExpiry { .. } => ProposalRejectionKind::RecipientAddressExpired,
+            _ => ProposalRejectionKind::Other,
+        }
+    }
+}
+
+impl ProposalFailure for GreedyInputSelectorError {
+    fn rejection_kind(&self) -> ProposalRejectionKind {
+        #[allow(
+            clippy::wildcard_enum_match_arm,
+            reason = "the error is non_exhaustive; variants without a typed kind are Other"
+        )]
+        match self {
+            // Since zcash_client_backend 0.25 these replace the InsufficientFunds results the
+            // selector used to return with more value available than required.
+            Self::RequirementCovered { .. }
+            | Self::DustInputsNotGiven
+            | Self::ExcludedNoteSelected
+            | Self::UnrequestedPoolSelected => ProposalRejectionKind::SelectionContractViolated,
+            _ => ProposalRejectionKind::Other,
+        }
+    }
+}
+
+/// Input-source failures while building a proposed transaction carry no proposal kind.
+impl ProposalFailure for SqliteClientError {
+    fn rejection_kind(&self) -> ProposalRejectionKind {
+        ProposalRejectionKind::Other
+    }
+}
+
+fn insufficient_funds(
+    required: zcash_protocol::value::Zatoshis,
+    available: zcash_protocol::value::Zatoshis,
+) -> ProposalRejectionKind {
+    ProposalRejectionKind::InsufficientFunds {
+        required_zat: Zatoshis::from(required),
+        available_zat: Zatoshis::from(available),
+    }
+}
+
+fn change_rejection_kind<ChangeErrT, NoteRefT>(
+    change: &zcash_client_backend::fees::ChangeError<ChangeErrT, NoteRefT>,
+) -> ProposalRejectionKind {
+    #[allow(
+        clippy::wildcard_enum_match_arm,
+        reason = "the error is non_exhaustive; variants without a typed kind are Other"
+    )]
+    match change {
+        zcash_client_backend::fees::ChangeError::InsufficientFunds {
+            available,
+            required,
+        } => insufficient_funds(*required, *available),
+        _ => ProposalRejectionKind::Other,
+    }
+}
+
+fn proposal_rejection_kind(
+    proposal: &zcash_client_backend::proposal::ProposalError,
+) -> ProposalRejectionKind {
+    use zcash_client_backend::proposal::ProposalError;
+    #[allow(
+        clippy::wildcard_enum_match_arm,
+        reason = "the error is non_exhaustive; variants without a typed kind are Other"
+    )]
+    match proposal {
+        ProposalError::InputsLocked(_) => ProposalRejectionKind::InputsLocked,
+        ProposalError::TransactionTooLarge { .. } => ProposalRejectionKind::TransactionTooLarge,
+        ProposalError::OrchardReceiverRequiresIronwood(_)
+        | ProposalError::OrchardPoolPayment(_) => {
+            ProposalRejectionKind::OrchardRecipientNeedsIronwood
+        }
+        _ => ProposalRejectionKind::Other,
+    }
+}
 
 /// Builds prepared-transaction records for each proposal step.
 ///
@@ -4204,33 +4302,59 @@ mod tests {
         })
     }
 
-    type TestSelectionError =
-        zcash_client_backend::data_api::wallet::input_selection::InputSelectorError<
-            SqliteClientError,
-            zcash_client_backend::data_api::wallet::input_selection::GreedyInputSelectorError,
-            std::convert::Infallible,
-            zcash_client_sqlite::ReceivedNoteId,
-        >;
+    type TestBuildError = zcash_client_backend::data_api::error::Error<
+        SqliteClientError,
+        SqliteClientError,
+        GreedyInputSelectorError,
+        std::convert::Infallible,
+        std::convert::Infallible,
+        zcash_client_sqlite::ReceivedNoteId,
+    >;
 
     fn upstream_zatoshis(zat: u64) -> zcash_protocol::value::Zatoshis {
         zcash_protocol::value::Zatoshis::const_from_u64(zat)
     }
 
-    #[test]
-    fn selector_insufficient_funds_classifies_as_insufficient_funds() {
-        let error = TestSelectionError::InsufficientFunds {
-            available: upstream_zatoshis(10_000),
-            required: upstream_zatoshis(20_000),
+    fn rejection_kind(error: &TestBuildError) -> Option<ProposalRejectionKind> {
+        let StorageError::ProposalRejected { kind, .. } = classify_proposal_build_error(error)
+        else {
+            return None;
         };
-        assert!(matches!(
-            classify_proposal_build_error(&error),
-            StorageError::InsufficientFunds { .. }
-        ));
+        Some(kind)
+    }
+
+    fn zat(value: u64) -> Zatoshis {
+        Zatoshis::from(upstream_zatoshis(value))
+    }
+
+    #[test]
+    fn insufficient_funds_carries_the_required_and_available_values() {
+        let expected = Some(ProposalRejectionKind::InsufficientFunds {
+            required_zat: zat(20_000),
+            available_zat: zat(10_000),
+        });
+        let from_selector = TestBuildError::from(
+            zcash_client_backend::data_api::wallet::input_selection::InputSelectorError::<
+                SqliteClientError,
+                GreedyInputSelectorError,
+                std::convert::Infallible,
+                zcash_client_sqlite::ReceivedNoteId,
+            >::InsufficientFunds {
+                available: upstream_zatoshis(10_000),
+                required: upstream_zatoshis(20_000),
+            },
+        );
+        let from_change =
+            TestBuildError::Change(zcash_client_backend::fees::ChangeError::InsufficientFunds {
+                available: upstream_zatoshis(10_000),
+                required: upstream_zatoshis(20_000),
+            });
+        assert_eq!(rejection_kind(&from_selector), expected);
+        assert_eq!(rejection_kind(&from_change), expected);
     }
 
     #[test]
     fn selector_contract_violations_require_an_operator() {
-        use zcash_client_backend::data_api::wallet::input_selection::GreedyInputSelectorError;
         for violation in [
             GreedyInputSelectorError::RequirementCovered {
                 required: upstream_zatoshis(20_000),
@@ -4240,56 +4364,104 @@ mod tests {
             GreedyInputSelectorError::ExcludedNoteSelected,
             GreedyInputSelectorError::UnrequestedPoolSelected,
         ] {
-            let error = TestSelectionError::Selection(violation);
+            let error = classify_proposal_build_error(&TestBuildError::NoteSelection(violation));
             assert!(
                 matches!(
-                    classify_proposal_build_error(&error),
-                    StorageError::ProposalBuildFailed {
-                        posture: FailurePosture::RequiresOperator,
+                    error,
+                    StorageError::ProposalRejected {
+                        kind: ProposalRejectionKind::SelectionContractViolated,
                         ..
                     }
                 ),
                 "{error:?}"
             );
+            assert_eq!(error.posture(), FailurePosture::RequiresOperator);
         }
     }
 
-    type TestBuildError = zcash_client_backend::data_api::error::Error<
-        SqliteClientError,
-        SqliteClientError,
-        zcash_client_backend::data_api::wallet::input_selection::GreedyInputSelectorError,
-        std::convert::Infallible,
-        std::convert::Infallible,
-        zcash_client_sqlite::ReceivedNoteId,
-    >;
+    #[test]
+    fn proposal_errors_classify_by_variant() {
+        use zcash_client_backend::proposal::ProposalError;
+        let locked = classify_proposal_build_error(&TestBuildError::Proposal(
+            ProposalError::InputsLocked(zcash_client_backend::wallet::OutputRef::new(
+                zcash_protocol::TxId::from_bytes([0x11; 32]),
+                zcash_protocol::PoolType::ORCHARD,
+                0,
+            )),
+        ));
+        assert!(matches!(
+            locked,
+            StorageError::ProposalRejected {
+                kind: ProposalRejectionKind::InputsLocked,
+                ..
+            }
+        ));
+        assert_eq!(locked.posture(), FailurePosture::Retryable);
+
+        let too_large = TestBuildError::Proposal(ProposalError::TransactionTooLarge {
+            estimated_size: 2_000_001,
+            limit: 2_000_000,
+            sapling_input_count: 0,
+            orchard_input_count: 0,
+            ironwood_input_count: 5_000,
+        });
+        assert_eq!(
+            rejection_kind(&too_large),
+            Some(ProposalRejectionKind::TransactionTooLarge)
+        );
+
+        for needs_ironwood in [
+            ProposalError::OrchardReceiverRequiresIronwood(
+                zcash_primitives::transaction::TxVersion::V5,
+            ),
+            ProposalError::OrchardPoolPayment(0),
+        ] {
+            assert_eq!(
+                rejection_kind(&TestBuildError::Proposal(needs_ironwood)),
+                Some(ProposalRejectionKind::OrchardRecipientNeedsIronwood)
+            );
+        }
+    }
 
     #[test]
-    fn expired_recipient_address_is_not_retryable() {
-        let error = TestBuildError::RecipientAddressExpiry {
+    fn caller_expiry_on_a_canonical_crossing_is_typed() {
+        let error = TestBuildError::ExpiryHeightConflictsWithCanonicalCrossing {
+            requested: zcash_protocol::consensus::BlockHeight::from_u32(4_500_000),
+        };
+        assert_eq!(
+            rejection_kind(&error),
+            Some(
+                ProposalRejectionKind::ExpiryConflictsWithCanonicalCrossing {
+                    requested_expiry_height: BlockHeight::from(4_500_000),
+                }
+            )
+        );
+    }
+
+    #[test]
+    fn expired_recipient_address_is_typed_and_not_retryable() {
+        let error = classify_proposal_build_error(&TestBuildError::RecipientAddressExpiry {
             payment_index: 0,
             error: zcash_client_backend::data_api::error::AddressExpiryError::TimeExpired {
                 expiry_time: 1,
             },
-        };
+        });
         assert!(matches!(
-            classify_proposal_build_error(&error),
-            StorageError::ProposalBuildFailed {
-                posture: FailurePosture::NotRetryable,
+            error,
+            StorageError::ProposalRejected {
+                kind: ProposalRejectionKind::RecipientAddressExpired,
                 ..
             }
         ));
+        assert_eq!(error.posture(), FailurePosture::NotRetryable);
     }
 
     #[test]
-    fn proposal_input_lock_conflict_is_retryable() {
-        let error = classify_proposal_build_error(&"InputsLocked");
-        assert!(matches!(
-            error,
-            StorageError::ProposalBuildFailed {
-                posture: FailurePosture::Retryable,
-                ..
-            }
-        ));
+    fn unclassified_rejections_are_other() {
+        assert_eq!(
+            rejection_kind(&TestBuildError::ScanRequired),
+            Some(ProposalRejectionKind::Other)
+        );
     }
 
     #[test]

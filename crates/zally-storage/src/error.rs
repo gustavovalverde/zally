@@ -2,6 +2,8 @@
 
 use zally_core::{BlockHeight, FailurePosture, TxId, Zatoshis};
 
+use crate::ProposalRejectionKind;
+
 /// Error returned by [`WalletStorage`](crate::WalletStorage) operations.
 ///
 /// Canonical error type for every storage backend. Backends with a different native error
@@ -219,23 +221,32 @@ pub enum StorageError {
         raw: String,
     },
 
-    /// `propose_*` could not build a transaction because the wallet has too little
-    /// spendable balance to cover amount + fee.
+    /// A dispense reservation would exceed the wallet's spendable balance.
     ///
     /// Posture: [`FailurePosture::NotRetryable`] until balance is replenished.
     #[error(
         "insufficient spendable balance: required {required_zat:?}, available {available_zat:?}"
     )]
     InsufficientFunds {
-        /// Total value (amount + fee) the proposal needed.
+        /// Amount the reservation asked for.
         required_zat: Zatoshis,
-        /// Spendable value the wallet could draw on at proposal time.
+        /// Spendable value left after the account's active reservations.
         available_zat: Zatoshis,
     },
 
-    /// The librustzcash proposal layer rejected the spend with a typed error that did not
-    /// project onto one of the more specific variants above (e.g. balance change required
-    /// for unsupported fee rule, missing anchor, address decode failure).
+    /// librustzcash refused to build a proposal or transaction.
+    ///
+    /// Posture follows [`ProposalRejectionKind::posture`].
+    #[error("proposal rejected ({kind:?}): {reason}")]
+    ProposalRejected {
+        /// Why the proposal was rejected.
+        kind: ProposalRejectionKind,
+        /// Upstream error detail.
+        reason: String,
+    },
+
+    /// Zally could not finish a proposal artifact librustzcash built, for example because
+    /// the PCZT failed to serialize.
     ///
     /// Posture is carried explicitly so the wallet boundary does not have to infer it from
     /// the message string.
@@ -315,6 +326,7 @@ impl StorageError {
             Self::SqliteFailed { posture, .. } | Self::ProposalBuildFailed { posture, .. } => {
                 *posture
             }
+            Self::ProposalRejected { kind, .. } => kind.posture(),
         }
     }
 
@@ -375,6 +387,10 @@ mod tests {
             StorageError::ProposalBuildFailed {
                 reason: "x".into(),
                 posture: FailurePosture::NotRetryable,
+            },
+            StorageError::ProposalRejected {
+                kind: ProposalRejectionKind::InputsLocked,
+                reason: "x".into(),
             },
             StorageError::HoldNotFound,
             StorageError::HoldRequestConflict,

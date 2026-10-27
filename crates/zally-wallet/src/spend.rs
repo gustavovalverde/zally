@@ -10,6 +10,7 @@ use zally_core::{
     AccountId, BlockHeight, IdempotencyKey, Memo, MemoBytes, Network, OutPoint, PaymentRecipient,
     TxId, Zatoshis,
 };
+use zally_storage::ProposalRejectionKind;
 
 use crate::error::WalletError;
 use crate::wallet::{Wallet, current_unix_ms};
@@ -661,6 +662,7 @@ impl Wallet {
             }
         }
         first_result.ok_or_else(|| WalletError::ProposalRejected {
+            kind: ProposalRejectionKind::Other,
             reason: "transaction construction returned no transactions".into(),
         })
     }
@@ -728,6 +730,7 @@ pub(crate) fn protocol_shielded_pool(
         ShieldedPool::Ironwood => zcash_protocol::ShieldedPool::Ironwood,
         _ => {
             return Err(WalletError::ProposalRejected {
+                kind: ProposalRejectionKind::Other,
                 reason: "shielded pool is not supported by this release".into(),
             });
         }
@@ -869,7 +872,9 @@ pub struct SendPaymentPlan<'submitter> {
     ///
     /// When set, the wallet builds the transaction through the PCZT path and sets
     /// `global.expiry_height` before the IO Finalizer, prover, and signer run. When
-    /// `None`, the wallet uses its own chain-tip-derived default.
+    /// `None`, the wallet uses its own chain-tip-derived default. A ZIP 318 canonical
+    /// crossing refuses a target with [`WalletError::ProposalRejected`] of kind
+    /// [`ExpiryConflictsWithCanonicalCrossing`](ProposalRejectionKind::ExpiryConflictsWithCanonicalCrossing).
     pub target_expiry_height: Option<BlockHeight>,
     /// Submitter that delivers the signed transaction.
     pub submitter: &'submitter dyn Submitter,
@@ -1026,6 +1031,7 @@ fn is_transparent_only_unified_address(recipient: &PaymentRecipient) -> bool {
 fn validate_non_zero(amount_zat: Zatoshis) -> Result<(), WalletError> {
     if amount_zat.as_u64() == 0 {
         Err(WalletError::ProposalRejected {
+            kind: ProposalRejectionKind::Other,
             reason: "amount must be greater than zero zatoshis".into(),
         })
     } else {

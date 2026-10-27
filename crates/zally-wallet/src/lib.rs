@@ -46,4 +46,5 @@ pub use sync::{
 pub use transparent_utxo_refresh::TransparentUtxoRefreshOutcome;
 pub use unspent_note::UnspentShieldedNote;
 pub use wallet::{ReserveForDispensePlan, Wallet, WalletBuilder};
+pub use zally_storage::ProposalRejectionKind;
 pub use zcash_payment_disclosure::PaymentDisclosureProfile;

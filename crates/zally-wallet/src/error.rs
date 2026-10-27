@@ -4,7 +4,7 @@ use zally_chain::{ChainSourceError, FailurePosture, SubmitterError};
 use zally_core::{BlockHeight, Network, TxId, Zatoshis};
 use zally_keys::{KeyDerivationError, SealingError};
 use zally_pczt::{PaymentDisclosureExportError, PcztError};
-use zally_storage::StorageError;
+use zally_storage::{ProposalRejectionKind, StorageError};
 
 /// Error returned by [`crate::Wallet`] operations.
 #[derive(Debug, thiserror::Error)]
@@ -78,14 +78,18 @@ pub enum WalletError {
     #[error("TEX recipients (ZIP-320) require an all-transparent input set")]
     ShieldedInputsOnTexRecipient,
 
-    /// The wallet does not have enough spendable balance for the requested send.
+    /// The wallet does not have enough spendable balance for the requested reservation or
+    /// send.
+    ///
+    /// librustzcash rejecting a proposal for insufficient funds also surfaces here, never as
+    /// [`WalletError::ProposalRejected`].
     ///
     /// Posture: [`FailurePosture::NotRetryable`] until balance is replenished.
     #[error("insufficient spendable balance: requested {requested_zat}, spendable {spendable_zat}")]
     InsufficientBalance {
-        /// Amount the caller asked to send.
+        /// Value the call needed: the reservation amount, or the payment total plus fee.
         requested_zat: Zatoshis,
-        /// Spendable balance reported by storage at proposal time.
+        /// Spendable balance at the time of the check.
         spendable_zat: Zatoshis,
     },
 
@@ -98,12 +102,17 @@ pub enum WalletError {
         reason: String,
     },
 
-    /// The proposal could not be built (e.g., unsupported recipient combination, missing
-    /// anchor, fee constraint).
+    /// The proposal or its transaction could not be built.
     ///
-    /// Posture: [`FailurePosture::NotRetryable`] for malformed input.
-    #[error("proposal rejected: {reason}")]
+    /// `kind` says what the caller can do next, for example retry when a concurrent proposal
+    /// locked a selected input, or retry without a target expiry height. Insufficient funds
+    /// surface as [`WalletError::InsufficientBalance`] instead.
+    ///
+    /// Posture follows [`ProposalRejectionKind::posture`].
+    #[error("proposal rejected ({kind:?}): {reason}")]
     ProposalRejected {
+        /// Why the proposal was rejected.
+        kind: ProposalRejectionKind,
         /// Underlying error description.
         reason: String,
     },
@@ -257,6 +266,7 @@ impl WalletError {
             Self::Submitter(e) => e.posture(),
             Self::CircuitBroken { .. } => FailurePosture::Retryable,
             Self::UnverifiedScanChunk { source, .. } => source.posture(),
+            Self::ProposalRejected { kind, .. } => kind.posture(),
             Self::NetworkMismatch { .. }
             | Self::NoSealedSeed
             | Self::AccountNotFound
@@ -268,7 +278,6 @@ impl WalletError {
             | Self::ShieldedInputsOnTexRecipient
             | Self::InsufficientBalance { .. }
             | Self::PaymentRequestParseFailed { .. }
-            | Self::ProposalRejected { .. }
             | Self::SubmissionRejected { .. }
             | Self::PaymentDisclosureSourceMissing { .. }
             | Self::TargetExpiryStale { .. }
@@ -311,14 +320,21 @@ impl From<StorageError> for WalletError {
             StorageError::InsufficientFunds {
                 required_zat,
                 available_zat,
+            }
+            | StorageError::ProposalRejected {
+                kind:
+                    ProposalRejectionKind::InsufficientFunds {
+                        required_zat,
+                        available_zat,
+                    },
+                ..
             } => Self::InsufficientBalance {
                 requested_zat: required_zat,
                 spendable_zat: available_zat,
             },
-            StorageError::ProposalBuildFailed {
-                reason,
-                posture: FailurePosture::NotRetryable,
-            } => Self::ProposalRejected { reason },
+            StorageError::ProposalRejected { kind, reason } => {
+                Self::ProposalRejected { kind, reason }
+            }
             other => Self::Storage(other),
         }
     }
@@ -350,7 +366,10 @@ mod tests {
                 spendable_zat: Zatoshis::zero(),
             },
             WalletError::PaymentRequestParseFailed { reason: "x".into() },
-            WalletError::ProposalRejected { reason: "x".into() },
+            WalletError::ProposalRejected {
+                kind: ProposalRejectionKind::Other,
+                reason: "x".into(),
+            },
             WalletError::SubmissionRejected {
                 reason: zally_chain::RejectionReason::Unknown,
                 detail: "x".into(),
@@ -400,14 +419,82 @@ mod tests {
         assert!(!err.is_retryable());
     }
 
+    fn storage_rejection(kind: ProposalRejectionKind) -> WalletError {
+        WalletError::from(StorageError::ProposalRejected {
+            kind,
+            reason: "upstream detail".to_owned(),
+        })
+    }
+
     #[test]
-    fn retryable_proposal_failure_preserves_storage_posture() {
-        let err = WalletError::from(StorageError::ProposalBuildFailed {
-            reason: "InputsLocked".to_owned(),
-            posture: FailurePosture::Retryable,
+    fn storage_proposal_rejections_keep_their_kind_and_posture() {
+        let expected = [
+            (
+                ProposalRejectionKind::InputsLocked,
+                FailurePosture::Retryable,
+            ),
+            (
+                ProposalRejectionKind::TransactionTooLarge,
+                FailurePosture::NotRetryable,
+            ),
+            (
+                ProposalRejectionKind::ExpiryConflictsWithCanonicalCrossing {
+                    requested_expiry_height: BlockHeight::from(4_500_000),
+                },
+                FailurePosture::NotRetryable,
+            ),
+            (
+                ProposalRejectionKind::RecipientAddressExpired,
+                FailurePosture::NotRetryable,
+            ),
+            (
+                ProposalRejectionKind::OrchardRecipientNeedsIronwood,
+                FailurePosture::NotRetryable,
+            ),
+            (
+                ProposalRejectionKind::SelectionContractViolated,
+                FailurePosture::RequiresOperator,
+            ),
+            (ProposalRejectionKind::Other, FailurePosture::NotRetryable),
+        ];
+        for (kind, posture) in expected {
+            let err = storage_rejection(kind);
+            assert!(
+                matches!(&err, WalletError::ProposalRejected { kind: actual, reason }
+                    if *actual == kind && reason == "upstream detail"),
+                "{err:?}"
+            );
+            assert_eq!(err.posture(), posture, "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn insufficient_funds_rejection_reports_insufficient_balance() {
+        let required_zat = Zatoshis::try_from(20_000_u64).unwrap_or(Zatoshis::zero());
+        let available_zat = Zatoshis::try_from(10_000_u64).unwrap_or(Zatoshis::zero());
+        let err = storage_rejection(ProposalRejectionKind::InsufficientFunds {
+            required_zat,
+            available_zat,
         });
-        assert!(matches!(err, WalletError::Storage(_)));
-        assert_eq!(err.posture(), FailurePosture::Retryable);
+        assert!(
+            matches!(err, WalletError::InsufficientBalance { requested_zat, spendable_zat }
+                if requested_zat == required_zat && spendable_zat == available_zat),
+            "{err:?}"
+        );
+        assert_eq!(err.posture(), FailurePosture::NotRetryable);
+    }
+
+    #[test]
+    fn unfinished_proposal_artifact_stays_a_storage_error() {
+        let err = WalletError::from(StorageError::ProposalBuildFailed {
+            reason: "pczt serialize failed".to_owned(),
+            posture: FailurePosture::NotRetryable,
+        });
+        assert!(matches!(
+            err,
+            WalletError::Storage(StorageError::ProposalBuildFailed { .. })
+        ));
+        assert_eq!(err.posture(), FailurePosture::NotRetryable);
     }
 
     #[test]

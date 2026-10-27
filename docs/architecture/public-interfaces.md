@@ -113,6 +113,7 @@ A name must survive a change of its implementation.
 | `SyncSnapshot` | `zally-wallet` | Observable state emitted by a running `SyncDriver`. |
 | `SyncObservation` | `zally-wallet` | Chain state the wallet has committed and checked against the chain, and when. Carried on `SyncSnapshot::last_observation`; the age input to a consumer's spend-freshness gate. |
 | `WalletStorage` | `zally-storage` | Trait abstraction over librustzcash's `WalletRead` + `WalletWrite`. |
+| `ProposalRejectionKind` | `zally-storage`, re-exported by `zally-wallet` | Why a proposal or its transaction could not be built, with its posture. Carried by `WalletError::ProposalRejected` and `StorageError::ProposalRejected`; see the [error vocabulary](../reference/error-vocabulary.md#proposalrejectionkind). |
 | `ChainSource` | `zally-chain` | Trait for compact-block reads, tree state, transparent UTXO lookups. |
 | `ChainEventCursor` | `zally-chain` | Opaque cursor for resuming chain-event streams without exposing backend internals. |
 | `ChainEventStreamStart` | `zally-chain` | Explicit chain-event subscription start position (`AfterCursor` \| `EarliestRetained` \| `LiveTail`). |

@@ -10,6 +10,7 @@
 use zally_chain::Submitter;
 use zally_core::{BlockHeight, Network, TxId};
 use zally_pczt::{PcztBytes, Prover, Signer};
+use zally_storage::ProposalRejectionKind;
 
 use crate::error::WalletError;
 use crate::spend::{ProposalPlan, SendOutcome, storage_proposal_request};
@@ -23,11 +24,15 @@ impl Wallet {
     /// storage layer. When `target_expiry_height` is set, the caller-supplied value lands
     /// on `Global::expiry_height` before the upstream IO Finalizer runs, which is the only
     /// stage that can pin a value without invalidating the dummy spends the finalizer
-    /// signs. The returned bytes carry the wallet's network and must be proven and
-    /// authorized via [`Wallet::prove_pczt`] and [`Wallet::sign_pczt`] before submission.
+    /// signs. A ZIP 318 canonical crossing takes its expiry from the ZIP 318 rolling window,
+    /// so a target expiry for one fails with [`WalletError::ProposalRejected`] of kind
+    /// [`ExpiryConflictsWithCanonicalCrossing`](ProposalRejectionKind::ExpiryConflictsWithCanonicalCrossing).
+    /// The returned bytes carry the wallet's network and must be proven and authorized via
+    /// [`Wallet::prove_pczt`] and [`Wallet::sign_pczt`] before submission.
     ///
     /// `not_retryable` on validation failure or insufficient balance; `retryable` on
-    /// transient I/O against the wallet database.
+    /// transient I/O against the wallet database or on inputs locked by a concurrent
+    /// proposal.
     pub async fn propose_pczt(
         &self,
         plan: ProposalPlan,
@@ -199,6 +204,7 @@ fn validate_proposal_plan(plan: &ProposalPlan, wallet_network: Network) -> Resul
     }
     if plan.amount_zat.as_u64() == 0 {
         return Err(WalletError::ProposalRejected {
+            kind: ProposalRejectionKind::Other,
             reason: "amount must be positive".into(),
         });
     }

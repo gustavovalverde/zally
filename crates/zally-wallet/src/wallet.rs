@@ -8,7 +8,7 @@ use tokio::sync::broadcast;
 use zally_chain::ChainSource;
 use zally_core::{AccountId, BlockHeight, HoldId, IdempotencyKey, Network, TxId, Zatoshis};
 use zally_keys::{Mnemonic, SealingError, SeedMaterial, SeedSealing};
-use zally_storage::WalletStorage;
+use zally_storage::{ProposalRejectionKind, WalletStorage};
 use zcash_keys::address::UnifiedAddress;
 
 use crate::capabilities::{Capability, SealingCapability, StorageCapability, WalletCapabilities};
@@ -420,6 +420,7 @@ impl Wallet {
         } = plan;
         if amount_zat.as_u64() == 0 {
             return Err(WalletError::ProposalRejected {
+                kind: ProposalRejectionKind::Other,
                 reason: "reservation amount must be greater than zero zatoshis".into(),
             });
         }
