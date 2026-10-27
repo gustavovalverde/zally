@@ -8,13 +8,14 @@ mod pending_broadcast_input_row;
 mod proposal_rejection_kind;
 mod sqlite;
 mod wallet;
+mod zip218;
 
 pub use account_balance_row::AccountBalanceRow;
 pub use error::StorageError;
 pub use exposed_address_row::ExposedAddressRow;
 pub use hold_row::{HeldNote, HoldRow};
 pub use pending_broadcast_input_row::PendingBroadcastInputRow;
-pub use proposal_rejection_kind::ProposalRejectionKind;
+pub use proposal_rejection_kind::{ProposalRejectionKind, ShieldedBlockLimit};
 pub use sqlite::{Sqlite, SqliteOptions};
 pub use wallet::{
     ChainTips, CommitmentTreeRoots, HoldRecord, PendingBroadcastRecord, PreparedTransaction,

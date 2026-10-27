@@ -71,6 +71,7 @@ use zcash_transparent::bundle::{OutPoint as UpstreamOutPoint, TxOut};
 use crate::ProposalRejectionKind;
 use crate::error::StorageError;
 use crate::wallet::{ChainTips, WalletStorage};
+use crate::zip218::check_zip218_limits;
 
 type StorageClock = SystemClock;
 type StorageOsRng = rand::rand_core::UnwrapErr<SysRng>;
@@ -1024,6 +1025,7 @@ impl WalletStorage for Sqlite {
                 source_pool,
                 None,
             )?;
+            check_zip218_limits(&params, &proposal)?;
             let first_step = proposal.steps().first();
             let balance = first_step.balance();
             let payment_count = first_step.transaction_request().payments().len();
@@ -1075,6 +1077,7 @@ impl WalletStorage for Sqlite {
                 Some(lock_request),
             )?;
             let build_result = (|| {
+                check_zip218_limits(&params, &proposal)?;
                 ensure_proposal_anchors(db, &proposal)?;
                 let clock = storage_clock();
                 let mut rng = storage_os_rng();
@@ -1165,6 +1168,7 @@ impl WalletStorage for Sqlite {
             )
             .map_err(|err| classify_proposal_build_error(&err))?;
             let build_result = (|| {
+                check_zip218_limits(&params, &proposal)?;
                 ensure_proposal_anchors(db, &proposal)?;
                 let clock = storage_clock();
                 let mut rng = storage_os_rng();
@@ -1234,6 +1238,7 @@ impl WalletStorage for Sqlite {
                     Some(lock_request),
                 )?;
                 let build_result = (|| {
+                    check_zip218_limits(&params, &proposal)?;
                     ensure_proposal_anchors(db, &proposal)?;
                     let clock = storage_clock();
                     let mut rng = storage_os_rng();

@@ -114,6 +114,7 @@ A name must survive a change of its implementation.
 | `SyncObservation` | `zally-wallet` | Chain state the wallet has committed and checked against the chain, and when. Carried on `SyncSnapshot::last_observation`; the age input to a consumer's spend-freshness gate. |
 | `WalletStorage` | `zally-storage` | Trait abstraction over librustzcash's `WalletRead` + `WalletWrite`. |
 | `ProposalRejectionKind` | `zally-storage`, re-exported by `zally-wallet` | Why a proposal or its transaction could not be built, with its posture. Carried by `WalletError::ProposalRejected` and `StorageError::ProposalRejected`; see the [error vocabulary](../reference/error-vocabulary.md#proposalrejectionkind). |
+| `ShieldedBlockLimit` | `zally-storage`, re-exported by `zally-wallet` | The ZIP 218 per-block limit a proposal exceeded: Orchard actions, Ironwood actions, Sapling spends and outputs, or all shielded pools together. Carried by `ProposalRejectionKind::ShieldedLimitExceeded`. |
 | `ChainSource` | `zally-chain` | Trait for compact-block reads, tree state, transparent UTXO lookups. |
 | `ChainEventCursor` | `zally-chain` | Opaque cursor for resuming chain-event streams without exposing backend internals. |
 | `ChainEventStreamStart` | `zally-chain` | Explicit chain-event subscription start position (`AfterCursor` \| `EarliestRetained` \| `LiveTail`). |
@@ -280,6 +281,7 @@ Unified Address strings are encoded at ZIP-316 Revision 0 when Revision 0 can re
 - **SPEND-9**: `Wallet::get_pending_transparent_inputs(account_id) -> PendingTransparentInputs` returns transparent inputs recorded for wallet-owned broadcasts not yet observed mined. The operator snapshot honours `WalletOptions::pending_broadcast_window_ms`; this window controls visibility only. librustzcash's persisted spend and transaction-expiry state remains the input-selection authority.
 - **SPEND-10**: `Wallet::send_payment` uses the same upstream proposal-lock lifecycle as SPEND-7. Once transaction creation persists the spend, librustzcash excludes the inputs while the unmined transaction remains unexpired. Zally records broadcast inputs in its operator ledger before calling `Submitter::submit`, closing the submit-accept persistence window without maintaining a parallel input selector.
 - **SPEND-11**: `Wallet::reserve_for_dispense(ReserveForDispensePlan) -> DispenseReservation` atomically locks `amount_zat` of the account's shielded balance against the caller-supplied `request_id`. The reservation persists in storage so it survives a process restart; concurrent reservations whose amounts sum above spendable cannot both pass (one returns `InsufficientBalance`). The wallet plane exposes `Wallet::release_dispense_reservation`, `Wallet::finalize_dispense_reservation`, and `Wallet::spendable_for_next_dispense` to complete the lifecycle; the latter subtracts every active reservation from the wallet's shielded view. See [ADR-0003](../adrs/0003-dispense-reservations.md).
+- **SPEND-12**: Once NU7 is active at a proposal's target height, every proposal step is checked against the ZIP 218 per-block shielded limits before its inputs are used: 330 Orchard actions, 330 Ironwood actions, 300 Sapling spends and outputs, and 330 across those pools. An over-limit proposal fails with `ProposalRejectionKind::ShieldedLimitExceeded` and releases its input locks. The check is Zally's until librustzcash ships its own.
 
 ### PCZT and external signing (PCZT)
 
@@ -338,6 +340,7 @@ Which ZIPs Zally implements directly, which it inherits through librustzcash, an
 - **ZIP-311**: Draft1 Sapling payment-disclosure production and verification. The proof algorithms follow the Draft ZIP; the explicitly versioned wire encoding is incubating because the ZIP has not specified one.
 - **ZIP-315**: Wallet best practices. Explicit transparent shielding, trusted vs untrusted TXO accounting, confirmation-depth defaults aligned with the ZIP.
 - **ZIP-316**: Unified Addresses, UFVKs, UIVKs. First-class address type; UFVK export.
+- **ZIP-218**: Per-block shielded limits after NU7. Proposals whose steps exceed a limit are refused before they are built (SPEND-12).
 - **ZIP-317**: Conventional fee mechanism.
 - **ZIP-320**: TEX addresses. Recognised as transparent recipients at the API boundary.
 - **ZIP-321**: Payment request URIs. First-class `PaymentRequest` type.

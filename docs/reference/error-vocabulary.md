@@ -105,7 +105,7 @@ Only `retryable` moves the breaker's failure counter, and only a call that compl
 
 ## ProposalRejectionKind
 
-Carried by `WalletError::ProposalRejected` and `StorageError::ProposalRejected`. Kinds are matched from the typed librustzcash error variants, never from error text; an unrecognized upstream variant is `Other`.
+Carried by `WalletError::ProposalRejected` and `StorageError::ProposalRejected`. Kinds are matched from the typed librustzcash error variants, never from error text; an unrecognized upstream variant is `Other`. `ShieldedLimitExceeded` is the exception: Zally checks each proposal against the ZIP 218 limits itself until librustzcash ships that check.
 
 | Kind | Posture | Meaning |
 |------|---------|---------|
@@ -116,6 +116,7 @@ Carried by `WalletError::ProposalRejected` and `StorageError::ProposalRejected`.
 | `RecipientAddressExpired` | `not_retryable` | A ZIP 316 Revision 2 recipient address has expired; ask for a current one. Also returned when the address only expires before the transaction would; an earlier target expiry height passes, but choosing it to fit the address reveals the address's expiry on chain (ZIP 316), so prefer a longer-lived address. |
 | `OrchardRecipientNeedsIronwood` | `not_retryable` | After NU6.3, an Orchard-receiver payment can only be delivered through the Ironwood pool, which a transaction of the requested version cannot carry. |
 | `SelectionContractViolated` | `requires_operator` | librustzcash reported a broken internal contract while selecting inputs or building a step, such as a selected note it was asked to exclude or an Orchard-pool payment after Ironwood activation. |
+| `ShieldedLimitExceeded` | `not_retryable` | Once NU7 is active, a transaction of the proposal would carry more shielded components than ZIP 218 allows in one block, so no block could include it. `limit` names the bound (`ShieldedBlockLimit`: Orchard actions, Ironwood actions, Sapling spends and outputs, or all shielded pools together) and `component_count` the padded count. Send a smaller amount, or consolidate notes first. |
 | `Other` | `not_retryable` | Any other rejection; the reason carries the detail. |
 
 ## PcztError
