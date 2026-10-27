@@ -369,6 +369,43 @@ async fn concurrent_syncs_report_an_unmineable_broadcast_once() -> Result<(), Te
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_birthday_rebuild_keeps_judging_an_in_flight_broadcast() -> Result<(), TestError> {
+    let PendingShieldingWallet {
+        wallet,
+        storage,
+        chain,
+        chain_handle,
+        pending_tx_id,
+        temp: _temp,
+        ..
+    } = wallet_with_pending_shielding().await?;
+    wallet.reset_to_birthday(&chain).await?;
+    let shield_key = IdempotencyKey::try_from(SHIELD_KEY)
+        .map_err(|_| TestError::Fixture("invalid idempotency key"))?;
+    assert_eq!(
+        storage.find_idempotent_submission(&shield_key).await?,
+        Some(pending_tx_id),
+        "the rebuild keeps the in-flight broadcast's key"
+    );
+
+    let mut events = wallet.observe();
+    let settled = NU7_ACTIVATION_HEIGHT - 1;
+    sync_to(&wallet, &chain, &chain_handle, settled + 6, settled).await?;
+    let reports = unmineable_reports(&mut events).await;
+    assert_eq!(
+        reports.iter().map(|(tx_id, _)| *tx_id).collect::<Vec<_>>(),
+        vec![pending_tx_id],
+        "the rebuilt wallet must still judge the in-flight broadcast"
+    );
+    assert_eq!(
+        storage.find_idempotent_submission(&shield_key).await?,
+        None,
+        "the verdict frees the key after the rebuild"
+    );
+    Ok(())
+}
+
 /// Accepts every transaction and echoes its canonical transaction ID, as a node does.
 struct AcceptingSubmitter {
     network: Network,

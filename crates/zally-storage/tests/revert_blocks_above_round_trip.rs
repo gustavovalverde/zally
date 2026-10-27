@@ -344,7 +344,7 @@ async fn rewind_records_reverted_sends_and_the_cursor_with_the_truncation() -> R
     assert_eq!(reverted_send.tx_id, shielding_tx_id);
     assert_eq!(
         reverted_send.reverted_from_height,
-        BlockHeight::from(SHIELDING_MINED_HEIGHT)
+        Some(BlockHeight::from(SHIELDING_MINED_HEIGHT))
     );
     assert_eq!(
         reverted_send.expiry_height,

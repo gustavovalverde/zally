@@ -555,7 +555,7 @@ const LEDGER_SCHEMA_SQL: &str = "CREATE TABLE IF NOT EXISTS ext_zally_idempotenc
                  tx_id_bytes BLOB PRIMARY KEY NOT NULL,\
                  raw_tx_bytes BLOB NOT NULL,\
                  expiry_height INTEGER NOT NULL,\
-                 reverted_from_height INTEGER NOT NULL,\
+                 reverted_from_height INTEGER,\
                  recorded_at_ms INTEGER NOT NULL,\
                  resubmitted_at_ms INTEGER\
              );";
@@ -690,6 +690,28 @@ fn rebuild_database_with_ledger(
     Ok(account_id)
 }
 
+/// Carries every unsettled wallet-created transaction into the rebuilt reverted-broadcast ledger.
+///
+/// A transaction is unsettled when it is unmined, an idempotency key still names it, or it
+/// still has pending-broadcast rows.
+///
+/// The rebuild discards the transaction records `zcash_client_sqlite` keeps, so without its
+/// raw bytes and expiry the rebuilt wallet could neither judge nor resubmit such a
+/// transaction, and its idempotency key would stay bound forever. One that the rescan finds
+/// mined leaves the ledger through the usual join on `transactions`.
+const UNSETTLED_SENDS_CARRY_SQL: &str = "\
+    INSERT OR IGNORE INTO main.ext_zally_reverted_broadcasts \
+        (tx_id_bytes, raw_tx_bytes, expiry_height, reverted_from_height, recorded_at_ms, \
+         resubmitted_at_ms) \
+    SELECT t.txid, t.raw, IFNULL(t.expiry_height, 0), t.mined_height, ?1, NULL \
+    FROM prior.transactions t \
+    WHERE t.created IS NOT NULL AND t.raw IS NOT NULL \
+      AND (t.mined_height IS NULL \
+           OR t.txid IN (SELECT tx_id_bytes FROM prior.ext_zally_idempotency \
+                         WHERE unmineable_at_height IS NULL) \
+           OR t.txid IN (SELECT broadcast_tx_id \
+                         FROM prior.ext_zally_pending_broadcast_inputs))";
+
 /// Columns `table` has in both the rebuilt and the prior database, comma-separated.
 ///
 /// A prior ledger can predate a column added since; naming the shared columns keeps the copy
@@ -749,6 +771,7 @@ fn carry_ledger_rows(ledger: &rusqlite::Connection, prior_path: &Path) -> Result
                 [],
             )?;
         }
+        transaction.execute(UNSETTLED_SENDS_CARRY_SQL, [current_unix_ms_for_ledger()])?;
         transaction.commit()
     })();
     let detached = ledger.execute("DETACH DATABASE prior", []);
@@ -1222,7 +1245,7 @@ impl WalletStorage for Sqlite {
                         row.get::<_, Vec<u8>>(0)?,
                         row.get::<_, Vec<u8>>(1)?,
                         row.get::<_, u32>(2)?,
-                        row.get::<_, u32>(3)?,
+                        row.get::<_, Option<u32>>(3)?,
                         row.get::<_, Option<u32>>(4)?,
                         row.get::<_, Option<i64>>(5)?,
                     ))
@@ -1248,7 +1271,7 @@ impl WalletStorage for Sqlite {
                     )?,
                     raw_tx_bytes,
                     expiry_height: BlockHeight::from(expiry_height),
-                    reverted_from_height: BlockHeight::from(reverted_from_height),
+                    reverted_from_height: reverted_from_height.map(BlockHeight::from),
                     mined_height: mined_height.map(BlockHeight::from),
                     resubmitted_at_ms: resubmitted_at_ms
                         .map(|at_ms| {
