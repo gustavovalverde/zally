@@ -15,7 +15,7 @@ The `0.11.0-pre.0` prereleases encoded unified viewing keys and unified addresse
 
 ## Decision
 
-1. **The wallet plane uses one librustzcash cohort.** The workspace pins `zcash_client_backend 0.25.0`, `zcash_client_sqlite 0.23.0`, `zcash_keys 0.17.0`, `zcash_primitives 0.31.0`, `zcash_protocol 0.11.0`, `zcash_address 0.14.0`, `zcash_proofs 0.31.0`, `zcash_transparent 0.11.0`, `pczt 0.10.0`, `zip321 0.10.0`, `orchard 0.16.0`, `sapling-crypto 0.9`, `zip32 0.3`, `shardtree 0.8`, and `incrementalmerkletree 0.9`. These versions are compatible as one cohort. Keep concrete type boundaries on the selected versions.
+1. **The wallet plane uses one librustzcash cohort.** The workspace pins `zcash_client_backend 0.25.0`, `zcash_client_sqlite 0.23.0`, `zcash_keys 0.17.0`, `zcash_primitives 0.31.0`, `zcash_protocol 0.11.0`, `zcash_address 0.14.0`, `zcash_proofs 0.31.0`, `zcash_transparent 0.11.0`, `pczt 0.10.0`, `zip321 0.10.0`, `orchard 0.16.0`, `sapling-crypto 0.9`, `zip32 0.3`, `shardtree 0.8.0`, and `incrementalmerkletree 0.9.0`. These versions are compatible as one cohort. Keep concrete type boundaries on the selected versions.
 
 2. **Registry sources are authoritative.** Zally does not patch librustzcash, Orchard, shardtree, or incrementalmerkletree. A future unpublished fix requires evidence that no compatible registry cohort contains it and a time-bounded ADR amendment naming the upstream exit condition.
 
@@ -58,4 +58,4 @@ The `0.11.0-pre.0` prereleases encoded unified viewing keys and unified addresse
 - 2026-07-10: Replaced global source patches with direct Git dependencies so Zinder's released lower-level family remained independently resolvable.
 - 2026-07-27: Replaced the Git family and custom Orchard and Merkle-tree patches with the current published family, adopted upstream proposal input locking including exported-PCZT abandonment, and renamed the PCZT capability around wire versions.
 - 2026-10-14: Moved the wallet dependency cohort to the NU7-compatible `0.11.0-pre.0` generation, recorded public testnet activation at height 4,465,026, and preserved the Zinder client revision and RPC contract.
-- 2026-10-27: Moved the cohort to the 2026-10-21 stable releases, which define mainnet NU7 activation at height 3,543,405. Pinned `AccountId` derivation to ZIP 316 Revision 0, recorded the duplicate `zcash_protocol` and `zcash_address` copies that the Zinder revision brings, and recorded the wallet migrations applied to databases from earlier releases.
+- 2026-10-27: Moved the cohort to the 2026-10-21 stable releases, which define mainnet NU7 activation at height 3,543,405. Pinned `AccountId` derivation to ZIP 316 Revision 0, recorded the duplicate `zcash_protocol` and `zcash_address` copies that the Zinder revision brings, recorded the wallet migrations applied to databases from earlier releases, and restored exact `shardtree` and `incrementalmerkletree` pins.
