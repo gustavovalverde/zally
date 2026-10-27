@@ -436,6 +436,20 @@ pub struct PendingBroadcastTransaction {
     pub mined_height: Option<BlockHeight>,
 }
 
+/// A dispense hold finalized with a transaction [`WalletStorage::record_unmineable_transaction`]
+/// recorded as unmineable.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub struct UnmineableHold {
+    /// The settled hold.
+    pub hold_id: HoldId,
+    /// Request identifier the hold was reserved under.
+    pub request_id: IdempotencyKey,
+    /// True when the hold is active again; false when it was released because another
+    /// active hold holds `request_id`.
+    pub is_reopened: bool,
+}
+
 /// Wallet activity a [`WalletStorage::revert_blocks_above`] call un-mined.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 #[non_exhaustive]
@@ -928,16 +942,21 @@ pub trait WalletStorage: Send + Sync + 'static {
 
     /// Records that `tx_id` can never be mined, as judged at `judged_height`.
     ///
-    /// In one storage transaction, drops the transaction's pending-broadcast rows and moves
-    /// every idempotency key bound to it into a terminal state, so the key's next send creates
-    /// a replacement. Repeating the call changes nothing.
+    /// In one storage transaction, drops the transaction's pending-broadcast and
+    /// reverted-broadcast rows, moves every idempotency key bound to it into a terminal state
+    /// so the key's next send creates a replacement, and undoes the finalization of every
+    /// hold finalized with it: the dispense did not happen. Each such hold becomes active
+    /// again, or is released when another active hold already holds its request identifier.
+    /// Repeating the call changes nothing and returns no holds.
+    ///
+    /// Returns the holds the call settled.
     ///
     /// `not_retryable` on schema errors; `retryable` on transient I/O.
     async fn record_unmineable_transaction(
         &self,
         tx_id: TxId,
         judged_height: BlockHeight,
-    ) -> Result<(), StorageError>;
+    ) -> Result<Vec<UnmineableHold>, StorageError>;
 
     /// Returns the per-pool balance snapshot for `account_id`, anchored to the wallet's last
     /// persisted visible tip.
@@ -1025,25 +1044,7 @@ pub trait WalletStorage: Send + Sync + 'static {
         resubmitted_at_ms: u64,
     ) -> Result<(), StorageError>;
 
-    /// Retires the reverted broadcast `tx_id` once the wallet has judged that it can never be
-    /// mined, releasing its idempotency keys.
-    ///
-    /// The caller judges the transaction at a height no reorg can revert and the wallet has
-    /// fully scanned, so a transaction that could still be mined is never retired. Each
-    /// idempotency key bound to it moves to a retired ledger, so
-    /// [`Self::find_idempotent_submission`] stops returning the dead transaction and the same
-    /// key can record a replacement. Its reverted-broadcast and pending-broadcast input rows
-    /// are removed in the same database transaction.
-    ///
-    /// `not_retryable` on schema errors; `retryable` on transient I/O.
-    async fn retire_reverted_broadcast(
-        &self,
-        tx_id: TxId,
-        retired_at_ms: u64,
-    ) -> Result<(), StorageError>;
-
-    /// Removes the reverted broadcast `tx_id` and its pending-broadcast input rows once it
-    /// is mined again.
+    /// Removes the reverted broadcast `tx_id` once the wallet has scanned it mined again.
     ///
     /// `not_retryable` on schema errors; `retryable` on transient I/O.
     async fn clear_reverted_broadcast(&self, tx_id: TxId) -> Result<(), StorageError>;

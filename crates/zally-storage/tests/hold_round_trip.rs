@@ -428,6 +428,119 @@ async fn holds_survive_storage_restart() -> Result<(), TestError> {
     Ok(())
 }
 
+async fn create_finalized_hold(
+    storage: &Sqlite,
+    account: AccountId,
+    request_id: &IdempotencyKey,
+    tx_id: TxId,
+) -> Result<HoldId, TestError> {
+    let hold_id = HoldId::new();
+    storage
+        .create_hold(make_record(HoldFixture {
+            hold_id,
+            request_id: request_id.clone(),
+            idempotency_key: IdempotencyKey::try_from("dispense-broadcast")?,
+            account_id: account,
+            amount_zat: Zatoshis::try_from(10_000_000_u64)?,
+            spendable_for_check_zat: one_zec_in_zats()?,
+            reserved_at_ms: 1_700_000_000_000,
+        }))
+        .await?;
+    storage.finalize_hold(hold_id, tx_id).await?;
+    Ok(hold_id)
+}
+
+#[tokio::test]
+async fn an_unmineable_dispense_reopens_its_hold() -> Result<(), TestError> {
+    let temp = TempDir::new()?;
+    let storage = open_storage(temp.path().join("wallet.db"));
+    storage.open_or_create().await?;
+    let account = make_account();
+    let request_id = make_request_id(7)?;
+    let dead_tx_id = TxId::from_bytes([0xD0; 32]);
+    let hold_id = create_finalized_hold(&storage, account, &request_id, dead_tx_id).await?;
+    assert!(storage.list_active_holds(account).await?.is_empty());
+
+    let settled = storage
+        .record_unmineable_transaction(dead_tx_id, zally_core::BlockHeight::from(50))
+        .await?;
+    assert_eq!(settled.len(), 1);
+    assert_eq!(settled[0].hold_id, hold_id);
+    assert_eq!(settled[0].request_id, request_id);
+    assert!(settled[0].is_reopened);
+    let active = storage.list_active_holds(account).await?;
+    assert_eq!(
+        active.iter().map(|hold| hold.hold_id).collect::<Vec<_>>(),
+        vec![hold_id],
+        "the dispense did not happen, so its hold reserves its amount again"
+    );
+    assert_eq!(active[0].finalized_tx_id, None);
+    assert!(
+        storage
+            .record_unmineable_transaction(dead_tx_id, zally_core::BlockHeight::from(51))
+            .await?
+            .is_empty(),
+        "a repeated verdict settles no hold twice"
+    );
+
+    let replacement = TxId::from_bytes([0xD1; 32]);
+    storage.finalize_hold(hold_id, replacement).await?;
+    assert!(storage.list_active_holds(account).await?.is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn an_unmineable_dispense_releases_its_hold_when_the_request_moved_on()
+-> Result<(), TestError> {
+    let temp = TempDir::new()?;
+    let storage = open_storage(temp.path().join("wallet.db"));
+    storage.open_or_create().await?;
+    let account = make_account();
+    let request_id = make_request_id(8)?;
+    let dead_tx_id = TxId::from_bytes([0xE0; 32]);
+    let first_hold = create_finalized_hold(&storage, account, &request_id, dead_tx_id).await?;
+    let second_hold = HoldId::new();
+    storage
+        .create_hold(make_record(HoldFixture {
+            hold_id: second_hold,
+            request_id: request_id.clone(),
+            idempotency_key: IdempotencyKey::try_from("dispense-broadcast-2")?,
+            account_id: account,
+            amount_zat: Zatoshis::try_from(10_000_000_u64)?,
+            spendable_for_check_zat: one_zec_in_zats()?,
+            reserved_at_ms: 1_700_000_000_001,
+        }))
+        .await?;
+
+    let settled = storage
+        .record_unmineable_transaction(dead_tx_id, zally_core::BlockHeight::from(50))
+        .await?;
+    assert_eq!(settled.len(), 1);
+    assert_eq!(settled[0].hold_id, first_hold);
+    assert!(
+        !settled[0].is_reopened,
+        "another active hold carries the request, so the first one is released"
+    );
+    let released = storage
+        .find_hold_by_request_id(&request_id)
+        .await?
+        .ok_or(TestError::MissingByRequest)?;
+    assert_eq!(
+        released.hold_id, second_hold,
+        "only the newer hold stays active"
+    );
+    assert_eq!(
+        storage
+            .list_active_holds(account)
+            .await?
+            .iter()
+            .map(|hold| hold.hold_id)
+            .collect::<Vec<_>>(),
+        vec![second_hold]
+    );
+    Ok(())
+}
+
 #[derive(Debug, thiserror::Error)]
 enum TestError {
     #[error("io error: {0}")]

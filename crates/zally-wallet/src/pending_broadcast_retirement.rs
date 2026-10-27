@@ -17,8 +17,10 @@ impl Wallet {
     /// wallet has seen every block up to that height, and a reorg within the chain source's
     /// bound cannot replace them. A broadcast mined at or below it drops its pending inputs. A
     /// broadcast not mined there that no later block accepts is recorded as unmineable once,
-    /// which drops its pending inputs and frees its idempotency key for a replacement, and
-    /// [`WalletEvent::PendingBroadcastUnmineable`] reports it. Judging at the visible tip
+    /// which drops its pending inputs, frees its idempotency key for a replacement, and
+    /// reopens the dispense holds finalized with it; [`WalletEvent::PendingBroadcastUnmineable`]
+    /// reports it and [`WalletEvent::HoldDispenseUnmineable`] reports each hold. A
+    /// transaction a rewind removed from the chain is judged the same way. Judging at the visible tip
     /// instead could report a broadcast that an unscanned or reorged block still mines, and
     /// its replacement would pay twice.
     pub(crate) async fn retire_pending_broadcasts(&self) -> Result<(), WalletError> {
@@ -58,7 +60,7 @@ impl Wallet {
             let Err(reason) = header.check_mineable(self.network(), judged_height) else {
                 continue;
             };
-            storage
+            let holds = storage
                 .record_unmineable_transaction(tx_id, judged_height)
                 .await?;
             tracing::warn!(
@@ -73,6 +75,22 @@ impl Wallet {
                 tx_id,
                 reason: reason.to_string(),
             });
+            for hold in holds {
+                tracing::warn!(
+                    target: "zally::wallet",
+                    event = "hold_dispense_unmineable",
+                    hold_id = %hold.hold_id.as_uuid(),
+                    %tx_id,
+                    is_reopened = hold.is_reopened,
+                    "dispense hold was finalized with a transaction that can never be mined"
+                );
+                self.publish_event(WalletEvent::HoldDispenseUnmineable {
+                    hold_id: hold.hold_id,
+                    request_id: hold.request_id,
+                    tx_id,
+                    is_reopened: hold.is_reopened,
+                });
+            }
         }
         Ok(())
     }

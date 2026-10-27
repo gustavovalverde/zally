@@ -551,12 +551,6 @@ const LEDGER_SCHEMA_SQL: &str = "CREATE TABLE IF NOT EXISTS ext_zally_idempotenc
                  cursor_bytes BLOB NOT NULL,\
                  recorded_at_ms INTEGER NOT NULL\
              ); \
-             CREATE TABLE IF NOT EXISTS ext_zally_retired_submissions (\
-                 idempotency_key TEXT NOT NULL,\
-                 tx_id_bytes BLOB NOT NULL,\
-                 retired_at_ms INTEGER NOT NULL,\
-                 PRIMARY KEY (idempotency_key, tx_id_bytes)\
-             ); \
              CREATE TABLE IF NOT EXISTS ext_zally_reverted_broadcasts (\
                  tx_id_bytes BLOB PRIMARY KEY NOT NULL,\
                  raw_tx_bytes BLOB NOT NULL,\
@@ -612,9 +606,8 @@ fn add_idempotency_unmineable_column(ledger: &rusqlite::Connection) -> Result<()
 ///
 /// `ext_zally_chain_tips` is absent on purpose: chain tips are derived state that the next
 /// sync records again against the rebuilt scan queue.
-const LEDGER_TABLES_KEPT_ACROSS_REBUILD: [&str; 8] = [
+const LEDGER_TABLES_KEPT_ACROSS_REBUILD: [&str; 7] = [
     "ext_zally_idempotency",
-    "ext_zally_retired_submissions",
     "ext_zally_finalized_pczts",
     "ext_zally_pending_pczt_inputs",
     "ext_zally_pending_broadcast_inputs",
@@ -1125,11 +1118,6 @@ impl WalletStorage for Sqlite {
                          resubmitted_at_ms = NULL",
                     rusqlite::params![u32::from(target), recorded_at_ms],
                 )?;
-                ext.execute(
-                    "DELETE FROM ext_zally_pending_broadcast_inputs WHERE broadcast_tx_id IN \
-                         (SELECT tx_id_bytes FROM ext_zally_reverted_broadcasts)",
-                    [],
-                )?;
                 WalletWrite::truncate_to_chain_state(wdb, chain_state)?;
                 if let Some(cursor_bytes) = applied_cursor.as_deref() {
                     ext.execute(
@@ -1295,49 +1283,14 @@ impl WalletStorage for Sqlite {
         .await
     }
 
-    async fn retire_reverted_broadcast(
-        &self,
-        tx_id: TxId,
-        retired_at_ms: u64,
-    ) -> Result<(), StorageError> {
-        let retired_at_ms = clamp_unsigned_to_i64(retired_at_ms);
-        self.with_ledger(move |conn| {
-            let transaction = conn
-                .unchecked_transaction()
-                .map_err(|err| map_sqlite_error(&err))?;
-            transaction
-                .execute(
-                    "INSERT OR IGNORE INTO ext_zally_retired_submissions \
-                         (idempotency_key, tx_id_bytes, retired_at_ms) \
-                     SELECT idempotency_key, tx_id_bytes, ?2 \
-                     FROM ext_zally_idempotency WHERE tx_id_bytes = ?1",
-                    rusqlite::params![tx_id.as_bytes().as_slice(), retired_at_ms],
-                )
-                .map_err(|err| map_sqlite_error(&err))?;
-            for statement in RETIRED_BROADCAST_CLEANUP_STATEMENTS {
-                transaction
-                    .execute(statement, [tx_id.as_bytes().as_slice()])
-                    .map_err(|err| map_sqlite_error(&err))?;
-            }
-            transaction.commit().map_err(|err| map_sqlite_error(&err))
-        })
-        .await
-    }
-
     async fn clear_reverted_broadcast(&self, tx_id: TxId) -> Result<(), StorageError> {
         self.with_ledger(move |conn| {
-            let transaction = conn
-                .unchecked_transaction()
-                .map_err(|err| map_sqlite_error(&err))?;
-            for statement in [
+            conn.execute(
                 "DELETE FROM ext_zally_reverted_broadcasts WHERE tx_id_bytes = ?1",
-                "DELETE FROM ext_zally_pending_broadcast_inputs WHERE broadcast_tx_id = ?1",
-            ] {
-                transaction
-                    .execute(statement, [tx_id.as_bytes().as_slice()])
-                    .map_err(|err| map_sqlite_error(&err))?;
-            }
-            transaction.commit().map_err(|err| map_sqlite_error(&err))
+                [tx_id.as_bytes().as_slice()],
+            )
+            .map(|_| ())
+            .map_err(|err| map_sqlite_error(&err))
         })
         .await
     }
@@ -2233,14 +2186,21 @@ impl WalletStorage for Sqlite {
         self.with_ledger(|conn| {
             let mut stmt = conn
                 .prepare(
-                    "SELECT t.txid, t.raw, t.mined_height FROM transactions t \
-                     WHERE t.raw IS NOT NULL \
-                       AND (t.txid IN (SELECT broadcast_tx_id \
-                                       FROM ext_zally_pending_broadcast_inputs) \
-                            OR (t.mined_height IS NULL \
-                                AND t.txid IN (SELECT tx_id_bytes FROM ext_zally_idempotency \
-                                               WHERE unmineable_at_height IS NULL))) \
-                     ORDER BY t.txid ASC",
+                    "SELECT txid, MIN(raw), MIN(mined_height) FROM ( \
+                         SELECT t.txid AS txid, t.raw AS raw, t.mined_height AS mined_height \
+                         FROM transactions t \
+                         WHERE t.raw IS NOT NULL \
+                           AND (t.txid IN (SELECT broadcast_tx_id \
+                                           FROM ext_zally_pending_broadcast_inputs) \
+                                OR (t.mined_height IS NULL \
+                                    AND t.txid IN (SELECT tx_id_bytes \
+                                                   FROM ext_zally_idempotency \
+                                                   WHERE unmineable_at_height IS NULL))) \
+                         UNION ALL \
+                         SELECT r.tx_id_bytes, r.raw_tx_bytes, t.mined_height \
+                         FROM ext_zally_reverted_broadcasts r \
+                         LEFT JOIN transactions t ON t.txid = r.tx_id_bytes \
+                     ) GROUP BY txid ORDER BY txid ASC",
                 )
                 .map_err(|err| StorageError::SqliteFailed {
                     reason: format!("pending-broadcast-transactions prepare failed: {err}"),
@@ -2331,9 +2291,10 @@ impl WalletStorage for Sqlite {
         &self,
         tx_id: TxId,
         judged_height: BlockHeight,
-    ) -> Result<(), StorageError> {
+    ) -> Result<Vec<crate::UnmineableHold>, StorageError> {
         let tx_bytes = tx_id.as_bytes().to_vec();
         let judged_height_i64 = i64::from(judged_height.as_u32());
+        let settled_at_ms = current_unix_ms_for_ledger();
         self.with_ledger(move |conn| {
             let tx = conn
                 .unchecked_transaction()
@@ -2350,20 +2311,22 @@ impl WalletStorage for Sqlite {
                 reason: format!("ext_zally_idempotency unmineable update failed: {err}"),
                 posture: FailurePosture::NotRetryable,
             })?;
-            tx.execute(
+            for statement in [
                 "DELETE FROM ext_zally_pending_broadcast_inputs WHERE broadcast_tx_id = ?1",
-                [&tx_bytes],
-            )
-            .map_err(|err| StorageError::SqliteFailed {
-                reason: format!(
-                    "ext_zally_pending_broadcast_inputs unmineable delete failed: {err}"
-                ),
-                posture: FailurePosture::NotRetryable,
-            })?;
+                "DELETE FROM ext_zally_reverted_broadcasts WHERE tx_id_bytes = ?1",
+            ] {
+                tx.execute(statement, [&tx_bytes])
+                    .map_err(|err| StorageError::SqliteFailed {
+                        reason: format!("unmineable-transaction ledger delete failed: {err}"),
+                        posture: FailurePosture::NotRetryable,
+                    })?;
+            }
+            let holds = settle_holds_of_unmineable_transaction(&tx, &tx_bytes, settled_at_ms)?;
             tx.commit().map_err(|err| StorageError::SqliteFailed {
                 reason: format!("unmineable-transaction record commit failed: {err}"),
                 posture: FailurePosture::Retryable,
-            })
+            })?;
+            Ok(holds)
         })
         .await
     }
@@ -3127,13 +3090,65 @@ fn query_wallet_tx_ids_mined_in_range(
     Ok(entries)
 }
 
-/// Rows a retired reverted broadcast leaves behind once its idempotency keys moved to the
-/// retired ledger.
-const RETIRED_BROADCAST_CLEANUP_STATEMENTS: [&str; 3] = [
-    "DELETE FROM ext_zally_idempotency WHERE tx_id_bytes = ?1",
-    "DELETE FROM ext_zally_reverted_broadcasts WHERE tx_id_bytes = ?1",
-    "DELETE FROM ext_zally_pending_broadcast_inputs WHERE broadcast_tx_id = ?1",
-];
+/// Undoes the finalization of every hold finalized with an unmineable transaction.
+///
+/// The dispense never happened, so each such hold becomes active again and reserves its
+/// amount for the replacement dispense. A hold whose request identifier another active hold
+/// already holds is released instead, since that other hold is the live attempt.
+fn settle_holds_of_unmineable_transaction(
+    transaction: &rusqlite::Transaction<'_>,
+    tx_bytes: &[u8],
+    settled_at_ms: i64,
+) -> Result<Vec<crate::UnmineableHold>, StorageError> {
+    let finalized: Vec<(Vec<u8>, String)> = {
+        let mut statement = transaction
+            .prepare(
+                "SELECT hold_id, request_id FROM ext_zally_holds \
+                 WHERE finalized_tx_id = ?1 AND released_at_ms IS NULL \
+                 ORDER BY reserved_at_ms ASC, hold_id ASC",
+            )
+            .map_err(|err| map_sqlite_error(&err))?;
+        let rows = statement
+            .query_map([tx_bytes], |row| Ok((row.get(0)?, row.get(1)?)))
+            .map_err(|err| map_sqlite_error(&err))?;
+        rows.collect::<Result<_, _>>()
+            .map_err(|err| map_row_decode_error(&err))?
+    };
+    let mut holds = Vec::with_capacity(finalized.len());
+    for (hold_id_bytes, request_id) in finalized {
+        let is_request_taken = transaction
+            .query_row(
+                "SELECT EXISTS (SELECT 1 FROM ext_zally_holds WHERE request_id = ?1 \
+                     AND finalized_tx_id IS NULL AND released_at_ms IS NULL)",
+                [&request_id],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(|err| map_sqlite_error(&err))?;
+        if is_request_taken {
+            transaction.execute(
+                "UPDATE ext_zally_holds SET released_at_ms = ?2 WHERE hold_id = ?1",
+                rusqlite::params![hold_id_bytes, settled_at_ms],
+            )
+        } else {
+            transaction.execute(
+                "UPDATE ext_zally_holds SET finalized_tx_id = NULL WHERE hold_id = ?1",
+                [&hold_id_bytes],
+            )
+        }
+        .map_err(|err| map_sqlite_error(&err))?;
+        holds.push(crate::UnmineableHold {
+            hold_id: decode_hold_id_bytes(hold_id_bytes)?,
+            request_id: IdempotencyKey::try_from(request_id).map_err(|_| {
+                StorageError::RowValueOutOfRange {
+                    column: "ext_zally_holds.request_id",
+                    raw: "invalid idempotency key".to_owned(),
+                }
+            })?,
+            is_reopened: !is_request_taken,
+        });
+    }
+    Ok(holds)
+}
 
 const CHAIN_EVENT_CURSOR_UPSERT_SQL: &str = "\
     INSERT INTO ext_zally_chain_event_cursor (id, cursor_bytes, recorded_at_ms) \
@@ -4753,6 +4768,17 @@ fn sum_active_reservations(
         column: "ext_zally_holds.amount_zat (sum)",
         raw: sum_i64.to_string(),
     })
+}
+
+fn decode_hold_id_bytes(hold_id_bytes: Vec<u8>) -> Result<HoldId, StorageError> {
+    let hold_id_array: [u8; 16] =
+        hold_id_bytes
+            .try_into()
+            .map_err(|raw: Vec<u8>| StorageError::RowValueOutOfRange {
+                column: "ext_zally_holds.hold_id",
+                raw: format!("uuid byte length {}", raw.len()),
+            })?;
+    Ok(HoldId::from_uuid(uuid::Uuid::from_bytes(hold_id_array)))
 }
 
 fn decode_hold_row(row: &rusqlite::Row<'_>) -> Result<crate::HoldRow, StorageError> {

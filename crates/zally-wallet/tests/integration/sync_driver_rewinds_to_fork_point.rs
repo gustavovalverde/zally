@@ -10,7 +10,7 @@
 //! chain `depth` blocks deep. Depth 900 sits inside the 1,000-block window Zinder keeps for a
 //! Zebra 7 node; the mock serves any depth.
 
-use zally_core::{BlockHeight, IdempotencyKey, TxId, Zatoshis};
+use zally_core::{BlockHeight, HoldId, IdempotencyKey, TxId, Zatoshis};
 use zally_storage::WalletStorage;
 use zally_wallet::{
     ShieldTransparentPlan, SyncDriverPhase, SyncHandle, SyncRepair, SyncSnapshot, WalletEvent,
@@ -98,6 +98,10 @@ async fn a_reverted_withdrawal_releases_its_key_once_it_can_never_be_mined()
 -> Result<(), FixtureError> {
     let funded = funded_chain(200).await?;
     let base = &funded.base;
+    let hold_id = record_hold(&base.storage, base.account_id).await?;
+    base.storage
+        .finalize_hold(hold_id, funded.shielding_tx_id)
+        .await?;
     let events = EventLog::record(base.wallet.observe());
     let handle = start_driver(&base.wallet, &base.chain, None, fast_driver_options())?;
     let mut seen = Vec::new();
@@ -135,14 +139,7 @@ async fn a_reverted_withdrawal_releases_its_key_once_it_can_never_be_mined()
                     && reason.contains(&format!("expired at height {expiry_height}")))
         })
         .await?;
-    assert!(base.storage.list_reverted_broadcasts().await?.is_empty());
-    assert_eq!(
-        base.storage
-            .find_idempotent_submission(&funded.shielding_key)
-            .await?,
-        None,
-        "a settled expiry releases the withdrawal's idempotency key"
-    );
+    assert_settled_unmineable_once(&funded, &events, hold_id).await?;
     let replacement = retry_withdrawal(&funded).await?;
     assert_ne!(
         replacement, funded.shielding_tx_id,
@@ -155,6 +152,52 @@ async fn a_reverted_withdrawal_releases_its_key_once_it_can_never_be_mined()
         "the key now refuses to pay the replacement twice"
     );
     handle.close().await?;
+    Ok(())
+}
+
+/// The verdict reports the dead withdrawal once, releases its key, and reopens the hold that
+/// was finalized with it, since that dispense did not happen.
+async fn assert_settled_unmineable_once(
+    funded: &FundedChain,
+    events: &EventLog,
+    hold_id: HoldId,
+) -> Result<(), FixtureError> {
+    let storage = &funded.base.storage;
+    events
+        .wait_for(|event| {
+            matches!(event, WalletEvent::HoldDispenseUnmineable {
+                hold_id: reopened, tx_id, is_reopened: true, ..
+            } if *reopened == hold_id && *tx_id == funded.shielding_tx_id)
+        })
+        .await?;
+    let unmineable_reports = events
+        .snapshot()
+        .iter()
+        .filter(|event| {
+            matches!(event, WalletEvent::PendingBroadcastUnmineable { tx_id, .. }
+                if *tx_id == funded.shielding_tx_id)
+        })
+        .count();
+    assert_eq!(
+        unmineable_reports, 1,
+        "a dead withdrawal is reported exactly once"
+    );
+    assert!(storage.list_reverted_broadcasts().await?.is_empty());
+    assert_eq!(
+        storage
+            .find_idempotent_submission(&funded.shielding_key)
+            .await?,
+        None,
+        "a settled expiry releases the withdrawal's idempotency key"
+    );
+    assert!(
+        storage
+            .list_active_holds(funded.base.account_id)
+            .await?
+            .iter()
+            .any(|hold| hold.hold_id == hold_id),
+        "the hold of a dispense that never happened must be active again"
+    );
     Ok(())
 }
 

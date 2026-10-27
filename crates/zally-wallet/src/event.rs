@@ -5,7 +5,7 @@ use std::pin::Pin;
 use futures_util::Stream;
 use tokio_stream::wrappers::BroadcastStream;
 use zally_chain::ShieldedPool;
-use zally_core::{AccountId, BlockHeight, TxId};
+use zally_core::{AccountId, BlockHeight, HoldId, IdempotencyKey, TxId};
 
 /// Push notification from the wallet's sync loop.
 ///
@@ -23,7 +23,8 @@ use zally_core::{AccountId, BlockHeight, TxId};
 ///
 /// [`WalletEvent::DerivedStateReset`] marks a wallet database rebuild from seed and birthday.
 /// [`WalletEvent::TransparentUtxoRefreshFaulted`] marks a faulted transparent-UTXO refresh
-/// attempt. [`WalletEvent::PendingBroadcastUnmineable`] names a broadcast to recreate.
+/// attempt. [`WalletEvent::PendingBroadcastUnmineable`] names a broadcast to recreate, and
+/// [`WalletEvent::HoldDispenseUnmineable`] names each dispense hold it had finalized.
 /// [`WalletEvent::Lagged`] is injected by the subscription
 /// stream when a consumer drops events; the sync loop never emits it directly.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -153,6 +154,24 @@ pub enum WalletEvent {
         tx_id: TxId,
         /// Why it can never be mined.
         reason: String,
+    },
+    /// A dispense hold was finalized with a transaction that can never be mined, so the
+    /// dispense did not happen.
+    ///
+    /// Published right after [`Self::PendingBroadcastUnmineable`] for `tx_id`. When
+    /// `is_reopened` is true the hold is active again and reserves its amount: dispense it
+    /// again (its idempotency key now builds a replacement) and finalize it with the new
+    /// transaction, or release it. When false, another active hold already holds
+    /// `request_id`, so this one was released and that other hold carries the dispense.
+    HoldDispenseUnmineable {
+        /// The hold whose dispense did not happen.
+        hold_id: HoldId,
+        /// Request identifier the hold was reserved under.
+        request_id: IdempotencyKey,
+        /// Transaction the hold had been finalized with.
+        tx_id: TxId,
+        /// The hold is active again; false when it was released instead.
+        is_reopened: bool,
     },
     /// Consumer fell behind; `dropped_count` events were skipped before this notification.
     Lagged {

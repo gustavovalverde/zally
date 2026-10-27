@@ -6,15 +6,12 @@
 //! announcing event's cursor in the same storage transaction. Every rewind, announced or
 //! found by the repair ladder, goes through [`Wallet::revert_to_height`], which reports what
 //! left the chain as [`WalletEvent`]s and leaves the wallet-sent transactions it un-mined in
-//! the reverted-broadcast ledger. [`Wallet::reconcile_reverted_broadcasts`] then judges each
-//! one with the same verdict as a pending broadcast: it submits it again while it can be
-//! mined, retires it once it is mined again, and retires it with its idempotency key released
-//! once it can never be mined.
+//! the reverted-broadcast ledger. Those transactions are pending broadcasts again: the
+//! pending-broadcast verdict retires one that can never be mined, and
+//! [`Wallet::reconcile_reverted_broadcasts`] submits one again while it can be mined and
+//! drops it from the ledger once it is mined again.
 
-use zally_chain::{
-    ChainEpoch, ChainEventCursor, ChainSource, Submitter, UnmineableReason,
-    parse_transaction_header,
-};
+use zally_chain::{ChainEpoch, ChainEventCursor, ChainSource, Submitter, parse_transaction_header};
 use zally_core::BlockHeight;
 
 use crate::error::WalletError;
@@ -152,22 +149,19 @@ impl Wallet {
         Ok(target)
     }
 
-    /// Settles every wallet-sent transaction a rewind removed from the chain against the
-    /// chain the wallet just caught up with.
+    /// Resubmits or retires the wallet-sent transactions a rewind removed from the chain.
     ///
-    /// Each one goes through the same verdict as a pending broadcast
-    /// ([`zally_chain::TransactionHeader::check_mineable`]):
+    /// A reverted transaction is a pending broadcast again, so
+    /// [`Wallet::retire_pending_broadcasts`] judges it with every other one: once it can never
+    /// be mined, that verdict releases its idempotency keys, reopens the dispense holds
+    /// finalized with it, and reports it once. This pass handles the rest:
     ///
-    /// - judged at the lower of the fully scanned height and the settled tip, a transaction
-    ///   that can never be mined is retired, its idempotency keys are released for a
-    ///   replacement payment, and the wallet publishes
-    ///   [`WalletEvent::PendingBroadcastUnmineable`]. No reorg within the source's bound and
-    ///   no unscanned block can mine it, so the replacement cannot pay twice;
-    /// - one the wallet has scanned mined again is retired; the scan already published
-    ///   [`WalletEvent::TransactionConfirmed`];
+    /// - one the wallet has scanned mined again leaves the reverted-broadcast ledger; the scan
+    ///   already published [`WalletEvent::TransactionConfirmed`];
     /// - any other is submitted once through `submitter` when the next block above the
-    ///   visible tip can include it. Without a submitter the wallet waits for the chain to
-    ///   mine it or for it to become unmineable.
+    ///   visible tip can include it, judged by the same
+    ///   [`zally_chain::TransactionHeader::check_mineable`]. Without a submitter the wallet
+    ///   waits for the chain to mine it or for the verdict to retire it.
     ///
     /// Callers run this against a freshly recorded chain tip.
     pub(crate) async fn reconcile_reverted_broadcasts(
@@ -179,72 +173,24 @@ impl Wallet {
         if reverted_broadcasts.is_empty() {
             return Ok(());
         }
-        let chain_tips = storage.find_chain_tips().await?;
-        let judged_height = storage
-            .fully_scanned_height()
-            .await?
-            .zip(chain_tips)
-            .map(|(scanned, tips)| scanned.min(tips.settled));
+        let visible_tip = storage.find_visible_tip().await?;
         for reverted in reverted_broadcasts {
             if reverted.mined_height.is_some() {
                 storage.clear_reverted_broadcast(reverted.tx_id).await?;
                 continue;
             }
-            let header = match parse_transaction_header(&reverted.raw_tx_bytes) {
-                Ok(header) => header,
-                Err(error) => {
-                    tracing::error!(
-                        target: "zally::sync",
-                        event = "reverted_broadcast_unreadable",
-                        tx_id = %reverted.tx_id,
-                        %error,
-                        "stored reverted broadcast could not be parsed"
-                    );
-                    continue;
-                }
-            };
-            if let Some(judged_height) = judged_height
-                && let Err(reason) = header.check_mineable(self.network(), judged_height)
-            {
-                self.retire_unmineable_reverted_broadcast(reverted.tx_id, &reason, judged_height)
-                    .await?;
-                continue;
-            }
-            let Some(submitter) = submitter else {
+            let (Some(submitter), Some(visible_tip), None) =
+                (submitter, visible_tip, reverted.resubmitted_at_ms)
+            else {
                 continue;
             };
-            let can_enter_next_block = chain_tips
-                .is_some_and(|tips| header.check_mineable(self.network(), tips.visible).is_ok());
-            if reverted.resubmitted_at_ms.is_none() && can_enter_next_block {
+            let can_enter_next_block = parse_transaction_header(&reverted.raw_tx_bytes)
+                .is_ok_and(|header| header.check_mineable(self.network(), visible_tip).is_ok());
+            if can_enter_next_block {
                 self.resubmit_reverted_broadcast(submitter, reverted.tx_id, &reverted.raw_tx_bytes)
                     .await?;
             }
         }
-        Ok(())
-    }
-
-    async fn retire_unmineable_reverted_broadcast(
-        &self,
-        tx_id: zally_core::TxId,
-        reason: &UnmineableReason,
-        judged_height: BlockHeight,
-    ) -> Result<(), WalletError> {
-        self.inner
-            .storage
-            .retire_reverted_broadcast(tx_id, current_unix_ms())
-            .await?;
-        tracing::warn!(
-            target: "zally::sync",
-            event = "reverted_broadcast_unmineable",
-            %tx_id,
-            %reason,
-            judged_height = judged_height.as_u32(),
-            "reverted transaction can never be mined; its idempotency key is released"
-        );
-        self.publish_event(WalletEvent::PendingBroadcastUnmineable {
-            tx_id,
-            reason: reason.to_string(),
-        });
         Ok(())
     }
 
