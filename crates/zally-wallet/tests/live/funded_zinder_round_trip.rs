@@ -24,7 +24,7 @@ use zally_wallet::{
     ExportPaymentDisclosurePlan, ProposalPlan, SendPaymentPlan, ShieldTransparentPlan, SyncDriver,
     SyncDriverOptions, SyncHandle, SyncSnapshotStream, SyncStatus, Wallet, WalletError,
 };
-use zcash_keys::address::Address;
+use zcash_keys::address::{Address, Receiver};
 use zcash_payment_disclosure::{PaymentDisclosureProfile, verify_disclosure};
 use zcash_primitives::transaction::builder::{BuildConfig, Builder};
 use zcash_proofs::prover::LocalTxProver;
@@ -528,7 +528,7 @@ fn build_regtest_funding_transaction(
             reason: format!("could not derive funding secret key: {error}"),
         })?;
     let public_key = PublicKey::from_secret_key(&secret_key);
-    let funding_address = ZallyTransparentAddress::from_pubkey(&public_key)
+    let funding_address = Receiver::Transparent(ZallyTransparentAddress::from_pubkey(&public_key))
         .to_zcash_address(NetworkType::Regtest)
         .encode();
     let coinbase = miner.locate_spendable_coinbase(&funding_address)?;

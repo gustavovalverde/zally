@@ -30,6 +30,7 @@ use zally_core::{
     TreeStateArtifact, TxId, Zatoshis,
 };
 use zally_keys::{KeyDerivationError, SeedMaterial, derive_ufvk};
+use zcash_address::unified::Revision;
 use zcash_client_backend::data_api::chain::{ChainState, CommitmentTreeRoot};
 use zcash_client_backend::data_api::scanning::ScanRange;
 use zcash_client_backend::data_api::wallet::{
@@ -700,7 +701,7 @@ impl WalletStorage for Sqlite {
                 .map_err(|e| map_sqlite_error(&e))?;
             let mut receivers = Vec::new();
             for (account_uuid, ufvk) in &accounts {
-                let account_id = account_id_from_ufvk(network, ufvk);
+                let account_id = account_id_from_ufvk(network, ufvk)?;
                 let transparent_addresses = db
                     .get_transparent_receivers(*account_uuid, true, true)
                     .map_err(|e| map_sqlite_error(&e))?;
@@ -3264,9 +3265,23 @@ where
 /// The id is the UUID v5 of the network-encoded UFVK under
 /// [`ZALLY_ACCOUNT_NAMESPACE`]. Account identity is key identity, so the id is stable
 /// across database rebuilds, machines, and resets.
-fn account_id_from_ufvk(network: Network, ufvk: &UnifiedFullViewingKey) -> AccountId {
-    let encoded = ufvk.encode(&network.to_parameters());
-    AccountId::from_uuid(Uuid::new_v5(&ZALLY_ACCOUNT_NAMESPACE, encoded.as_bytes()))
+///
+/// The encoding is pinned to ZIP 316 Revision 0, the revision every Zally account id has
+/// been derived from, so a change in the upstream default revision cannot change identity.
+/// A UFVK with no Revision 0 encoding fails rather than deriving a second identity.
+fn account_id_from_ufvk(
+    network: Network,
+    ufvk: &UnifiedFullViewingKey,
+) -> Result<AccountId, StorageError> {
+    let encoded = ufvk
+        .encode_revision(&network.to_parameters(), Revision::R0)
+        .map_err(|err| StorageError::KeyDerivationFailed {
+            reason: format!("account identity needs a Revision 0 UFVK encoding: {err}"),
+        })?;
+    Ok(AccountId::from_uuid(Uuid::new_v5(
+        &ZALLY_ACCOUNT_NAMESPACE,
+        encoded.as_bytes(),
+    )))
 }
 
 /// Computes the deterministic [`AccountId`] for a stored account via its UFVK.
@@ -3280,7 +3295,7 @@ fn deterministic_account_id<A: Account>(
             reason: "account has no unified full viewing key to derive its identity from"
                 .to_owned(),
         })?;
-    Ok(account_id_from_ufvk(network, ufvk))
+    account_id_from_ufvk(network, ufvk)
 }
 
 /// Resolves the wallet's single account to its deterministic [`AccountId`] and the
@@ -4316,18 +4331,20 @@ mod tests {
     }
 
     #[test]
-    fn account_id_is_deterministic_for_key_material() -> Result<(), KeyDerivationError> {
+    fn account_id_is_deterministic_for_key_material() -> Result<(), StorageError> {
         let mnemonic = Mnemonic::generate();
         let seed = SeedMaterial::from_mnemonic(&mnemonic, "");
         let regtest = Network::regtest();
 
-        let ufvk = derive_ufvk(regtest, &seed, zip32::AccountId::ZERO)?;
-        let first = account_id_from_ufvk(regtest, &ufvk);
-        let second = account_id_from_ufvk(regtest, &ufvk);
+        let ufvk = derive_ufvk(regtest, &seed, zip32::AccountId::ZERO)
+            .map_err(|err| map_derivation_error(&err))?;
+        let first = account_id_from_ufvk(regtest, &ufvk)?;
+        let second = account_id_from_ufvk(regtest, &ufvk)?;
         assert_eq!(first, second, "same key material must yield the same id");
 
-        let mainnet_ufvk = derive_ufvk(Network::Mainnet, &seed, zip32::AccountId::ZERO)?;
-        let mainnet = account_id_from_ufvk(Network::Mainnet, &mainnet_ufvk);
+        let mainnet_ufvk = derive_ufvk(Network::Mainnet, &seed, zip32::AccountId::ZERO)
+            .map_err(|err| map_derivation_error(&err))?;
+        let mainnet = account_id_from_ufvk(Network::Mainnet, &mainnet_ufvk)?;
         assert_ne!(
             first, mainnet,
             "a different network encoding must yield a different identity"

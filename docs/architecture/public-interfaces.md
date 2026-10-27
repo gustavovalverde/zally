@@ -236,7 +236,7 @@ The contract surface Zally publishes, grouped by domain. Each item is a guarante
 - **CORE-5**: Idempotent send by `IdempotencyKey`.
 - **CORE-6**: Network-tagged types throughout; compile error if a network is missing.
 
-Unified Address strings are encoded according to the ZIP-316 revision selected by the pinned Zcash address library. The NU7 prerelease cohort emits R2 addresses, whose human-readable prefixes differ from the R1 prefixes emitted by the previous cohort (for example, Regtest `zuregtest1…` rather than `uregtest1…`). Callers should parse the address and validate its network instead of classifying it by a fixed prefix. Zally does not guarantee identical encoded address text across upstream address revisions.
+Unified Address strings are encoded at ZIP-316 Revision 0 when Revision 0 can represent the address, and at Revision 2 otherwise. Addresses that Zally derives always carry a shielded receiver and no metadata, so they encode at Revision 0 (for example, Regtest `uregtest1…`). A recipient may still present a Revision 2 address, whose prefixes differ (for example, `zuregtest1…` or `turegtest1…`). Callers should parse the address and validate its network instead of classifying it by a fixed prefix. `AccountId` values derive from the Revision 0 UFVK encoding and stay stable across upstream encoder changes.
 
 ### Key management (KEYS)
 

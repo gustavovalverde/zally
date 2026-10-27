@@ -54,24 +54,23 @@ multiple_crate_versions = "allow"
 redundant_pub_crate = "allow"
 
 [workspace.dependencies]
-# Foundation: the NU7-compatible librustzcash prerelease cohort. Keep concrete
-# protocol types aligned with zcash_client_backend and advance the family as one
-# reviewed unit. These are prerelease versions; Zally absorbs API churn behind
-# its public surface.
-zcash_client_backend = "=0.25.0-pre.0"
-zcash_client_sqlite = "=0.23.0-pre.0"
-zcash_keys = "=0.17.0-pre.0"
-zcash_primitives = "=0.31.0-pre.0"
-zcash_protocol = { version = "=0.11.0-pre.0", features = ["local-consensus"] }
-zcash_address = "=0.14.0-pre.0"
-zcash_proofs = "=0.31.0-pre.0"
-zcash_transparent = { version = "=0.11.0-pre.0", default-features = false, features = ["transparent-inputs"] }
+# Foundation: the NU7 librustzcash release cohort. Keep concrete protocol types
+# aligned with zcash_client_backend and advance the family as one reviewed unit.
+# Zally absorbs API churn behind its public surface.
+zcash_client_backend = "=0.25.0"
+zcash_client_sqlite = "=0.23.0"
+zcash_keys = "=0.17.0"
+zcash_primitives = "=0.31.0"
+zcash_protocol = { version = "=0.11.0", features = ["local-consensus"] }
+zcash_address = "=0.14.0"
+zcash_proofs = "=0.31.0"
+zcash_transparent = { version = "=0.11.0", default-features = false, features = ["transparent-inputs"] }
 zcash_script = "0.6"
-pczt = { version = "=0.10.0-pre.0", features = ["orchard", "sapling", "transparent", "signer", "prover", "tx-extractor"] }
+pczt = { version = "=0.10.0", features = ["orchard", "sapling", "transparent", "signer", "prover", "tx-extractor"] }
 secp256k1 = "0.33"
 orchard = "=0.16.0"
 sapling = { package = "sapling-crypto", version = "0.9" }
-zip321 = "=0.10.0-pre.0"
+zip321 = "=0.10.0"
 zip32 = "0.3"
 shardtree = "0.8"
 incrementalmerkletree = "0.9"

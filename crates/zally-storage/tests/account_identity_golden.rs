@@ -99,8 +99,9 @@ fn golden_ufvk(network: Network) -> Result<UnifiedFullViewingKey, TestError> {
     )?)
 }
 
-fn encode_ufvk(network: Network, ufvk: &UnifiedFullViewingKey) -> String {
+fn encode_ufvk(network: Network, ufvk: &UnifiedFullViewingKey) -> Result<String, TestError> {
     ufvk.encode(&network.to_parameters())
+        .map_err(|err| TestError::UnifiedEncoding(err.to_string()))
 }
 
 fn encode_address(network: Network, address: &zcash_keys::address::UnifiedAddress) -> String {
@@ -126,7 +127,7 @@ async fn fresh_account(network: Network) -> Result<(Sqlite, AccountId, TempDir),
 #[test]
 fn ufvk_encoding_matches_golden() -> Result<(), TestError> {
     for (network, golden) in goldens() {
-        let encoded = encode_ufvk(network, &golden_ufvk(network)?);
+        let encoded = encode_ufvk(network, &golden_ufvk(network)?)?;
         assert_eq!(
             encoded, golden.ufvk,
             "{} UFVK encoding drifted",
@@ -285,6 +286,8 @@ enum TestError {
     KeyDerivation(#[from] KeyDerivationError),
     #[error("address generation error: {0:?}")]
     AddressGeneration(AddressGenerationError),
+    #[error("unified encoding error: {0}")]
+    UnifiedEncoding(String),
     #[error("no shielded-only exposed address was recorded")]
     MissingShieldedRow,
 }

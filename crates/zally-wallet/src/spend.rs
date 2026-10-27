@@ -1071,6 +1071,16 @@ mod tests {
     }
 
     #[test]
+    fn payment_request_rejects_sprout_recipient() {
+        let uri = "zcash:zc8E5gYid86n4bo2Usdq1cpr7PpfoJGzttwBHEEgGhGkLUg7SPPVFNB2AkRFXZ7usfphup5426dt1buMmY3fkYeRrQGLa8y?amount=1";
+        let outcome = PaymentRequest::from_uri(uri, Network::Mainnet);
+        assert!(matches!(
+            outcome,
+            Err(WalletError::PaymentRequestParseFailed { reason }) if reason.contains("Sprout")
+        ));
+    }
+
+    #[test]
     fn validate_recipient_network_rejects_mismatch() {
         let recipient = PaymentRecipient::UnifiedAddress {
             encoded: "u1example".into(),
