@@ -336,6 +336,39 @@ async fn unmineable_broadcast_frees_its_idempotency_key_for_one_replacement()
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_syncs_report_an_unmineable_broadcast_once() -> Result<(), TestError> {
+    let PendingShieldingWallet {
+        wallet,
+        chain,
+        chain_handle,
+        pending_tx_id,
+        temp: _temp,
+        ..
+    } = wallet_with_pending_shielding().await?;
+    let mut events = wallet.observe();
+    let settled = NU7_ACTIVATION_HEIGHT - 1;
+    if !chain_handle.set_chain_tips(BlockHeight::from(settled + 6), BlockHeight::from(settled)) {
+        return Err(TestError::Fixture("settled tip above visible tip"));
+    }
+    let (first, second, third) = tokio::join!(
+        wallet.sync(&chain),
+        wallet.sync(&chain),
+        wallet.sync(&chain)
+    );
+    first?;
+    second?;
+    third?;
+    sync_to(&wallet, &chain, &chain_handle, settled + 6, settled).await?;
+    let reports = unmineable_reports(&mut events).await;
+    assert_eq!(
+        reports.iter().map(|(tx_id, _)| *tx_id).collect::<Vec<_>>(),
+        vec![pending_tx_id],
+        "concurrent syncs must report the unmineable broadcast exactly once"
+    );
+    Ok(())
+}
+
 /// Accepts every transaction and echoes its canonical transaction ID, as a node does.
 struct AcceptingSubmitter {
     network: Network,

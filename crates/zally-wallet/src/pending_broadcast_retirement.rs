@@ -60,9 +60,12 @@ impl Wallet {
             let Err(reason) = header.check_mineable(self.network(), judged_height) else {
                 continue;
             };
-            let holds = storage
+            let Some(holds) = storage
                 .record_unmineable_transaction(tx_id, judged_height)
-                .await?;
+                .await?
+            else {
+                continue;
+            };
             tracing::warn!(
                 target: "zally::wallet",
                 event = "pending_broadcast_unmineable",

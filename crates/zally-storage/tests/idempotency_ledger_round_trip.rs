@@ -76,9 +76,13 @@ async fn a_key_whose_transaction_is_unmineable_binds_its_replacement() -> Result
     storage
         .record_unmineable_transaction(unmineable, BlockHeight::from(20))
         .await?;
-    storage
-        .record_unmineable_transaction(unmineable, BlockHeight::from(21))
-        .await?;
+    assert_eq!(
+        storage
+            .record_unmineable_transaction(unmineable, BlockHeight::from(21))
+            .await?,
+        None,
+        "a repeated verdict changes nothing"
+    );
     assert_eq!(
         storage.find_idempotent_submission(&key).await?,
         None,

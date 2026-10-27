@@ -2291,7 +2291,7 @@ impl WalletStorage for Sqlite {
         &self,
         tx_id: TxId,
         judged_height: BlockHeight,
-    ) -> Result<Vec<crate::UnmineableHold>, StorageError> {
+    ) -> Result<Option<Vec<crate::UnmineableHold>>, StorageError> {
         let tx_bytes = tx_id.as_bytes().to_vec();
         let judged_height_i64 = i64::from(judged_height.as_u32());
         let settled_at_ms = current_unix_ms_for_ledger();
@@ -2302,31 +2302,36 @@ impl WalletStorage for Sqlite {
                     reason: format!("unmineable-transaction record start failed: {err}"),
                     posture: FailurePosture::Retryable,
                 })?;
-            tx.execute(
-                "UPDATE ext_zally_idempotency SET unmineable_at_height = ?2 \
-                 WHERE tx_id_bytes = ?1 AND unmineable_at_height IS NULL",
-                rusqlite::params![&tx_bytes, judged_height_i64],
-            )
-            .map_err(|err| StorageError::SqliteFailed {
-                reason: format!("ext_zally_idempotency unmineable update failed: {err}"),
-                posture: FailurePosture::NotRetryable,
-            })?;
+            let mut changed_rows = tx
+                .execute(
+                    "UPDATE ext_zally_idempotency SET unmineable_at_height = ?2 \
+                     WHERE tx_id_bytes = ?1 AND unmineable_at_height IS NULL",
+                    rusqlite::params![&tx_bytes, judged_height_i64],
+                )
+                .map_err(|err| StorageError::SqliteFailed {
+                    reason: format!("ext_zally_idempotency unmineable update failed: {err}"),
+                    posture: FailurePosture::NotRetryable,
+                })?;
             for statement in [
                 "DELETE FROM ext_zally_pending_broadcast_inputs WHERE broadcast_tx_id = ?1",
                 "DELETE FROM ext_zally_reverted_broadcasts WHERE tx_id_bytes = ?1",
             ] {
-                tx.execute(statement, [&tx_bytes])
-                    .map_err(|err| StorageError::SqliteFailed {
+                changed_rows += tx.execute(statement, [&tx_bytes]).map_err(|err| {
+                    StorageError::SqliteFailed {
                         reason: format!("unmineable-transaction ledger delete failed: {err}"),
                         posture: FailurePosture::NotRetryable,
-                    })?;
+                    }
+                })?;
             }
             let holds = settle_holds_of_unmineable_transaction(&tx, &tx_bytes, settled_at_ms)?;
+            if changed_rows == 0 && holds.is_empty() {
+                return Ok(None);
+            }
             tx.commit().map_err(|err| StorageError::SqliteFailed {
                 reason: format!("unmineable-transaction record commit failed: {err}"),
                 posture: FailurePosture::Retryable,
             })?;
-            Ok(holds)
+            Ok(Some(holds))
         })
         .await
     }

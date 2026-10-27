@@ -947,16 +947,17 @@ pub trait WalletStorage: Send + Sync + 'static {
     /// so the key's next send creates a replacement, and undoes the finalization of every
     /// hold finalized with it: the dispense did not happen. Each such hold becomes active
     /// again, or is released when another active hold already holds its request identifier.
-    /// Repeating the call changes nothing and returns no holds.
     ///
-    /// Returns the holds the call settled.
+    /// Returns the holds the call settled, or `None` when the transaction was already recorded
+    /// and the call changed nothing. Callers report the verdict only on `Some`, so concurrent
+    /// judges of one transaction report it once.
     ///
     /// `not_retryable` on schema errors; `retryable` on transient I/O.
     async fn record_unmineable_transaction(
         &self,
         tx_id: TxId,
         judged_height: BlockHeight,
-    ) -> Result<Vec<UnmineableHold>, StorageError>;
+    ) -> Result<Option<Vec<UnmineableHold>>, StorageError>;
 
     /// Returns the per-pool balance snapshot for `account_id`, anchored to the wallet's last
     /// persisted visible tip.

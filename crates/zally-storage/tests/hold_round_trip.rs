@@ -463,7 +463,8 @@ async fn an_unmineable_dispense_reopens_its_hold() -> Result<(), TestError> {
 
     let settled = storage
         .record_unmineable_transaction(dead_tx_id, zally_core::BlockHeight::from(50))
-        .await?;
+        .await?
+        .ok_or(TestError::VerdictNotRecorded)?;
     assert_eq!(settled.len(), 1);
     assert_eq!(settled[0].hold_id, hold_id);
     assert_eq!(settled[0].request_id, request_id);
@@ -479,8 +480,8 @@ async fn an_unmineable_dispense_reopens_its_hold() -> Result<(), TestError> {
         storage
             .record_unmineable_transaction(dead_tx_id, zally_core::BlockHeight::from(51))
             .await?
-            .is_empty(),
-        "a repeated verdict settles no hold twice"
+            .is_none(),
+        "a repeated verdict changes nothing and settles no hold twice"
     );
 
     let replacement = TxId::from_bytes([0xD1; 32]);
@@ -514,7 +515,8 @@ async fn an_unmineable_dispense_releases_its_hold_when_the_request_moved_on()
 
     let settled = storage
         .record_unmineable_transaction(dead_tx_id, zally_core::BlockHeight::from(50))
-        .await?;
+        .await?
+        .ok_or(TestError::VerdictNotRecorded)?;
     assert_eq!(settled.len(), 1);
     assert_eq!(settled[0].hold_id, first_hold);
     assert!(
@@ -553,4 +555,6 @@ enum TestError {
     Zatoshis(#[from] ZatoshisError),
     #[error("expected to find reservation by request id, found none")]
     MissingByRequest,
+    #[error("the unmineable verdict changed nothing")]
+    VerdictNotRecorded,
 }
