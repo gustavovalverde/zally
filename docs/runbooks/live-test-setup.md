@@ -230,6 +230,26 @@ ZALLY_TEST_LIVE=1 \
 Set `ZALLY_TEST_NODE_RPC_USER` and `ZALLY_TEST_NODE_RPC_PASSWORD` together only when the
 node requires basic auth.
 
+To run the round trip under NU7, use Zebra 7.0.0 or later. Zebra 7 leaves NU5 through NU7
+unset on Regtest, so set every upgrade the test needs explicitly, in activation order, and keep
+any configured funding streams from overlapping:
+
+```toml
+[network]
+network = "Regtest"
+
+[network.testnet_parameters.activation_heights]
+NU5 = 1
+NU6 = 1
+"NU6.1" = 1
+"NU6.2" = 1
+"NU6.3" = 1
+NU7 = 1
+```
+
+The test reads the `NU7` row from `getblockchaininfo`, so Zally builds version 6 transactions
+on branch `0x77190AD9` with the 120-block default expiry once the chain reaches that height.
+
 Optional amount overrides:
 
 - `ZALLY_TEST_SHIELDING_THRESHOLD_ZAT`: minimum transparent value to shield (default `1000000`).

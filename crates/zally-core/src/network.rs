@@ -152,6 +152,7 @@ struct RegtestActivations {
     nu6_1: Option<u32>,
     nu6_2: Option<u32>,
     nu6_3: Option<u32>,
+    #[serde(default)]
     nu7: Option<u32>,
 }
 
@@ -226,6 +227,7 @@ impl From<NetworkWire> for Network {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use zcash_protocol::consensus::BranchId;
 
     #[test]
     fn regtest_matches_local_live_topology() {
@@ -263,14 +265,58 @@ mod tests {
         assert_eq!(testnet.network_type(), NetworkType::Test);
     }
 
+    fn regtest_with_nu7() -> Network {
+        let height = |value| Some(zcash_protocol::consensus::BlockHeight::from_u32(value));
+        Network::Regtest(LocalNetwork {
+            overwinter: height(1),
+            sapling: height(1),
+            blossom: height(1),
+            heartwood: height(1),
+            canopy: height(1),
+            nu5: height(2),
+            nu6: height(2),
+            nu6_1: height(3),
+            nu6_2: height(4),
+            nu6_3: height(5),
+            nu7: height(6),
+        })
+    }
+
+    #[test]
+    fn regtest_nu7_activation_selects_the_nu7_branch() {
+        let params = regtest_with_nu7().to_parameters();
+        assert_eq!(
+            BranchId::for_height(&params, zcash_protocol::consensus::BlockHeight::from_u32(5)),
+            BranchId::Nu6_3
+        );
+        let nu7 =
+            BranchId::for_height(&params, zcash_protocol::consensus::BlockHeight::from_u32(6));
+        assert_eq!(nu7, BranchId::Nu7);
+        assert_eq!(u32::from(nu7), 0x7719_0AD9);
+    }
+
     #[cfg(feature = "serde")]
     #[test]
     fn network_serde_round_trip() -> Result<(), serde_json::Error> {
-        for net in [Network::Mainnet, Network::Testnet, Network::regtest()] {
+        for net in [
+            Network::Mainnet,
+            Network::Testnet,
+            Network::regtest(),
+            regtest_with_nu7(),
+        ] {
             let encoded = serde_json::to_string(&net)?;
             let decoded: Network = serde_json::from_str(&encoded)?;
             assert_eq!(decoded, net);
         }
+        Ok(())
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn regtest_serialized_before_nu7_still_deserializes() -> Result<(), serde_json::Error> {
+        let pre_nu7 = r#"{"kind":"regtest","overwinter":1,"sapling":1,"blossom":1,"heartwood":1,"canopy":1,"nu5":2,"nu6":2,"nu6_1":null,"nu6_2":null,"nu6_3":null}"#;
+        let decoded: Network = serde_json::from_str(pre_nu7)?;
+        assert_eq!(decoded, Network::regtest());
         Ok(())
     }
 }

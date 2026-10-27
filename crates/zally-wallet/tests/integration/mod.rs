@@ -18,6 +18,7 @@ mod list_exposed_addresses_round_trip;
 mod list_unspent_shielded_notes_round_trip;
 mod metrics_snapshot_round_trip;
 mod network_mismatch_fails_closed;
+mod nu7_pczt_round_trip;
 mod observe_emits_scan_progress;
 mod open_or_create_account_round_trip;
 mod open_without_seal_returns_no_sealed_seed;
