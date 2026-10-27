@@ -1180,6 +1180,42 @@ async fn drain_ready_chain_events(
     }
 }
 
+/// Applies a pending announced reorg, or the ladder's repair while recovering; returns
+/// whether either ran.
+async fn repair_before_scan(
+    ctx: &DriverContext<'_>,
+    state: &mut DriverState,
+    recovering: bool,
+) -> Result<bool, WalletError> {
+    if is_fork_rewind_due(state, recovering) {
+        if recovering && let Some(recovery) = state.recovery.as_mut() {
+            recovery.attempts_at_rung = recovery.attempts_at_rung.saturating_add(1);
+        }
+        apply_pending_reorg(ctx, state).await?;
+        Ok(true)
+    } else if recovering {
+        apply_repair(ctx, state).await?;
+        Ok(true)
+    } else {
+        Ok(false)
+    }
+}
+
+/// Whether this iteration applies a pending announced reorg instead of the ladder's repair.
+///
+/// The fork-point rewind stands in for the ladder's rewind rungs and counts as their
+/// attempt, so a fork-point rewind that keeps failing still escalates. Once the ladder
+/// reaches a rebuild, the rebuild runs first; the pending reorg then finds nothing to rewind
+/// and only records its cursor.
+fn is_fork_rewind_due(state: &DriverState, recovering: bool) -> bool {
+    state.pending_reorg.is_some()
+        && state
+            .recovery
+            .as_ref()
+            .filter(|_| recovering)
+            .is_none_or(|recovery| recovery.rung < SyncRepair::RescanFromBirthday)
+}
+
 /// Rewinds to the pending announced fork point and records the cursor that announced it.
 async fn apply_pending_reorg(
     ctx: &DriverContext<'_>,
@@ -1362,15 +1398,13 @@ async fn run_sync_wakeup(
             chain_tip = ChainTipRecord::Stale;
         }
         drain_ready_chain_events(ctx, state, feed).await;
-        if state.pending_reorg.is_some() {
-            chain_tip = ChainTipRecord::Stale;
-            if let Err(rewind_error) = apply_pending_reorg(ctx, state).await {
-                record_fault(ctx, state, ClassifiedFault::from_error(&rewind_error), None).await;
+        match repair_before_scan(ctx, state, recovering).await {
+            Ok(true) => chain_tip = ChainTipRecord::Stale,
+            Ok(false) => {}
+            Err(repair_error) => {
+                record_fault(ctx, state, ClassifiedFault::from_error(&repair_error), None).await;
                 continue;
             }
-        } else if recovering && let Err(repair_error) = apply_repair(ctx, state).await {
-            record_fault(ctx, state, ClassifiedFault::from_error(&repair_error), None).await;
-            continue;
         }
         let frontier_before = tokio::select! {
             biased;

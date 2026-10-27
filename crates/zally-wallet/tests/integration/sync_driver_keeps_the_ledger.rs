@@ -176,3 +176,72 @@ async fn a_birthday_rescan_keeps_the_payment_ledger() -> Result<(), FixtureError
     );
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_fork_point_rewind_that_keeps_failing_escalates_to_a_rebuild() -> Result<(), FixtureError>
+{
+    let base = chain_wallet(40).await?;
+    let key = record_ledger(&base).await?;
+    let events = EventLog::record(base.wallet.observe());
+    let options = fast_driver_options().with_recovery_policy(
+        SyncRecoveryPolicy::default()
+            .with_escalate_after_faults(1)
+            .with_max_rescan_attempts(2)
+            .with_fault_backoff_initial_ms(10)
+            .with_fault_backoff_cap_ms(20)
+            .with_park_reprobe_ms(None),
+    );
+    let handle = start_driver(&base.wallet, &base.chain, None, options)?;
+    let mut seen = Vec::new();
+    wait_for_driver(&handle, &mut seen, |snapshot| {
+        snapshot.phase == SyncDriverPhase::Waiting
+            && snapshot.scanned_height == Some(BlockHeight::from(40))
+    })
+    .await?;
+
+    base.chain_handle
+        .fail_tree_state_at_next(BlockHeight::from(30), 4, || {
+            ChainSourceError::BlockHeightBelowFloor {
+                requested_height: BlockHeight::from(30),
+                earliest_height: BlockHeight::from(31),
+            }
+        });
+    base.chain_handle
+        .trigger_reorg(BlockHeight::from(31), BlockHeight::from(42));
+    seen.clear();
+    wait_for_driver(&handle, &mut seen, |snapshot| {
+        snapshot.phase == SyncDriverPhase::Waiting
+            && snapshot.scanned_height == Some(BlockHeight::from(42))
+            && snapshot.last_fault.is_none()
+    })
+    .await?;
+    handle.close().await?;
+
+    events
+        .wait_for(|event| matches!(event, WalletEvent::DerivedStateReset { .. }))
+        .await?;
+    assert!(saw_phase(&seen, |phase| matches!(
+        phase,
+        SyncDriverPhase::Recovering {
+            repair: SyncRepair::RescanFromBirthday,
+            ..
+        }
+    )));
+    assert_eq!(
+        base.chain_handle.failures_consumed(),
+        4,
+        "each rewind rung must have tried the fork point before the rebuild"
+    );
+    assert_ledger_kept(&base, &key).await?;
+    assert_eq!(
+        base.storage.find_chain_event_cursor().await?,
+        Some(
+            base.chain_handle
+                .latest_chain_event_sequence()
+                .to_be_bytes()
+                .to_vec()
+        ),
+        "the reorg's cursor is recorded once the rebuild made its rewind unnecessary"
+    );
+    Ok(())
+}
