@@ -18,8 +18,8 @@ use zally_core::{AccountId, BlockHeight, TxId};
 /// [`WalletEvent::TransactionReverted`] per wallet transaction and one
 /// [`WalletEvent::ShieldedReceiveReverted`] per received note that left the chain. A reverted
 /// transaction later produces [`WalletEvent::TransactionConfirmed`] again when the
-/// replacement chain mines it. Any sent transaction the settled chain passes the expiry
-/// height of without mining it produces [`WalletEvent::TransactionExpired`].
+/// replacement chain mines it, or [`WalletEvent::PendingBroadcastUnmineable`] once it can
+/// never be mined.
 ///
 /// [`WalletEvent::DerivedStateReset`] marks a wallet database rebuild from seed and birthday.
 /// [`WalletEvent::TransparentUtxoRefreshFaulted`] marks a faulted transparent-UTXO refresh
@@ -49,25 +49,12 @@ pub enum WalletEvent {
     ///
     /// The counterpart of [`Self::TransactionConfirmed`]. A transaction the wallet sent is
     /// submitted again while it can still be mined; the replacement chain either confirms it
-    /// again or lets it expire.
+    /// again or it becomes [`Self::PendingBroadcastUnmineable`].
     TransactionReverted {
         /// Reverted transaction identifier.
         tx_id: TxId,
         /// Height the transaction was mined at before the rewind.
         mined_height: BlockHeight,
-    },
-    /// A transaction the wallet sent can no longer be mined: the settled chain passed its
-    /// expiry height without it.
-    ///
-    /// Its payment did not happen and the wallet spends its inputs again. The wallet
-    /// releases the send's idempotency key at the same moment, so retrying the request with
-    /// the same key creates a replacement payment. Until this event, a retry with the key
-    /// returns this transaction, so a payment that can still be mined is never paid twice.
-    TransactionExpired {
-        /// Expired transaction identifier.
-        tx_id: TxId,
-        /// Last height at which the transaction could have been mined.
-        expiry_height: BlockHeight,
     },
     /// A transaction belonging to the wallet was confirmed at `confirmed_at_height`.
     TransactionConfirmed {

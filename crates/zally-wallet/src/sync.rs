@@ -533,9 +533,9 @@ impl SyncSnapshotStream {
 /// The driver records the cursor of every chain event it has applied and resumes after it,
 /// so a reorg announced while the host was stopped is applied on the next start. A
 /// `ChainReorged` event rewinds the wallet to its fork point before the next scan. Once
-/// caught up, the driver reconciles the payment ledger: it resubmits reverted withdrawals
-/// through the submitter given to [`SyncDriver::with_submitter`] and releases the
-/// idempotency keys of sent transactions that can no longer be mined.
+/// caught up, the driver reconciles what rewinds reverted: it resubmits reverted
+/// withdrawals through the submitter given to [`SyncDriver::with_submitter`] and releases
+/// the idempotency keys of reverted transactions that can never be mined.
 ///
 /// The driver task is infallible while its handle is alive. Faults engage the escalating
 /// repair ladder ([`SyncRepair`]) instead of killing the task; the task exits only through
@@ -1469,13 +1469,17 @@ async fn complete_sync(
     state.observe_completed_run(outcome);
     state.last_fault = None;
     let should_continue = should_continue_syncing(outcome, recorded_tip);
-    if !should_continue && let Err(error) = ctx.wallet.reconcile_payment_ledger(ctx.submitter).await
+    if !should_continue
+        && let Err(error) = ctx
+            .wallet
+            .reconcile_reverted_broadcasts(ctx.submitter)
+            .await
     {
         tracing::warn!(
             target: "zally::sync",
-            event = "wallet_payment_ledger_reconcile_failed",
+            event = "wallet_reverted_broadcast_reconcile_failed",
             %error,
-            "could not reconcile the payment ledger; the next caught-up sync retries"
+            "could not reconcile reverted broadcasts; the next caught-up sync retries"
         );
     }
     let phase = if should_continue {

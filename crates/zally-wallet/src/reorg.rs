@@ -6,11 +6,15 @@
 //! announcing event's cursor in the same storage transaction. Every rewind, announced or
 //! found by the repair ladder, goes through [`Wallet::revert_to_height`], which reports what
 //! left the chain as [`WalletEvent`]s and leaves the wallet-sent transactions it un-mined in
-//! the reverted-broadcast ledger. [`Wallet::reconcile_payment_ledger`] then submits each one
-//! again while it can be mined, retires it once it is mined again, and retires any sent
-//! transaction that can no longer be mined, releasing its idempotency key.
+//! the reverted-broadcast ledger. [`Wallet::reconcile_reverted_broadcasts`] then judges each
+//! one with the same verdict as a pending broadcast: it submits it again while it can be
+//! mined, retires it once it is mined again, and retires it with its idempotency key released
+//! once it can never be mined.
 
-use zally_chain::{ChainEpoch, ChainEventCursor, ChainSource, Submitter};
+use zally_chain::{
+    ChainEpoch, ChainEventCursor, ChainSource, Submitter, UnmineableReason,
+    parse_transaction_header,
+};
 use zally_core::BlockHeight;
 
 use crate::error::WalletError;
@@ -148,69 +152,99 @@ impl Wallet {
         Ok(target)
     }
 
-    /// Settles the payment ledger against the chain the wallet just caught up with.
+    /// Settles every wallet-sent transaction a rewind removed from the chain against the
+    /// chain the wallet just caught up with.
     ///
-    /// A wallet-sent transaction that can no longer be mined is retired first: it was never
-    /// mined at or below its expiry height, and both the settled tip and the wallet's fully
-    /// scanned height have passed that height, so no reorg can bring it back. Its
-    /// idempotency keys are released for a replacement payment and the wallet publishes
-    /// [`WalletEvent::TransactionExpired`]; its inputs are spendable again.
+    /// Each one goes through the same verdict as a pending broadcast
+    /// ([`zally_chain::TransactionHeader::check_mineable`]):
     ///
-    /// Every other transaction a rewind removed from the chain is retired once the wallet
-    /// has scanned it mined again (the scan already published
-    /// [`WalletEvent::TransactionConfirmed`]), or submitted once through `submitter` while
-    /// the next block can still include it. Without a submitter the wallet waits for the
-    /// chain to mine it or for it to expire.
+    /// - judged at the lower of the fully scanned height and the settled tip, a transaction
+    ///   that can never be mined is retired, its idempotency keys are released for a
+    ///   replacement payment, and the wallet publishes
+    ///   [`WalletEvent::PendingBroadcastUnmineable`]. No reorg within the source's bound and
+    ///   no unscanned block can mine it, so the replacement cannot pay twice;
+    /// - one the wallet has scanned mined again is retired; the scan already published
+    ///   [`WalletEvent::TransactionConfirmed`];
+    /// - any other is submitted once through `submitter` when the next block above the
+    ///   visible tip can include it. Without a submitter the wallet waits for the chain to
+    ///   mine it or for it to become unmineable.
     ///
     /// Callers run this against a freshly recorded chain tip.
-    pub(crate) async fn reconcile_payment_ledger(
+    pub(crate) async fn reconcile_reverted_broadcasts(
         &self,
         submitter: Option<&dyn Submitter>,
     ) -> Result<(), WalletError> {
-        let chain_tips = self.inner.storage.find_chain_tips().await?;
-        let fully_scanned = self.inner.storage.fully_scanned_height().await?;
-        if let (Some(chain_tips), Some(fully_scanned)) = (chain_tips, fully_scanned) {
-            let final_height = chain_tips.settled.min(fully_scanned);
-            for (tx_id, expiry_height) in self
-                .inner
-                .storage
-                .retire_expired_submissions(final_height, current_unix_ms())
-                .await?
-            {
-                tracing::warn!(
-                    target: "zally::sync",
-                    event = "wallet_submission_expired",
-                    tx_id = %tx_id,
-                    expiry_height = expiry_height.as_u32(),
-                    "sent transaction can no longer be mined; its idempotency key is released"
-                );
-                self.publish_event(WalletEvent::TransactionExpired {
-                    tx_id,
-                    expiry_height,
-                });
-            }
+        let storage = &self.inner.storage;
+        let reverted_broadcasts = storage.list_reverted_broadcasts().await?;
+        if reverted_broadcasts.is_empty() {
+            return Ok(());
         }
-
-        let next_height = chain_tips.map_or(0, |tips| tips.visible.as_u32().saturating_add(1));
-        for reverted in self.inner.storage.list_reverted_broadcasts().await? {
+        let chain_tips = storage.find_chain_tips().await?;
+        let judged_height = storage
+            .fully_scanned_height()
+            .await?
+            .zip(chain_tips)
+            .map(|(scanned, tips)| scanned.min(tips.settled));
+        for reverted in reverted_broadcasts {
             if reverted.mined_height.is_some() {
-                self.inner
-                    .storage
-                    .clear_reverted_broadcast(reverted.tx_id)
+                storage.clear_reverted_broadcast(reverted.tx_id).await?;
+                continue;
+            }
+            let header = match parse_transaction_header(&reverted.raw_tx_bytes) {
+                Ok(header) => header,
+                Err(error) => {
+                    tracing::error!(
+                        target: "zally::sync",
+                        event = "reverted_broadcast_unreadable",
+                        tx_id = %reverted.tx_id,
+                        %error,
+                        "stored reverted broadcast could not be parsed"
+                    );
+                    continue;
+                }
+            };
+            if let Some(judged_height) = judged_height
+                && let Err(reason) = header.check_mineable(self.network(), judged_height)
+            {
+                self.retire_unmineable_reverted_broadcast(reverted.tx_id, &reason, judged_height)
                     .await?;
                 continue;
             }
-            let expiry_height = reverted.expiry_height.as_u32();
-            let is_minable = expiry_height == 0 || next_height <= expiry_height;
             let Some(submitter) = submitter else {
                 continue;
             };
-            if reverted.resubmitted_at_ms.is_some() || !is_minable {
-                continue;
+            let can_enter_next_block = chain_tips
+                .is_some_and(|tips| header.check_mineable(self.network(), tips.visible).is_ok());
+            if reverted.resubmitted_at_ms.is_none() && can_enter_next_block {
+                self.resubmit_reverted_broadcast(submitter, reverted.tx_id, &reverted.raw_tx_bytes)
+                    .await?;
             }
-            self.resubmit_reverted_broadcast(submitter, reverted.tx_id, &reverted.raw_tx_bytes)
-                .await?;
         }
+        Ok(())
+    }
+
+    async fn retire_unmineable_reverted_broadcast(
+        &self,
+        tx_id: zally_core::TxId,
+        reason: &UnmineableReason,
+        judged_height: BlockHeight,
+    ) -> Result<(), WalletError> {
+        self.inner
+            .storage
+            .retire_reverted_broadcast(tx_id, current_unix_ms())
+            .await?;
+        tracing::warn!(
+            target: "zally::sync",
+            event = "reverted_broadcast_unmineable",
+            %tx_id,
+            %reason,
+            judged_height = judged_height.as_u32(),
+            "reverted transaction can never be mined; its idempotency key is released"
+        );
+        self.publish_event(WalletEvent::PendingBroadcastUnmineable {
+            tx_id,
+            reason: reason.to_string(),
+        });
         Ok(())
     }
 

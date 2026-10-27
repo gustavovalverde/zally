@@ -2,7 +2,8 @@
 //!
 //! The rewind keeps the payment ledger, reports what left the chain, and resubmits the
 //! withdrawal it reverted. A retried withdrawal is refused by its idempotency key until the
-//! settled chain passes the withdrawal's expiry height; only then does the key pay again.
+//! withdrawal can never be mined, judged at the settled and fully scanned height; only then
+//! does the key pay again.
 //!
 //! Each case shields a transparent UTXO through the wallet so the chain holds a withdrawal
 //! the wallet sent and a deposit it received, mined two blocks below the tip, then reorgs the
@@ -93,7 +94,7 @@ async fn announced_reorg_keeps_the_ledger(depth: u32) -> Result<(), FixtureError
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn an_expired_withdrawal_releases_its_key_once_the_expiry_is_settled()
+async fn a_reverted_withdrawal_releases_its_key_once_it_can_never_be_mined()
 -> Result<(), FixtureError> {
     let funded = funded_chain(200).await?;
     let base = &funded.base;
@@ -119,7 +120,7 @@ async fn an_expired_withdrawal_releases_its_key_once_the_expiry_is_settled()
         !events
             .snapshot()
             .iter()
-            .any(|event| matches!(event, WalletEvent::TransactionExpired { .. })),
+            .any(|event| matches!(event, WalletEvent::PendingBroadcastUnmineable { .. })),
         "a withdrawal is not dead while a reorg could still mine it below its expiry"
     );
     assert_eq!(retry_withdrawal(&funded).await?, funded.shielding_tx_id);
@@ -129,9 +130,9 @@ async fn an_expired_withdrawal_releases_its_key_once_the_expiry_is_settled()
         .advance_tip(BlockHeight::from(past_expiry + 1));
     events
         .wait_for(|event| {
-            matches!(event, WalletEvent::TransactionExpired { tx_id, expiry_height: expired_at }
+            matches!(event, WalletEvent::PendingBroadcastUnmineable { tx_id, reason }
                 if *tx_id == funded.shielding_tx_id
-                    && *expired_at == BlockHeight::from(expiry_height))
+                    && reason.contains(&format!("expired at height {expiry_height}")))
         })
         .await?;
     assert!(base.storage.list_reverted_broadcasts().await?.is_empty());

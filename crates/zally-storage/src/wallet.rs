@@ -1025,25 +1025,22 @@ pub trait WalletStorage: Send + Sync + 'static {
         resubmitted_at_ms: u64,
     ) -> Result<(), StorageError>;
 
-    /// Retires every wallet-sent transaction that can no longer be mined: it was never
-    /// mined at or below its expiry height, and that height is at or below `final_height`.
+    /// Retires the reverted broadcast `tx_id` once the wallet has judged that it can never be
+    /// mined, releasing its idempotency keys.
     ///
-    /// `final_height` must be a height no reorg can revert and one the wallet has fully
-    /// scanned, so a transaction mined at or below its expiry would be known: callers pass
-    /// the lower of the settled chain tip and the fully scanned height. Each retired
-    /// transaction's idempotency keys move to a retired ledger, so
-    /// [`Self::find_idempotent_submission`] stops returning the dead transaction and the
-    /// same key can record a replacement. Its reverted-broadcast and pending-broadcast
-    /// input rows are removed in the same database transaction.
-    ///
-    /// Returns each retired transaction with its expiry height.
+    /// The caller judges the transaction at a height no reorg can revert and the wallet has
+    /// fully scanned, so a transaction that could still be mined is never retired. Each
+    /// idempotency key bound to it moves to a retired ledger, so
+    /// [`Self::find_idempotent_submission`] stops returning the dead transaction and the same
+    /// key can record a replacement. Its reverted-broadcast and pending-broadcast input rows
+    /// are removed in the same database transaction.
     ///
     /// `not_retryable` on schema errors; `retryable` on transient I/O.
-    async fn retire_expired_submissions(
+    async fn retire_reverted_broadcast(
         &self,
-        final_height: BlockHeight,
+        tx_id: TxId,
         retired_at_ms: u64,
-    ) -> Result<Vec<(TxId, BlockHeight)>, StorageError>;
+    ) -> Result<(), StorageError>;
 
     /// Removes the reverted broadcast `tx_id` and its pending-broadcast input rows once it
     /// is mined again.
