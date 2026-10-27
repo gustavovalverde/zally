@@ -3719,10 +3719,10 @@ fn proposal_rejection_kind(
     match proposal {
         ProposalError::InputsLocked(_) => ProposalRejectionKind::InputsLocked,
         ProposalError::TransactionTooLarge { .. } => ProposalRejectionKind::TransactionTooLarge,
-        ProposalError::OrchardReceiverRequiresIronwood(_)
-        | ProposalError::OrchardPoolPayment(_) => {
+        ProposalError::OrchardReceiverRequiresIronwood(_) => {
             ProposalRejectionKind::OrchardRecipientNeedsIronwood
         }
+        ProposalError::OrchardPoolPayment(_) => ProposalRejectionKind::SelectionContractViolated,
         _ => ProposalRejectionKind::Other,
     }
 }
@@ -4354,8 +4354,8 @@ mod tests {
     }
 
     #[test]
-    fn selector_contract_violations_require_an_operator() {
-        for violation in [
+    fn upstream_contract_violations_require_an_operator() {
+        let selector_violations = [
             GreedyInputSelectorError::RequirementCovered {
                 required: upstream_zatoshis(20_000),
                 available: upstream_zatoshis(30_000),
@@ -4363,8 +4363,16 @@ mod tests {
             GreedyInputSelectorError::DustInputsNotGiven,
             GreedyInputSelectorError::ExcludedNoteSelected,
             GreedyInputSelectorError::UnrequestedPoolSelected,
-        ] {
-            let error = classify_proposal_build_error(&TestBuildError::NoteSelection(violation));
+        ]
+        .map(TestBuildError::NoteSelection);
+        let orchard_pool_payment = TestBuildError::Proposal(
+            zcash_client_backend::proposal::ProposalError::OrchardPoolPayment(0),
+        );
+        for violation in selector_violations
+            .into_iter()
+            .chain([orchard_pool_payment])
+        {
+            let error = classify_proposal_build_error(&violation);
             assert!(
                 matches!(
                     error,
@@ -4410,17 +4418,14 @@ mod tests {
             Some(ProposalRejectionKind::TransactionTooLarge)
         );
 
-        for needs_ironwood in [
-            ProposalError::OrchardReceiverRequiresIronwood(
+        let needs_ironwood =
+            TestBuildError::Proposal(ProposalError::OrchardReceiverRequiresIronwood(
                 zcash_primitives::transaction::TxVersion::V5,
-            ),
-            ProposalError::OrchardPoolPayment(0),
-        ] {
-            assert_eq!(
-                rejection_kind(&TestBuildError::Proposal(needs_ironwood)),
-                Some(ProposalRejectionKind::OrchardRecipientNeedsIronwood)
-            );
-        }
+            ));
+        assert_eq!(
+            rejection_kind(&needs_ironwood),
+            Some(ProposalRejectionKind::OrchardRecipientNeedsIronwood)
+        );
     }
 
     #[test]
@@ -4439,21 +4444,36 @@ mod tests {
     }
 
     #[test]
-    fn expired_recipient_address_is_typed_and_not_retryable() {
-        let error = classify_proposal_build_error(&TestBuildError::RecipientAddressExpiry {
-            payment_index: 0,
-            error: zcash_client_backend::data_api::error::AddressExpiryError::TimeExpired {
-                expiry_time: 1,
+    fn recipient_address_expiry_is_typed_and_not_retryable() {
+        use zcash_client_backend::data_api::error::AddressExpiryError;
+        use zcash_protocol::consensus::BlockHeight as UpstreamBlockHeight;
+        for expiry in [
+            AddressExpiryError::TimeExpired { expiry_time: 1 },
+            AddressExpiryError::HeightExpired {
+                address_expiry: UpstreamBlockHeight::from_u32(100),
+                chain_height: UpstreamBlockHeight::from_u32(101),
             },
-        });
-        assert!(matches!(
-            error,
-            StorageError::ProposalRejected {
-                kind: ProposalRejectionKind::RecipientAddressExpired,
-                ..
-            }
-        ));
-        assert_eq!(error.posture(), FailurePosture::NotRetryable);
+            AddressExpiryError::ExpiryHeightConflict {
+                address_expiry: UpstreamBlockHeight::from_u32(150),
+                transaction_expiry: UpstreamBlockHeight::from_u32(160),
+            },
+        ] {
+            let error = classify_proposal_build_error(&TestBuildError::RecipientAddressExpiry {
+                payment_index: 0,
+                error: expiry,
+            });
+            assert!(
+                matches!(
+                    error,
+                    StorageError::ProposalRejected {
+                        kind: ProposalRejectionKind::RecipientAddressExpired,
+                        ..
+                    }
+                ),
+                "{error:?}"
+            );
+            assert_eq!(error.posture(), FailurePosture::NotRetryable);
+        }
     }
 
     #[test]

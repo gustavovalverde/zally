@@ -44,15 +44,20 @@ pub enum ProposalRejectionKind {
     /// A recipient's ZIP 316 Revision 2 address has expired, or expires before the
     /// transaction would.
     ///
-    /// Posture: [`FailurePosture::NotRetryable`]; ask the recipient for a current address.
+    /// Posture: [`FailurePosture::NotRetryable`] with the same arguments. An expired address
+    /// needs a current one from the recipient. When the address only expires before the
+    /// transaction would, a transaction with an earlier target expiry height passes, but
+    /// ZIP 316 warns that choosing that height to fit the address reveals the address's
+    /// expiry on chain; asking the recipient for a longer-lived address avoids that.
     RecipientAddressExpired,
-    /// A payment to an Orchard receiver can only be delivered through the Ironwood pool,
-    /// which the requested transaction cannot carry.
+    /// After NU6.3, a payment to an Orchard receiver can only be delivered through the
+    /// Ironwood pool, which a transaction of the requested version cannot carry.
     ///
     /// Posture: [`FailurePosture::NotRetryable`] with the same arguments.
     OrchardRecipientNeedsIronwood,
-    /// The input selector reported a broken contract in the wallet database or change
-    /// strategy, such as a selected note it was asked to exclude.
+    /// librustzcash reported a broken internal contract while selecting inputs or building
+    /// a proposal step, such as a selected note it was asked to exclude, or a payment
+    /// directed to the Orchard pool after Ironwood activation.
     ///
     /// Posture: [`FailurePosture::RequiresOperator`]; this is a defect, not a balance problem.
     SelectionContractViolated,

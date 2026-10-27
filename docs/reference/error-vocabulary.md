@@ -113,9 +113,9 @@ Carried by `WalletError::ProposalRejected` and `StorageError::ProposalRejected`.
 | `InputsLocked` | `retryable` | A concurrent proposal or PCZT locked a selected input first; a retry selects around it. |
 | `TransactionTooLarge` | `not_retryable` | The transaction would exceed the block size; send less or consolidate notes. |
 | `ExpiryConflictsWithCanonicalCrossing` | `not_retryable` | A target expiry height was supplied for a ZIP 318 canonical crossing, whose expiry comes from the ZIP 318 rolling window; retry without one. |
-| `RecipientAddressExpired` | `not_retryable` | A ZIP 316 Revision 2 recipient address has expired or expires before the transaction. |
-| `OrchardRecipientNeedsIronwood` | `not_retryable` | An Orchard-receiver payment can only be delivered through the Ironwood pool, which the requested transaction cannot carry. |
-| `SelectionContractViolated` | `requires_operator` | The input selector reported a broken wallet-database or change-strategy contract. |
+| `RecipientAddressExpired` | `not_retryable` | A ZIP 316 Revision 2 recipient address has expired; ask for a current one. Also returned when the address only expires before the transaction would; an earlier target expiry height passes, but choosing it to fit the address reveals the address's expiry on chain (ZIP 316), so prefer a longer-lived address. |
+| `OrchardRecipientNeedsIronwood` | `not_retryable` | After NU6.3, an Orchard-receiver payment can only be delivered through the Ironwood pool, which a transaction of the requested version cannot carry. |
+| `SelectionContractViolated` | `requires_operator` | librustzcash reported a broken internal contract while selecting inputs or building a step, such as a selected note it was asked to exclude or an Orchard-pool payment after Ironwood activation. |
 | `Other` | `not_retryable` | Any other rejection; the reason carries the detail. |
 
 ## PcztError
