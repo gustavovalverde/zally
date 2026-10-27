@@ -269,7 +269,7 @@ Unified Address strings are encoded at ZIP-316 Revision 0 when Revision 0 can re
 ### Spending (SPEND)
 
 - **SPEND-1**: `Wallet::send_payment(SendPaymentPlan) -> SendOutcome`. Transparent and shielded recipients both supported.
-- **SPEND-2**: Refuse memo on transparent recipient (ZIP-302) at API call; typed error variant.
+- **SPEND-2**: Refuse memo on transparent recipient (ZIP-302) at API call, including a Unified Address whose only receiver is transparent; typed error variant.
 - **SPEND-3**: TEX address support per ZIP-320: model TEX recipients distinctly and reject memos as transparent recipients.
 - **SPEND-4**: Conventional fee per ZIP-317.
 - **SPEND-5**: `nExpiryHeight` set per ZIP-203.

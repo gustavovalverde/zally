@@ -3594,20 +3594,40 @@ pub(crate) fn coinbase_safe_shielding_policy() -> ConfirmationsPolicy {
 /// `Display` over its `NoteRef` generic.
 pub(crate) fn classify_proposal_build_error<E: std::fmt::Debug>(err: &E) -> StorageError {
     let reason = format!("{err:?}");
-    let lc = reason.to_lowercase();
-    if lc.contains("insufficientfunds") || lc.contains("insufficient funds") {
+    if GREEDY_SELECTOR_CONTRACT_VIOLATIONS
+        .iter()
+        .any(|variant| reason.contains(variant))
+    {
+        return StorageError::ProposalBuildFailed {
+            reason,
+            posture: FailurePosture::RequiresOperator,
+        };
+    }
+    if reason.contains("InsufficientFunds {") {
         return StorageError::InsufficientFunds {
             required_zat: Zatoshis::zero(),
             available_zat: Zatoshis::zero(),
         };
     }
-    let posture = if lc.contains("inputslocked") || lc.contains("inputs locked") {
+    let posture = if reason.contains("InputsLocked") {
         FailurePosture::Retryable
     } else {
         FailurePosture::NotRetryable
     };
     StorageError::ProposalBuildFailed { reason, posture }
 }
+
+/// `GreedyInputSelectorError` variants that report a broken upstream contract.
+///
+/// Since `zcash_client_backend` 0.25 these replace the `InsufficientFunds` results the
+/// selector used to return with more value available than required. They describe a
+/// defect in the wallet database or change strategy, not a balance the caller can top up.
+const GREEDY_SELECTOR_CONTRACT_VIOLATIONS: [&str; 4] = [
+    "RequirementCovered",
+    "DustInputsNotGiven",
+    "ExcludedNoteSelected",
+    "UnrequestedPoolSelected",
+];
 
 /// Builds prepared-transaction records for each proposal step.
 ///
@@ -4182,6 +4202,82 @@ mod tests {
             nu6_3: height(30),
             nu7: None,
         })
+    }
+
+    type TestSelectionError =
+        zcash_client_backend::data_api::wallet::input_selection::InputSelectorError<
+            SqliteClientError,
+            zcash_client_backend::data_api::wallet::input_selection::GreedyInputSelectorError,
+            std::convert::Infallible,
+            zcash_client_sqlite::ReceivedNoteId,
+        >;
+
+    fn upstream_zatoshis(zat: u64) -> zcash_protocol::value::Zatoshis {
+        zcash_protocol::value::Zatoshis::const_from_u64(zat)
+    }
+
+    #[test]
+    fn selector_insufficient_funds_classifies_as_insufficient_funds() {
+        let error = TestSelectionError::InsufficientFunds {
+            available: upstream_zatoshis(10_000),
+            required: upstream_zatoshis(20_000),
+        };
+        assert!(matches!(
+            classify_proposal_build_error(&error),
+            StorageError::InsufficientFunds { .. }
+        ));
+    }
+
+    #[test]
+    fn selector_contract_violations_require_an_operator() {
+        use zcash_client_backend::data_api::wallet::input_selection::GreedyInputSelectorError;
+        for violation in [
+            GreedyInputSelectorError::RequirementCovered {
+                required: upstream_zatoshis(20_000),
+                available: upstream_zatoshis(30_000),
+            },
+            GreedyInputSelectorError::DustInputsNotGiven,
+            GreedyInputSelectorError::ExcludedNoteSelected,
+            GreedyInputSelectorError::UnrequestedPoolSelected,
+        ] {
+            let error = TestSelectionError::Selection(violation);
+            assert!(
+                matches!(
+                    classify_proposal_build_error(&error),
+                    StorageError::ProposalBuildFailed {
+                        posture: FailurePosture::RequiresOperator,
+                        ..
+                    }
+                ),
+                "{error:?}"
+            );
+        }
+    }
+
+    type TestBuildError = zcash_client_backend::data_api::error::Error<
+        SqliteClientError,
+        SqliteClientError,
+        zcash_client_backend::data_api::wallet::input_selection::GreedyInputSelectorError,
+        std::convert::Infallible,
+        std::convert::Infallible,
+        zcash_client_sqlite::ReceivedNoteId,
+    >;
+
+    #[test]
+    fn expired_recipient_address_is_not_retryable() {
+        let error = TestBuildError::RecipientAddressExpiry {
+            payment_index: 0,
+            error: zcash_client_backend::data_api::error::AddressExpiryError::TimeExpired {
+                expiry_time: 1,
+            },
+        };
+        assert!(matches!(
+            classify_proposal_build_error(&error),
+            StorageError::ProposalBuildFailed {
+                posture: FailurePosture::NotRetryable,
+                ..
+            }
+        ));
     }
 
     #[test]

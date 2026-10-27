@@ -63,6 +63,9 @@ pub enum WalletError {
 
     /// A memo was provided for a transparent recipient.
     ///
+    /// Also returned for a Unified Address whose only receiver is transparent, which is
+    /// paid through that receiver.
+    ///
     /// Posture: [`FailurePosture::NotRetryable`]: ZIP-302 prohibits memos on transparent
     /// outputs.
     #[error("memos are not permitted on transparent recipients (ZIP-302)")]

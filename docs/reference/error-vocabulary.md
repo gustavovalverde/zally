@@ -28,7 +28,7 @@ Only `retryable` moves the breaker's failure counter, and only a call that compl
 | `NetworkMismatch` | `requires_operator` | Two configured boundaries disagree on network. |
 | `ChainSource(ChainSourceError)` | Mirrors `ChainSourceError` | A chain-read operation failed. |
 | `Submitter(SubmitterError)` | Mirrors `SubmitterError` | Transaction broadcast failed. |
-| `MemoOnTransparentRecipient` | `not_retryable` | ZIP-302 forbids memos on transparent recipients. |
+| `MemoOnTransparentRecipient` | `not_retryable` | ZIP-302 forbids memos on transparent recipients, including a Unified Address whose only receiver is transparent. |
 | `ShieldedInputsOnTexRecipient` | `not_retryable` | ZIP-320 requires transparent-only inputs for TEX. |
 | `InsufficientBalance` | `not_retryable` | The wallet lacks spendable funds. |
 | `PaymentRequestParseFailed` | `not_retryable` | ZIP-321 URI parsing failed. |
@@ -99,7 +99,7 @@ Only `retryable` moves the breaker's failure counter, and only a call that compl
 | `ChainReorgDetected` | `retryable` | Scanner input diverged from persisted chain state and needs rollback. |
 | `TransparentOutputNotRecognized` | `not_retryable` | A chain source returned a transparent output script Zally cannot map. |
 | `TransparentOutputValueOutOfRange` | `not_retryable` | A chain source returned a transparent output value outside the zatoshis range. |
-| `ProposalBuildFailed` | Carries `FailurePosture` | Proposal construction failed. An upstream input-lock conflict is retryable; malformed proposal state is not retryable. |
+| `ProposalBuildFailed` | Carries `FailurePosture` | Proposal construction failed. An upstream input-lock conflict is retryable; malformed proposal state is not retryable; an input-selector contract violation (a defect in the wallet database or change strategy) requires an operator. |
 | `ShieldedPoolUnsupported` | `requires_operator` | The requested shielded pool has no subtree-root write path in this storage backend. |
 
 ## PcztError
