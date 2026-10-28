@@ -51,6 +51,7 @@ impl Network {
             nu6_1: None,
             nu6_2: None,
             nu6_3: None,
+            nu7: None,
         })
     }
 
@@ -151,6 +152,7 @@ struct RegtestActivations {
     nu6_1: Option<u32>,
     nu6_2: Option<u32>,
     nu6_3: Option<u32>,
+    nu7: Option<u32>,
 }
 
 #[cfg(feature = "serde")]
@@ -170,6 +172,7 @@ impl From<Network> for NetworkWire {
                 nu6_1: local.nu6_1.map(u32::from),
                 nu6_2: local.nu6_2.map(u32::from),
                 nu6_3: local.nu6_3.map(u32::from),
+                nu7: local.nu7.map(u32::from),
             }),
         }
     }
@@ -212,6 +215,9 @@ impl From<NetworkWire> for Network {
                 nu6_3: activations
                     .nu6_3
                     .map(zcash_protocol::consensus::BlockHeight::from_u32),
+                nu7: activations
+                    .nu7
+                    .map(zcash_protocol::consensus::BlockHeight::from_u32),
             }),
         }
     }
@@ -239,6 +245,7 @@ mod tests {
         assert_eq!(params.activation_height(NetworkUpgrade::Nu6_1), None);
         assert_eq!(params.activation_height(NetworkUpgrade::Nu6_2), None);
         assert_eq!(params.activation_height(NetworkUpgrade::Nu6_3), None);
+        assert_eq!(params.activation_height(NetworkUpgrade::Nu7), None);
     }
 
     #[test]

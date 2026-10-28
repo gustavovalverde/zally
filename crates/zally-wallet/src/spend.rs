@@ -136,32 +136,50 @@ impl ParsedPayment {
 }
 
 fn classify_recipient(encoded: &str, network: Network) -> PaymentRecipient {
-    // Best-effort classification by encoded prefix. Authoritative disambiguation happens
-    // in `zcash_address` at proposal time; the Zally guards distinguish the four shapes
-    // below based on the encoded prefix.
-    if encoded.starts_with("tex") {
-        PaymentRecipient::TexAddress {
+    let parsed_kind = encoded
+        .parse::<zcash_address::ZcashAddress>()
+        .ok()
+        .and_then(|address| address.convert::<zcash_keys::address::Address>().ok());
+    match parsed_kind {
+        Some(zcash_keys::address::Address::Unified(_)) => PaymentRecipient::UnifiedAddress {
             encoded: encoded.to_owned(),
             network,
-        }
-    } else if encoded.starts_with('u') {
-        PaymentRecipient::UnifiedAddress {
+        },
+        Some(zcash_keys::address::Address::Sapling(_)) => PaymentRecipient::SaplingAddress {
             encoded: encoded.to_owned(),
             network,
+        },
+        Some(zcash_keys::address::Address::Transparent(_)) => {
+            PaymentRecipient::TransparentAddress {
+                encoded: encoded.to_owned(),
+                network,
+            }
         }
-    } else if encoded.starts_with("zs")
-        || encoded.starts_with("ztestsapling")
-        || encoded.starts_with("zregtestsapling")
-    {
-        PaymentRecipient::SaplingAddress {
+        Some(zcash_keys::address::Address::Tex(_)) => PaymentRecipient::TexAddress {
             encoded: encoded.to_owned(),
             network,
-        }
-    } else {
-        PaymentRecipient::TransparentAddress {
+        },
+        None if encoded.starts_with("tex") => PaymentRecipient::TexAddress {
             encoded: encoded.to_owned(),
             network,
+        },
+        None if encoded.starts_with('u') => PaymentRecipient::UnifiedAddress {
+            encoded: encoded.to_owned(),
+            network,
+        },
+        None if encoded.starts_with("zs")
+            || encoded.starts_with("ztestsapling")
+            || encoded.starts_with("zregtestsapling") =>
+        {
+            PaymentRecipient::SaplingAddress {
+                encoded: encoded.to_owned(),
+                network,
+            }
         }
+        None => PaymentRecipient::TransparentAddress {
+            encoded: encoded.to_owned(),
+            network,
+        },
     }
 }
 

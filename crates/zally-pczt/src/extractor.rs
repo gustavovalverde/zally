@@ -1,6 +1,7 @@
 //! `Extractor` role: pulls the final transaction out of a fully-authorized PCZT.
 
 use pczt::roles::tx_extractor::TransactionExtractor;
+use rand::{rand_core::UnwrapErr, rngs::SysRng};
 use zally_core::{Network, TxId};
 use zcash_proofs::prover::LocalTxProver;
 
@@ -54,7 +55,7 @@ impl Extractor {
 
         let tx = TransactionExtractor::new(parsed)
             .with_sapling(&spend_vk, &output_vk)
-            .extract()
+            .extract(UnwrapErr(SysRng))
             .map_err(|err| PcztError::NotFinalized {
                 reason: format!("upstream extraction failed: {err:?}"),
             })?;

@@ -5,8 +5,8 @@ use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
 
-use rand::rngs::OsRng;
-use secp256k1::{PublicKey, Secp256k1};
+use rand::rng;
+use secp256k1::PublicKey;
 use serde_json::{Value, json};
 use zally_chain::{
     ChainSource, ShieldedPool, SubmitOutcome, Submitter, ZinderChainSource, ZinderRemoteOptions,
@@ -527,8 +527,7 @@ fn build_regtest_funding_transaction(
         .map_err(|error| TestError::TransparentFunding {
             reason: format!("could not derive funding secret key: {error}"),
         })?;
-    let secp = Secp256k1::new();
-    let public_key = PublicKey::from_secret_key(&secp, &secret_key);
+    let public_key = PublicKey::from_secret_key(&secret_key);
     let funding_address = ZallyTransparentAddress::from_pubkey(&public_key)
         .to_zcash_address(NetworkType::Regtest)
         .encode();
@@ -583,7 +582,7 @@ fn build_regtest_funding_transaction(
             reason: format!("could not add funding output: {error}"),
         })?;
     let built = builder
-        .mock_build(&signing_set, &[], &[], OsRng)
+        .mock_build(&signing_set, &[], &[], rng())
         .map_err(|error| TestError::TransparentFunding {
             reason: format!("could not build funding transaction: {error}"),
         })?;
@@ -872,6 +871,7 @@ fn zally_local_network_from_upgrades(upgrades: &[NodeUpgrade]) -> ZallyLocalNetw
         nu6_1: activation_height("NU6.1"),
         nu6_2: activation_height("NU6.2"),
         nu6_3: activation_height("NU6.3"),
+        nu7: activation_height("NU7"),
     }
 }
 

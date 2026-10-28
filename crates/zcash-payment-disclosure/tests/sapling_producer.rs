@@ -14,10 +14,11 @@ fn fixture_plan(
     network: NetworkType,
 ) -> Result<(PaymentDisclosurePlan, sapling::keys::SpendAuthorizingKey), Box<dyn std::error::Error>>
 {
-    let spending_key = ExtendedSpendingKey::master(&[7; 32]);
+    let spending_key =
+        ExtendedSpendingKey::master(&[7; 32]).ok_or("invalid fixture spending key")?;
     let (_, recipient) = spending_key.default_address();
-    let proof_generation_key = spending_key.expsk.proof_generation_key();
-    let ask = spending_key.expsk.ask;
+    let proof_generation_key = spending_key.expsk().proof_generation_key();
+    let ask = spending_key.expsk().ask().clone();
     let node = Option::from(Node::from_bytes([0; 32])).ok_or("invalid fixture node")?;
     let witness = MerklePath::from_parts(vec![node; 32], Position::from(0))
         .map_err(|()| "invalid fixture witness")?;
@@ -80,10 +81,11 @@ fn message_and_network_change_the_signed_disclosure() -> Result<(), Box<dyn std:
 fn producer_rejects_an_authorizing_key_for_another_account()
 -> Result<(), Box<dyn std::error::Error>> {
     let (plan, _) = fixture_plan(b"merchant-challenge", NetworkType::Test)?;
-    let unrelated_ask = ExtendedSpendingKey::master(&[8; 32]).expsk.ask;
+    let unrelated_key =
+        ExtendedSpendingKey::master(&[8; 32]).ok_or("invalid unrelated fixture key")?;
     let outcome = prove_disclosure(
         plan,
-        &unrelated_ask,
+        unrelated_key.expsk().ask(),
         &MockSpendProver,
         &mut StdRng::from_seed([3; 32]),
     );

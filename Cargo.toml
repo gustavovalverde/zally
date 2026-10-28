@@ -54,26 +54,27 @@ multiple_crate_versions = "allow"
 redundant_pub_crate = "allow"
 
 [workspace.dependencies]
-# Foundation: released librustzcash crates. Keep the concrete protocol family
-# aligned with zcash_client_backend and advance it as one reviewed unit. Zally
-# absorbs the upstream churn behind its own public surface.
-zcash_client_backend = "=0.24.0-rc.4"
-zcash_client_sqlite = "=0.22.0-rc.4"
-zcash_keys = "=0.16.0"
-zcash_primitives = "=0.30.0"
-zcash_protocol = { version = "=0.10.1", features = ["local-consensus"] }
-zcash_address = "=0.13.0"
-zcash_proofs = "=0.30.0"
-zcash_transparent = { version = "=0.10.0", default-features = false, features = ["transparent-inputs"] }
-zcash_script = "0.4"
-pczt = { version = "=0.9.1", features = ["orchard", "sapling", "transparent", "signer", "prover", "tx-extractor"] }
-secp256k1 = "0.29"
-orchard = "=0.15.4"
-sapling = { package = "sapling-crypto", version = "0.7" }
-zip321 = "=0.9.0-rc.1"
-zip32 = "0.2"
-shardtree = "=0.7.1"
-incrementalmerkletree = "=0.8.2"
+# Foundation: the NU7-compatible librustzcash prerelease cohort. Keep concrete
+# protocol types aligned with zcash_client_backend and advance the family as one
+# reviewed unit. These are prerelease versions; Zally absorbs API churn behind
+# its public surface.
+zcash_client_backend = "=0.25.0-pre.0"
+zcash_client_sqlite = "=0.23.0-pre.0"
+zcash_keys = "=0.17.0-pre.0"
+zcash_primitives = "=0.31.0-pre.0"
+zcash_protocol = { version = "=0.11.0-pre.0", features = ["local-consensus"] }
+zcash_address = "=0.14.0-pre.0"
+zcash_proofs = "=0.31.0-pre.0"
+zcash_transparent = { version = "=0.11.0-pre.0", default-features = false, features = ["transparent-inputs"] }
+zcash_script = "0.6"
+pczt = { version = "=0.10.0-pre.0", features = ["orchard", "sapling", "transparent", "signer", "prover", "tx-extractor"] }
+secp256k1 = "0.33"
+orchard = "=0.16.0"
+sapling = { package = "sapling-crypto", version = "0.9" }
+zip321 = "=0.10.0-pre.0"
+zip32 = "0.3"
+shardtree = "0.8"
+incrementalmerkletree = "0.9"
 
 # Optional chain-plane backend. The `zinder` cargo feature on zally-chain pulls these
 # crates from a pinned git revision so the wallet integration tracks the Zinder typed-
@@ -105,7 +106,7 @@ hex = "0.4"
 age = "0.10"
 secrecy = "0.8"
 zeroize = "1.8"
-rand = "0.8"
+rand = "0.10"
 blake2b_simd = "1.0"
 
 # Storage.

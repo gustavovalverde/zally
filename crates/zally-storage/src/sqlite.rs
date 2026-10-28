@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
 use orchard::tree::MerkleHashOrchard;
-use rand::rngs::OsRng;
+use rand::rngs::SysRng;
 use rusqlite::OptionalExtension as _;
 use sapling::Node as SaplingNode;
 use secrecy::{ExposeSecret as _, SecretVec};
@@ -37,8 +37,8 @@ use zcash_client_backend::data_api::wallet::{
     input_selection::{GreedyInputSelector, LockFilter, LockedInputPolicy, SpendPolicy},
 };
 use zcash_client_backend::data_api::{
-    Account, AccountBirthday, MaxSpendMode, TargetValue, WalletCommitmentTrees, WalletRead,
-    WalletWrite,
+    Account, AccountBirthday, MaxSpendMode, OutputLockStore, TargetValue, WalletCommitmentTrees,
+    WalletRead, WalletWrite,
 };
 use zcash_client_backend::fees::{DustOutputPolicy, StandardFeeRule, standard};
 use zcash_client_backend::proto::compact_formats::{
@@ -68,7 +68,17 @@ use zcash_transparent::bundle::{OutPoint as UpstreamOutPoint, TxOut};
 use crate::error::StorageError;
 use crate::wallet::{ChainTips, WalletStorage};
 
-type Db = WalletDb<rusqlite::Connection, NetworkParameters, SystemClock, OsRng>;
+type StorageClock = SystemClock;
+type StorageOsRng = rand::rand_core::UnwrapErr<SysRng>;
+type Db = WalletDb<rusqlite::Connection, NetworkParameters, StorageClock, StorageOsRng>;
+
+fn storage_clock() -> StorageClock {
+    SystemClock
+}
+
+fn storage_os_rng() -> StorageOsRng {
+    rand::rand_core::UnwrapErr(SysRng)
+}
 
 const DEFAULT_ACCOUNT_NAME: &str = "primary";
 /// Far exceeds the local proving window; successful transaction storage clears the lock.
@@ -438,7 +448,7 @@ fn open_wallet_db(
         options.gap_limit.internal,
         options.gap_limit.ephemeral,
     );
-    let mut db = WalletDb::for_path(&options.db_path, params, SystemClock, OsRng)
+    let mut db = WalletDb::for_path(&options.db_path, params, storage_clock(), storage_os_rng())
         .map_err(|e| StorageError::SqliteFailed {
             reason: e.to_string(),
             posture: FailurePosture::NotRetryable,
@@ -1062,6 +1072,8 @@ impl WalletStorage for Sqlite {
             )?;
             let build_result = (|| {
                 ensure_proposal_anchors(db, &proposal)?;
+                let clock = storage_clock();
+                let mut rng = storage_os_rng();
                 let txids = zcash_client_backend::data_api::wallet::create_proposed_transactions::<
                     Db,
                     NetworkParameters,
@@ -1072,6 +1084,8 @@ impl WalletStorage for Sqlite {
                 >(
                     db,
                     &params,
+                    &clock,
+                    &mut rng,
                     &prover,
                     &prover,
                     &spending_keys,
@@ -1148,6 +1162,8 @@ impl WalletStorage for Sqlite {
             .map_err(|err| classify_proposal_build_error(&err))?;
             let build_result = (|| {
                 ensure_proposal_anchors(db, &proposal)?;
+                let clock = storage_clock();
+                let mut rng = storage_os_rng();
                 let txids = zcash_client_backend::data_api::wallet::create_proposed_transactions::<
                     Db,
                     NetworkParameters,
@@ -1158,6 +1174,8 @@ impl WalletStorage for Sqlite {
                 >(
                     db,
                     &params,
+                    &clock,
+                    &mut rng,
                     &prover,
                     &prover,
                     &spending_keys,
@@ -1213,6 +1231,8 @@ impl WalletStorage for Sqlite {
                 )?;
                 let build_result = (|| {
                     ensure_proposal_anchors(db, &proposal)?;
+                    let clock = storage_clock();
+                    let mut rng = storage_os_rng();
                     let pczt = zcash_client_backend::data_api::wallet::create_pczt_from_proposal::<
                         Db,
                         NetworkParameters,
@@ -1223,6 +1243,8 @@ impl WalletStorage for Sqlite {
                     >(
                         db,
                         &params,
+                        &clock,
+                        &mut rng,
                         account_uuid,
                         zcash_client_backend::wallet::OvkPolicy::Sender,
                         &proposal,
@@ -1275,11 +1297,20 @@ impl WalletStorage for Sqlite {
             WalletDbState::NotOpened => Err(StorageError::NotOpened),
             WalletDbState::Opened { db, ledger } => {
                 let db = db.as_mut();
+                let clock = storage_clock();
+                let mut rng = storage_os_rng();
                 let tx_id =
                     zcash_client_backend::data_api::wallet::extract_and_store_transaction_from_pczt::<
                         Db,
                         zcash_client_sqlite::ReceivedNoteId,
-                    >(db, parsed, Some((&spend_vk, &output_vk)), None)
+                    >(
+                        db,
+                        &clock,
+                        &mut rng,
+                        parsed,
+                        Some((&spend_vk, &output_vk)),
+                        None,
+                    )
                     .map_err(|err| StorageError::SqliteFailed {
                         reason: format!("extract_and_store_transaction_from_pczt failed: {err}"),
                         posture: FailurePosture::NotRetryable,
@@ -1914,7 +1945,7 @@ impl WalletStorage for Sqlite {
                     .transpose()?;
                 let has_transparent_receiver = unified_address.transparent().is_some();
                 rows.push(crate::ExposedAddressRow {
-                    unified_address,
+                    unified_address: *unified_address,
                     diversifier_index,
                     has_transparent_receiver,
                     exposed_at_height,
@@ -3361,7 +3392,8 @@ fn propose_payment_proposal<DbT>(
     StorageError,
 >
 where
-    DbT: zcash_client_backend::data_api::WalletWrite<
+    DbT: zcash_client_backend::data_api::WalletWrite
+        + zcash_client_backend::data_api::WalletRead<
             AccountId = AccountUuid,
             Error = zcash_client_sqlite::error::SqliteClientError,
         > + zcash_client_backend::data_api::InputSource<
@@ -3422,7 +3454,10 @@ where
 }
 
 fn proposal_lock_request() -> LockRequest {
-    LockRequest::new(LockOwner::random(&mut OsRng), PROPOSAL_INPUT_LOCK_BLOCKS)
+    LockRequest::new(
+        LockOwner::random(&mut storage_os_rng()),
+        PROPOSAL_INPUT_LOCK_BLOCKS,
+    )
 }
 
 fn proposal_input_refs<FeeRuleT, NoteRefT>(
@@ -4125,6 +4160,7 @@ mod tests {
             nu6_1: height(22),
             nu6_2: height(23),
             nu6_3: height(30),
+            nu7: None,
         })
     }
 
