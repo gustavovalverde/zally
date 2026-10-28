@@ -591,14 +591,16 @@ impl Wallet {
         if let Some(cause) = source_halt {
             return Err(WalletError::ChainSourceHalted { cause });
         }
+        let Some(required_blocks) = self.inner.options.minimum_source_reorg_window_blocks else {
+            return Ok(());
+        };
         let reorg_window = *self.inner.source_reorg_window.lock();
         match reorg_window {
-            SourceReorgWindowCheck::Unverified { required_blocks } => {
+            SourceReorgWindowCheck::Unverified => {
                 Err(WalletError::SourceReorgWindowUnverified { required_blocks })
             }
             SourceReorgWindowCheck::TooShallow {
                 reorg_window_blocks,
-                required_blocks,
             } => Err(WalletError::SourceReorgWindowTooShallow {
                 reorg_window_blocks,
                 required_blocks,

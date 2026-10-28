@@ -598,10 +598,7 @@ impl SyncDriver {
     /// or retry ladder affects the other's.
     #[must_use]
     pub fn sync_continuously(self) -> SyncHandle {
-        if let Some(required_blocks) = self.wallet.inner.options.minimum_source_reorg_window_blocks
-        {
-            self.wallet.start_source_reorg_window_check(required_blocks);
-        }
+        self.wallet.start_source_reorg_window_check();
         let (close_tx, close_rx) = oneshot::channel();
         let (status_tx, status_rx) = watch::channel(SyncSnapshot::starting(self.wallet.network()));
         let (transparent_utxo_refresh_close_tx, transparent_utxo_refresh_close_rx) =
@@ -1353,31 +1350,13 @@ async fn publish_source_recovered(ctx: &DriverContext<'_>, state: &mut DriverSta
 /// succeeded yet. A read that fails or times out keeps the prior result, so a window never
 /// read keeps spends and unmineable verdicts held.
 async fn check_source_reorg_window(ctx: &DriverContext<'_>) {
-    let Some(required_blocks) = ctx.wallet.inner.options.minimum_source_reorg_window_blocks else {
-        return;
-    };
-    let read = tokio::time::timeout(
-        Duration::from_secs(ctx.options.sync_timeout_seconds),
-        ctx.chain.reorg_window_blocks(),
-    )
-    .await;
-    match read {
-        Ok(Ok(reorg_window_blocks)) => ctx
-            .wallet
-            .record_source_reorg_window(reorg_window_blocks, required_blocks),
-        Ok(Err(error)) => tracing::warn!(
-            target: "zally::sync",
-            event = "wallet_source_reorg_window_unreadable",
-            %error,
-            "could not read the chain source reorg window; keeping the prior verdict"
-        ),
-        Err(_elapsed) => tracing::warn!(
-            target: "zally::sync",
-            event = "wallet_source_reorg_window_unreadable",
-            timeout_seconds = ctx.options.sync_timeout_seconds,
-            "chain source reorg window read timed out; keeping the prior verdict"
-        ),
-    }
+    let _ = ctx
+        .wallet
+        .verify_source_reorg_window(
+            ctx.chain,
+            Duration::from_secs(ctx.options.sync_timeout_seconds),
+        )
+        .await;
 }
 
 async fn close_sync_driver(ctx: &DriverContext<'_>, state: &DriverState) {

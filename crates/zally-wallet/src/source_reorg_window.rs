@@ -13,67 +13,75 @@
 //! until a read succeeds, so new spends are refused while the window is too shallow or not yet
 //! read.
 
+use std::time::Duration;
+
 use zally_chain::ChainSource;
 
 use crate::event::WalletEvent;
 use crate::wallet::Wallet;
 
-/// What the wallet last established about the chain source's reorg window.
+/// What the wallet last established about the chain source's reorg window, against
+/// [`crate::WalletOptions::minimum_source_reorg_window_blocks`].
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) enum SourceReorgWindowCheck {
     /// Nothing has read the window, or the sync driver that read it closed.
     #[default]
     Unchecked,
-    /// A sync driver requires `required_blocks` and has not yet read the window.
-    Unverified { required_blocks: u32 },
+    /// A sync driver requires the minimum and has not yet read the window.
+    Unverified,
     /// The window the source reported is below the minimum.
-    TooShallow {
-        reorg_window_blocks: u32,
-        required_blocks: u32,
-    },
+    TooShallow { reorg_window_blocks: u32 },
     /// The window the source reported meets the minimum.
     Sufficient,
 }
 
 impl Wallet {
-    /// Marks the window unverified when a sync driver that requires `required_blocks` starts,
-    /// before its task runs, until its first successful read.
-    pub(crate) fn start_source_reorg_window_check(&self, required_blocks: u32) {
-        *self.inner.source_reorg_window.lock() =
-            SourceReorgWindowCheck::Unverified { required_blocks };
+    /// Marks the window unverified when a sync driver starts under a minimum, before its task
+    /// runs, until its first successful read.
+    pub(crate) fn start_source_reorg_window_check(&self) {
+        if self
+            .inner
+            .options
+            .minimum_source_reorg_window_blocks
+            .is_some()
+        {
+            *self.inner.source_reorg_window.lock() = SourceReorgWindowCheck::Unverified;
+        }
     }
 
-    /// Reads the source's reorg window right before a verdict and records it; returns whether
-    /// the verdict may free anything. Without a minimum it always may; a read that fails, or
-    /// shows a window below the minimum, holds the verdict.
-    pub(crate) async fn verify_source_reorg_window(&self, chain: &dyn ChainSource) -> bool {
+    /// Reads the source's reorg window, waiting at most `timeout`, and records it; returns
+    /// whether the window meets the minimum, so a verdict may free anything. Without a minimum
+    /// it always does. A read that fails or times out does not, and keeps the prior record.
+    pub(crate) async fn verify_source_reorg_window(
+        &self,
+        chain: &dyn ChainSource,
+        timeout: Duration,
+    ) -> bool {
         let Some(required_blocks) = self.inner.options.minimum_source_reorg_window_blocks else {
             return true;
         };
-        let read = tokio::time::timeout(
-            std::time::Duration::from_millis(self.inner.options.source_lookup_timeout_ms),
-            chain.reorg_window_blocks(),
-        )
-        .await;
-        match read {
+        match tokio::time::timeout(timeout, chain.reorg_window_blocks()).await {
             Ok(Ok(reorg_window_blocks)) => {
                 self.record_source_reorg_window(reorg_window_blocks, required_blocks);
                 reorg_window_blocks >= required_blocks
             }
-            Err(_elapsed) => {
-                tracing::warn!(
-                    target: "zally::wallet",
-                    event = "source_reorg_window_unreadable",
-                    "chain source reorg window read timed out; unmineable verdicts wait"
-                );
-                false
-            }
             Ok(Err(error)) => {
                 tracing::warn!(
                     target: "zally::wallet",
-                    event = "source_reorg_window_unreadable",
+                    event = "wallet_source_reorg_window_unreadable",
                     %error,
-                    "could not read the chain source reorg window; unmineable verdicts wait"
+                    "could not read the chain source reorg window; keeping the prior result, \
+                     and unmineable verdicts wait"
+                );
+                false
+            }
+            Err(_elapsed) => {
+                tracing::warn!(
+                    target: "zally::wallet",
+                    event = "wallet_source_reorg_window_unreadable",
+                    timeout_ms = timeout.as_millis(),
+                    "chain source reorg window read timed out; keeping the prior result, and \
+                     unmineable verdicts wait"
                 );
                 false
             }
@@ -85,15 +93,10 @@ impl Wallet {
     /// Publishes [`WalletEvent::SourceReorgWindowTooShallow`] when a shortfall starts or the
     /// reported window changes, and [`WalletEvent::SourceReorgWindowSufficient`] when a
     /// shortfall lifts.
-    pub(crate) fn record_source_reorg_window(
-        &self,
-        reorg_window_blocks: u32,
-        required_blocks: u32,
-    ) {
+    fn record_source_reorg_window(&self, reorg_window_blocks: u32, required_blocks: u32) {
         let check = if reorg_window_blocks < required_blocks {
             SourceReorgWindowCheck::TooShallow {
                 reorg_window_blocks,
-                required_blocks,
             }
         } else {
             SourceReorgWindowCheck::Sufficient
@@ -147,9 +150,6 @@ impl Wallet {
 
     /// Whether a sync driver requires a window it has not read yet.
     pub(crate) fn is_source_reorg_window_unverified(&self) -> bool {
-        matches!(
-            *self.inner.source_reorg_window.lock(),
-            SourceReorgWindowCheck::Unverified { .. }
-        )
+        *self.inner.source_reorg_window.lock() == SourceReorgWindowCheck::Unverified
     }
 }

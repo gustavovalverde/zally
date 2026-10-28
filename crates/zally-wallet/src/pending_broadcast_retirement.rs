@@ -92,7 +92,9 @@ impl Wallet {
         };
         let judged_height = scanned_height.min(settled_tip_height);
         if self.is_source_reorg_window_too_shallow() {
-            let _ = self.verify_source_reorg_window(chain).await;
+            let _ = self
+                .verify_source_reorg_window(chain, self.source_lookup_timeout())
+                .await;
         }
         let mut pass = VerdictPass {
             chain,
@@ -211,7 +213,10 @@ impl Wallet {
         chain: &dyn ChainSource,
         judged_height: BlockHeight,
     ) -> VerdictGate {
-        if !self.verify_source_reorg_window(chain).await {
+        if !self
+            .verify_source_reorg_window(chain, self.source_lookup_timeout())
+            .await
+        {
             return VerdictGate::Closed(
                 "the chain source's reorg window is not verified to meet the minimum".to_owned(),
             );
