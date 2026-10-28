@@ -30,11 +30,14 @@ use zally_core::{
     TreeStateArtifact, TxId, Zatoshis,
 };
 use zally_keys::{KeyDerivationError, SeedMaterial, derive_ufvk};
+use zcash_address::unified::Revision;
 use zcash_client_backend::data_api::chain::{ChainState, CommitmentTreeRoot};
 use zcash_client_backend::data_api::scanning::ScanRange;
 use zcash_client_backend::data_api::wallet::{
     ConfirmationsPolicy, LockRequest, SpendingKeys,
-    input_selection::{GreedyInputSelector, LockFilter, LockedInputPolicy, SpendPolicy},
+    input_selection::{
+        GreedyInputSelector, GreedyInputSelectorError, LockFilter, LockedInputPolicy, SpendPolicy,
+    },
 };
 use zcash_client_backend::data_api::{
     Account, AccountBirthday, MaxSpendMode, OutputLockStore, TargetValue, WalletCommitmentTrees,
@@ -65,6 +68,7 @@ use zcash_protocol::{PoolType, ShieldedPool};
 use zcash_transparent::address::Script;
 use zcash_transparent::bundle::{OutPoint as UpstreamOutPoint, TxOut};
 
+use crate::ProposalRejectionKind;
 use crate::error::StorageError;
 use crate::wallet::{ChainTips, WalletStorage};
 
@@ -700,7 +704,7 @@ impl WalletStorage for Sqlite {
                 .map_err(|e| map_sqlite_error(&e))?;
             let mut receivers = Vec::new();
             for (account_uuid, ufvk) in &accounts {
-                let account_id = account_id_from_ufvk(network, ufvk);
+                let account_id = account_id_from_ufvk(network, ufvk)?;
                 let transparent_addresses = db
                     .get_transparent_receivers(*account_uuid, true, true)
                     .map_err(|e| map_sqlite_error(&e))?;
@@ -2622,6 +2626,10 @@ const PENDING_BROADCAST_INPUT_UPSERT_SQL: &str = "\
 /// shape, decoding the diversifier index, and projecting to [`ExposedAddressRow`] happens
 /// in Rust so the SQL stays portable across `zcash_client_sqlite` migrations.
 ///
+/// Rows without a diversifier index are imported standalone transparent addresses
+/// (`key_scope = -1`), which `zcash_client_sqlite` marks exposed when they receive funds.
+/// They were never derived, so they have no place in derivation order.
+///
 /// [`ExposedAddressRow`]: crate::ExposedAddressRow
 const EXPOSED_ADDRESSES_SQL: &str = "\
     SELECT a.address, a.diversifier_index_be, a.exposed_at_height \
@@ -2629,6 +2637,7 @@ const EXPOSED_ADDRESSES_SQL: &str = "\
     JOIN accounts ac ON ac.id = a.account_id \
     WHERE ac.uuid = ?1 \
       AND a.exposed_at_height IS NOT NULL \
+      AND a.diversifier_index_be IS NOT NULL \
     ORDER BY a.exposed_at_height ASC, a.diversifier_index_be ASC";
 
 /// Aggregate of unmatured wallet-owned coinbase transparent value at one target height.
@@ -3264,9 +3273,23 @@ where
 /// The id is the UUID v5 of the network-encoded UFVK under
 /// [`ZALLY_ACCOUNT_NAMESPACE`]. Account identity is key identity, so the id is stable
 /// across database rebuilds, machines, and resets.
-fn account_id_from_ufvk(network: Network, ufvk: &UnifiedFullViewingKey) -> AccountId {
-    let encoded = ufvk.encode(&network.to_parameters());
-    AccountId::from_uuid(Uuid::new_v5(&ZALLY_ACCOUNT_NAMESPACE, encoded.as_bytes()))
+///
+/// The encoding is pinned to ZIP 316 Revision 0, the revision every Zally account id has
+/// been derived from, so a change in the upstream default revision cannot change identity.
+/// A UFVK with no Revision 0 encoding fails rather than deriving a second identity.
+fn account_id_from_ufvk(
+    network: Network,
+    ufvk: &UnifiedFullViewingKey,
+) -> Result<AccountId, StorageError> {
+    let encoded = ufvk
+        .encode_revision(&network.to_parameters(), Revision::R0)
+        .map_err(|err| StorageError::KeyDerivationFailed {
+            reason: format!("account identity needs a Revision 0 UFVK encoding: {err}"),
+        })?;
+    Ok(AccountId::from_uuid(Uuid::new_v5(
+        &ZALLY_ACCOUNT_NAMESPACE,
+        encoded.as_bytes(),
+    )))
 }
 
 /// Computes the deterministic [`AccountId`] for a stored account via its UFVK.
@@ -3280,7 +3303,7 @@ fn deterministic_account_id<A: Account>(
             reason: "account has no unified full viewing key to derive its identity from"
                 .to_owned(),
         })?;
-    Ok(account_id_from_ufvk(network, ufvk))
+    account_id_from_ufvk(network, ufvk)
 }
 
 /// Resolves the wallet's single account to its deterministic [`AccountId`] and the
@@ -3566,27 +3589,142 @@ pub(crate) fn coinbase_safe_shielding_policy() -> ConfirmationsPolicy {
         .expect("trusted=3 <= untrusted=100 satisfies the policy invariant")
 }
 
-/// Classifies a proposal-build error into a typed [`StorageError`] variant.
+/// Classifies a librustzcash proposal or transaction-construction error.
 ///
-/// Distinguishes insufficient funds from other build failures so the wallet boundary does
-/// not have to string-match the error display. Takes the error by `Debug` rather than
-/// `Display` because the upstream `data_api::error::Error<...>` does not implement
-/// `Display` over its `NoteRef` generic.
-pub(crate) fn classify_proposal_build_error<E: std::fmt::Debug>(err: &E) -> StorageError {
-    let reason = format!("{err:?}");
-    let lc = reason.to_lowercase();
-    if lc.contains("insufficientfunds") || lc.contains("insufficient funds") {
-        return StorageError::InsufficientFunds {
-            required_zat: Zatoshis::zero(),
-            available_zat: Zatoshis::zero(),
-        };
+/// Matches the upstream error variants rather than their text, so a new upstream variant
+/// falls through to [`ProposalRejectionKind::Other`] instead of being misread. The reason
+/// keeps the upstream `Debug` rendering, because `data_api::error::Error` implements
+/// `Display` only for a `Display` note reference.
+pub(crate) fn classify_proposal_build_error<E: ProposalFailure>(err: &E) -> StorageError {
+    StorageError::ProposalRejected {
+        kind: err.rejection_kind(),
+        reason: format!("{err:?}"),
     }
-    let posture = if lc.contains("inputslocked") || lc.contains("inputs locked") {
-        FailurePosture::Retryable
-    } else {
-        FailurePosture::NotRetryable
-    };
-    StorageError::ProposalBuildFailed { reason, posture }
+}
+
+/// An upstream error raised while proposing or building a transaction.
+pub(crate) trait ProposalFailure: std::fmt::Debug {
+    /// Why the proposal was rejected.
+    fn rejection_kind(&self) -> ProposalRejectionKind;
+}
+
+/// `Infallible` has no values, so this is never called.
+impl ProposalFailure for std::convert::Infallible {
+    fn rejection_kind(&self) -> ProposalRejectionKind {
+        ProposalRejectionKind::Other
+    }
+}
+
+impl<DataSourceErrT, CommitmentTreeErrT, SelectionErrT, FeeErrT, ChangeErrT, NoteRefT>
+    ProposalFailure
+    for zcash_client_backend::data_api::error::Error<
+        DataSourceErrT,
+        CommitmentTreeErrT,
+        SelectionErrT,
+        FeeErrT,
+        ChangeErrT,
+        NoteRefT,
+    >
+where
+    DataSourceErrT: std::fmt::Debug,
+    CommitmentTreeErrT: std::fmt::Debug,
+    SelectionErrT: ProposalFailure,
+    FeeErrT: std::fmt::Debug,
+    ChangeErrT: std::fmt::Debug,
+    NoteRefT: std::fmt::Debug,
+{
+    fn rejection_kind(&self) -> ProposalRejectionKind {
+        #[allow(
+            clippy::wildcard_enum_match_arm,
+            reason = "the error is non_exhaustive; variants without a typed kind are Other"
+        )]
+        match self {
+            Self::InsufficientFunds {
+                available,
+                required,
+            } => insufficient_funds(*required, *available),
+            Self::NoteSelection(selection) => selection.rejection_kind(),
+            Self::Change(change) => change_rejection_kind(change),
+            Self::Proposal(proposal) => proposal_rejection_kind(proposal),
+            Self::ExpiryHeightConflictsWithCanonicalCrossing { requested } => {
+                ProposalRejectionKind::ExpiryConflictsWithCanonicalCrossing {
+                    requested_expiry_height: BlockHeight::from(u32::from(*requested)),
+                }
+            }
+            Self::RecipientAddressExpiry { .. } => ProposalRejectionKind::RecipientAddressExpired,
+            _ => ProposalRejectionKind::Other,
+        }
+    }
+}
+
+impl ProposalFailure for GreedyInputSelectorError {
+    fn rejection_kind(&self) -> ProposalRejectionKind {
+        #[allow(
+            clippy::wildcard_enum_match_arm,
+            reason = "the error is non_exhaustive; variants without a typed kind are Other"
+        )]
+        match self {
+            // Since zcash_client_backend 0.25 these replace the InsufficientFunds results the
+            // selector used to return with more value available than required.
+            Self::RequirementCovered { .. }
+            | Self::DustInputsNotGiven
+            | Self::ExcludedNoteSelected
+            | Self::UnrequestedPoolSelected => ProposalRejectionKind::SelectionContractViolated,
+            _ => ProposalRejectionKind::Other,
+        }
+    }
+}
+
+/// Input-source failures while building a proposed transaction carry no proposal kind.
+impl ProposalFailure for SqliteClientError {
+    fn rejection_kind(&self) -> ProposalRejectionKind {
+        ProposalRejectionKind::Other
+    }
+}
+
+fn insufficient_funds(
+    required: zcash_protocol::value::Zatoshis,
+    available: zcash_protocol::value::Zatoshis,
+) -> ProposalRejectionKind {
+    ProposalRejectionKind::InsufficientFunds {
+        required_zat: Zatoshis::from(required),
+        available_zat: Zatoshis::from(available),
+    }
+}
+
+fn change_rejection_kind<ChangeErrT, NoteRefT>(
+    change: &zcash_client_backend::fees::ChangeError<ChangeErrT, NoteRefT>,
+) -> ProposalRejectionKind {
+    #[allow(
+        clippy::wildcard_enum_match_arm,
+        reason = "the error is non_exhaustive; variants without a typed kind are Other"
+    )]
+    match change {
+        zcash_client_backend::fees::ChangeError::InsufficientFunds {
+            available,
+            required,
+        } => insufficient_funds(*required, *available),
+        _ => ProposalRejectionKind::Other,
+    }
+}
+
+fn proposal_rejection_kind(
+    proposal: &zcash_client_backend::proposal::ProposalError,
+) -> ProposalRejectionKind {
+    use zcash_client_backend::proposal::ProposalError;
+    #[allow(
+        clippy::wildcard_enum_match_arm,
+        reason = "the error is non_exhaustive; variants without a typed kind are Other"
+    )]
+    match proposal {
+        ProposalError::InputsLocked(_) => ProposalRejectionKind::InputsLocked,
+        ProposalError::TransactionTooLarge { .. } => ProposalRejectionKind::TransactionTooLarge,
+        ProposalError::OrchardReceiverRequiresIronwood(_) => {
+            ProposalRejectionKind::OrchardRecipientNeedsIronwood
+        }
+        ProposalError::OrchardPoolPayment(_) => ProposalRejectionKind::SelectionContractViolated,
+        _ => ProposalRejectionKind::Other,
+    }
 }
 
 /// Builds prepared-transaction records for each proposal step.
@@ -4164,16 +4302,186 @@ mod tests {
         })
     }
 
+    type TestBuildError = zcash_client_backend::data_api::error::Error<
+        SqliteClientError,
+        SqliteClientError,
+        GreedyInputSelectorError,
+        std::convert::Infallible,
+        std::convert::Infallible,
+        zcash_client_sqlite::ReceivedNoteId,
+    >;
+
+    fn upstream_zatoshis(zat: u64) -> zcash_protocol::value::Zatoshis {
+        zcash_protocol::value::Zatoshis::const_from_u64(zat)
+    }
+
+    fn rejection_kind(error: &TestBuildError) -> Option<ProposalRejectionKind> {
+        let StorageError::ProposalRejected { kind, .. } = classify_proposal_build_error(error)
+        else {
+            return None;
+        };
+        Some(kind)
+    }
+
+    fn zat(value: u64) -> Zatoshis {
+        Zatoshis::from(upstream_zatoshis(value))
+    }
+
     #[test]
-    fn proposal_input_lock_conflict_is_retryable() {
-        let error = classify_proposal_build_error(&"InputsLocked");
+    fn insufficient_funds_carries_the_required_and_available_values() {
+        let expected = Some(ProposalRejectionKind::InsufficientFunds {
+            required_zat: zat(20_000),
+            available_zat: zat(10_000),
+        });
+        let from_selector = TestBuildError::from(
+            zcash_client_backend::data_api::wallet::input_selection::InputSelectorError::<
+                SqliteClientError,
+                GreedyInputSelectorError,
+                std::convert::Infallible,
+                zcash_client_sqlite::ReceivedNoteId,
+            >::InsufficientFunds {
+                available: upstream_zatoshis(10_000),
+                required: upstream_zatoshis(20_000),
+            },
+        );
+        let from_change =
+            TestBuildError::Change(zcash_client_backend::fees::ChangeError::InsufficientFunds {
+                available: upstream_zatoshis(10_000),
+                required: upstream_zatoshis(20_000),
+            });
+        assert_eq!(rejection_kind(&from_selector), expected);
+        assert_eq!(rejection_kind(&from_change), expected);
+    }
+
+    #[test]
+    fn upstream_contract_violations_require_an_operator() {
+        let selector_violations = [
+            GreedyInputSelectorError::RequirementCovered {
+                required: upstream_zatoshis(20_000),
+                available: upstream_zatoshis(30_000),
+            },
+            GreedyInputSelectorError::DustInputsNotGiven,
+            GreedyInputSelectorError::ExcludedNoteSelected,
+            GreedyInputSelectorError::UnrequestedPoolSelected,
+        ]
+        .map(TestBuildError::NoteSelection);
+        let orchard_pool_payment = TestBuildError::Proposal(
+            zcash_client_backend::proposal::ProposalError::OrchardPoolPayment(0),
+        );
+        for violation in selector_violations
+            .into_iter()
+            .chain([orchard_pool_payment])
+        {
+            let error = classify_proposal_build_error(&violation);
+            assert!(
+                matches!(
+                    error,
+                    StorageError::ProposalRejected {
+                        kind: ProposalRejectionKind::SelectionContractViolated,
+                        ..
+                    }
+                ),
+                "{error:?}"
+            );
+            assert_eq!(error.posture(), FailurePosture::RequiresOperator);
+        }
+    }
+
+    #[test]
+    fn proposal_errors_classify_by_variant() {
+        use zcash_client_backend::proposal::ProposalError;
+        let locked = classify_proposal_build_error(&TestBuildError::Proposal(
+            ProposalError::InputsLocked(zcash_client_backend::wallet::OutputRef::new(
+                zcash_protocol::TxId::from_bytes([0x11; 32]),
+                zcash_protocol::PoolType::ORCHARD,
+                0,
+            )),
+        ));
         assert!(matches!(
-            error,
-            StorageError::ProposalBuildFailed {
-                posture: FailurePosture::Retryable,
+            locked,
+            StorageError::ProposalRejected {
+                kind: ProposalRejectionKind::InputsLocked,
                 ..
             }
         ));
+        assert_eq!(locked.posture(), FailurePosture::Retryable);
+
+        let too_large = TestBuildError::Proposal(ProposalError::TransactionTooLarge {
+            estimated_size: 2_000_001,
+            limit: 2_000_000,
+            sapling_input_count: 0,
+            orchard_input_count: 0,
+            ironwood_input_count: 5_000,
+        });
+        assert_eq!(
+            rejection_kind(&too_large),
+            Some(ProposalRejectionKind::TransactionTooLarge)
+        );
+
+        let needs_ironwood =
+            TestBuildError::Proposal(ProposalError::OrchardReceiverRequiresIronwood(
+                zcash_primitives::transaction::TxVersion::V5,
+            ));
+        assert_eq!(
+            rejection_kind(&needs_ironwood),
+            Some(ProposalRejectionKind::OrchardRecipientNeedsIronwood)
+        );
+    }
+
+    #[test]
+    fn caller_expiry_on_a_canonical_crossing_is_typed() {
+        let error = TestBuildError::ExpiryHeightConflictsWithCanonicalCrossing {
+            requested: zcash_protocol::consensus::BlockHeight::from_u32(4_500_000),
+        };
+        assert_eq!(
+            rejection_kind(&error),
+            Some(
+                ProposalRejectionKind::ExpiryConflictsWithCanonicalCrossing {
+                    requested_expiry_height: BlockHeight::from(4_500_000),
+                }
+            )
+        );
+    }
+
+    #[test]
+    fn recipient_address_expiry_is_typed_and_not_retryable() {
+        use zcash_client_backend::data_api::error::AddressExpiryError;
+        use zcash_protocol::consensus::BlockHeight as UpstreamBlockHeight;
+        for expiry in [
+            AddressExpiryError::TimeExpired { expiry_time: 1 },
+            AddressExpiryError::HeightExpired {
+                address_expiry: UpstreamBlockHeight::from_u32(100),
+                chain_height: UpstreamBlockHeight::from_u32(101),
+            },
+            AddressExpiryError::ExpiryHeightConflict {
+                address_expiry: UpstreamBlockHeight::from_u32(150),
+                transaction_expiry: UpstreamBlockHeight::from_u32(160),
+            },
+        ] {
+            let error = classify_proposal_build_error(&TestBuildError::RecipientAddressExpiry {
+                payment_index: 0,
+                error: expiry,
+            });
+            assert!(
+                matches!(
+                    error,
+                    StorageError::ProposalRejected {
+                        kind: ProposalRejectionKind::RecipientAddressExpired,
+                        ..
+                    }
+                ),
+                "{error:?}"
+            );
+            assert_eq!(error.posture(), FailurePosture::NotRetryable);
+        }
+    }
+
+    #[test]
+    fn unclassified_rejections_are_other() {
+        assert_eq!(
+            rejection_kind(&TestBuildError::ScanRequired),
+            Some(ProposalRejectionKind::Other)
+        );
     }
 
     #[test]
@@ -4316,18 +4624,20 @@ mod tests {
     }
 
     #[test]
-    fn account_id_is_deterministic_for_key_material() -> Result<(), KeyDerivationError> {
+    fn account_id_is_deterministic_for_key_material() -> Result<(), StorageError> {
         let mnemonic = Mnemonic::generate();
         let seed = SeedMaterial::from_mnemonic(&mnemonic, "");
         let regtest = Network::regtest();
 
-        let ufvk = derive_ufvk(regtest, &seed, zip32::AccountId::ZERO)?;
-        let first = account_id_from_ufvk(regtest, &ufvk);
-        let second = account_id_from_ufvk(regtest, &ufvk);
+        let ufvk = derive_ufvk(regtest, &seed, zip32::AccountId::ZERO)
+            .map_err(|err| map_derivation_error(&err))?;
+        let first = account_id_from_ufvk(regtest, &ufvk)?;
+        let second = account_id_from_ufvk(regtest, &ufvk)?;
         assert_eq!(first, second, "same key material must yield the same id");
 
-        let mainnet_ufvk = derive_ufvk(Network::Mainnet, &seed, zip32::AccountId::ZERO)?;
-        let mainnet = account_id_from_ufvk(Network::Mainnet, &mainnet_ufvk);
+        let mainnet_ufvk = derive_ufvk(Network::Mainnet, &seed, zip32::AccountId::ZERO)
+            .map_err(|err| map_derivation_error(&err))?;
+        let mainnet = account_id_from_ufvk(Network::Mainnet, &mainnet_ufvk)?;
         assert_ne!(
             first, mainnet,
             "a different network encoding must yield a different identity"

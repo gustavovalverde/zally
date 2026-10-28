@@ -70,7 +70,9 @@ pub enum WalletEvent {
         block_timestamp_ms: u64,
         /// Shielded pool the note was created on.
         pool: ShieldedPool,
-        /// `zcash_client_sqlite` marked this note as change for the receiving account.
+        /// `zcash_client_sqlite` marked this note as change for the receiving account
+        /// when the event was emitted. The flag can later move to true; see
+        /// [`crate::ShieldedReceiveRecord::is_change`].
         is_change: bool,
         /// The producing transaction spent at least one input owned by the receiving
         /// account, across Sapling, Orchard, Ironwood, or transparent pools.

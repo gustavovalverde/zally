@@ -10,6 +10,7 @@ use zally_core::{
     AccountId, BlockHeight, IdempotencyKey, Memo, MemoBytes, Network, OutPoint, PaymentRecipient,
     TxId, Zatoshis,
 };
+use zally_storage::ProposalRejectionKind;
 
 use crate::error::WalletError;
 use crate::wallet::{Wallet, current_unix_ms};
@@ -661,6 +662,7 @@ impl Wallet {
             }
         }
         first_result.ok_or_else(|| WalletError::ProposalRejected {
+            kind: ProposalRejectionKind::Other,
             reason: "transaction construction returned no transactions".into(),
         })
     }
@@ -728,6 +730,7 @@ pub(crate) fn protocol_shielded_pool(
         ShieldedPool::Ironwood => zcash_protocol::ShieldedPool::Ironwood,
         _ => {
             return Err(WalletError::ProposalRejected {
+                kind: ProposalRejectionKind::Other,
                 reason: "shielded pool is not supported by this release".into(),
             });
         }
@@ -869,7 +872,9 @@ pub struct SendPaymentPlan<'submitter> {
     ///
     /// When set, the wallet builds the transaction through the PCZT path and sets
     /// `global.expiry_height` before the IO Finalizer, prover, and signer run. When
-    /// `None`, the wallet uses its own chain-tip-derived default.
+    /// `None`, the wallet uses its own chain-tip-derived default. A ZIP 318 canonical
+    /// crossing refuses a target with [`WalletError::ProposalRejected`] of kind
+    /// [`ExpiryConflictsWithCanonicalCrossing`](ProposalRejectionKind::ExpiryConflictsWithCanonicalCrossing).
     pub target_expiry_height: Option<BlockHeight>,
     /// Submitter that delivers the signed transaction.
     pub submitter: &'submitter dyn Submitter,
@@ -988,16 +993,45 @@ fn validate_memo_against_recipient(
     if matches!(memo, Memo::Empty) {
         return Ok(());
     }
-    if recipient.is_transparent() {
+    if recipient.is_transparent() || is_transparent_only_unified_address(recipient) {
         Err(WalletError::MemoOnTransparentRecipient)
     } else {
         Ok(())
     }
 }
 
+/// Whether `recipient` is a Unified Address whose only receivers are transparent.
+///
+/// `zcash_client_backend` pays a Unified Address through its transparent receiver when it
+/// has no shielded one, so a memo cannot be delivered. ZIP 316 Revision 2 makes such
+/// addresses encodable (`tu…`).
+fn is_transparent_only_unified_address(recipient: &PaymentRecipient) -> bool {
+    let PaymentRecipient::UnifiedAddress { encoded, network } = recipient else {
+        return false;
+    };
+    encoded
+        .parse::<zcash_address::ZcashAddress>()
+        .ok()
+        .and_then(|address| {
+            address
+                .convert_if_network::<zcash_keys::address::Address>(
+                    zcash_protocol::consensus::Parameters::network_type(&network.to_parameters()),
+                )
+                .ok()
+        })
+        .is_some_and(|address| {
+            matches!(
+                address,
+                zcash_keys::address::Address::Unified(unified)
+                    if !unified.has_orchard() && !unified.has_sapling()
+            )
+        })
+}
+
 fn validate_non_zero(amount_zat: Zatoshis) -> Result<(), WalletError> {
     if amount_zat.as_u64() == 0 {
         Err(WalletError::ProposalRejected {
+            kind: ProposalRejectionKind::Other,
             reason: "amount must be greater than zero zatoshis".into(),
         })
     } else {
@@ -1067,6 +1101,129 @@ mod tests {
                 encoded: recipient_encoded,
                 network: Network::Testnet,
             } if recipient_encoded == encoded
+        ));
+    }
+
+    fn golden_ufvk(
+        network: Network,
+    ) -> Result<zcash_keys::keys::UnifiedFullViewingKey, WalletError> {
+        let seed = zally_keys::SeedMaterial::from_raw_bytes(vec![0x5a; 32]).map_err(|err| {
+            WalletError::PaymentRequestParseFailed {
+                reason: err.to_string(),
+            }
+        })?;
+        Ok(zally_keys::derive_ufvk(
+            network,
+            &seed,
+            zip32::AccountId::ZERO,
+        )?)
+    }
+
+    fn encode_revision_2(
+        network: Network,
+        address: &zcash_keys::address::UnifiedAddress,
+    ) -> Result<String, WalletError> {
+        address
+            .encode_revision(
+                &network.to_parameters(),
+                zcash_address::unified::Revision::R2,
+            )
+            .map_err(|err| WalletError::PaymentRequestParseFailed {
+                reason: err.to_string(),
+            })
+    }
+
+    fn default_address(
+        network: Network,
+        request: zcash_keys::keys::UnifiedAddressRequest,
+    ) -> Result<zcash_keys::address::UnifiedAddress, WalletError> {
+        golden_ufvk(network)?
+            .default_address(request)
+            .map(|(address, _index)| address)
+            .map_err(|err| WalletError::PaymentRequestParseFailed {
+                reason: format!("{err:?}"),
+            })
+    }
+
+    #[test]
+    fn classify_recipient_recognizes_revision_2_unified_addresses() -> Result<(), WalletError> {
+        use zcash_keys::keys::UnifiedAddressRequest;
+        for (network, shielded_hrp, transparent_hrp) in [
+            (Network::Mainnet, "zu1", "tu1"),
+            (Network::Testnet, "zutest1", "tutest1"),
+            (regtest(), "zuregtest1", "turegtest1"),
+        ] {
+            let shielded = encode_revision_2(
+                network,
+                &default_address(network, UnifiedAddressRequest::SHIELDED)?,
+            )?;
+            let with_transparent = encode_revision_2(
+                network,
+                &default_address(network, UnifiedAddressRequest::AllAvailableKeys)?,
+            )?;
+            assert!(shielded.starts_with(shielded_hrp), "{shielded}");
+            assert!(
+                with_transparent.starts_with(transparent_hrp),
+                "{with_transparent}"
+            );
+            for encoded in [shielded, with_transparent] {
+                assert!(matches!(
+                    classify_recipient(&encoded, network),
+                    PaymentRecipient::UnifiedAddress { encoded: classified, .. }
+                        if classified == encoded
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn validate_memo_rejects_text_memo_on_transparent_only_unified_address()
+    -> Result<(), WalletError> {
+        let network = regtest();
+        let full = default_address(
+            network,
+            zcash_keys::keys::UnifiedAddressRequest::AllAvailableKeys,
+        )?;
+        let transparent_only = zcash_keys::address::UnifiedAddress::from_receivers(
+            None,
+            None,
+            full.transparent().copied(),
+            None,
+            None,
+        )
+        .ok_or_else(|| WalletError::PaymentRequestParseFailed {
+            reason: "transparent-only unified address".into(),
+        })?;
+        let memo =
+            Memo::from_bytes(b"hello").map_err(|err| WalletError::PaymentRequestParseFailed {
+                reason: err.to_string(),
+            })?;
+
+        let transparent_recipient = PaymentRecipient::UnifiedAddress {
+            encoded: transparent_only.encode(&network.to_parameters()),
+            network,
+        };
+        assert!(matches!(
+            validate_memo_against_recipient(Some(&memo), &transparent_recipient),
+            Err(WalletError::MemoOnTransparentRecipient)
+        ));
+
+        let full_recipient = PaymentRecipient::UnifiedAddress {
+            encoded: full.encode(&network.to_parameters()),
+            network,
+        };
+        validate_memo_against_recipient(Some(&memo), &full_recipient)?;
+        Ok(())
+    }
+
+    #[test]
+    fn payment_request_rejects_sprout_recipient() {
+        let uri = "zcash:zc8E5gYid86n4bo2Usdq1cpr7PpfoJGzttwBHEEgGhGkLUg7SPPVFNB2AkRFXZ7usfphup5426dt1buMmY3fkYeRrQGLa8y?amount=1";
+        let outcome = PaymentRequest::from_uri(uri, Network::Mainnet);
+        assert!(matches!(
+            outcome,
+            Err(WalletError::PaymentRequestParseFailed { reason }) if reason.contains("Sprout")
         ));
     }
 

@@ -285,6 +285,11 @@ pub struct ReceivedShieldedNoteRow {
     /// True when `zcash_client_sqlite` marked this note as change for the receiving
     /// account, meaning the receiving account also spent notes in the producing
     /// transaction and the note is internally-scoped.
+    ///
+    /// The flag only moves from false to true. `zcash_client_sqlite` sets it late when the
+    /// scanner could not see the funding spend, including through wallet migrations such
+    /// as `fix_bad_ironwood_change_flagging`, so a later read can report `true` for a note
+    /// an earlier read or event reported as `false`. The latest read is authoritative.
     pub is_change: bool,
     /// True when the producing transaction's input set includes any UTXO or shielded
     /// note owned by the receiving account, across the Sapling, Orchard, Ironwood,

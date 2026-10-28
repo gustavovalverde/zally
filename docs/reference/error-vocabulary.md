@@ -28,11 +28,11 @@ Only `retryable` moves the breaker's failure counter, and only a call that compl
 | `NetworkMismatch` | `requires_operator` | Two configured boundaries disagree on network. |
 | `ChainSource(ChainSourceError)` | Mirrors `ChainSourceError` | A chain-read operation failed. |
 | `Submitter(SubmitterError)` | Mirrors `SubmitterError` | Transaction broadcast failed. |
-| `MemoOnTransparentRecipient` | `not_retryable` | ZIP-302 forbids memos on transparent recipients. |
+| `MemoOnTransparentRecipient` | `not_retryable` | ZIP-302 forbids memos on transparent recipients, including a Unified Address whose only receiver is transparent. |
 | `ShieldedInputsOnTexRecipient` | `not_retryable` | ZIP-320 requires transparent-only inputs for TEX. |
-| `InsufficientBalance` | `not_retryable` | The wallet lacks spendable funds. |
+| `InsufficientBalance` | `not_retryable` | The wallet lacks spendable funds for a reservation or a send, including a proposal librustzcash rejected for insufficient funds. |
 | `PaymentRequestParseFailed` | `not_retryable` | ZIP-321 URI parsing failed. |
-| `ProposalRejected` | `not_retryable` | Proposal construction failed. |
+| `ProposalRejected` | Follows `ProposalRejectionKind` | The proposal or its transaction could not be built; `kind` says why. |
 | `SubmissionRejected` | `not_retryable` | The node rejected the submitted transaction. |
 | `SubmittedTransactionIdMismatch` | `requires_operator` | A success-kind submitter response returned a transaction ID different from the submitted transaction bytes. |
 | `Pczt` | Mirrors `PcztError` | A PCZT role failed. |
@@ -99,8 +99,24 @@ Only `retryable` moves the breaker's failure counter, and only a call that compl
 | `ChainReorgDetected` | `retryable` | Scanner input diverged from persisted chain state and needs rollback. |
 | `TransparentOutputNotRecognized` | `not_retryable` | A chain source returned a transparent output script Zally cannot map. |
 | `TransparentOutputValueOutOfRange` | `not_retryable` | A chain source returned a transparent output value outside the zatoshis range. |
-| `ProposalBuildFailed` | Carries `FailurePosture` | Proposal construction failed. An upstream input-lock conflict is retryable; malformed proposal state is not retryable. |
+| `ProposalRejected` | Follows `ProposalRejectionKind` | librustzcash refused to build a proposal or transaction; `kind` says why. |
+| `ProposalBuildFailed` | Carries `FailurePosture` | Zally could not finish a proposal artifact librustzcash built, such as serializing a PCZT. |
 | `ShieldedPoolUnsupported` | `requires_operator` | The requested shielded pool has no subtree-root write path in this storage backend. |
+
+## ProposalRejectionKind
+
+Carried by `WalletError::ProposalRejected` and `StorageError::ProposalRejected`. Kinds are matched from the typed librustzcash error variants, never from error text; an unrecognized upstream variant is `Other`.
+
+| Kind | Posture | Meaning |
+|------|---------|---------|
+| `InsufficientFunds` | `not_retryable` | The spendable balance does not cover the payment and its fee. The wallet reports it as `WalletError::InsufficientBalance`. |
+| `InputsLocked` | `retryable` | A concurrent proposal or PCZT locked a selected input first; a retry selects around it. |
+| `TransactionTooLarge` | `not_retryable` | The transaction would exceed the block size; send less or consolidate notes. |
+| `ExpiryConflictsWithCanonicalCrossing` | `not_retryable` | A target expiry height was supplied for a ZIP 318 canonical crossing, whose expiry comes from the ZIP 318 rolling window; retry without one. |
+| `RecipientAddressExpired` | `not_retryable` | A ZIP 316 Revision 2 recipient address has expired; ask for a current one. Also returned when the address only expires before the transaction would; an earlier target expiry height passes, but choosing it to fit the address reveals the address's expiry on chain (ZIP 316), so prefer a longer-lived address. |
+| `OrchardRecipientNeedsIronwood` | `not_retryable` | After NU6.3, an Orchard-receiver payment can only be delivered through the Ironwood pool, which a transaction of the requested version cannot carry. |
+| `SelectionContractViolated` | `requires_operator` | librustzcash reported a broken internal contract while selecting inputs or building a step, such as a selected note it was asked to exclude or an Orchard-pool payment after Ironwood activation. |
+| `Other` | `not_retryable` | Any other rejection; the reason carries the detail. |
 
 ## PcztError
 

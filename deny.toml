@@ -7,6 +7,9 @@ ignore = [
     # proc-macro-error unmaintained advisory; pulled transitively through age's i18n stack.
     # Not a vulnerability; tracking upstream replacement.
     "RUSTSEC-2024-0370",
+    # basic-toml unmaintained advisory; pulled transitively through age's i18n stack
+    # (i18n-config). Not a vulnerability; no maintained release exists to move to.
+    "RUSTSEC-2026-0374",
 ]
 
 [licenses]

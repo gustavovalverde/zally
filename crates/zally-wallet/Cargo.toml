@@ -50,6 +50,7 @@ zip321.workspace = true
 
 [dev-dependencies]
 async-trait.workspace = true
+incrementalmerkletree.workspace = true
 orchard.workspace = true
 rand.workspace = true
 sapling.workspace = true
@@ -61,6 +62,7 @@ tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "time
 tracing-subscriber.workspace = true
 uuid.workspace = true
 zally-testkit = { path = "../zally-testkit", version = "0.1" }
+wagyu-zcash-parameters = "0.2"
 zcash_primitives = { workspace = true, features = ["circuits", "test-dependencies"] }
 zcash_proofs.workspace = true
 
