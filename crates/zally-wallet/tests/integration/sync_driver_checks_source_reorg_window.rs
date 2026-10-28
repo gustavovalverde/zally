@@ -5,10 +5,10 @@
 //! resume once the window is raised.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
 
-use futures_util::stream;
+use futures_util::{StreamExt as _, stream};
 use tokio::sync::Notify;
 use zally_chain::{
     BlockHeightRange, ChainEpoch, ChainEventEnvelope, ChainEventEnvelopeStream,
@@ -16,13 +16,17 @@ use zally_chain::{
     SubtreeIndex, SubtreeRoot, TransactionStatus, TransparentUtxo,
 };
 use zally_core::{BlockHeight, IdempotencyKey, Network, TreeStateArtifact, TxId, Zatoshis};
+use zally_storage::WalletStorage as _;
 use zally_testkit::{MockChainSource, MockSubmitter};
 use zally_wallet::{
-    ShieldTransparentPlan, SyncDriver, SyncDriverOptions, SyncHandle, WalletError, WalletEvent,
-    WalletEventStream,
+    ShieldTransparentPlan, SyncDriver, SyncDriverOptions, SyncDriverPhase, SyncHandle,
+    SyncSnapshot, WalletError, WalletEvent, WalletEventStream,
 };
 
-use super::reorg_fixtures::{ChainWallet, FixtureError, chain_wallet, fast_driver_options};
+use super::reorg_fixtures::{
+    ChainWallet, EventLog, FixtureError, chain_wallet, fast_driver_options, funded_chain,
+    wait_for_driver,
+};
 
 const SHALLOW_WINDOW_BLOCKS: u32 = 100;
 const REQUIRED_WINDOW_BLOCKS: u32 = 1_000;
@@ -106,17 +110,120 @@ async fn a_disabled_check_accepts_a_shallow_source_reorg_window() -> Result<(), 
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_shallow_source_reorg_window_holds_unmineable_verdicts() -> Result<(), FixtureError> {
+    let funded = funded_chain(200).await?;
+    let base = &funded.base;
+    base.chain_handle
+        .set_reorg_window_blocks(SHALLOW_WINDOW_BLOCKS);
+    let stream_fault = Arc::new(Notify::new());
+    let events = EventLog::record(base.wallet.observe());
+    let handle = start_driver(base, Arc::clone(&stream_fault), fast_driver_options())?;
+    let mut seen = Vec::new();
+    wait_for_driver(&handle, &mut seen, |snapshot| {
+        is_scanned_to(snapshot, funded.tip_height)
+    })
+    .await?;
+
+    // A reorg removes the withdrawal, and the settled tip moves past its expiry.
+    let expiry_height = u32::from(funded.shielding.expiry_height());
+    base.chain_handle.trigger_reorg(
+        BlockHeight::from(funded.funding_height),
+        BlockHeight::from(funded.tip_height + 1),
+    );
+    let past_expiry = expiry_height + 1;
+    if !base.chain_handle.commit_tips(
+        BlockHeight::from(past_expiry),
+        BlockHeight::from(past_expiry),
+    ) {
+        return Err(FixtureError::Fixture("settled tip above visible tip"));
+    }
+    wait_for_driver(&handle, &mut seen, |snapshot| {
+        is_scanned_to(snapshot, past_expiry)
+    })
+    .await?;
+    assert!(
+        !events
+            .snapshot()
+            .iter()
+            .any(|event| matches!(event, WalletEvent::PendingBroadcastUnmineable { .. })),
+        "a source that can still replace its settled tip cannot back an unmineable verdict"
+    );
+    assert_eq!(
+        base.storage
+            .find_idempotent_submission(&funded.shielding_key)
+            .await?,
+        Some(funded.shielding_tx_id),
+        "the withdrawal keeps its key while the verdict is held"
+    );
+
+    base.chain_handle
+        .set_reorg_window_blocks(REQUIRED_WINDOW_BLOCKS);
+    stream_fault.notify_one();
+    events
+        .wait_for(|event| {
+            matches!(event, WalletEvent::PendingBroadcastUnmineable { tx_id, .. }
+                if *tx_id == funded.shielding_tx_id)
+        })
+        .await?;
+    handle.close().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unread_source_reorg_window_refuses_spends() -> Result<(), FixtureError> {
+    let base = chain_wallet(10).await?;
+    let handle =
+        start_driver_reading_window(&base, Arc::new(Notify::new()), fast_driver_options(), false)?;
+    let mut seen = Vec::new();
+    wait_for_driver(&handle, &mut seen, |snapshot| is_scanned_to(snapshot, 10)).await?;
+    let refused = try_shielding(&base).await?;
+    assert!(
+        matches!(
+            refused,
+            WalletError::SourceReorgWindowUnverified {
+                required_blocks: REQUIRED_WINDOW_BLOCKS
+            }
+        ),
+        "a window the driver could not read refuses spends: {refused:?}"
+    );
+    handle.close().await?;
+    assert!(
+        !matches!(
+            try_shielding(&base).await?,
+            WalletError::SourceReorgWindowUnverified { .. }
+        ),
+        "closing the driver lifts the refusal"
+    );
+    Ok(())
+}
+
 fn start_driver(
     base: &ChainWallet,
     stream_fault: Arc<Notify>,
     options: SyncDriverOptions,
 ) -> Result<SyncHandle, FixtureError> {
+    start_driver_reading_window(base, stream_fault, options, true)
+}
+
+fn start_driver_reading_window(
+    base: &ChainWallet,
+    stream_fault: Arc<Notify>,
+    options: SyncDriverOptions,
+    is_window_readable: bool,
+) -> Result<SyncHandle, FixtureError> {
     let chain: Arc<dyn ChainSource> = Arc::new(FaultingFirstStreamChain {
         inner: Arc::clone(&base.chain),
         stream_fault,
         stream_open_count: AtomicU32::new(0),
+        is_window_readable: AtomicBool::new(is_window_readable),
     });
     Ok(SyncDriver::new(base.wallet.clone(), chain, options)?.sync_continuously())
+}
+
+fn is_scanned_to(snapshot: &SyncSnapshot, height: u32) -> bool {
+    snapshot.phase == SyncDriverPhase::Waiting
+        && snapshot.scanned_height == Some(BlockHeight::from(height))
 }
 
 /// Shields with an unfunded wallet; returns the error that refused it.
@@ -153,12 +260,15 @@ async fn wait_for_event(
     .map_err(|_elapsed| FixtureError::Fixture("timed out waiting for a wallet event"))?
 }
 
-/// Delegates to a mock chain, except that the first chain-event stream faults once
-/// `stream_fault` is notified, so the driver reopens it.
+/// Delegates to a mock chain, with a first chain-event stream that can be made to fault.
+///
+/// The first stream faults once `stream_fault` is notified, so the driver reopens it, and the
+/// reorg window read fails while `is_window_readable` is false.
 struct FaultingFirstStreamChain {
     inner: Arc<MockChainSource>,
     stream_fault: Arc<Notify>,
     stream_open_count: AtomicU32,
+    is_window_readable: AtomicBool,
 }
 
 #[async_trait::async_trait]
@@ -217,19 +327,28 @@ impl ChainSource for FaultingFirstStreamChain {
         &self,
         start: ChainEventStreamStart,
     ) -> Result<ChainEventEnvelopeStream, ChainSourceError> {
-        if self.stream_open_count.fetch_add(1, Ordering::SeqCst) > 0 {
-            return self.inner.chain_event_envelopes(start).await;
+        let is_first_stream = self.stream_open_count.fetch_add(1, Ordering::SeqCst) == 0;
+        let delivered = self.inner.chain_event_envelopes(start).await?;
+        if !is_first_stream {
+            return Ok(delivered);
         }
         let stream_fault = Arc::clone(&self.stream_fault);
-        Ok(Box::pin(stream::once(async move {
-            stream_fault.notified().await;
-            Err::<ChainEventEnvelope, _>(ChainSourceError::Unavailable {
-                reason: "chain-event stream interrupted".into(),
-            })
-        })))
+        let interrupted = async move { stream_fault.notified().await };
+        Ok(Box::pin(delivered.take_until(interrupted).chain(
+            stream::once(async {
+                Err::<ChainEventEnvelope, _>(ChainSourceError::Unavailable {
+                    reason: "chain-event stream interrupted".into(),
+                })
+            }),
+        )))
     }
 
     async fn reorg_window_blocks(&self) -> Result<u32, ChainSourceError> {
+        if !self.is_window_readable.load(Ordering::SeqCst) {
+            return Err(ChainSourceError::Unavailable {
+                reason: "server info unavailable".into(),
+            });
+        }
         self.inner.reorg_window_blocks().await
     }
 }

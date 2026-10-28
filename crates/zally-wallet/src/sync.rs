@@ -248,10 +248,12 @@ pub struct SyncDriverOptions {
     /// the source's settled tip, so the promise never to pay twice holds only while the source
     /// follows every reorg the node can produce. The driver reads
     /// [`ChainSource::reorg_window_blocks`] when it starts and each time it reopens the
-    /// chain-event stream. While the window is smaller, new spends fail with
-    /// [`WalletError::SourceReorgWindowTooShallow`] and
+    /// chain-event stream. Until a read meets the minimum, the wallet records no pending
+    /// broadcast as unmineable, so no key is freed and no hold reopened, and new spends fail:
+    /// with [`WalletError::SourceReorgWindowUnverified`] before the first successful read, and
+    /// with [`WalletError::SourceReorgWindowTooShallow`] while the window is smaller, which
     /// [`WalletEvent::SourceReorgWindowTooShallow`](crate::WalletEvent::SourceReorgWindowTooShallow)
-    /// reports it; scanning continues. Closing the driver lifts the refusal.
+    /// reports. Scanning continues. Closing the driver lifts the hold.
     ///
     /// Default: 1,000 blocks, the deepest reorg Zebra produces.
     pub minimum_source_reorg_window_blocks: Option<u32>,
@@ -1036,6 +1038,9 @@ async fn run_sync_driver(
     };
     let started = ctx.status_tx.borrow().clone();
     publish_transition(ctx.status_tx, started, &DriverTransition::DriverStarted);
+    if let Some(required_blocks) = ctx.options.minimum_source_reorg_window_blocks {
+        ctx.wallet.start_source_reorg_window_check(required_blocks);
+    }
     check_source_reorg_window(&ctx).await;
 
     let mut poll = interval(Duration::from_millis(ctx.options.poll_interval_ms));
@@ -1392,7 +1397,7 @@ async fn publish_source_recovered(ctx: &DriverContext<'_>, state: &mut DriverSta
 ///
 /// Runs when the driver starts and each time it reopens the chain-event stream, where a
 /// restarted source with a new configuration first shows. A read that fails or times out
-/// keeps the prior verdict.
+/// keeps the prior result, so a window never read keeps spends and unmineable verdicts held.
 async fn check_source_reorg_window(ctx: &DriverContext<'_>) {
     let Some(required_blocks) = ctx.options.minimum_source_reorg_window_blocks else {
         return;

@@ -290,6 +290,21 @@ pub enum WalletError {
         required_blocks: u32,
     },
 
+    /// The sync driver requires a minimum chain source reorg window and has not yet read the
+    /// source's window, so the wallet refuses new spends until it has.
+    ///
+    /// Posture: [`FailurePosture::Retryable`]: retry once the driver has read the window,
+    /// normally right after it starts. A source whose window cannot be read keeps spends
+    /// refused.
+    #[error(
+        "chain source reorg window not yet verified against the required {required_blocks} \
+         blocks; new spends are refused"
+    )]
+    SourceReorgWindowUnverified {
+        /// Minimum window the sync driver requires.
+        required_blocks: u32,
+    },
+
     /// The sync-driver task panicked. Surfaced only by [`crate::SyncHandle::close`]; the
     /// driver task never fails while its handle is alive.
     ///
@@ -315,9 +330,9 @@ impl WalletError {
             Self::PaymentDisclosureExport(e) => e.posture(),
             Self::ChainSource(e) => e.posture(),
             Self::Submitter(e) => e.posture(),
-            Self::CircuitBroken { .. } | Self::ChainSourceHalted { .. } => {
-                FailurePosture::Retryable
-            }
+            Self::CircuitBroken { .. }
+            | Self::ChainSourceHalted { .. }
+            | Self::SourceReorgWindowUnverified { .. } => FailurePosture::Retryable,
             Self::UnverifiedScanChunk { source, .. } => source.posture(),
             Self::ProposalRejected { kind, .. } => kind.posture(),
             Self::NetworkMismatch { .. }

@@ -22,7 +22,9 @@ impl Wallet {
     /// reports it and [`WalletEvent::HoldDispenseUnmineable`] reports each hold. A
     /// transaction a rewind removed from the chain is judged the same way. Judging at the visible tip
     /// instead could report a broadcast that an unscanned or reorged block still mines, and
-    /// its replacement would pay twice.
+    /// its replacement would pay twice. No broadcast is recorded unmineable while the sync
+    /// driver holds verdicts over the chain source's reorg window, because a settled tip the
+    /// source can still replace cannot back one.
     pub(crate) async fn retire_pending_broadcasts(&self) -> Result<(), WalletError> {
         let storage = &self.inner.storage;
         let (Some(scanned_height), Some(settled_tip_height)) = (
@@ -32,6 +34,7 @@ impl Wallet {
             return Ok(());
         };
         let judged_height = scanned_height.min(settled_tip_height);
+        let is_verdict_held = self.is_source_reorg_window_holding();
         for pending in storage.list_pending_broadcast_transactions().await? {
             let tx_id = pending.broadcast_tx_id;
             match pending.mined_height {
@@ -42,6 +45,7 @@ impl Wallet {
                     continue;
                 }
                 Some(_) => continue,
+                None if is_verdict_held => continue,
                 None => {}
             }
             let header = match parse_transaction_header(&pending.raw_bytes) {

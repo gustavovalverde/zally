@@ -194,7 +194,8 @@ pub enum WalletEvent {
     SourceRecovered,
     /// The sync driver read a chain source reorg window below
     /// [`crate::SyncDriverOptions::minimum_source_reorg_window_blocks`], so the wallet refuses
-    /// new spends with [`crate::WalletError::SourceReorgWindowTooShallow`].
+    /// new spends with [`crate::WalletError::SourceReorgWindowTooShallow`] and records no
+    /// pending broadcast as unmineable.
     ///
     /// Emitted when the refusal starts, and again when the reported window changes while it
     /// stays too shallow. Raise the source's reorg window to at least `required_blocks`.
@@ -205,7 +206,7 @@ pub enum WalletEvent {
         required_blocks: u32,
     },
     /// The sync driver read a chain source reorg window that meets its minimum again, so the
-    /// refusal reported by [`Self::SourceReorgWindowTooShallow`] is lifted.
+    /// hold reported by [`Self::SourceReorgWindowTooShallow`] is lifted.
     SourceReorgWindowSufficient {
         /// Reorg window the source reported.
         reorg_window_blocks: u32,
