@@ -129,6 +129,9 @@ enum WalletDbState {
     Opened {
         db: Box<Db>,
         ledger: Box<rusqlite::Connection>,
+        /// Exclusive advisory lock that makes this storage the database's only writer, held
+        /// until the state leaves `Opened`.
+        writer_lock: std::fs::File,
     },
 }
 
@@ -239,6 +242,11 @@ fn validated_sapling_parameter_bytes(
 ///
 /// Cloning yields another handle to the same actor; the actor lives until all
 /// clones are dropped.
+///
+/// A wallet database admits one writer. Opening takes an exclusive advisory lock on the
+/// sibling file `<db_path>.lock`, held until the actor exits, so another `Sqlite` on the same
+/// file, in this process or another, fails with [`StorageError::DatabaseLocked`]. Share one
+/// handle by cloning it.
 #[derive(Clone)]
 pub struct Sqlite {
     options: SqliteOptions,
@@ -316,11 +324,13 @@ impl Sqlite {
                     {
                         let cleanup = match state {
                             WalletDbState::NotOpened => Err(StorageError::NotOpened),
-                            WalletDbState::Opened { db, ledger } => release_pending_pczt_inputs(
-                                db.as_mut(),
-                                ledger.as_ref(),
-                                lock_owner,
-                            ),
+                            WalletDbState::Opened { db, ledger, .. } => {
+                                release_pending_pczt_inputs(
+                                    db.as_mut(),
+                                    ledger.as_ref(),
+                                    lock_owner,
+                                )
+                            }
                         };
                         if let Err(error) = cleanup {
                             tracing::error!(
@@ -400,7 +410,7 @@ impl Sqlite {
     {
         self.dispatch(move |state, _options| match state {
             WalletDbState::NotOpened => Err(StorageError::NotOpened),
-            WalletDbState::Opened { db, ledger } => work(db.as_mut(), ledger.as_ref()),
+            WalletDbState::Opened { db, ledger, .. } => work(db.as_mut(), ledger.as_ref()),
         })
         .await
     }
@@ -412,7 +422,7 @@ impl Sqlite {
     {
         self.dispatch(move |state, _options| match state {
             WalletDbState::NotOpened => Err(StorageError::NotOpened),
-            WalletDbState::Opened { db, ledger } => work(db.as_ref(), ledger.as_ref()),
+            WalletDbState::Opened { db, ledger, .. } => work(db.as_ref(), ledger.as_ref()),
         })
         .await
     }
@@ -619,6 +629,21 @@ const LEDGER_TABLES_KEPT_ACROSS_REBUILD: [&str; 7] = [
 /// Suffix of the sibling file a wallet rebuild writes before it replaces the live database.
 const REBUILD_FILE_SUFFIX: &str = ".rebuild";
 
+/// Suffix of the sibling file whose exclusive advisory lock marks the database's only writer.
+///
+/// A sibling rather than the database file itself, because on some platforms a whole-file
+/// lock would collide with the byte-range locks `SQLite` takes on the database. The lock
+/// file is never deleted; the operating system releases the lock with the process.
+const WRITER_LOCK_FILE_SUFFIX: &str = ".lock";
+
+/// How long opening waits for another writer to release the database before failing.
+///
+/// A storage handle in this process releases the lock when its wallet-db actor exits, shortly
+/// after its last clone is dropped, so a wallet reopened right after the prior one was dropped
+/// waits briefly instead of failing.
+const WRITER_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+const WRITER_LOCK_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
+
 /// Sidecar suffixes `SQLite` may keep next to a database file.
 ///
 /// A rollback journal or WAL left next to a replaced database would be replayed into its
@@ -629,6 +654,50 @@ fn sibling_path(db_path: &Path, suffix: &str) -> PathBuf {
     let mut os_path = db_path.as_os_str().to_owned();
     os_path.push(suffix);
     PathBuf::from(os_path)
+}
+
+/// Takes the exclusive advisory lock that makes the caller the only writer of the database
+/// at `db_path`, across storage handles and processes.
+///
+/// Two writers would each keep their own per-key send lock, and one writer's rebuild would
+/// swap the file under the other's open connections, losing its later ledger writes.
+fn lock_database_writer(db_path: &Path) -> Result<std::fs::File, StorageError> {
+    if let Some(parent) = db_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| StorageError::SqliteFailed {
+            reason: format!("could not create database directory: {e}"),
+            posture: FailurePosture::NotRetryable,
+        })?;
+    }
+    let lock_path = sibling_path(db_path, WRITER_LOCK_FILE_SUFFIX);
+    let lock_failed = |err: &dyn std::fmt::Display| StorageError::SqliteFailed {
+        reason: format!(
+            "could not lock wallet database writer file '{}': {err}",
+            lock_path.display()
+        ),
+        posture: FailurePosture::RequiresOperator,
+    };
+    let lock_file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .map_err(|err| lock_failed(&err))?;
+    let deadline = std::time::Instant::now() + WRITER_LOCK_WAIT;
+    loop {
+        match lock_file.try_lock() {
+            Ok(()) => return Ok(lock_file),
+            Err(std::fs::TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(WRITER_LOCK_RETRY_INTERVAL);
+            }
+            Err(std::fs::TryLockError::WouldBlock) => {
+                return Err(StorageError::DatabaseLocked {
+                    db_path: db_path.to_path_buf(),
+                });
+            }
+            Err(std::fs::TryLockError::Error(err)) => return Err(lock_failed(&err)),
+        }
+    }
 }
 
 fn remove_database_file(path: &Path) -> Result<(), StorageError> {
@@ -791,8 +860,13 @@ impl WalletStorage for Sqlite {
             if matches!(state, WalletDbState::Opened { .. }) {
                 return Ok(());
             }
+            let writer_lock = lock_database_writer(&options.db_path)?;
             let (db, ledger) = open_wallet_db(options)?;
-            *state = WalletDbState::Opened { db, ledger };
+            *state = WalletDbState::Opened {
+                db,
+                ledger,
+                writer_lock,
+            };
             Ok(())
         })
         .await
@@ -823,10 +897,19 @@ impl WalletStorage for Sqlite {
         let secret = SecretVec::new(seed.expose_secret().to_vec());
 
         self.dispatch(move |state, options| {
-            *state = WalletDbState::NotOpened;
+            let writer_lock = match std::mem::replace(state, WalletDbState::NotOpened) {
+                WalletDbState::Opened { writer_lock, .. } => writer_lock,
+                WalletDbState::NotOpened => lock_database_writer(&options.db_path)?,
+            };
             let rebuilt = rebuild_database_with_ledger(options, &secret, prior_chain_state);
             match open_wallet_db(options) {
-                Ok((db, ledger)) => *state = WalletDbState::Opened { db, ledger },
+                Ok((db, ledger)) => {
+                    *state = WalletDbState::Opened {
+                        db,
+                        ledger,
+                        writer_lock,
+                    };
+                }
                 Err(reopen_error) => return Err(rebuilt.err().unwrap_or(reopen_error)),
             }
             let account_id = rebuilt?;
@@ -1629,7 +1712,7 @@ impl WalletStorage for Sqlite {
 
         self.dispatch_pczt_creation(move |state, _options| match state {
             WalletDbState::NotOpened => Err(StorageError::NotOpened),
-            WalletDbState::Opened { db, ledger } => {
+            WalletDbState::Opened { db, ledger, .. } => {
                 let db = db.as_mut();
                 let account_uuid = resolve_account_uuid(db, network, account_id)?;
                 let lock_request = proposal_lock_request();
@@ -1711,7 +1794,7 @@ impl WalletStorage for Sqlite {
 
         self.dispatch(move |state, _options| match state {
             WalletDbState::NotOpened => Err(StorageError::NotOpened),
-            WalletDbState::Opened { db, ledger } => {
+            WalletDbState::Opened { db, ledger, .. } => {
                 let db = db.as_mut();
                 let clock = storage_clock();
                 let mut rng = storage_os_rng();
@@ -1775,7 +1858,7 @@ impl WalletStorage for Sqlite {
             pending_pczt_lock_owner(&parsed)?.ok_or(StorageError::PcztLockOwnerMissing)?;
         self.dispatch(move |state, _options| match state {
             WalletDbState::NotOpened => Err(StorageError::NotOpened),
-            WalletDbState::Opened { db, ledger } => {
+            WalletDbState::Opened { db, ledger, .. } => {
                 release_pending_pczt_inputs(db.as_mut(), ledger.as_ref(), lock_owner)
             }
         })

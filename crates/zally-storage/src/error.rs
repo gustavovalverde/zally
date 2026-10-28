@@ -19,6 +19,24 @@ pub enum StorageError {
     #[error("wallet storage was not opened; call open_or_create first")]
     NotOpened,
 
+    /// Another storage handle, in this process or another, already holds the wallet database
+    /// at `db_path` open for writing.
+    ///
+    /// One storage handle writes a wallet database at a time; its clones share it. A second
+    /// writer would keep its own per-key send lock and could swap the file under the first
+    /// writer during a rebuild.
+    ///
+    /// Posture: [`FailurePosture::RequiresOperator`]; stop the other writer, or share one
+    /// handle by cloning it.
+    #[error(
+        "wallet database '{}' is already open for writing by another storage handle or process",
+        db_path.display()
+    )]
+    DatabaseLocked {
+        /// Path of the wallet database.
+        db_path: std::path::PathBuf,
+    },
+
     /// Schema migration failed.
     ///
     /// Posture: [`FailurePosture::RequiresOperator`]; a schema mismatch needs manual
@@ -314,6 +332,7 @@ impl StorageError {
             | Self::HoldNotFound
             | Self::HoldRequestConflict => FailurePosture::NotRetryable,
             Self::MigrationFailed { .. }
+            | Self::DatabaseLocked { .. }
             | Self::ProverUnavailable
             | Self::ShieldedPoolUnsupported { .. }
             | Self::RowValueOutOfRange { .. } => FailurePosture::RequiresOperator,

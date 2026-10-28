@@ -1,8 +1,9 @@
-//! Full round-trip via `AgeFileSealing`: create, derive, drop, re-open (CORE-1, CORE-2, CORE-4).
+//! Full round-trip via `AgeFileSealing`: create, derive, drop, re-open (CORE-1, CORE-2, CORE-4),
+//! and the single writer a wallet database admits (CORE-5).
 
 use zally_core::{BlockHeight, Network};
 use zally_keys::{AgeFileSealing, AgeFileSealingOptions};
-use zally_storage::{Sqlite, SqliteOptions};
+use zally_storage::{Sqlite, SqliteOptions, StorageError};
 use zally_testkit::TempWalletPath;
 use zally_wallet::{Wallet, WalletError};
 
@@ -37,6 +38,7 @@ async fn create_then_open_round_trip() -> Result<(), TestError> {
         ua_first, ua_second,
         "ZIP-316: each derive_next_address call must advance the diversifier index"
     );
+    drop(wallet);
 
     let sealing = AgeFileSealing::new(AgeFileSealingOptions::at_path(temp.seed_path()));
     let storage = Sqlite::new(SqliteOptions::for_network(network, temp.db_path()));
@@ -50,6 +52,36 @@ async fn create_then_open_round_trip() -> Result<(), TestError> {
         ua_second, ua_third,
         "diversifier index must continue advancing across opens"
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_second_wallet_cannot_open_a_database_another_wallet_holds() -> Result<(), TestError> {
+    let temp = TempWalletPath::create()?;
+    let network = Network::regtest();
+    let sealing = AgeFileSealing::new(AgeFileSealingOptions::at_path(temp.seed_path()));
+    let storage = Sqlite::new(SqliteOptions::for_network(network, temp.db_path()));
+    let chain = zally_testkit::MockChainSource::new(network);
+    let (wallet, _account_id, _mnemonic) = Wallet::builder(network, sealing, storage)
+        .create(&chain, BlockHeight::from(1))
+        .await?;
+
+    let sealing = AgeFileSealing::new(AgeFileSealingOptions::at_path(temp.seed_path()));
+    let storage = Sqlite::new(SqliteOptions::for_network(network, temp.db_path()));
+    let second = Wallet::builder(network, sealing, storage).open().await;
+    assert!(
+        matches!(
+            &second,
+            Err(WalletError::Storage(StorageError::DatabaseLocked { .. }))
+        ),
+        "a second writer would bypass the first wallet's per-key send lock: {:?}",
+        second.as_ref().err()
+    );
+
+    drop(wallet);
+    let sealing = AgeFileSealing::new(AgeFileSealingOptions::at_path(temp.seed_path()));
+    let storage = Sqlite::new(SqliteOptions::for_network(network, temp.db_path()));
+    Wallet::builder(network, sealing, storage).open().await?;
     Ok(())
 }
 

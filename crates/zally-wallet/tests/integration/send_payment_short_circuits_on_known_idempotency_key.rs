@@ -4,25 +4,26 @@
 use zally_core::{
     IdempotencyKey, IdempotencyKeyError, PaymentRecipient, TxId, Zatoshis, ZatoshisError,
 };
-use zally_storage::{Sqlite, SqliteOptions, StorageError, WalletStorage};
+use zally_storage::{StorageError, WalletStorage};
 use zally_testkit::MockSubmitter;
 use zally_wallet::{SendPaymentPlan, WalletError};
 
-use super::fixtures::{TestWalletFixture, create_test_wallet};
+use super::fixtures::{TestWalletFixture, create_test_wallet_with_storage};
 
 #[tokio::test]
 async fn send_payment_short_circuits_on_known_idempotency_key() -> Result<(), TestError> {
-    let TestWalletFixture {
-        temp,
-        wallet,
-        account_id,
-    } = create_test_wallet().await?;
+    let (
+        TestWalletFixture {
+            temp: _temp,
+            wallet,
+            account_id,
+        },
+        storage,
+    ) = create_test_wallet_with_storage().await?;
     let network = wallet.network();
 
     let known_key = IdempotencyKey::try_from("invoice-deadbeef-1")?;
     let prior_tx_id = TxId::from_bytes([0xCC_u8; 32]);
-    let storage = Sqlite::new(SqliteOptions::for_network(network, temp.db_path()));
-    storage.open_or_create().await?;
     storage
         .record_idempotent_submission(known_key.clone(), prior_tx_id)
         .await?;

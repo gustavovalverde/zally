@@ -52,17 +52,33 @@ fn rewinds(events: &EventLog) -> Vec<BlockHeight> {
         .collect()
 }
 
-/// Reopens the wallet from its files, as a restarted process would.
-async fn reopen(base: &ChainWallet) -> Result<(Wallet, Sqlite), FixtureError> {
-    let storage = Sqlite::new(SqliteOptions::for_network(
-        base.network,
-        base.temp.db_path(),
-    ));
-    let sealing = AgeFileSealing::new(AgeFileSealingOptions::at_path(base.temp.seed_path()));
-    let (wallet, _account_id) = Wallet::builder(base.network, sealing, storage.clone())
+/// Closes the wallet and reopens it from its files, as a restarted process would.
+async fn reopen(base: ChainWallet) -> Result<ChainWallet, FixtureError> {
+    let ChainWallet {
+        temp,
+        wallet,
+        storage,
+        account_id,
+        chain,
+        chain_handle,
+        network,
+    } = base;
+    drop(wallet);
+    drop(storage);
+    let storage = Sqlite::new(SqliteOptions::for_network(network, temp.db_path()));
+    let sealing = AgeFileSealing::new(AgeFileSealingOptions::at_path(temp.seed_path()));
+    let (wallet, _account_id) = Wallet::builder(network, sealing, storage.clone())
         .open()
         .await?;
-    Ok((wallet, storage))
+    Ok(ChainWallet {
+        temp,
+        wallet,
+        storage,
+        account_id,
+        chain,
+        chain_handle,
+        network,
+    })
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -91,9 +107,9 @@ async fn a_reorg_while_stopped_is_replayed_through_the_recorded_cursor() -> Resu
         .trigger_reorg(BlockHeight::from(26), BlockHeight::from(32));
     base.chain_handle.advance_tip(BlockHeight::from(33));
 
-    let (wallet, storage) = reopen(&base).await?;
-    let events = EventLog::record(wallet.observe());
-    let handle = start_driver(&wallet, &base.chain, None, fast_driver_options())?;
+    let base = reopen(base).await?;
+    let events = EventLog::record(base.wallet.observe());
+    let handle = start_driver(&base.wallet, &base.chain, None, fast_driver_options())?;
     wait_until_scanned_to(&handle, 33).await?;
     handle.close().await?;
 
@@ -110,12 +126,17 @@ async fn a_reorg_while_stopped_is_replayed_through_the_recorded_cursor() -> Resu
         "the replayed reorg must rewind to its fork point"
     );
     assert_eq!(
-        storage.find_idempotent_submission(&withdrawal_key).await?,
+        base.storage
+            .find_idempotent_submission(&withdrawal_key)
+            .await?,
         Some(TxId::from_bytes([0xab; 32]))
     );
-    assert_eq!(storage.list_active_holds(base.account_id).await?.len(), 1);
     assert_eq!(
-        storage.find_chain_event_cursor().await?,
+        base.storage.list_active_holds(base.account_id).await?.len(),
+        1
+    );
+    assert_eq!(
+        base.storage.find_chain_event_cursor().await?,
         Some(cursor_for(base.chain_handle.latest_chain_event_sequence()))
     );
     Ok(())

@@ -100,6 +100,7 @@ Returned by `TransactionHeader::check_mineable` and carried by `WalletError::Tra
 |---------|---------|---------|
 | `NotOpened` | `not_retryable` | Storage was used before `open_or_create`. |
 | `MigrationFailed` | `requires_operator` | SQLite schema migration failed. |
+| `DatabaseLocked` | `requires_operator` | Another storage handle, in this process or another, holds the wallet database open for writing; a database admits one writer (CORE-7). Stop the other writer, or share one handle by cloning it. |
 | `SqliteFailed` | Carries `is_retryable` | SQLite returned an implementation error. |
 | `AccountNotFound` | `not_retryable` | The requested account was absent from storage. |
 | `AccountAlreadyExists` | `not_retryable` | The wallet already has its single supported account. |
