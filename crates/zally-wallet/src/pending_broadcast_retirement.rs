@@ -51,6 +51,9 @@ struct VerdictPass<'a> {
     judged_height: BlockHeight,
     /// `None` holds every verdict; see `WalletInner::scan_blind_sends`.
     scan_blind_sends: Option<HashSet<TxId>>,
+    /// Whether the source's reorg window meets the minimum, when the pass already read it
+    /// because the last read showed it too shallow; `None` leaves the read to the gate.
+    is_reorg_window_verified: Option<bool>,
     /// Opened on the first broadcast that needs a verdict, then reused.
     gate: Option<VerdictGate>,
     withheld: HashSet<TxId>,
@@ -91,15 +94,19 @@ impl Wallet {
             return Ok(());
         };
         let judged_height = scanned_height.min(settled_tip_height);
-        if self.is_source_reorg_window_too_shallow() {
-            let _ = self
-                .verify_source_reorg_window(chain, self.source_lookup_timeout())
-                .await;
-        }
+        let is_reorg_window_verified = if self.is_source_reorg_window_too_shallow() {
+            Some(
+                self.verify_source_reorg_window(chain, self.source_lookup_timeout())
+                    .await,
+            )
+        } else {
+            None
+        };
         let mut pass = VerdictPass {
             chain,
             judged_height,
             scan_blind_sends: self.inner.scan_blind_sends.lock().clone(),
+            is_reorg_window_verified,
             gate: None,
             withheld: HashSet::new(),
         };
@@ -182,9 +189,14 @@ impl Wallet {
         };
         let gate = match pass.gate {
             Some(ref gate) => gate,
-            None => pass
-                .gate
-                .insert(self.open_verdict_gate(pass.chain, pass.judged_height).await),
+            None => pass.gate.insert(
+                self.open_verdict_gate(
+                    pass.chain,
+                    pass.judged_height,
+                    pass.is_reorg_window_verified,
+                )
+                .await,
+            ),
         };
         let presence = match gate {
             VerdictGate::Open(epoch) => {
@@ -205,17 +217,22 @@ impl Wallet {
         }
     }
 
-    /// Reads the source's reorg window and pins an epoch whose visible tip covers
-    /// `judged_height`.
+    /// Reads the source's reorg window, unless the pass already did
+    /// (`is_reorg_window_verified`), and pins an epoch whose visible tip covers `judged_height`.
     async fn open_verdict_gate(
         &self,
         chain: &dyn ChainSource,
         judged_height: BlockHeight,
+        is_reorg_window_verified: Option<bool>,
     ) -> VerdictGate {
-        if !self
-            .verify_source_reorg_window(chain, self.source_lookup_timeout())
-            .await
-        {
+        let is_reorg_window_verified = match is_reorg_window_verified {
+            Some(is_verified) => is_verified,
+            None => {
+                self.verify_source_reorg_window(chain, self.source_lookup_timeout())
+                    .await
+            }
+        };
+        if !is_reorg_window_verified {
             return VerdictGate::Closed(
                 "the chain source's reorg window is not verified to meet the minimum".to_owned(),
             );
