@@ -15,17 +15,17 @@ use zally_chain::{
     ChainEventStreamStart, ChainSource, ChainSourceError, CompactBlockStream, ShieldedPool,
     SubtreeIndex, SubtreeRoot, TransactionStatus, TransparentUtxo,
 };
-use zally_core::{BlockHeight, IdempotencyKey, Network, TreeStateArtifact, TxId, Zatoshis};
+use zally_core::{BlockHeight, Network, TreeStateArtifact, TxId};
 use zally_storage::WalletStorage as _;
-use zally_testkit::{MockChainSource, MockSubmitter};
+use zally_testkit::MockChainSource;
 use zally_wallet::{
-    ShieldTransparentPlan, SyncDriver, SyncDriverOptions, SyncDriverPhase, SyncHandle,
-    SyncSnapshot, WalletError, WalletEvent, WalletEventStream, WalletOptions,
+    SyncDriver, SyncDriverOptions, SyncDriverPhase, SyncHandle, SyncSnapshot, WalletError,
+    WalletEvent, WalletEventStream, WalletOptions,
 };
 
 use super::reorg_fixtures::{
     ChainWallet, EventLog, FixtureError, chain_wallet, chain_wallet_with_options,
-    fast_driver_options, funded_chain, wait_for_driver,
+    fast_driver_options, funded_chain, try_shielding, wait_for_driver,
 };
 
 const SHALLOW_WINDOW_BLOCKS: u32 = 100;
@@ -238,24 +238,6 @@ fn start_driver_reading_window(
 fn is_scanned_to(snapshot: &SyncSnapshot, height: u32) -> bool {
     snapshot.phase == SyncDriverPhase::Waiting
         && snapshot.scanned_height == Some(BlockHeight::from(height))
-}
-
-/// Shields with an unfunded wallet; returns the error that refused it.
-async fn try_shielding(base: &ChainWallet) -> Result<WalletError, FixtureError> {
-    let submitter = MockSubmitter::accepting(base.network);
-    let outcome = base
-        .wallet
-        .shield_transparent_funds(ShieldTransparentPlan::new(
-            base.account_id,
-            IdempotencyKey::try_from("shield-on-shallow-window".to_owned())
-                .map_err(|_| FixtureError::Fixture("idempotency key"))?,
-            Zatoshis::try_from(1_000_u64).map_err(|_| FixtureError::Fixture("zatoshis"))?,
-            &submitter,
-        ))
-        .await;
-    outcome
-        .err()
-        .ok_or(FixtureError::Fixture("an unfunded wallet cannot shield"))
 }
 
 async fn wait_for_event(

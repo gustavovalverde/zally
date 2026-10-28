@@ -14,20 +14,12 @@ use zally_wallet::{
 };
 
 use super::reorg_fixtures::{
-    ChainWallet, FixtureError, chain_wallet, fast_driver_options, start_driver, wait_for_driver,
+    ChainWallet, FixtureError, chain_wallet, fast_driver_options, start_driver, try_shielding,
+    wait_for_driver,
 };
 
 const STALL_LIMIT_MS: u64 = 2_000;
 const EVENT_TIMEOUT: Duration = Duration::from_secs(30);
-
-async fn try_shielding(base: &ChainWallet) -> Result<WalletError, FixtureError> {
-    let key = IdempotencyKey::try_from("shield-during-halt".to_owned())
-        .map_err(|_| FixtureError::Fixture("idempotency key"))?;
-    shield_with_key(base, key)
-        .await
-        .err()
-        .ok_or(FixtureError::Fixture("an unfunded wallet cannot shield"))
-}
 
 async fn shield_with_key(
     base: &ChainWallet,

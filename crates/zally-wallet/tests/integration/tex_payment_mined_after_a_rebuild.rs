@@ -9,28 +9,25 @@
 //! scan recognizes the payment. The chain source is only a second guard: a source that reports
 //! a mined payment missing cannot free its key.
 
-use zally_chain::Submitter;
 use zally_core::{
     BlockHeight, CompactChainMetadata, CompactSaplingOutput, CompactSaplingSpend,
     CompactTransaction, CompactTransparentInput, CompactTransparentOutput, IdempotencyKey,
-    PaymentRecipient, TransparentGapLimit, TxId, Zatoshis,
+    TransparentGapLimit, TxId, Zatoshis,
 };
 use zally_storage::WalletStorage as _;
 use zally_testkit::{MockCommitmentTrees, MockSubmitter, MockTransactionStatusMode};
-use zally_wallet::{RetryPolicy, SendOutcome, SendPaymentPlan, WalletError, WalletEvent};
+use zally_wallet::{RetryPolicy, WalletError, WalletEvent};
 use zcash_primitives::transaction::Transaction;
 use zcash_protocol::consensus::BranchId;
 use zcash_transparent::address::Script;
 use zcash_transparent::keys::NonHardenedChildIndex;
 
 use super::reorg_fixtures::{
-    EventLog, FixtureError, FundedChain, funded_chain_with_gap_limit, sync_to_tip,
+    EventLog, FixtureError, FundedChain, PRE_FUNDING_TIP_HEIGHT, SPEND_TIP_HEIGHT,
+    TEX_RECIPIENT_HASH, funded_chain_with_gap_limit, pay_tex, sync_to_tip,
 };
 
 const PAYMENT_KEY: &str = "tex-payout-0001";
-const PAYMENT_RECIPIENT_HASH: [u8; 20] = [0x5e; 20];
-const PRE_FUNDING_TIP_HEIGHT: u32 = 110;
-const SPEND_TIP_HEIGHT: u32 = PRE_FUNDING_TIP_HEIGHT + 20;
 /// Blocks a test advances past each block it mines before the wallet builds again.
 const BLOCKS_AFTER_EACH_MINED_BLOCK: u32 = 15;
 /// Blocks past the payment's mined height where the verdict judges it, beyond its expiry.
@@ -186,9 +183,9 @@ async fn a_payment_the_scan_passed_without_its_funding_output_is_never_judged_un
     let retry_submitter =
         MockSubmitter::accepting(base.network).with_tx_id_derivation(nu7_transaction_id);
     let retried = pay_tex(
-        &paid.wallet.funded,
+        &paid.wallet.funded.base,
         PAYMENT_KEY,
-        PAYMENT_RECIPIENT_HASH,
+        TEX_RECIPIENT_HASH,
         &retry_submitter,
     )
     .await;
@@ -303,7 +300,7 @@ impl TexWallet {
     ) -> Result<(Transaction, Transaction), FixtureError> {
         let submitter = MockSubmitter::accepting(self.funded.base.network)
             .with_tx_id_derivation(nu7_transaction_id);
-        let paid = pay_tex(&self.funded, key, recipient_hash, &submitter).await?;
+        let paid = pay_tex(&self.funded.base, key, recipient_hash, &submitter).await?;
         let sent_steps = submitter.handle().submitted_bytes();
         let [funding_bytes, paying_bytes] = sent_steps.as_slice() else {
             return Err(FixtureError::Fixture("a TEX payment submits two steps"));
@@ -318,7 +315,7 @@ impl TexWallet {
 
     /// Pays a TEX address under [`PAYMENT_KEY`], then rebuilds the wallet from its birthday.
     async fn pay_then_rebuild(self) -> Result<PaidThenRebuilt, FixtureError> {
-        let (funding_step, paying_step) = self.pay(PAYMENT_KEY, PAYMENT_RECIPIENT_HASH).await?;
+        let (funding_step, paying_step) = self.pay(PAYMENT_KEY, TEX_RECIPIENT_HASH).await?;
         let base = &self.funded.base;
         base.wallet.reset_to_birthday(base.chain.as_ref()).await?;
         Ok(PaidThenRebuilt {
@@ -427,9 +424,9 @@ impl PaidThenRebuilt {
             MockSubmitter::accepting(funded.base.network).with_tx_id_derivation(nu7_transaction_id);
         assert_eq!(
             pay_tex(
-                funded,
+                &funded.base,
                 PAYMENT_KEY,
-                PAYMENT_RECIPIENT_HASH,
+                TEX_RECIPIENT_HASH,
                 &retry_submitter
             )
             .await?
@@ -466,32 +463,6 @@ fn ephemeral_script(funded: &FundedChain, index: u32) -> Result<Vec<u8>, Fixture
         .and_then(|ivk| ivk.derive_ephemeral_address(address_index))
         .map_err(|_| FixtureError::Fixture("ephemeral address"))?;
     Ok(Script::from(address.script()).0.0)
-}
-
-async fn pay_tex(
-    funded: &FundedChain,
-    key: &str,
-    recipient_hash: [u8; 20],
-    submitter: &dyn Submitter,
-) -> Result<SendOutcome, WalletError> {
-    let base = &funded.base;
-    let encoded =
-        zcash_keys::address::Address::Tex(recipient_hash).encode(&base.network.to_parameters());
-    let invalid = |field: &str| WalletError::PaymentRequestParseFailed {
-        reason: field.to_owned(),
-    };
-    base.wallet
-        .send_payment(SendPaymentPlan::conventional(
-            base.account_id,
-            IdempotencyKey::try_from(key).map_err(|_| invalid("idempotency key"))?,
-            PaymentRecipient::TexAddress {
-                encoded,
-                network: base.network,
-            },
-            Zatoshis::try_from(50_000_u64).map_err(|_| invalid("amount"))?,
-            submitter,
-        ))
-        .await
 }
 
 fn nu7_transaction_id(raw_tx: &[u8]) -> TxId {

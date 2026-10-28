@@ -10,10 +10,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use parking_lot::Mutex;
-use zally_chain::{ChainSource, ShieldedPool};
+use zally_chain::{ChainSource, ShieldedPool, Submitter};
 use zally_core::{
     AccountId, BlockHeight, CompactChainMetadata, CompactSaplingOutput, CompactTransaction,
-    CompactTransparentInput, HoldId, IdempotencyKey, Network, TransparentGapLimit, TxId, Zatoshis,
+    CompactTransparentInput, HoldId, IdempotencyKey, Network, PaymentRecipient,
+    TransparentGapLimit, TxId, Zatoshis,
 };
 use zally_keys::{AgeFileSealing, AgeFileSealingOptions, SeedMaterial};
 use zally_storage::{HoldRecord, Sqlite, SqliteOptions, TransparentUtxoRow, WalletStorage};
@@ -21,8 +22,9 @@ use zally_testkit::{
     MockChainSource, MockChainSourceHandle, MockCommitmentTrees, MockSubmitter, TempWalletPath,
 };
 use zally_wallet::{
-    ShieldTransparentPlan, SyncDriver, SyncDriverOptions, SyncHandle, SyncRecoveryPolicy,
-    SyncSnapshot, Wallet, WalletEvent, WalletEventStream, WalletOptions,
+    SendOutcome, SendPaymentPlan, ShieldTransparentPlan, SyncDriver, SyncDriverOptions, SyncHandle,
+    SyncRecoveryPolicy, SyncSnapshot, Wallet, WalletError, WalletEvent, WalletEventStream,
+    WalletOptions,
 };
 use zcash_primitives::transaction::Transaction;
 use zcash_protocol::consensus::BranchId;
@@ -34,6 +36,15 @@ pub(crate) const TRANSPARENT_FUNDING_TX_ID: [u8; 32] = [0x77; 32];
 const TRANSPARENT_UTXO_ZAT: u64 = 1_000_000;
 pub(crate) const SHIELDING_KEY: &str = "withdrawal-0001";
 const HOLD_REQUEST: &str = "hold-request-0001";
+/// Key of the shieldings [`try_shielding`] expects the wallet to refuse.
+const REFUSED_SHIELDING_KEY: &str = "shield-refused";
+/// Tip a wallet that pays a TEX address syncs to before its funding is mined.
+pub(crate) const PRE_FUNDING_TIP_HEIGHT: u32 = 110;
+/// Tip at which the funded note has the confirmations a TEX payment's first step needs.
+pub(crate) const SPEND_TIP_HEIGHT: u32 = PRE_FUNDING_TIP_HEIGHT + 20;
+/// Recipient of the TEX payments the tests make.
+pub(crate) const TEX_RECIPIENT_HASH: [u8; 20] = [0x5e; 20];
+const TEX_PAYMENT_ZAT: u64 = 50_000;
 
 /// Every upgrade through NU7 activates at height 1.
 pub(crate) fn regtest_with_nu7_from_height_one() -> Network {
@@ -267,6 +278,50 @@ pub(crate) async fn record_hold(
         })
         .await?;
     Ok(hold_id)
+}
+
+/// Shields with a wallet that has nothing to shield; returns the error that refused it.
+pub(crate) async fn try_shielding(base: &ChainWallet) -> Result<WalletError, FixtureError> {
+    let submitter = MockSubmitter::accepting(base.network);
+    let outcome = base
+        .wallet
+        .shield_transparent_funds(ShieldTransparentPlan::new(
+            base.account_id,
+            IdempotencyKey::try_from(REFUSED_SHIELDING_KEY)
+                .map_err(|_| FixtureError::Fixture("idempotency key"))?,
+            zatoshis(1_000)?,
+            &submitter,
+        ))
+        .await;
+    outcome
+        .err()
+        .ok_or(FixtureError::Fixture("an unfunded wallet cannot shield"))
+}
+
+/// Pays the TEX address `recipient_hash` under `key` through `Wallet::send_payment`.
+pub(crate) async fn pay_tex(
+    base: &ChainWallet,
+    key: &str,
+    recipient_hash: [u8; 20],
+    submitter: &dyn Submitter,
+) -> Result<SendOutcome, WalletError> {
+    let encoded =
+        zcash_keys::address::Address::Tex(recipient_hash).encode(&base.network.to_parameters());
+    let invalid = |field: &str| WalletError::PaymentRequestParseFailed {
+        reason: field.to_owned(),
+    };
+    base.wallet
+        .send_payment(SendPaymentPlan::conventional(
+            base.account_id,
+            IdempotencyKey::try_from(key).map_err(|_| invalid("idempotency key"))?,
+            PaymentRecipient::TexAddress {
+                encoded,
+                network: base.network,
+            },
+            Zatoshis::try_from(TEX_PAYMENT_ZAT).map_err(|_| invalid("amount"))?,
+            submitter,
+        ))
+        .await
 }
 
 /// Drives `Wallet::sync` and `Wallet::scan_queued_range` until the wallet reaches the tip.

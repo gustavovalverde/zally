@@ -18,23 +18,20 @@ use zally_chain::{
     ChainSourceError, RejectionReason, SubmitOutcome, Submitter, SubmitterError,
     parse_transaction_id,
 };
-use zally_core::{AccountId, BlockHeight, IdempotencyKey, Network, PaymentRecipient, TxId};
+use zally_core::{AccountId, BlockHeight, IdempotencyKey, Network, TxId};
 use zally_storage::WalletStorage as _;
 use zally_wallet::{
-    CircuitBreakerConfig, RetryPolicy, SendOutcome, SendPaymentPlan, ShieldTransparentPlan, Wallet,
-    WalletError, WalletOptions,
+    CircuitBreakerConfig, RetryPolicy, SendOutcome, ShieldTransparentPlan, Wallet, WalletError,
+    WalletOptions,
 };
 
 use super::reorg_fixtures::{
-    ChainWallet, FixtureError, TRANSPARENT_FUNDING_TX_ID, chain_wallet_with_options, funded_chain,
+    ChainWallet, FixtureError, PRE_FUNDING_TIP_HEIGHT, SPEND_TIP_HEIGHT, TEX_RECIPIENT_HASH,
+    TRANSPARENT_FUNDING_TX_ID, chain_wallet_with_options, funded_chain, pay_tex,
     record_transparent_utxo, sync_to_tip,
 };
 
 const SEND_KEY: &str = "payout-0001";
-const PRE_FUNDING_TIP_HEIGHT: u32 = 110;
-/// Tip at which the funded note has the confirmations a TEX payment's first step needs.
-const SPEND_TIP_HEIGHT: u32 = PRE_FUNDING_TIP_HEIGHT + 20;
-const TEX_PAYMENT_ZAT: u64 = 50_000;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_lost_acknowledgement_never_pays_twice() -> Result<(), FixtureError> {
@@ -168,14 +165,16 @@ async fn a_lost_acknowledgement_of_the_paying_step_never_pays_twice() -> Result<
         vec![NodeResponse::Accept, NodeResponse::LoseAcknowledgement],
     );
 
-    let first = pay_tex(&base, &submitter).await;
+    let first = pay_tex(&base, SEND_KEY, TEX_RECIPIENT_HASH, &submitter).await;
     assert!(
         matches!(&first, Err(error) if error.is_retryable()),
         "the lost acknowledgement surfaces as a retryable error: {first:?}"
     );
     let received = submitter.received();
     assert_eq!(received.len(), 2, "both steps reached the node");
-    let retried = pay_tex(&base, &submitter).await?.tx_id();
+    let retried = pay_tex(&base, SEND_KEY, TEX_RECIPIENT_HASH, &submitter)
+        .await?
+        .tx_id();
     assert_eq!(
         Some(retried),
         received.last().copied(),
@@ -195,7 +194,7 @@ async fn a_failed_funding_step_frees_the_key_and_is_never_resubmitted() -> Resul
     let (base, funding_shielding_tx_id) = wallet_with_spendable_note().await?;
     let submitter = ScriptedSubmitter::new(base.network, vec![NodeResponse::LoseAcknowledgement]);
 
-    let first = pay_tex(&base, &submitter).await;
+    let first = pay_tex(&base, SEND_KEY, TEX_RECIPIENT_HASH, &submitter).await;
     assert!(first.is_err(), "the funding step failed: {first:?}");
     assert_eq!(
         submitter.received().len(),
@@ -243,7 +242,7 @@ async fn a_retry_after_a_crash_before_the_funding_step_submits_every_step()
     };
     let entered = Arc::clone(&stalling.entered);
     tokio::select! {
-        _ = pay_tex(&base, &stalling) => {
+        _ = pay_tex(&base, SEND_KEY, TEX_RECIPIENT_HASH, &stalling) => {
             return Err(FixtureError::Fixture("a stalled submission returned"));
         }
         () = entered.notified() => {}
@@ -252,7 +251,9 @@ async fn a_retry_after_a_crash_before_the_funding_step_submits_every_step()
     // received the funding step.
 
     let submitter = ScriptedSubmitter::new(base.network, Vec::new());
-    let retried = pay_tex(&base, &submitter).await?.tx_id();
+    let retried = pay_tex(&base, SEND_KEY, TEX_RECIPIENT_HASH, &submitter)
+        .await?
+        .tx_id();
     let received = submitter.received();
     assert_eq!(
         received.len(),
@@ -316,35 +317,6 @@ async fn shield(base: &ChainWallet, submitter: &dyn Submitter) -> Result<SendOut
             base.account_id,
             key,
             threshold,
-            submitter,
-        ))
-        .await
-}
-
-async fn pay_tex(
-    base: &ChainWallet,
-    submitter: &dyn Submitter,
-) -> Result<SendOutcome, WalletError> {
-    let encoded =
-        zcash_keys::address::Address::Tex([0x5e; 20]).encode(&base.network.to_parameters());
-    let amount = zally_core::Zatoshis::try_from(TEX_PAYMENT_ZAT).map_err(|_| {
-        WalletError::PaymentRequestParseFailed {
-            reason: "amount".into(),
-        }
-    })?;
-    let key =
-        IdempotencyKey::try_from(SEND_KEY).map_err(|_| WalletError::PaymentRequestParseFailed {
-            reason: "idempotency key".into(),
-        })?;
-    base.wallet
-        .send_payment(SendPaymentPlan::conventional(
-            base.account_id,
-            key,
-            PaymentRecipient::TexAddress {
-                encoded,
-                network: base.network,
-            },
-            amount,
             submitter,
         ))
         .await
