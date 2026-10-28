@@ -1839,52 +1839,53 @@ impl WalletStorage for Sqlite {
         key: IdempotencyKey,
         tx_id: TxId,
     ) -> Result<(), StorageError> {
-        let key_str = key.as_str().to_owned();
-        let tx_bytes = tx_id.as_bytes().to_vec();
-        let recorded_at_unix = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0_i64, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX));
+        self.with_ledger(move |conn| bind_idempotency_key(conn, &key, tx_id))
+            .await
+    }
+
+    async fn record_pending_submission(
+        &self,
+        key: IdempotencyKey,
+        tx_id: TxId,
+        records: Vec<crate::wallet::PendingBroadcastRecord>,
+    ) -> Result<(), StorageError> {
         self.with_ledger(move |conn| {
-            let prior = conn
-                .query_row(
-                    "SELECT tx_id_bytes, unmineable_at_height IS NOT NULL \
-                     FROM ext_zally_idempotency WHERE idempotency_key = ?1",
-                    [&key_str],
-                    |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, bool>(1)?)),
-                )
-                .optional()
-                .map_err(|err| StorageError::SqliteFailed {
-                    reason: format!("ext_zally_idempotency lookup failed: {err}"),
-                    posture: FailurePosture::NotRetryable,
-                })?;
-            let statement = match prior {
-                None => {
-                    "INSERT INTO ext_zally_idempotency \
-                         (idempotency_key, tx_id_bytes, recorded_at_unix) \
-                      VALUES (?1, ?2, ?3)"
+            let transaction = conn
+                .unchecked_transaction()
+                .map_err(|err| ledger_transaction_failed("pending-submission record", &err))?;
+            bind_idempotency_key(&transaction, &key, tx_id)?;
+            for record in &records {
+                insert_pending_broadcast_inputs(&transaction, record)?;
+            }
+            transaction
+                .commit()
+                .map_err(|err| ledger_transaction_failed("pending-submission record", &err))
+        })
+        .await
+    }
+
+    async fn release_pending_submission(&self, tx_ids: Vec<TxId>) -> Result<(), StorageError> {
+        self.with_ledger(move |conn| {
+            let transaction = conn
+                .unchecked_transaction()
+                .map_err(|err| ledger_transaction_failed("pending-submission release", &err))?;
+            for tx_id in &tx_ids {
+                for statement in [
+                    "DELETE FROM ext_zally_idempotency \
+                     WHERE tx_id_bytes = ?1 AND unmineable_at_height IS NULL",
+                    "DELETE FROM ext_zally_pending_broadcast_inputs WHERE broadcast_tx_id = ?1",
+                ] {
+                    transaction
+                        .execute(statement, [tx_id.as_bytes().as_slice()])
+                        .map_err(|err| StorageError::SqliteFailed {
+                            reason: format!("pending-submission release failed: {err}"),
+                            posture: FailurePosture::NotRetryable,
+                        })?;
                 }
-                Some((_, true)) => {
-                    "UPDATE ext_zally_idempotency \
-                     SET tx_id_bytes = ?2, recorded_at_unix = ?3, unmineable_at_height = NULL \
-                     WHERE idempotency_key = ?1"
-                }
-                Some((prior_bytes, false)) => {
-                    return if prior_bytes == tx_bytes {
-                        Ok(())
-                    } else {
-                        Err(StorageError::IdempotencyKeyConflict)
-                    };
-                }
-            };
-            conn.execute(
-                statement,
-                rusqlite::params![&key_str, &tx_bytes, recorded_at_unix],
-            )
-            .map_err(|err| StorageError::SqliteFailed {
-                reason: format!("ext_zally_idempotency write failed: {err}"),
-                posture: FailurePosture::NotRetryable,
-            })?;
-            Ok(())
+            }
+            transaction
+                .commit()
+                .map_err(|err| ledger_transaction_failed("pending-submission release", &err))
         })
         .await
     }
@@ -2039,12 +2040,6 @@ impl WalletStorage for Sqlite {
         &self,
         record: crate::wallet::PendingBroadcastRecord,
     ) -> Result<(), StorageError> {
-        let account_uuid_bytes = record.account_id.as_uuid().as_bytes().to_vec();
-        let broadcast_tx_bytes = record.broadcast_tx_id.as_bytes().to_vec();
-        let broadcast_at_ms_i64 = clamp_unsigned_to_i64(record.broadcast_at_ms);
-        let broadcast_at_height_i64 = record.broadcast_at_height.map(|h| i64::from(h.as_u32()));
-        let inputs = record.inputs;
-
         self.with_ledger(move |conn| {
             let tx = conn
                 .unchecked_transaction()
@@ -2054,31 +2049,7 @@ impl WalletStorage for Sqlite {
                     ),
                     posture: FailurePosture::Retryable,
                 })?;
-            {
-                let mut stmt = tx
-                    .prepare_cached(PENDING_BROADCAST_INPUT_UPSERT_SQL)
-                    .map_err(|err| StorageError::SqliteFailed {
-                        reason: format!("ext_zally_pending_broadcast_inputs prepare failed: {err}"),
-                        posture: FailurePosture::NotRetryable,
-                    })?;
-                for (outpoint, value_zat) in inputs {
-                    let outpoint_tx_bytes = outpoint.tx_id.as_bytes().to_vec();
-                    let value_zat_i64 = clamp_unsigned_to_i64(value_zat.as_u64());
-                    stmt.execute(rusqlite::params![
-                        &broadcast_tx_bytes,
-                        &outpoint_tx_bytes,
-                        i64::from(outpoint.output_index),
-                        value_zat_i64,
-                        &account_uuid_bytes,
-                        broadcast_at_ms_i64,
-                        broadcast_at_height_i64,
-                    ])
-                    .map_err(|err| StorageError::SqliteFailed {
-                        reason: format!("ext_zally_pending_broadcast_inputs insert failed: {err}"),
-                        posture: FailurePosture::NotRetryable,
-                    })?;
-                }
-            }
+            insert_pending_broadcast_inputs(&tx, &record)?;
             tx.commit().map_err(|err| StorageError::SqliteFailed {
                 reason: format!("ext_zally_pending_broadcast_inputs commit failed: {err}"),
                 posture: FailurePosture::Retryable,
@@ -3176,6 +3147,105 @@ fn settle_holds_of_unmineable_transaction(
         });
     }
     Ok(holds)
+}
+
+/// Binds `key` to `tx_id` in the idempotency ledger.
+///
+/// A key whose transaction was recorded unmineable is rebound; a key already bound to
+/// `tx_id` is left as it is; a key bound to another transaction that can still be mined fails
+/// with [`StorageError::IdempotencyKeyConflict`].
+fn bind_idempotency_key(
+    conn: &rusqlite::Connection,
+    key: &IdempotencyKey,
+    tx_id: TxId,
+) -> Result<(), StorageError> {
+    let key_str = key.as_str();
+    let tx_bytes = tx_id.as_bytes().to_vec();
+    let recorded_at_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0_i64, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX));
+    let prior = conn
+        .query_row(
+            "SELECT tx_id_bytes, unmineable_at_height IS NOT NULL \
+             FROM ext_zally_idempotency WHERE idempotency_key = ?1",
+            [key_str],
+            |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, bool>(1)?)),
+        )
+        .optional()
+        .map_err(|err| StorageError::SqliteFailed {
+            reason: format!("ext_zally_idempotency lookup failed: {err}"),
+            posture: FailurePosture::NotRetryable,
+        })?;
+    let statement = match prior {
+        None => {
+            "INSERT INTO ext_zally_idempotency \
+                 (idempotency_key, tx_id_bytes, recorded_at_unix) \
+              VALUES (?1, ?2, ?3)"
+        }
+        Some((_, true)) => {
+            "UPDATE ext_zally_idempotency \
+             SET tx_id_bytes = ?2, recorded_at_unix = ?3, unmineable_at_height = NULL \
+             WHERE idempotency_key = ?1"
+        }
+        Some((prior_bytes, false)) => {
+            return if prior_bytes == tx_bytes {
+                Ok(())
+            } else {
+                Err(StorageError::IdempotencyKeyConflict)
+            };
+        }
+    };
+    conn.execute(
+        statement,
+        rusqlite::params![key_str, &tx_bytes, recorded_at_unix],
+    )
+    .map_err(|err| StorageError::SqliteFailed {
+        reason: format!("ext_zally_idempotency write failed: {err}"),
+        posture: FailurePosture::NotRetryable,
+    })?;
+    Ok(())
+}
+
+/// A ledger transaction that could not start or commit, which a retry may complete.
+fn ledger_transaction_failed(operation: &str, err: &rusqlite::Error) -> StorageError {
+    StorageError::SqliteFailed {
+        reason: format!("{operation} transaction failed: {err}"),
+        posture: FailurePosture::Retryable,
+    }
+}
+
+fn insert_pending_broadcast_inputs(
+    conn: &rusqlite::Connection,
+    record: &crate::wallet::PendingBroadcastRecord,
+) -> Result<(), StorageError> {
+    let account_uuid_bytes = record.account_id.as_uuid().as_bytes().to_vec();
+    let broadcast_tx_bytes = record.broadcast_tx_id.as_bytes().to_vec();
+    let broadcast_at_ms_i64 = clamp_unsigned_to_i64(record.broadcast_at_ms);
+    let broadcast_at_height_i64 = record.broadcast_at_height.map(|h| i64::from(h.as_u32()));
+    let mut stmt = conn
+        .prepare_cached(PENDING_BROADCAST_INPUT_UPSERT_SQL)
+        .map_err(|err| StorageError::SqliteFailed {
+            reason: format!("ext_zally_pending_broadcast_inputs prepare failed: {err}"),
+            posture: FailurePosture::NotRetryable,
+        })?;
+    for (outpoint, value_zat) in &record.inputs {
+        let outpoint_tx_bytes = outpoint.tx_id.as_bytes().to_vec();
+        let value_zat_i64 = clamp_unsigned_to_i64(value_zat.as_u64());
+        stmt.execute(rusqlite::params![
+            &broadcast_tx_bytes,
+            &outpoint_tx_bytes,
+            i64::from(outpoint.output_index),
+            value_zat_i64,
+            &account_uuid_bytes,
+            broadcast_at_ms_i64,
+            broadcast_at_height_i64,
+        ])
+        .map_err(|err| StorageError::SqliteFailed {
+            reason: format!("ext_zally_pending_broadcast_inputs insert failed: {err}"),
+            posture: FailurePosture::NotRetryable,
+        })?;
+    }
+    Ok(())
 }
 
 const CHAIN_EVENT_CURSOR_UPSERT_SQL: &str = "\

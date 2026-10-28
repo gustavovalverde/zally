@@ -902,6 +902,36 @@ pub trait WalletStorage: Send + Sync + 'static {
         record: PendingBroadcastRecord,
     ) -> Result<(), StorageError>;
 
+    /// Records a send before any of its transactions is submitted: binds `key` to `tx_id`,
+    /// the transaction that pays, and records the pending-broadcast inputs of every
+    /// transaction in `records`, in one storage transaction.
+    ///
+    /// Recording first means a lost submit acknowledgement, or a crash between the broadcast
+    /// and any later write, cannot let a retry with the same key build and pay a second
+    /// transaction: the retry finds the key bound. A binding whose transaction is never
+    /// mined is freed by [`Self::record_unmineable_transaction`]. Rebinding follows
+    /// [`Self::record_idempotent_submission`].
+    ///
+    /// `not_retryable` on `IdempotencyKeyConflict` or schema errors; `retryable` on transient
+    /// I/O.
+    async fn record_pending_submission(
+        &self,
+        key: IdempotencyKey,
+        tx_id: TxId,
+        records: Vec<PendingBroadcastRecord>,
+    ) -> Result<(), StorageError>;
+
+    /// Undoes [`Self::record_pending_submission`] for transactions that can never be mined:
+    /// drops the idempotency bindings that still name any of `tx_ids` and their
+    /// pending-broadcast inputs, in one storage transaction.
+    ///
+    /// The caller passes only transactions no submitter received, or ones a node rejected
+    /// for a reason that holds for every block. Releasing one that may still be mined would
+    /// let its key pay twice.
+    ///
+    /// `not_retryable` on schema errors; `retryable` on transient I/O.
+    async fn release_pending_submission(&self, tx_ids: Vec<TxId>) -> Result<(), StorageError>;
+
     /// Returns every pending broadcast input owned by `account_id` whose `broadcast_at_ms`
     /// is at or after `after_at_ms`. Older rows are filtered out so the caller does not
     /// need to apply the inflight-window cutoff itself.
@@ -929,8 +959,7 @@ pub trait WalletStorage: Send + Sync + 'static {
     /// Drops every pending-broadcast row whose `broadcast_tx_id` appears in `tx_ids`.
     ///
     /// Called by `Wallet::sync` to retire pending entries whose spending transaction is mined
-    /// at or below the height it judges pending broadcasts at, and by the spend path when a
-    /// submission fails.
+    /// at or below the height it judges pending broadcasts at.
     ///
     /// Returns the number of rows removed.
     ///

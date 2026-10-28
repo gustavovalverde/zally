@@ -1,5 +1,6 @@
 //! `WalletStorage::record_idempotent_submission` + `find_idempotent_submission` integration,
-//! and the terminal state `record_unmineable_transaction` gives a key.
+//! the terminal state `record_unmineable_transaction` gives a key, and the send record
+//! `record_pending_submission` writes before submitting.
 
 use tempfile::TempDir;
 use zally_core::{AccountId, BlockHeight, IdempotencyKey, OutPoint, TxId, Zatoshis};
@@ -107,6 +108,76 @@ async fn a_key_whose_transaction_is_unmineable_binds_its_replacement() -> Result
     assert!(
         matches!(conflict, Err(StorageError::IdempotencyKeyConflict)),
         "the replacement binds the key until it too is judged unmineable: {conflict:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_pending_submission_binds_the_paying_transaction_until_released() -> Result<(), TestError>
+{
+    let temp = TempDir::new()?;
+    let storage = Sqlite::new(SqliteOptions::for_network(
+        zally_core::Network::regtest(),
+        temp.path().join("wallet.db"),
+    ));
+    storage.open_or_create().await?;
+    let key = IdempotencyKey::try_from("payout-0002")?;
+    let funding = TxId::from_bytes([0x11_u8; 32]);
+    let paying = TxId::from_bytes([0x22_u8; 32]);
+    let account_id = AccountId::from_uuid(uuid::Uuid::from_bytes([0x33_u8; 16]));
+    let record = |broadcast_tx_id: TxId, outpoint_tx_byte: u8| PendingBroadcastRecord {
+        broadcast_tx_id,
+        account_id,
+        broadcast_at_ms: 1,
+        broadcast_at_height: Some(BlockHeight::from(10)),
+        inputs: vec![(
+            OutPoint::new(TxId::from_bytes([outpoint_tx_byte; 32]), 0),
+            Zatoshis::try_from(1_000_u64).unwrap_or(Zatoshis::zero()),
+        )],
+    };
+    let pending_broadcasts = || async {
+        let mut broadcasts: Vec<TxId> = storage
+            .list_pending_broadcast_inputs(account_id, 0)
+            .await?
+            .into_iter()
+            .map(|row| row.broadcast_tx_id)
+            .collect();
+        broadcasts.sort_by_key(|tx_id| *tx_id.as_bytes());
+        Ok::<_, StorageError>(broadcasts)
+    };
+
+    storage
+        .record_pending_submission(
+            key.clone(),
+            paying,
+            vec![record(funding, 0x44), record(paying, 0x55)],
+        )
+        .await?;
+    assert_eq!(
+        storage.find_idempotent_submission(&key).await?,
+        Some(paying)
+    );
+    assert_eq!(pending_broadcasts().await?, vec![funding, paying]);
+
+    let conflict = storage
+        .record_pending_submission(key.clone(), funding, vec![record(funding, 0x44)])
+        .await;
+    assert!(
+        matches!(conflict, Err(StorageError::IdempotencyKeyConflict)),
+        "a bound key refuses another transaction: {conflict:?}"
+    );
+    assert_eq!(
+        pending_broadcasts().await?,
+        vec![funding, paying],
+        "the refused record writes nothing"
+    );
+
+    storage.release_pending_submission(vec![paying]).await?;
+    assert_eq!(storage.find_idempotent_submission(&key).await?, None);
+    assert_eq!(
+        pending_broadcasts().await?,
+        vec![funding],
+        "a step that may be in flight keeps its pending inputs"
     );
     Ok(())
 }

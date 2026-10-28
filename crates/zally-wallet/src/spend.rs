@@ -7,8 +7,8 @@
 
 use zally_chain::{ShieldedPool, Submitter};
 use zally_core::{
-    AccountId, BlockHeight, IdempotencyKey, Memo, MemoBytes, Network, OutPoint, PaymentRecipient,
-    TxId, Zatoshis,
+    AccountId, BlockHeight, IdempotencyKey, Memo, MemoBytes, Network, PaymentRecipient, TxId,
+    Zatoshis,
 };
 use zally_storage::ProposalRejectionKind;
 
@@ -25,14 +25,7 @@ struct SubmissionContext<'a> {
     submitter: &'a dyn Submitter,
     account_id: AccountId,
     visible_tip: Option<BlockHeight>,
-}
-
-/// Pending-broadcast row contents derived from one prepared transaction.
-struct PendingBroadcastSnapshot {
-    broadcast_tx_id: TxId,
-    broadcast_at_ms: u64,
-    visible_tip: Option<BlockHeight>,
-    inputs: Vec<(OutPoint, Zatoshis)>,
+    idempotency: &'a IdempotencyKey,
 }
 
 /// Parsed ZIP-321 payment request.
@@ -352,12 +345,15 @@ impl Wallet {
     /// Calls `WalletStorage::prepare_payment` to run `propose_transfer` +
     /// `create_proposed_transactions` against the live `WalletDb` using a `LocalTxProver`
     /// loaded from the platform-default Sapling params location, then submits the raw
-    /// transaction bytes through the supplied `Submitter`. Returns the first txid; multi-step
-    /// proposals submit each step in order and return the first.
+    /// transaction bytes through the supplied `Submitter`. Multi-step proposals (ZIP 320)
+    /// submit each step in order; the returned transaction is the last one, which pays the
+    /// recipient.
     ///
-    /// `plan.idempotency` makes the send idempotent. A key that already names a transaction
+    /// `plan.idempotency` makes the send idempotent. The key is bound to the paying
+    /// transaction before anything is submitted. A key that already names a transaction
     /// returns that transaction instead of building another, while the transaction is pending
-    /// or mined. Once [`Wallet::sync`] judges it unmineable and reports
+    /// or mined, including after a submit error that may have reached the node or a node
+    /// rejection. Once [`Wallet::sync`] judges it unmineable and reports
     /// [`WalletEvent::PendingBroadcastUnmineable`](crate::WalletEvent::PendingBroadcastUnmineable),
     /// the same key builds one replacement. Sends that share a key through one wallet handle
     /// run one at a time, so concurrent retries return the same transaction.
@@ -441,14 +437,10 @@ impl Wallet {
                     submitter: plan.submitter,
                     account_id: plan.account_id,
                     visible_tip,
+                    idempotency: &plan.idempotency,
                 },
                 prepared,
             )
-            .await?;
-
-        self.inner
-            .storage
-            .record_idempotent_submission(plan.idempotency, result_tx_id)
             .await?;
 
         Ok(SendOutcome {
@@ -540,9 +532,10 @@ impl Wallet {
     /// caller should run [`Wallet::sync`] first so transparent UTXOs have been refreshed from
     /// the configured [`zally_chain::ChainSource`].
     ///
-    /// `plan.idempotency` makes the send idempotent. A key that already names a transaction
-    /// returns that transaction instead of building another, while the transaction is pending
-    /// or mined. Once [`Wallet::sync`] judges it unmineable and reports
+    /// `plan.idempotency` makes the send idempotent, as for [`Wallet::send_payment`]: the key
+    /// is bound to the shielding transaction before it is submitted, and a key that already
+    /// names a transaction returns that transaction instead of building another, while the
+    /// transaction is pending or mined. Once [`Wallet::sync`] judges it unmineable and reports
     /// [`WalletEvent::PendingBroadcastUnmineable`](crate::WalletEvent::PendingBroadcastUnmineable),
     /// the same key builds one replacement. Sends that share a key through one wallet handle
     /// run one at a time, so concurrent retries return the same transaction.
@@ -608,14 +601,10 @@ impl Wallet {
                     submitter: plan.submitter,
                     account_id: plan.account_id,
                     visible_tip,
+                    idempotency: &plan.idempotency,
                 },
                 prepared,
             )
-            .await?;
-
-        self.inner
-            .storage
-            .record_idempotent_submission(plan.idempotency, result_tx_id)
             .await?;
 
         Ok(SendOutcome {
@@ -631,95 +620,96 @@ impl Wallet {
         })
     }
 
-    /// Submits each prepared transaction, recording its outpoints in the pending-broadcast
-    /// filter **before** the submit call so a crash between submit-accept and
-    /// row-persistence cannot leave an in-flight broadcast unrecorded. On submit rejection
-    /// the just-recorded row is removed so the outpoints become spendable again.
+    /// Submits the prepared transactions in order, after durably recording the send.
     ///
-    /// Returns the first transaction's `(tx_id, tx_expiry_height)` pair so callers can
+    /// The last transaction is the one that pays; earlier steps of a multi-step proposal
+    /// (ZIP 320) only fund it. Before anything is submitted, one storage transaction binds
+    /// the idempotency key to the paying transaction and records every transaction's
+    /// transparent inputs as pending. A lost submit acknowledgement or a crash after the
+    /// broadcast therefore leaves the key bound, and a retry with the same key returns the
+    /// paying transaction instead of building and paying a second one.
+    ///
+    /// A failed step releases the binding only when the paying transaction can no longer be
+    /// mined: the failure stopped the send before the paying transaction reached a submitter
+    /// (an open circuit breaker never calls it), or a node rejected a step for a reason that
+    /// holds for every block ([`is_definitive_rejection`]). The released transactions lose
+    /// their pending rows, while an earlier step a node may hold keeps them. Any other
+    /// failure of the paying transaction may have reached the node and keeps everything; the
+    /// pending-broadcast verdict frees the key if that transaction is never mined.
+    ///
+    /// Returns the paying transaction's `(tx_id, tx_expiry_height)` pair so callers can
     /// pass expiry through to consumers that need to bound their wait for confirmation.
     async fn submit_and_record_pending(
         &self,
         submission: SubmissionContext<'_>,
         prepared: Vec<zally_storage::PreparedTransaction>,
     ) -> Result<(TxId, BlockHeight), WalletError> {
-        let mut first_result = None;
+        let Some(paying) = prepared.last() else {
+            return Err(WalletError::ProposalRejected {
+                kind: ProposalRejectionKind::Other,
+                reason: "transaction construction returned no transactions".into(),
+            });
+        };
+        let paying_result = (paying.tx_id, paying.tx_expiry_height);
         let broadcast_at_ms = current_unix_ms();
-        for transaction in prepared {
-            let tx_expiry_height = transaction.tx_expiry_height;
-            self.record_broadcast_inputs(
-                submission.account_id,
-                PendingBroadcastSnapshot {
-                    broadcast_tx_id: transaction.tx_id,
-                    broadcast_at_ms,
-                    visible_tip: submission.visible_tip,
-                    inputs: transaction.transparent_inputs.clone(),
-                },
-            )
+        let records = prepared
+            .iter()
+            .map(|transaction| zally_storage::PendingBroadcastRecord {
+                broadcast_tx_id: transaction.tx_id,
+                account_id: submission.account_id,
+                broadcast_at_ms,
+                broadcast_at_height: submission.visible_tip,
+                inputs: transaction.transparent_inputs.clone(),
+            })
+            .collect();
+        self.inner
+            .storage
+            .record_pending_submission(submission.idempotency.clone(), paying_result.0, records)
             .await?;
 
+        for (step_index, transaction) in prepared.iter().enumerate() {
             let policy = self.broadcast_retry_policy();
-            let outcome = crate::retry::with_breaker_and_retry(
+            let submitted = crate::retry::with_breaker_and_retry(
                 &self.inner.circuit_breaker,
                 policy,
                 submission.operation,
                 || submission.submitter.submit(&transaction.raw_bytes),
                 WalletError::from,
             )
-            .await;
-            let outcome = match outcome {
-                Ok(outcome) => outcome,
-                Err(err) => {
-                    self.clear_pending_after_failed_submit(transaction.tx_id)
-                        .await;
-                    return Err(err);
-                }
-            };
-            let tx_id = match resolve_send_outcome(outcome, transaction.tx_id) {
-                Ok(tx_id) => tx_id,
-                Err(err) => {
-                    self.clear_pending_after_failed_submit(transaction.tx_id)
-                        .await;
-                    return Err(err);
-                }
-            };
-            if first_result.is_none() {
-                first_result = Some((tx_id, tx_expiry_height));
-            }
-        }
-        first_result.ok_or_else(|| WalletError::ProposalRejected {
-            kind: ProposalRejectionKind::Other,
-            reason: "transaction construction returned no transactions".into(),
-        })
-    }
-
-    async fn record_broadcast_inputs(
-        &self,
-        account_id: AccountId,
-        snapshot: PendingBroadcastSnapshot,
-    ) -> Result<(), WalletError> {
-        if snapshot.inputs.is_empty() {
-            return Ok(());
-        }
-        self.inner
-            .storage
-            .record_pending_broadcast_inputs(zally_storage::PendingBroadcastRecord {
-                broadcast_tx_id: snapshot.broadcast_tx_id,
-                account_id,
-                broadcast_at_ms: snapshot.broadcast_at_ms,
-                broadcast_at_height: snapshot.visible_tip,
-                inputs: snapshot.inputs,
-            })
             .await
-            .map_err(WalletError::from)
-    }
-
-    async fn clear_pending_after_failed_submit(&self, broadcast_tx_id: TxId) {
-        let _ = self
-            .inner
-            .storage
-            .clear_pending_broadcast_inputs_for_mined(&[broadcast_tx_id])
-            .await;
+            .and_then(|outcome| resolve_send_outcome(outcome, transaction.tx_id));
+            let Err(error) = submitted else {
+                continue;
+            };
+            let never_mined_from = if is_unsubmitted_or_definitively_rejected(&error) {
+                step_index
+            } else {
+                step_index.saturating_add(1)
+            };
+            let never_mined: Vec<TxId> = prepared
+                .get(never_mined_from..)
+                .unwrap_or_default()
+                .iter()
+                .map(|step| step.tx_id)
+                .collect();
+            if !never_mined.is_empty()
+                && let Err(release_error) = self
+                    .inner
+                    .storage
+                    .release_pending_submission(never_mined)
+                    .await
+            {
+                tracing::error!(
+                    target: "zally::wallet",
+                    event = "pending_submission_release_failed",
+                    %release_error,
+                    %error,
+                    "send failed and its idempotency key stays bound until the pending-broadcast verdict"
+                );
+            }
+            return Err(error);
+        }
+        Ok(paying_result)
     }
 
     async fn visible_tip_or_zero(&self) -> Result<BlockHeight, WalletError> {
@@ -730,6 +720,32 @@ impl Wallet {
             .await?
             .unwrap_or_else(|| BlockHeight::from(0)))
     }
+}
+
+/// Whether a failed submission proves its transaction can never be mined.
+///
+/// An open circuit breaker fails the call before any submitter sees the transaction. A node
+/// rejection proves it only when its reason holds for every block
+/// ([`is_definitive_rejection`]).
+fn is_unsubmitted_or_definitively_rejected(error: &WalletError) -> bool {
+    matches!(error, WalletError::CircuitBroken { .. })
+        || matches!(
+            error,
+            WalletError::SubmissionRejected { reason, .. } if is_definitive_rejection(*reason)
+        )
+}
+
+/// Whether a node rejection proves that no copy of the transaction can ever be mined, so its
+/// idempotency key may build a replacement at once.
+///
+/// No rejection proves it yet. The chain source types a rejection by matching the node's
+/// free-form message, and a reason such as an expired or wrong-branch verdict describes the
+/// node's tip at one attempt rather than every block, while an earlier attempt whose
+/// acknowledgement was lost may already have been accepted. Every rejection therefore keeps
+/// the key bound until the pending-broadcast verdict frees it. Once the chain source reports
+/// rejection reasons that hold for every block, this is where they release the key.
+const fn is_definitive_rejection(_reason: zally_chain::RejectionReason) -> bool {
+    false
 }
 
 fn resolve_shielding_request(

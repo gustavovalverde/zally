@@ -134,26 +134,7 @@ pub(crate) async fn funded_chain(pre_funding_tip: u32) -> Result<FundedChain, Fi
     base.chain_handle
         .advance_tip(BlockHeight::from(pre_funding_tip));
     sync_to_tip(&base.wallet, base.chain.as_ref()).await?;
-
-    let address = base
-        .storage
-        .derive_next_address_with_transparent(base.account_id)
-        .await?;
-    let transparent = address.transparent().copied().ok_or(FixtureError::Fixture(
-        "derived address has no transparent receiver",
-    ))?;
-    base.storage
-        .record_transparent_utxos(
-            None,
-            vec![TransparentUtxoRow::new(
-                TxId::from_bytes(TRANSPARENT_FUNDING_TX_ID),
-                0,
-                zatoshis(TRANSPARENT_UTXO_ZAT)?,
-                BlockHeight::from(1),
-                Script::from(transparent.script()).0.0,
-            )],
-        )
-        .await?;
+    record_transparent_utxo(&base, TRANSPARENT_FUNDING_TX_ID).await?;
 
     let submitter = Arc::new(
         MockSubmitter::accepting(base.network).with_tx_id_derivation(parsed_transaction_id),
@@ -202,6 +183,33 @@ pub(crate) async fn funded_chain(pre_funding_tip: u32) -> Result<FundedChain, Fi
         .chain_handle
         .advance_tip(BlockHeight::from(tip_height));
     Ok(funded)
+}
+
+/// Records a transparent UTXO the wallet owns, created by `funding_tx_id` at height 1.
+pub(crate) async fn record_transparent_utxo(
+    base: &ChainWallet,
+    funding_tx_id: [u8; 32],
+) -> Result<(), FixtureError> {
+    let address = base
+        .storage
+        .derive_next_address_with_transparent(base.account_id)
+        .await?;
+    let transparent = address.transparent().copied().ok_or(FixtureError::Fixture(
+        "derived address has no transparent receiver",
+    ))?;
+    base.storage
+        .record_transparent_utxos(
+            None,
+            vec![TransparentUtxoRow::new(
+                TxId::from_bytes(funding_tx_id),
+                0,
+                zatoshis(TRANSPARENT_UTXO_ZAT)?,
+                BlockHeight::from(1),
+                Script::from(transparent.script()).0.0,
+            )],
+        )
+        .await?;
+    Ok(())
 }
 
 /// Records a hold in the wallet's ledger, as a dispense reservation would.
