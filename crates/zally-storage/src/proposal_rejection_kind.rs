@@ -61,10 +61,47 @@ pub enum ProposalRejectionKind {
     ///
     /// Posture: [`FailurePosture::RequiresOperator`]; this is a defect, not a balance problem.
     SelectionContractViolated,
+    /// A transaction of the proposal carries more shielded components than ZIP 218 allows in
+    /// one block once NU7 is active, so no block could include it.
+    ///
+    /// Posture: [`FailurePosture::NotRetryable`]; send a smaller amount so fewer notes are
+    /// spent, or first consolidate notes in transactions that each stay within the limits.
+    ShieldedLimitExceeded {
+        /// The per-block limit the transaction exceeds.
+        limit: ShieldedBlockLimit,
+        /// The transaction's components counted against that limit, padding included.
+        component_count: usize,
+    },
     /// Any other rejection; the accompanying reason carries the detail.
     ///
     /// Posture: [`FailurePosture::NotRetryable`].
     Other,
+}
+
+/// A ZIP 218 limit on the shielded components of one block where NU7 is active.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum ShieldedBlockLimit {
+    /// Orchard actions, at most 330.
+    OrchardActions,
+    /// Ironwood actions, at most 330, counted apart from Orchard actions.
+    IronwoodActions,
+    /// Sapling spends and outputs together, at most 300.
+    SaplingSpendsAndOutputs,
+    /// Orchard actions, Ironwood actions, and Sapling spends and outputs together, at most
+    /// 330.
+    AllShieldedPools,
+}
+
+impl std::fmt::Display for ShieldedBlockLimit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::OrchardActions => "Orchard actions",
+            Self::IronwoodActions => "Ironwood actions",
+            Self::SaplingSpendsAndOutputs => "Sapling spends and outputs",
+            Self::AllShieldedPools => "shielded components across all pools",
+        })
+    }
 }
 
 impl ProposalRejectionKind {
@@ -79,6 +116,7 @@ impl ProposalRejectionKind {
             | Self::ExpiryConflictsWithCanonicalCrossing { .. }
             | Self::RecipientAddressExpired
             | Self::OrchardRecipientNeedsIronwood
+            | Self::ShieldedLimitExceeded { .. }
             | Self::Other => FailurePosture::NotRetryable,
         }
     }

@@ -8,22 +8,21 @@
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub struct WalletOptions {
-    /// How long after a successful broadcast a wallet-owned transaction's transparent inputs
-    /// stay excluded from new input selection. The exclusion is what stops the auto-shield
-    /// loop from selecting the same outpoints across consecutive ticks before the spending
-    /// tx has been observed mined.
+    /// Age after which `Wallet::get_pending_transparent_inputs` flags a pending broadcast's
+    /// inputs as stale.
     ///
-    /// The same value drives `Wallet::get_pending_transparent_inputs`: it bounds how far
-    /// back the snapshot reaches. Entries older than the window are dropped from the
-    /// snapshot and become eligible inputs again on the next spend.
+    /// The flag is an operator signal only. A pending broadcast stays recorded until
+    /// `Wallet::sync` sees it mined at a settled height or judges it unmineable, however old
+    /// it is, because the settled tip can trail the chain by the source's whole reorg window.
+    /// Whether an input can be selected again is librustzcash's decision, from its locks,
+    /// persisted spends, and transaction expiry.
     ///
-    /// Default: 2 hours (7,200,000 ms). Operators on faster networks (mainnet 75-second
-    /// blocks) may reduce; testnet/regtest deployments can stay at the default.
+    /// Default: 2 hours (7,200,000 ms).
     pub pending_broadcast_window_ms: u64,
 }
 
 impl WalletOptions {
-    /// Default inflight window for pending wallet-owned broadcasts: 2 hours.
+    /// Default age after which pending broadcast inputs are flagged stale: 2 hours.
     pub const DEFAULT_PENDING_BROADCAST_WINDOW_MS: u64 = 2 * 60 * 60 * 1000;
 
     /// Returns a copy of `self` with `pending_broadcast_window_ms` set to `window_ms`.

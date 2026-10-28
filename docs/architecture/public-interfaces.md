@@ -98,13 +98,13 @@ A name must survive a change of its implementation.
 | `AccountBalance` | `zally-wallet` | Per-pool balance snapshot anchored to the persisted visible tip; network-tagged with mature/immature transparent split. |
 | `ExposedAddress` | `zally-wallet` | Previously-derived Unified Address in derivation order, with diversifier index and transparent-receiver flag. |
 | `PendingTransparentInputs` | `zally-wallet` | Snapshot of transparent outpoints locked by wallet-owned broadcasts not yet observed mined. |
-| `PendingTransparentInput` | `zally-wallet` | Single locked outpoint, with `broadcast_tx_id`, `broadcast_at_ms`, and `broadcast_at_height`. The same field names appear on the storage-side row; no rename across layers. |
+| `PendingTransparentInput` | `zally-wallet` | Single outpoint spent by an unsettled broadcast, with `broadcast_tx_id`, `broadcast_at_ms`, `broadcast_at_height`, and `is_stale`. The same field names appear on the storage-side row; no rename across layers. |
 | `DispenseReservation` | `zally-wallet` | Amount lock returned by `Wallet::reserve_for_dispense`. Carries the wallet-issued `ReservationId`, the caller-supplied `request_id` and `idempotency_key`, `amount_zat`, `locked_notes_summary`, and `available_after_release_zat`. |
 | `LockedNotesSummary` | `zally-wallet` | Count and total value of the shielded notes the wallet considered locked at reservation time. Informational; reservations enforce by amount, not by note identity. |
 | `ReserveForDispensePlan` | `zally-wallet` | Inputs to `Wallet::reserve_for_dispense`: `account_id`, `amount_zat`, `request_id`, `idempotency_key`. |
 | `SignedPayload` | `zally-core` | Chain-neutral envelope returned by wallet-runtime signers and consumed by facilitators. `bytes` carry the opaque signed artifact, `format` names how to extract or broadcast it, and chain-specific amounts stay in the `Amount` decimal-string shape. |
 | `SignedPayloadFormat` | `zally-core` | Wire discriminant for `SignedPayload::bytes`. Zcash x402 exact uses `pczt-v2-extractable`; older PCZT v1 integrations use `pczt-v1`. |
-| `WalletOptions` | `zally-wallet` | Open-time wallet configuration; currently carries the pending-broadcast inflight window. |
+| `WalletOptions` | `zally-wallet` | Open-time wallet configuration; currently carries the age after which pending broadcast inputs are flagged stale. |
 | `ExportPaymentDisclosurePlan` | `zally-wallet` | Network-tagged recipient, transaction, amount, message, and explicit ZIP-311 profile used by `Wallet::export_payment_disclosure`. |
 | `PaymentDisclosure` | `zally-wallet` | Network-tagged wrapper around the portable, canonically encoded disclosure. Its `Debug` output omits messages, proofs, and outgoing cipher keys. |
 | `OutPoint` | `zally-core` | Transparent transaction outpoint (`tx_id` + `output_index`). Zally-owned so the public surface composes only Zally domain types; inside `zally-storage` the upstream `zcash_transparent::bundle::OutPoint` is imported as `UpstreamOutPoint` to avoid the same-name collision. |
@@ -113,13 +113,17 @@ A name must survive a change of its implementation.
 | `SyncSnapshot` | `zally-wallet` | Observable state emitted by a running `SyncDriver`. |
 | `SyncObservation` | `zally-wallet` | Chain state the wallet has committed and checked against the chain, and when. Carried on `SyncSnapshot::last_observation`; the age input to a consumer's spend-freshness gate. |
 | `WalletStorage` | `zally-storage` | Trait abstraction over librustzcash's `WalletRead` + `WalletWrite`. |
+| `PendingBroadcastTransaction` | `zally-storage` | A wallet-owned broadcast whose fate the chain has not settled: transaction ID, stored bytes, and mined height. Returned by `WalletStorage::list_pending_broadcast_transactions`. |
 | `ProposalRejectionKind` | `zally-storage`, re-exported by `zally-wallet` | Why a proposal or its transaction could not be built, with its posture. Carried by `WalletError::ProposalRejected` and `StorageError::ProposalRejected`; see the [error vocabulary](../reference/error-vocabulary.md#proposalrejectionkind). |
+| `ShieldedBlockLimit` | `zally-storage`, re-exported by `zally-wallet` | The ZIP 218 per-block limit a proposal exceeded: Orchard actions, Ironwood actions, Sapling spends and outputs, or all shielded pools together. Carried by `ProposalRejectionKind::ShieldedLimitExceeded`. |
 | `ChainSource` | `zally-chain` | Trait for compact-block reads, tree state, transparent UTXO lookups. |
 | `ChainEventCursor` | `zally-chain` | Opaque cursor for resuming chain-event streams without exposing backend internals. |
 | `ChainEventStreamStart` | `zally-chain` | Explicit chain-event subscription start position (`AfterCursor` \| `EarliestRetained` \| `LiveTail`). |
 | `ChainEventEnvelope` | `zally-chain` | Cursor-bound chain event consumed by sync drivers. |
 | `Submitter` | `zally-chain` | Trait for transaction broadcast. |
 | `TransactionParseError` | `zally-chain` | Typed rejection of malformed serialized transaction bytes at the chain-plane boundary. |
+| `TransactionHeader` | `zally-chain` | Version, consensus branch, and expiry height of a serialized transaction or a PCZT. `check_mineable` says whether any block after a given tip can still include it. |
+| `UnmineableReason` | `zally-chain` | Why a transaction can never be mined: `Expired`, `ConsensusBranchMismatch`, or `VersionNotAccepted`. Carried by `WalletError::TransactionUnmineable`. |
 | `SeedSealing` | `zally-keys` | Trait for at-rest seed encryption. |
 | `WalletCapabilities` | `zally-wallet` | Runtime descriptor of supported features (ZIP coverage, PCZT version, sealing impl). |
 
@@ -224,6 +228,12 @@ Zally's public API is the contract; librustzcash version churn behind Zally is n
 
 Internal modules (`pub(crate)`, private), test code, fixtures, and rustdoc examples are not covered by semver.
 
+`WalletStorage` is a public trait, so a new required method breaks every implementation outside Zally. The NU7 activation guards made these breaking changes:
+
+- Added `list_pending_broadcast_transactions`, which returns `PendingBroadcastTransaction` values, and `record_unmineable_transaction`.
+- Removed `clear_expired_pending_broadcast_inputs`, because wall-clock age no longer retires a pending broadcast.
+- `find_idempotent_submission` returns `None`, and `record_idempotent_submission` rebinds the key, once the key's transaction is recorded as unmineable.
+
 ## Capability surface
 
 The contract surface Zally publishes, grouped by domain. Each item is a guarantee the public API enforces.
@@ -234,7 +244,7 @@ The contract surface Zally publishes, grouped by domain. Each item is a guarante
 - **CORE-2**: Open an existing wallet from a sealed seed; fail closed on integrity error.
 - **CORE-3**: One operator identity per process; the wallet has one account per `Wallet::create`.
 - **CORE-4**: UA derivation per ZIP-316; UFVK and UIVK export. Previously exposed Unified Addresses are queryable in derivation order via `Wallet::list_exposed_addresses` without advancing the diversifier index or consuming BIP-44 transparent gap-limit slots.
-- **CORE-5**: Idempotent send by `IdempotencyKey`.
+- **CORE-5**: Idempotent send by `IdempotencyKey`. `Wallet::send_payment` and `Wallet::shield_transparent_funds` return the transaction a key already names while it is pending or mined, without building another. Once SYNC-10 records that transaction as unmineable, the key builds one replacement on its next send. Sends that share a key through one wallet handle run one at a time, so concurrent retries cannot build two transactions.
 - **CORE-6**: Network-tagged types throughout; compile error if a network is missing.
 
 Unified Address strings are encoded at ZIP-316 Revision 0 when Revision 0 can represent the address, and at Revision 2 otherwise. Addresses that Zally derives always carry a shielded receiver and no metadata, so they encode at Revision 0 (for example, Regtest `uregtest1…`). A recipient may still present a Revision 2 address, whose prefixes differ (for example, `zuregtest1…` or `turegtest1…`). Callers should parse the address and validate its network instead of classifying it by a fixed prefix. `AccountId` values derive from the Revision 0 UFVK encoding and stay stable across upstream encoder changes.
@@ -254,6 +264,7 @@ Unified Address strings are encoded at ZIP-316 Revision 0 when Revision 0 can re
 - **CHAIN-4**: `ChainEventCursor` is opaque Zally vocabulary. Backend cursor types never cross the public Zally API.
 - **CHAIN-5**: A chain-event subscription states its start position explicitly through `ChainEventStreamStart` (`AfterCursor` | `EarliestRetained` | `LiveTail`); there is no implicit empty-cursor default.
 - **CHAIN-6**: `parse_transaction_expiry_height` parses a serialized transaction through the same librustzcash family as the chain plane and returns its `BlockHeight` without pulling a storage backend into the caller.
+- **CHAIN-7**: `parse_transaction_header` returns a transaction's `TransactionHeader`, and `TransactionHeader::from_pczt_global` builds one from a PCZT's global fields. `TransactionHeader::check_mineable(network, tip_height)` judges the block after the tip with `BranchId::for_height` and `TxVersion::valid_in_branch`: it rejects a transaction that expired, that commits to a consensus branch the chain has left, or whose version the branch no longer accepts. A transaction committed to a branch that activates later is not rejected.
 
 ### Sync and scanning (SYNC)
 
@@ -266,6 +277,7 @@ Unified Address strings are encoded at ZIP-316 Revision 0 when Revision 0 can re
 - **SYNC-7**: `Wallet::status_snapshot() -> WalletStatus` reports `SyncStatus`, scan height, observed tip, lag, subscriber count, and circuit-breaker state.
 - **SYNC-8**: `Wallet::open_or_create_account(...) -> (Wallet, AccountId)` opens the sealed-seed account or creates it on a fresh storage volume.
 - **SYNC-9**: `Wallet::sync(...)` refreshes wallet-owned transparent UTXOs through `ChainSource::transparent_utxos` because compact blocks do not expose transparent receive details.
+- **SYNC-10**: Each `Wallet::sync` and `Wallet::scan_queued_range` settles pending broadcasts at the judged height, the lower of the fully scanned height and the settled tip. The pending broadcasts are the transactions with pending-broadcast rows and the unmined transactions an idempotency key still names. A broadcast mined at or below the judged height loses its pending-broadcast rows. A broadcast that CHAIN-7 rules out for every block above it, such as one signed for NU6.3 while NU7 activated, is recorded as unmineable: in one storage transaction its pending-broadcast rows are dropped and its idempotency keys become free for a replacement (CORE-5). `WalletEvent::PendingBroadcastUnmineable` reports it exactly once, and the host recreates the payment. Nothing else retires a pending broadcast; wall-clock age never does, because the settled tip can trail the chain by the source's whole reorg window. Judging at the judged height means a broadcast that an unscanned block, or a reorg within the chain source's bound, could still mine is never reported. librustzcash keeps excluding an unmineable transaction's inputs from selection until its expiry height passes.
 
 ### Spending (SPEND)
 
@@ -277,9 +289,10 @@ Unified Address strings are encoded at ZIP-316 Revision 0 when Revision 0 can re
 - **SPEND-6**: ZIP-321 payment URI parsing through `PaymentRequest::from_uri`.
 - **SPEND-7**: `Wallet::shield_transparent_funds(ShieldTransparentPlan) -> SendOutcome` explicitly shields wallet-owned transparent UTXOs before shielded spending. `ShieldTransparentPlan::with_destination_pool(ShieldedPool)` selects Sapling, Orchard, or Ironwood explicitly; omitting it preserves the activation-aware default. Proposal inputs are locked through librustzcash's `LockRequest` until transaction creation records their spends. A failed build releases its locks before returning; concurrent proposals exclude active locks through `LockedInputPolicy::Exclude`.
 - **SPEND-8**: `Wallet::get_account_balance(account_id) -> AccountBalance` returns a per-pool balance snapshot (Sapling, Orchard, Ironwood, transparent-mature, transparent-immature) anchored to the wallet's persisted visible tip. Read-only; composes the persisted wallet rows that drive `Wallet::sync` and `Wallet::list_unspent_shielded_notes`. Transparent values split by ZIP-213 coinbase maturity (100 confirmations) computed against `as_of_height + 1`, matching `zcash_client_backend`'s `chain_tip + 1` convention.
-- **SPEND-9**: `Wallet::get_pending_transparent_inputs(account_id) -> PendingTransparentInputs` returns transparent inputs recorded for wallet-owned broadcasts not yet observed mined. The operator snapshot honours `WalletOptions::pending_broadcast_window_ms`; this window controls visibility only. librustzcash's persisted spend and transaction-expiry state remains the input-selection authority.
+- **SPEND-9**: `Wallet::get_pending_transparent_inputs(account_id) -> PendingTransparentInputs` returns transparent inputs recorded for wallet-owned broadcasts that SYNC-10 has not settled. An input broadcast longer ago than `WalletOptions::pending_broadcast_window_ms` is flagged `is_stale` for the operator and is never dropped for its age. librustzcash's persisted spend and transaction-expiry state remains the input-selection authority.
 - **SPEND-10**: `Wallet::send_payment` uses the same upstream proposal-lock lifecycle as SPEND-7. Once transaction creation persists the spend, librustzcash excludes the inputs while the unmined transaction remains unexpired. Zally records broadcast inputs in its operator ledger before calling `Submitter::submit`, closing the submit-accept persistence window without maintaining a parallel input selector.
 - **SPEND-11**: `Wallet::reserve_for_dispense(ReserveForDispensePlan) -> DispenseReservation` atomically locks `amount_zat` of the account's shielded balance against the caller-supplied `request_id`. The reservation persists in storage so it survives a process restart; concurrent reservations whose amounts sum above spendable cannot both pass (one returns `InsufficientBalance`). The wallet plane exposes `Wallet::release_dispense_reservation`, `Wallet::finalize_dispense_reservation`, and `Wallet::spendable_for_next_dispense` to complete the lifecycle; the latter subtracts every active reservation from the wallet's shielded view. See [ADR-0003](../adrs/0003-dispense-reservations.md).
+- **SPEND-12**: Once NU7 is active at a proposal's target height, every proposal step is checked against the ZIP 218 per-block shielded limits before its inputs are used: 330 Orchard actions, 330 Ironwood actions, 300 Sapling spends and outputs, and 330 across those pools. An over-limit proposal fails with `ProposalRejectionKind::ShieldedLimitExceeded` and releases its input locks. The check is Zally's until librustzcash ships its own.
 
 ### PCZT and external signing (PCZT)
 
@@ -292,6 +305,7 @@ Unified Address strings are encoded at ZIP-316 Revision 0 when Revision 0 can re
 - **PCZT-7**: Wallet runtimes that return `SignedPayload` for Zcash x402 exact set `format = pczt-v2-extractable` and put extractor-ready ZIP-374 PCZT bytes in `bytes`; facilitators never need wallet private keys to verify, extract, and broadcast.
 - **PCZT-8**: Successful finalized-PCZT extraction retains the exact PCZT bytes by transaction ID before submission. The retained bytes are privacy-sensitive disclosure source material: they are never logged, identical writes are idempotent, and conflicting bytes fail closed.
 - **PCZT-9**: Every Zally-created PCZT carries an opaque, non-secret librustzcash lock-owner token while Zally retains the exact selected output references in its wallet ledger. `Wallet::abandon_pczt(&pczt)` releases only that artifact's inputs and is idempotent; successful extraction deletes the lifecycle row after upstream transaction storage clears the locks. If an async caller is cancelled before accepting a newly created PCZT, the storage actor performs the same owner-scoped release.
+- **PCZT-10**: `Wallet::prove_pczt`, `Wallet::sign_pczt`, `Wallet::extract_pczt`, and `Wallet::extract_and_submit_pczt` judge the PCZT with CHAIN-7 at the wallet's recorded visible tip before touching the seed or storing a transaction. A PCZT that can never be mined, such as one created before NU7 activated, fails with `WalletError::TransactionUnmineable` after its inputs are released as by `Wallet::abandon_pczt`; signing it again cannot repair it, so the caller recreates it. The verdict is safe only while the wallet is the PCZT's sole broadcaster: a copy extracted and broadcast elsewhere, for example by a facilitator, may already be mined, and recreating its payment would pay twice.
 
 ### Payment disclosures (DISCLOSURE)
 
@@ -338,6 +352,7 @@ Which ZIPs Zally implements directly, which it inherits through librustzcash, an
 - **ZIP-311**: Draft1 Sapling payment-disclosure production and verification. The proof algorithms follow the Draft ZIP; the explicitly versioned wire encoding is incubating because the ZIP has not specified one.
 - **ZIP-315**: Wallet best practices. Explicit transparent shielding, trusted vs untrusted TXO accounting, confirmation-depth defaults aligned with the ZIP.
 - **ZIP-316**: Unified Addresses, UFVKs, UIVKs. First-class address type; UFVK export.
+- **ZIP-218**: Per-block shielded limits after NU7. Proposals whose steps exceed a limit are refused before they are built (SPEND-12).
 - **ZIP-317**: Conventional fee mechanism.
 - **ZIP-320**: TEX addresses. Recognised as transparent recipients at the API boundary.
 - **ZIP-321**: Payment request URIs. First-class `PaymentRequest` type.

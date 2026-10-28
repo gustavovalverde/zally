@@ -34,6 +34,7 @@ Only `retryable` moves the breaker's failure counter, and only a call that compl
 | `PaymentRequestParseFailed` | `not_retryable` | ZIP-321 URI parsing failed. |
 | `ProposalRejected` | Follows `ProposalRejectionKind` | The proposal or its transaction could not be built; `kind` says why. |
 | `SubmissionRejected` | `not_retryable` | The node rejected the submitted transaction. |
+| `TransactionUnmineable` | `not_retryable` | A PCZT can never be mined, so it was refused before signing, proving, or extraction and its inputs were released; `reason` is the `UnmineableReason`. Recreate it; signing it again cannot repair it. The verdict assumes the wallet is the PCZT's sole broadcaster. |
 | `SubmittedTransactionIdMismatch` | `requires_operator` | A success-kind submitter response returned a transaction ID different from the submitted transaction bytes. |
 | `Pczt` | Mirrors `PcztError` | A PCZT role failed. |
 | `PaymentDisclosureExport` | Mirrors `PaymentDisclosureExportError` | A retained PCZT could not produce the requested disclosure profile. |
@@ -80,6 +81,16 @@ Only `retryable` moves the breaker's failure counter, and only a call that compl
 |---------|---------|---------|
 | `Read` | `not_retryable` | Serialized transaction bytes could not be decoded. |
 
+## UnmineableReason
+
+Returned by `TransactionHeader::check_mineable` and carried by `WalletError::TransactionUnmineable`. Every reason means the same thing to the caller: recreate the transaction from a new proposal. When `Wallet::sync` reaches the same verdict for a pending broadcast, it reports `WalletEvent::PendingBroadcastUnmineable` instead of an error, and the broadcast's idempotency key then builds the replacement.
+
+| Reason | Meaning |
+|--------|---------|
+| `Expired` | The next block is above the transaction's expiry height. |
+| `ConsensusBranchMismatch` | The transaction commits to a consensus branch the chain has left, for example NU6.3 once NU7 is active. |
+| `VersionNotAccepted` | The next block's consensus branch rejects the transaction version, such as v4 once NU7 is active (ZIP 2003). |
+
 ## StorageError
 
 | Variant | Posture | Meaning |
@@ -92,7 +103,7 @@ Only `retryable` moves the breaker's failure counter, and only a call that compl
 | `BlockingTaskFailed` | `retryable` | A blocking storage task was cancelled or panicked. |
 | `KeyDerivationFailed` | `not_retryable` | Deterministic key derivation failed inside storage. |
 | `ProverUnavailable` | `requires_operator` | Sapling proving parameters are missing from the configured paths or the platform-default location. |
-| `IdempotencyKeyConflict` | `not_retryable` | A send idempotency key already maps to a different transaction. |
+| `IdempotencyKeyConflict` | `not_retryable` | A send idempotency key already maps to a different transaction that can still be mined. A key whose transaction was recorded as unmineable is rebound instead. |
 | `FinalizedPcztConflict` | `not_retryable` | A transaction ID is already bound to different finalized PCZT bytes. |
 | `PcztLockOwnerMissing` | `not_retryable` | A PCZT supplied for abandonment was not created by this Zally storage and lacks its owner-scoped recovery token. |
 | `PcztLockOwnerMalformed` | `not_retryable` | A PCZT carries a Zally lock-owner field that is not exactly 32 bytes. |
@@ -105,7 +116,7 @@ Only `retryable` moves the breaker's failure counter, and only a call that compl
 
 ## ProposalRejectionKind
 
-Carried by `WalletError::ProposalRejected` and `StorageError::ProposalRejected`. Kinds are matched from the typed librustzcash error variants, never from error text; an unrecognized upstream variant is `Other`.
+Carried by `WalletError::ProposalRejected` and `StorageError::ProposalRejected`. Kinds are matched from the typed librustzcash error variants, never from error text; an unrecognized upstream variant is `Other`. `ShieldedLimitExceeded` is the exception: Zally checks each proposal against the ZIP 218 limits itself until librustzcash ships that check.
 
 | Kind | Posture | Meaning |
 |------|---------|---------|
@@ -116,6 +127,7 @@ Carried by `WalletError::ProposalRejected` and `StorageError::ProposalRejected`.
 | `RecipientAddressExpired` | `not_retryable` | A ZIP 316 Revision 2 recipient address has expired; ask for a current one. Also returned when the address only expires before the transaction would; an earlier target expiry height passes, but choosing it to fit the address reveals the address's expiry on chain (ZIP 316), so prefer a longer-lived address. |
 | `OrchardRecipientNeedsIronwood` | `not_retryable` | After NU6.3, an Orchard-receiver payment can only be delivered through the Ironwood pool, which a transaction of the requested version cannot carry. |
 | `SelectionContractViolated` | `requires_operator` | librustzcash reported a broken internal contract while selecting inputs or building a step, such as a selected note it was asked to exclude or an Orchard-pool payment after Ironwood activation. |
+| `ShieldedLimitExceeded` | `not_retryable` | Once NU7 is active, a transaction of the proposal would carry more shielded components than ZIP 218 allows in one block, so no block could include it. `limit` names the bound (`ShieldedBlockLimit`: Orchard actions, Ironwood actions, Sapling spends and outputs, or all shielded pools together) and `component_count` the padded count. Send a smaller amount, or consolidate notes first. |
 | `Other` | `not_retryable` | Any other rejection; the reason carries the detail. |
 
 ## PcztError

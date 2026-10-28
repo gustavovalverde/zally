@@ -8,9 +8,11 @@ mod error;
 mod event;
 mod exposed_address;
 mod hold;
+mod idempotency_key_locks;
 mod metrics;
 mod options;
 mod pczt;
+mod pending_broadcast_retirement;
 mod pending_transparent_inputs;
 mod received_note;
 mod retry;
@@ -18,6 +20,7 @@ mod spend;
 mod status;
 mod sync;
 mod transparent_utxo_refresh;
+mod unmineable_transactions;
 mod unspent_note;
 mod wallet;
 
@@ -46,5 +49,5 @@ pub use sync::{
 pub use transparent_utxo_refresh::TransparentUtxoRefreshOutcome;
 pub use unspent_note::UnspentShieldedNote;
 pub use wallet::{ReserveForDispensePlan, Wallet, WalletBuilder};
-pub use zally_storage::ProposalRejectionKind;
+pub use zally_storage::{ProposalRejectionKind, ShieldedBlockLimit};
 pub use zcash_payment_disclosure::PaymentDisclosureProfile;

@@ -46,6 +46,7 @@ uuid = { workspace = true, features = ["v5"] }
 
 [dev-dependencies]
 hex.workspace = true
+nonempty = "0.11"
 prost = "0.14"
 serde_json.workspace = true
 tempfile.workspace = true

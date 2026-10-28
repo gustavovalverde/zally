@@ -1754,7 +1754,8 @@ impl Wallet {
         .await
     }
 
-    /// Runs one breaker-guarded scan attempt and retires the broadcasts it aged out.
+    /// Runs one breaker-guarded scan attempt and retires the pending broadcasts the chain
+    /// settled.
     ///
     /// One attempt is one unit of breaker accounting: splitting the chain-tip read into its
     /// own guarded call would record a success for every attempt whose scan then failed,
@@ -1776,18 +1777,8 @@ impl Wallet {
             std::convert::identity,
         )
         .await?;
-        self.retire_expired_pending_broadcasts().await?;
+        self.retire_pending_broadcasts().await?;
         Ok(outcome)
-    }
-
-    async fn retire_expired_pending_broadcasts(&self) -> Result<(), WalletError> {
-        let before_at_ms =
-            current_unix_ms().saturating_sub(self.inner.options.pending_broadcast_window_ms);
-        self.inner
-            .storage
-            .clear_expired_pending_broadcast_inputs(before_at_ms)
-            .await?;
-        Ok(())
     }
 
     async fn sync_inner(&self, chain: &dyn ChainSource) -> Result<SyncOutcome, WalletError> {
@@ -2068,8 +2059,6 @@ impl Wallet {
             .storage
             .wallet_tx_ids_mined_in_range(scanned_from, outcome.scanned_to_height)
             .await?;
-        self.retire_pending_broadcasts_for_mined(&newly_confirmed)
-            .await?;
         for (tx_id, confirmed_at_height) in newly_confirmed {
             self.publish_event(WalletEvent::TransactionConfirmed {
                 tx_id,
@@ -2195,21 +2184,6 @@ impl Wallet {
                 Ok(Some(height))
             }
         }
-    }
-
-    async fn retire_pending_broadcasts_for_mined(
-        &self,
-        newly_confirmed: &[(zally_core::TxId, BlockHeight)],
-    ) -> Result<(), WalletError> {
-        if newly_confirmed.is_empty() {
-            return Ok(());
-        }
-        let confirmed_tx_ids: Vec<_> = newly_confirmed.iter().map(|(tx_id, _)| *tx_id).collect();
-        self.inner
-            .storage
-            .clear_pending_broadcast_inputs_for_mined(&confirmed_tx_ids)
-            .await?;
-        Ok(())
     }
 }
 
