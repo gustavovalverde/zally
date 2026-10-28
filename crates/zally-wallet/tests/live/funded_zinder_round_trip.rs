@@ -128,7 +128,8 @@ async fn shielding_does_not_reselect_a_pending_spend() -> Result<(), TestError> 
 }
 
 struct FundedZinderRoundTrip {
-    wallet_path: TempWalletPath,
+    /// Keeps the wallet's files on disk for the round trip's lifetime.
+    _wallet_path: TempWalletPath,
     miner: JsonRpcClient,
     wallet: Wallet,
     account_id: AccountId,
@@ -167,7 +168,7 @@ impl FundedZinderRoundTrip {
         let sync_snapshots = sync_handle.observe_status();
 
         Ok(Self {
-            wallet_path,
+            _wallet_path: wallet_path,
             miner,
             wallet,
             account_id,
@@ -272,18 +273,10 @@ impl FundedZinderRoundTrip {
                 None,
             )
             .await?;
-        let reopened_sealing =
-            AgeFileSealing::new(AgeFileSealingOptions::at_path(self.wallet_path.seed_path()));
-        let reopened_storage = Sqlite::new(SqliteOptions::for_network(
-            self.network,
-            self.wallet_path.db_path(),
-        ));
-        let (reopened_wallet, reopened_account_id) =
-            Wallet::builder(self.network, reopened_sealing, reopened_storage)
-                .open()
-                .await?;
-        assert_eq!(reopened_account_id, self.account_id);
-        reopened_wallet.abandon_pczt(&first_pczt).await?;
+        // The database admits one writer, so another handle abandons the PCZT through a clone
+        // of the open wallet rather than a second open.
+        let other_handle = self.wallet.clone();
+        other_handle.abandon_pczt(&first_pczt).await?;
 
         let second_recipient =
             derive_unified_recipient(&self.wallet, self.account_id, self.network).await?;
