@@ -694,13 +694,15 @@ impl Wallet {
 
     /// Returns the transaction `key` already names, or `None` when it names none.
     ///
-    /// A transaction the wallet holds bytes for, has not seen mined, and that the next block
-    /// can include is submitted again first: the send that bound the key may have failed
-    /// before any node received it, and a retry that only returned the identifier would report
-    /// a payment nobody broadcast. The same bytes cannot pay twice. A node that already holds or
-    /// mined the transaction answers with a duplicate. A submit error or rejection is returned,
-    /// and the key stays bound. One the next block cannot include is returned with its expiry
-    /// height until the pending-broadcast verdict frees its key.
+    /// A transaction the wallet holds bytes for and has not seen mined is submitted again
+    /// first: the send that bound the key may have failed before any node received it, and a
+    /// retry that only returned the identifier would report a payment nobody broadcast. The
+    /// same bytes cannot pay twice. A node that already holds or mined the transaction answers
+    /// with a duplicate. A submit error or rejection is returned, and the key stays bound. One
+    /// the next block can no longer include fails with
+    /// [`WalletError::PendingBroadcastUnsettled`] until the pending-broadcast verdict settles
+    /// it. A transaction the wallet holds no bytes for is returned as it is: the wallet has
+    /// seen it mined, or the key was recorded outside a send.
     ///
     /// Runs before the source-health refusal, so a key that already names a transaction keeps
     /// answering with it while new spends are refused.
@@ -733,9 +735,13 @@ impl Wallet {
                     .is_ok_and(|header| header.check_mineable(self.network(), tip).is_ok())
             })
         };
-        if let Some(unmined) = stored.filter(|pending| {
-            pending.mined_height.is_none() && can_enter_next_block(&pending.raw_bytes)
-        }) {
+        if let Some(unmined) = stored.filter(|pending| pending.mined_height.is_none()) {
+            if !can_enter_next_block(&unmined.raw_bytes) {
+                return Err(WalletError::PendingBroadcastUnsettled {
+                    tx_id,
+                    tx_expiry_height,
+                });
+            }
             let outcome = crate::retry::with_breaker_and_retry(
                 &self.inner.circuit_breaker,
                 self.broadcast_retry_policy(),

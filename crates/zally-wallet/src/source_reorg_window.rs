@@ -8,7 +8,8 @@
 //! the node legitimately produces could still mine the released broadcast after its
 //! replacement was paid. A sync driver with
 //! [`crate::SyncDriverOptions::minimum_source_reorg_window_blocks`] reads the source's window
-//! when it starts and each time it reopens the chain-event stream. Until a read meets the
+//! when it starts, each time it reopens the chain-event stream, and on every polling wakeup
+//! until a read succeeds. Until a read meets the
 //! minimum, the wallet refuses new spends and records no broadcast as unmineable, so no key is
 //! freed under a window that cannot back the verdict.
 
@@ -41,7 +42,7 @@ impl SourceReorgWindowCheck {
 
 impl Wallet {
     /// Marks the window unverified when a sync driver that requires `required_blocks` starts,
-    /// until its first read.
+    /// before its task runs, until its first successful read.
     pub(crate) fn start_source_reorg_window_check(&self, required_blocks: u32) {
         *self.inner.source_reorg_window.lock() =
             SourceReorgWindowCheck::Unverified { required_blocks };
@@ -109,5 +110,13 @@ impl Wallet {
     /// Whether the window check holds unmineable verdicts.
     pub(crate) fn is_source_reorg_window_holding(&self) -> bool {
         self.inner.source_reorg_window.lock().is_holding()
+    }
+
+    /// Whether a sync driver requires a window it has not read yet.
+    pub(crate) fn is_source_reorg_window_unverified(&self) -> bool {
+        matches!(
+            *self.inner.source_reorg_window.lock(),
+            SourceReorgWindowCheck::Unverified { .. }
+        )
     }
 }

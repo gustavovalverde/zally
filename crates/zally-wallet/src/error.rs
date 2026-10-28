@@ -290,6 +290,27 @@ pub enum WalletError {
         required_blocks: u32,
     },
 
+    /// The send's idempotency key names a transaction that the next block can no longer
+    /// include and that the pending-broadcast verdict has not yet settled.
+    ///
+    /// A reorg within the chain source's window could still mine it, so paying again under
+    /// another key could pay twice. Once the wallet reports
+    /// [`crate::WalletEvent::PendingBroadcastUnmineable`] for `tx_id`, the same key builds a
+    /// replacement; a [`crate::WalletEvent::TransactionConfirmed`] for it means it was paid.
+    ///
+    /// Posture: [`FailurePosture::Retryable`]: retry the same key after either event.
+    #[error(
+        "transaction {tx_id} bound to this idempotency key can no longer enter the next block \
+         (expiry height {}) and awaits the pending-broadcast verdict",
+        tx_expiry_height.as_u32()
+    )]
+    PendingBroadcastUnsettled {
+        /// Transaction the key names.
+        tx_id: TxId,
+        /// The transaction's expiry height.
+        tx_expiry_height: BlockHeight,
+    },
+
     /// The sync driver requires a minimum chain source reorg window and has not yet read the
     /// source's window, so the wallet refuses new spends until it has.
     ///
@@ -332,7 +353,8 @@ impl WalletError {
             Self::Submitter(e) => e.posture(),
             Self::CircuitBroken { .. }
             | Self::ChainSourceHalted { .. }
-            | Self::SourceReorgWindowUnverified { .. } => FailurePosture::Retryable,
+            | Self::SourceReorgWindowUnverified { .. }
+            | Self::PendingBroadcastUnsettled { .. } => FailurePosture::Retryable,
             Self::UnverifiedScanChunk { source, .. } => source.posture(),
             Self::ProposalRejected { kind, .. } => kind.posture(),
             Self::NetworkMismatch { .. }

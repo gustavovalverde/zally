@@ -43,6 +43,7 @@ Only `retryable` moves the breaker's failure counter, and only a call that compl
 | `ChainSourceHalted` | `retryable` | The sync driver found the chain source stopped following the chain, so new spends are refused; retry once the driver reports the source recovered. |
 | `SourceReorgWindowTooShallow` | `requires_operator` | The sync driver read a chain source reorg window below `SyncDriverOptions::minimum_source_reorg_window_blocks`, so new spends are refused; raise the source's window (Zinder `reorg_window_blocks`) or lower the minimum. |
 | `SourceReorgWindowUnverified` | `retryable` | The sync driver requires a minimum chain source reorg window and has not yet read the source's window, so new spends are refused; retry once it has, normally right after the driver starts. |
+| `PendingBroadcastUnsettled` | `retryable` | A retried send's idempotency key names a transaction the next block can no longer include, and the pending-broadcast verdict has not settled it. Do not pay again under another key; retry the same key after `PendingBroadcastUnmineable` (the key then builds a replacement) or `TransactionConfirmed`. |
 | `SyncDriverFailed` | Carries `FailurePosture` | The sync driver failed outside a wallet operation. Cancellation surfaces `Retryable`; panic surfaces `RequiresOperator`. |
 
 ## ChainSourceError

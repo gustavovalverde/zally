@@ -632,6 +632,9 @@ impl SyncDriver {
     /// or retry ladder affects the other's.
     #[must_use]
     pub fn sync_continuously(self) -> SyncHandle {
+        if let Some(required_blocks) = self.options.minimum_source_reorg_window_blocks {
+            self.wallet.start_source_reorg_window_check(required_blocks);
+        }
         let (close_tx, close_rx) = oneshot::channel();
         let (status_tx, status_rx) = watch::channel(SyncSnapshot::starting(self.wallet.network()));
         let (transparent_utxo_refresh_close_tx, transparent_utxo_refresh_close_rx) =
@@ -1038,9 +1041,6 @@ async fn run_sync_driver(
     };
     let started = ctx.status_tx.borrow().clone();
     publish_transition(ctx.status_tx, started, &DriverTransition::DriverStarted);
-    if let Some(required_blocks) = ctx.options.minimum_source_reorg_window_blocks {
-        ctx.wallet.start_source_reorg_window_check(required_blocks);
-    }
     check_source_reorg_window(&ctx).await;
 
     let mut poll = interval(Duration::from_millis(ctx.options.poll_interval_ms));
@@ -1315,6 +1315,8 @@ async fn handle_poll_tick(
         if feed.stream.is_some() {
             check_source_reorg_window(ctx).await;
         }
+    } else if ctx.wallet.is_source_reorg_window_unverified() {
+        check_source_reorg_window(ctx).await;
     }
     if state.source_tip.halted().is_some() {
         let refreshed = ctx.status_tx.borrow().clone();
@@ -1395,9 +1397,10 @@ async fn publish_source_recovered(ctx: &DriverContext<'_>, state: &mut DriverSta
 
 /// Reads the chain source's reorg window and records it against the driver's minimum.
 ///
-/// Runs when the driver starts and each time it reopens the chain-event stream, where a
-/// restarted source with a new configuration first shows. A read that fails or times out
-/// keeps the prior result, so a window never read keeps spends and unmineable verdicts held.
+/// Runs when the driver starts, each time it reopens the chain-event stream, where a restarted
+/// source with a new configuration first shows, and on every polling wakeup while no read has
+/// succeeded yet. A read that fails or times out keeps the prior result, so a window never
+/// read keeps spends and unmineable verdicts held.
 async fn check_source_reorg_window(ctx: &DriverContext<'_>) {
     let Some(required_blocks) = ctx.options.minimum_source_reorg_window_blocks else {
         return;

@@ -13,7 +13,8 @@
 use zally_core::{BlockHeight, HoldId, IdempotencyKey, TxId, Zatoshis};
 use zally_storage::WalletStorage;
 use zally_wallet::{
-    ShieldTransparentPlan, SyncDriverPhase, SyncHandle, SyncRepair, SyncSnapshot, WalletEvent,
+    ShieldTransparentPlan, SyncDriverPhase, SyncHandle, SyncRepair, SyncSnapshot, WalletError,
+    WalletEvent,
 };
 
 use super::reorg_fixtures::{
@@ -136,7 +137,15 @@ async fn a_reverted_withdrawal_releases_its_key_once_it_can_never_be_mined()
             .any(|event| matches!(event, WalletEvent::PendingBroadcastUnmineable { .. })),
         "a withdrawal is not dead while a reorg could still mine it below its expiry"
     );
-    assert_eq!(retry_withdrawal(&funded).await?, funded.shielding_tx_id);
+    let unsettled = retry_withdrawal(&funded).await;
+    assert!(
+        matches!(
+            &unsettled,
+            Err(FixtureError::Wallet(WalletError::PendingBroadcastUnsettled { tx_id, .. }))
+                if *tx_id == funded.shielding_tx_id
+        ),
+        "a retry neither pays again nor reports the expired withdrawal as sent: {unsettled:?}"
+    );
     assert_eq!(funded.submitter.handle().submission_count(), 1);
 
     base.chain_handle

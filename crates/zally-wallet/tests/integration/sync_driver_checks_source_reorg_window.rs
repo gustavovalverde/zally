@@ -171,10 +171,16 @@ async fn a_shallow_source_reorg_window_holds_unmineable_verdicts() -> Result<(),
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn an_unread_source_reorg_window_refuses_spends() -> Result<(), FixtureError> {
+async fn an_unread_source_reorg_window_refuses_spends_until_a_read_succeeds()
+-> Result<(), FixtureError> {
     let base = chain_wallet(10).await?;
-    let handle =
-        start_driver_reading_window(&base, Arc::new(Notify::new()), fast_driver_options(), false)?;
+    let is_window_readable = Arc::new(AtomicBool::new(false));
+    let handle = start_driver_reading_window(
+        &base,
+        Arc::new(Notify::new()),
+        fast_driver_options(),
+        Arc::clone(&is_window_readable),
+    )?;
     let mut seen = Vec::new();
     wait_for_driver(&handle, &mut seen, |snapshot| is_scanned_to(snapshot, 10)).await?;
     let refused = try_shielding(&base).await?;
@@ -187,14 +193,22 @@ async fn an_unread_source_reorg_window_refuses_spends() -> Result<(), FixtureErr
         ),
         "a window the driver could not read refuses spends: {refused:?}"
     );
+
+    is_window_readable.store(true, Ordering::SeqCst);
+    tokio::time::timeout(EVENT_TIMEOUT, async {
+        loop {
+            let outcome = try_shielding(&base).await?;
+            if !matches!(outcome, WalletError::SourceReorgWindowUnverified { .. }) {
+                return Ok::<_, FixtureError>(());
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .map_err(|_elapsed| {
+        FixtureError::Fixture("the driver never re-read the window while its stream stayed open")
+    })??;
     handle.close().await?;
-    assert!(
-        !matches!(
-            try_shielding(&base).await?,
-            WalletError::SourceReorgWindowUnverified { .. }
-        ),
-        "closing the driver lifts the refusal"
-    );
     Ok(())
 }
 
@@ -203,20 +217,20 @@ fn start_driver(
     stream_fault: Arc<Notify>,
     options: SyncDriverOptions,
 ) -> Result<SyncHandle, FixtureError> {
-    start_driver_reading_window(base, stream_fault, options, true)
+    start_driver_reading_window(base, stream_fault, options, Arc::new(AtomicBool::new(true)))
 }
 
 fn start_driver_reading_window(
     base: &ChainWallet,
     stream_fault: Arc<Notify>,
     options: SyncDriverOptions,
-    is_window_readable: bool,
+    is_window_readable: Arc<AtomicBool>,
 ) -> Result<SyncHandle, FixtureError> {
     let chain: Arc<dyn ChainSource> = Arc::new(FaultingFirstStreamChain {
         inner: Arc::clone(&base.chain),
         stream_fault,
         stream_open_count: AtomicU32::new(0),
-        is_window_readable: AtomicBool::new(is_window_readable),
+        is_window_readable,
     });
     Ok(SyncDriver::new(base.wallet.clone(), chain, options)?.sync_continuously())
 }
@@ -268,7 +282,7 @@ struct FaultingFirstStreamChain {
     inner: Arc<MockChainSource>,
     stream_fault: Arc<Notify>,
     stream_open_count: AtomicU32,
-    is_window_readable: AtomicBool,
+    is_window_readable: Arc<AtomicBool>,
 }
 
 #[async_trait::async_trait]
