@@ -33,7 +33,7 @@ Only `retryable` moves the breaker's failure counter, and only a call that compl
 | `InsufficientBalance` | `not_retryable` | The wallet lacks spendable funds for a reservation or a send, including a proposal librustzcash rejected for insufficient funds. |
 | `PaymentRequestParseFailed` | `not_retryable` | ZIP-321 URI parsing failed. |
 | `ProposalRejected` | Follows `ProposalRejectionKind` | The proposal or its transaction could not be built; `kind` says why. |
-| `SubmissionRejected` | `not_retryable` | The node rejected the submitted transaction. |
+| `SubmissionRejected` | `not_retryable` | The node rejected the submitted transaction. The send's idempotency key stays bound to it, so a retry with the same key returns it, until the pending-broadcast verdict records it as unmineable (CORE-5). |
 | `TransactionUnmineable` | `not_retryable` | A PCZT can never be mined, so it was refused before signing, proving, or extraction and its inputs were released; `reason` is the `UnmineableReason`. Recreate it; signing it again cannot repair it. The verdict assumes the wallet is the PCZT's sole broadcaster. |
 | `SubmittedTransactionIdMismatch` | `requires_operator` | A success-kind submitter response returned a transaction ID different from the submitted transaction bytes. |
 | `Pczt` | Mirrors `PcztError` | A PCZT role failed. |
