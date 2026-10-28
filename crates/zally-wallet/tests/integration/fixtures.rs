@@ -80,7 +80,10 @@ pub(crate) enum TestWalletError {
 }
 
 /// Longest any test waits for a sync-driver snapshot before failing.
-const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(5);
+///
+/// A ceiling on liveness, not a speed requirement: a loaded host can take far longer than an
+/// idle one to rebuild and rescan.
+const SNAPSHOT_TIMEOUT: Duration = Duration::from_mins(1);
 
 /// Waits for the first snapshot satisfying `predicate`, bounded by [`SNAPSHOT_TIMEOUT`].
 pub(crate) async fn wait_for_snapshot(

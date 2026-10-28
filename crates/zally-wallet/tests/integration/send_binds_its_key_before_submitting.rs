@@ -10,6 +10,7 @@
 //! address and the second pays the recipient from it.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use parking_lot::Mutex;
 use tokio::sync::Notify;
@@ -20,11 +21,12 @@ use zally_chain::{
 use zally_core::{AccountId, BlockHeight, IdempotencyKey, Network, PaymentRecipient, TxId};
 use zally_storage::WalletStorage as _;
 use zally_wallet::{
-    RetryPolicy, SendOutcome, SendPaymentPlan, ShieldTransparentPlan, Wallet, WalletError,
+    CircuitBreakerConfig, RetryPolicy, SendOutcome, SendPaymentPlan, ShieldTransparentPlan, Wallet,
+    WalletError, WalletOptions,
 };
 
 use super::reorg_fixtures::{
-    ChainWallet, FixtureError, TRANSPARENT_FUNDING_TX_ID, chain_wallet, funded_chain,
+    ChainWallet, FixtureError, TRANSPARENT_FUNDING_TX_ID, chain_wallet_with_options, funded_chain,
     record_transparent_utxo, sync_to_tip,
 };
 
@@ -119,7 +121,14 @@ async fn a_rejection_keeps_the_key_bound() -> Result<(), FixtureError> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_send_the_open_circuit_breaker_stopped_frees_its_key() -> Result<(), FixtureError> {
-    let base = shieldable_wallet().await?;
+    // A cooldown far longer than proving can take keeps the breaker open until the submit.
+    let base = shieldable_wallet_with_options(
+        WalletOptions::default().with_circuit_breaker_config(CircuitBreakerConfig {
+            failure_threshold: 5,
+            cooldown: Duration::from_hours(24),
+        }),
+    )
+    .await?;
     base.wallet.set_retry_policy(RetryPolicy::none());
     base.chain_handle
         .fail_current_epoch_next(20, || ChainSourceError::Unavailable {
@@ -257,7 +266,14 @@ async fn a_retry_after_a_crash_before_the_funding_step_submits_every_step()
 /// A wallet synced past [`PRE_FUNDING_TIP_HEIGHT`] that owns one transparent UTXO and submits
 /// without retrying, so every submit error reaches the caller.
 async fn shieldable_wallet() -> Result<ChainWallet, FixtureError> {
-    let base = chain_wallet(PRE_FUNDING_TIP_HEIGHT - 100).await?;
+    shieldable_wallet_with_options(WalletOptions::default()).await
+}
+
+/// Same as [`shieldable_wallet`], with caller-supplied [`WalletOptions`].
+async fn shieldable_wallet_with_options(
+    options: WalletOptions,
+) -> Result<ChainWallet, FixtureError> {
+    let base = chain_wallet_with_options(PRE_FUNDING_TIP_HEIGHT - 100, options).await?;
     // A scan chunk ends at a checkpoint; the one at `PRE_FUNDING_TIP_HEIGHT - 100` anchors the
     // shielding proposal's 100-confirmation policy.
     sync_to_tip(&base.wallet, base.chain.as_ref()).await?;

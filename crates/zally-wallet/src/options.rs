@@ -1,5 +1,7 @@
 //! Open-time configuration for a [`crate::Wallet`].
 
+use crate::circuit_breaker::CircuitBreakerConfig;
+
 /// Wallet open-time configuration.
 ///
 /// Constructed at `Wallet::create` / `Wallet::open` / `Wallet::open_or_create_account` and
@@ -35,6 +37,12 @@ pub struct WalletOptions {
     ///
     /// Default: 1,000 blocks, the deepest reorg Zebra produces.
     pub minimum_source_reorg_window_blocks: Option<u32>,
+    /// Failure threshold and cooldown of the circuit breaker that guards the wallet's chain
+    /// reads and submissions.
+    ///
+    /// Default: [`CircuitBreakerConfig::default`], five consecutive retryable failures and a
+    /// one-minute cooldown.
+    pub circuit_breaker: CircuitBreakerConfig,
 }
 
 impl WalletOptions {
@@ -45,6 +53,16 @@ impl WalletOptions {
     /// finalized state only once its best chain is longer than this, so it never presents a
     /// deeper reorg.
     pub const DEFAULT_MINIMUM_SOURCE_REORG_WINDOW_BLOCKS: u32 = 1_000;
+
+    /// Returns a copy of `self` with `circuit_breaker` replaced.
+    #[must_use]
+    pub const fn with_circuit_breaker_config(
+        mut self,
+        circuit_breaker: CircuitBreakerConfig,
+    ) -> Self {
+        self.circuit_breaker = circuit_breaker;
+        self
+    }
 
     /// Returns a copy of `self` with `minimum_source_reorg_window_blocks` replaced.
     #[must_use]
@@ -71,6 +89,7 @@ impl Default for WalletOptions {
             minimum_source_reorg_window_blocks: Some(
                 Self::DEFAULT_MINIMUM_SOURCE_REORG_WINDOW_BLOCKS,
             ),
+            circuit_breaker: CircuitBreakerConfig::default(),
         }
     }
 }

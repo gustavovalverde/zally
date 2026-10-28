@@ -12,7 +12,7 @@ use zally_storage::{ProposalRejectionKind, WalletStorage};
 use zcash_keys::address::UnifiedAddress;
 
 use crate::capabilities::{Capability, SealingCapability, StorageCapability, WalletCapabilities};
-use crate::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig, CircuitBreakerState};
+use crate::circuit_breaker::{CircuitBreaker, CircuitBreakerState};
 use crate::error::WalletError;
 use crate::event::{WalletEvent, WalletEventStream};
 use crate::hold::{Hold, LockedNotesSummary};
@@ -784,7 +784,7 @@ where
         base_capabilities: capabilities,
         event_tx,
         retry_policy: Mutex::new(RetryPolicy::default()),
-        circuit_breaker: CircuitBreaker::new(CircuitBreakerConfig::default()),
+        circuit_breaker: CircuitBreaker::new(options.circuit_breaker),
         options,
         idempotency_key_locks: IdempotencyKeyLocks::default(),
         source_halt: Mutex::new(None),
