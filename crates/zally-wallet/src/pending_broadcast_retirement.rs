@@ -201,7 +201,6 @@ impl Wallet {
         }
         match (blind_cause, presence) {
             (Some(cause), ChainPresence::Absent) => ChainPresence::Unknown(cause.to_owned()),
-            (_, ChainPresence::Unresponsive(cause)) => ChainPresence::Unknown(cause),
             (_, presence) => presence,
         }
     }
