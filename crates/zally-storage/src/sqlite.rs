@@ -5525,13 +5525,7 @@ fn decode_hold_row(row: &rusqlite::Row<'_>) -> Result<crate::HoldRow, StorageErr
     let finalized_tx_bytes: Option<Vec<u8>> = row.get(7).map_err(|e| map_row_decode_error(&e))?;
     let released_at_ms_raw: Option<i64> = row.get(8).map_err(|e| map_row_decode_error(&e))?;
 
-    let reservation_uuid_array: [u8; 16] =
-        reservation_uuid_bytes.try_into().map_err(|raw: Vec<u8>| {
-            StorageError::RowValueOutOfRange {
-                column: "ext_zally_holds.hold_id",
-                raw: format!("uuid byte length {}", raw.len()),
-            }
-        })?;
+    let hold_id = decode_hold_id_bytes(reservation_uuid_bytes)?;
     let account_uuid_array: [u8; 16] =
         account_uuid_bytes
             .try_into()
@@ -5580,7 +5574,7 @@ fn decode_hold_row(row: &rusqlite::Row<'_>) -> Result<crate::HoldRow, StorageErr
     let locked_notes = decode_locked_notes(&locked_notes_blob)?;
 
     Ok(crate::HoldRow {
-        hold_id: HoldId::from_uuid(uuid::Uuid::from_bytes(reservation_uuid_array)),
+        hold_id,
         request_id,
         idempotency_key,
         account_id: AccountId::from_uuid(uuid::Uuid::from_bytes(account_uuid_array)),
