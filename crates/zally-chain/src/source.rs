@@ -405,6 +405,15 @@ pub trait ChainSource: Send + Sync + 'static {
         &self,
         start: ChainEventStreamStart,
     ) -> Result<ChainEventEnvelopeStream, ChainSourceError>;
+
+    /// Returns the depth, in blocks, of the deepest reorg the source follows, as the source
+    /// is configured now.
+    ///
+    /// The source never replaces a block more than this far below its visible tip: it halts
+    /// rather than follow a deeper reorg. A wallet's settled verdicts, and its promise never
+    /// to pay twice, hold only while this is at least the deepest reorg the node can produce
+    /// (1,000 blocks for Zebra).
+    async fn reorg_window_blocks(&self) -> Result<u32, ChainSourceError>;
 }
 
 #[cfg(test)]

@@ -18,6 +18,7 @@ mod received_note;
 mod reorg;
 mod retry;
 mod source_halt;
+mod source_reorg_window;
 mod spend;
 mod status;
 mod sync;

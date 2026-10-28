@@ -20,6 +20,7 @@ use crate::idempotency_key_locks::IdempotencyKeyLocks;
 use crate::options::WalletOptions;
 use crate::retry::RetryPolicy;
 use crate::source_halt::SourceHalt;
+use crate::source_reorg_window::ReorgWindowShortfall;
 use crate::sync::fetch_prior_chain_state;
 
 const EVENT_CHANNEL_CAPACITY: usize = 1024;
@@ -47,6 +48,8 @@ pub(crate) struct WalletInner {
     pub(crate) idempotency_key_locks: IdempotencyKeyLocks,
     /// Set by the sync driver while the chain source has stopped following the chain.
     pub(crate) source_halt: Mutex<Option<SourceHalt>>,
+    /// Set by the sync driver while the chain source's reorg window is below its minimum.
+    pub(crate) source_reorg_window_shortfall: Mutex<Option<ReorgWindowShortfall>>,
 }
 
 impl Wallet {
@@ -575,11 +578,19 @@ impl Wallet {
         *self.inner.source_halt.lock() = cause;
     }
 
-    /// Refuses a new spend while the sync driver reports the chain source halted.
+    /// Refuses a new spend while the sync driver reports the chain source halted, or its
+    /// reorg window below the driver's minimum.
     pub(crate) fn ensure_source_following(&self) -> Result<(), WalletError> {
         let source_halt = *self.inner.source_halt.lock();
-        source_halt.map_or(Ok(()), |cause| {
-            Err(WalletError::ChainSourceHalted { cause })
+        if let Some(cause) = source_halt {
+            return Err(WalletError::ChainSourceHalted { cause });
+        }
+        let shortfall = *self.inner.source_reorg_window_shortfall.lock();
+        shortfall.map_or(Ok(()), |shortfall| {
+            Err(WalletError::SourceReorgWindowTooShallow {
+                reorg_window_blocks: shortfall.reorg_window_blocks,
+                required_blocks: shortfall.required_blocks,
+            })
         })
     }
 
@@ -770,6 +781,7 @@ where
         options,
         idempotency_key_locks: IdempotencyKeyLocks::default(),
         source_halt: Mutex::new(None),
+        source_reorg_window_shortfall: Mutex::new(None),
     });
     Wallet { inner }
 }

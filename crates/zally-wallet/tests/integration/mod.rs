@@ -37,6 +37,7 @@ mod send_payment_rejects_stale_target_expiry;
 mod send_payment_short_circuits_on_known_idempotency_key;
 mod sync_catches_up_to_tip;
 mod sync_drains_bulk_ranges;
+mod sync_driver_checks_source_reorg_window;
 mod sync_driver_follows_chain;
 mod sync_driver_halts_on_stalled_source;
 mod sync_driver_keeps_the_ledger;

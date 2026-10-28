@@ -41,6 +41,7 @@ Only `retryable` moves the breaker's failure counter, and only a call that compl
 | `PaymentDisclosureSourceMissing` | `not_retryable` | No finalized PCZT was retained for the transaction. |
 | `CircuitBroken` | `retryable` | The wallet IO circuit breaker is open. |
 | `ChainSourceHalted` | `retryable` | The sync driver found the chain source stopped following the chain, so new spends are refused; retry once the driver reports the source recovered. |
+| `SourceReorgWindowTooShallow` | `requires_operator` | The sync driver read a chain source reorg window below `SyncDriverOptions::minimum_source_reorg_window_blocks`, so new spends are refused; raise the source's window (Zinder `reorg_window_blocks`) or lower the minimum. |
 | `SyncDriverFailed` | Carries `FailurePosture` | The sync driver failed outside a wallet operation. Cancellation surfaces `Retryable`; panic surfaces `RequiresOperator`. |
 
 ## ChainSourceError

@@ -13,7 +13,9 @@
 //!   [`MockChainSourceHandle::serve_tree_state`], so tree-root verification sees
 //!   chain roots the test controls,
 //! - resume chain events from a cursor over a retained event window whose floor
-//!   [`MockChainSourceHandle::expire_chain_events_through`] raises.
+//!   [`MockChainSourceHandle::expire_chain_events_through`] raises,
+//! - report a reorg window other than 1,000 blocks via
+//!   [`MockChainSourceHandle::set_reorg_window_blocks`].
 //!
 //! Blocks on the original branch carry all-zero hashes, so tests that serve their own
 //! all-zero tree states keep chaining. Every block a reorg replaces carries a hash derived
@@ -47,6 +49,8 @@ use zally_core::{
 use zcash_protocol::consensus::{NetworkUpgrade, Parameters as _};
 
 const EVENT_CHANNEL_CAPACITY: usize = 256;
+/// Reorg window the mock reports until a test sets another: the deepest reorg Zebra produces.
+const DEFAULT_REORG_WINDOW_BLOCKS: u32 = 1_000;
 
 struct MockState {
     network: Network,
@@ -71,6 +75,7 @@ struct MockState {
     next_event_sequence: u64,
     retained_from_sequence: u64,
     subscription_starts: Vec<ChainEventStreamStart>,
+    reorg_window_blocks: u32,
 }
 
 /// Commitment trees as they stand after one mined block.
@@ -220,6 +225,7 @@ impl MockChainSource {
                 next_event_sequence: 1,
                 retained_from_sequence: 1,
                 subscription_starts: Vec::new(),
+                reorg_window_blocks: DEFAULT_REORG_WINDOW_BLOCKS,
             })),
             event_tx,
         }
@@ -566,6 +572,12 @@ impl MockChainSourceHandle {
     pub fn failures_consumed(&self) -> u32 {
         self.state.lock().failures_consumed
     }
+
+    /// Sets the reorg window the mock reports through [`ChainSource::reorg_window_blocks`].
+    /// The mock starts at 1,000 blocks.
+    pub fn set_reorg_window_blocks(&self, reorg_window_blocks: u32) {
+        self.state.lock().reorg_window_blocks = reorg_window_blocks;
+    }
 }
 
 fn chain_epoch_from_state(state: &MockState) -> ChainEpoch {
@@ -796,6 +808,10 @@ impl ChainSource for MockChainSource {
             Ok(_) | Err(_) => None,
         });
         Ok(Box::pin(tokio_stream::iter(replay).chain(live)))
+    }
+
+    async fn reorg_window_blocks(&self) -> Result<u32, ChainSourceError> {
+        Ok(self.state.lock().reorg_window_blocks)
     }
 }
 

@@ -158,7 +158,10 @@ impl FundedZinderRoundTrip {
             chain_source,
             SyncDriverOptions::default()
                 .with_poll_interval_ms(250)
-                .with_max_sync_iterations_per_wake_count(16),
+                .with_max_sync_iterations_per_wake_count(16)
+                // The live Zinder pair keeps its default 100-block reorg window; the
+                // integration suite covers the window check.
+                .with_minimum_source_reorg_window_blocks(None),
         )?;
         let sync_handle = driver.sync_continuously();
         let sync_snapshots = sync_handle.observe_status();

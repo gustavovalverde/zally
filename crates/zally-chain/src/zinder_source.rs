@@ -396,6 +396,21 @@ impl ChainSource for ZinderChainSource {
         });
         Ok(Box::pin(mapped) as ChainEventEnvelopeStream)
     }
+
+    async fn reorg_window_blocks(&self) -> Result<u32, ChainSourceError> {
+        let descriptor = self
+            .inner
+            .server_info()
+            .await
+            .map_err(Self::map_indexer_error)?;
+        if descriptor.contract_revision < zinder_client::MIN_SUPPORTED_CONTRACT_REVISION {
+            return Err(ChainSourceError::ContractRevisionUnsupported {
+                minimum_revision: zinder_client::MIN_SUPPORTED_CONTRACT_REVISION,
+                actual_revision: descriptor.contract_revision,
+            });
+        }
+        Ok(descriptor.reorg_window_blocks)
+    }
 }
 
 fn translate_chain_event_envelope(

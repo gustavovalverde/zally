@@ -241,6 +241,20 @@ pub struct SyncDriverOptions {
     ///
     /// Default: 30 minutes, at least 24 block intervals at the longest Zcash target spacing.
     pub visible_tip_stall_limit_ms: Option<u64>,
+    /// Smallest chain source reorg window, in blocks, under which the wallet still accepts new
+    /// spends. `None` disables the check.
+    ///
+    /// The wallet frees an idempotency key once it judges the key's transaction unmineable at
+    /// the source's settled tip, so the promise never to pay twice holds only while the source
+    /// follows every reorg the node can produce. The driver reads
+    /// [`ChainSource::reorg_window_blocks`] when it starts and each time it reopens the
+    /// chain-event stream. While the window is smaller, new spends fail with
+    /// [`WalletError::SourceReorgWindowTooShallow`] and
+    /// [`WalletEvent::SourceReorgWindowTooShallow`](crate::WalletEvent::SourceReorgWindowTooShallow)
+    /// reports it; scanning continues. Closing the driver lifts the refusal.
+    ///
+    /// Default: 1,000 blocks, the deepest reorg Zebra produces.
+    pub minimum_source_reorg_window_blocks: Option<u32>,
 }
 
 impl SyncDriverOptions {
@@ -316,6 +330,18 @@ impl SyncDriverOptions {
         }
     }
 
+    /// Returns options with `minimum_source_reorg_window_blocks` replaced.
+    #[must_use]
+    pub const fn with_minimum_source_reorg_window_blocks(
+        self,
+        minimum_source_reorg_window_blocks: Option<u32>,
+    ) -> Self {
+        Self {
+            minimum_source_reorg_window_blocks,
+            ..self
+        }
+    }
+
     fn normalized(self) -> Self {
         Self {
             poll_interval_ms: self.poll_interval_ms.max(1),
@@ -329,6 +355,7 @@ impl SyncDriverOptions {
             visible_tip_stall_limit_ms: self
                 .visible_tip_stall_limit_ms
                 .map(|limit_ms| limit_ms.max(1)),
+            minimum_source_reorg_window_blocks: self.minimum_source_reorg_window_blocks,
         }
     }
 }
@@ -343,9 +370,14 @@ impl Default for SyncDriverOptions {
             transparent_utxo_refresh_interval_ms: 5_000,
             transparent_utxo_refresh_timeout_seconds: 120,
             visible_tip_stall_limit_ms: Some(30 * 60 * 1_000),
+            minimum_source_reorg_window_blocks: Some(ZEBRA_MAX_REORG_DEPTH_BLOCKS),
         }
     }
 }
+
+/// Deepest reorg Zebra produces: it commits a block to finalized state only once its best
+/// chain is longer than this.
+const ZEBRA_MAX_REORG_DEPTH_BLOCKS: u32 = 1_000;
 
 /// Repair rung the sync driver applies before its next sync attempt.
 ///
@@ -1003,6 +1035,7 @@ async fn run_sync_driver(
     };
     let started = ctx.status_tx.borrow().clone();
     publish_transition(ctx.status_tx, started, &DriverTransition::DriverStarted);
+    check_source_reorg_window(&ctx).await;
 
     let mut poll = interval(Duration::from_millis(ctx.options.poll_interval_ms));
     poll.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -1273,6 +1306,9 @@ async fn handle_poll_tick(
     };
     if feed.stream.is_none() && current_unix_ms() >= state.stream_next_attempt_at_ms {
         feed.stream = open_chain_events(ctx, state, &mut feed.start).await;
+        if feed.stream.is_some() {
+            check_source_reorg_window(ctx).await;
+        }
     }
     if state.source_tip.halted().is_some() {
         let refreshed = ctx.status_tx.borrow().clone();
@@ -1346,8 +1382,42 @@ async fn publish_source_recovered(ctx: &DriverContext<'_>, state: &mut DriverSta
     publish_transition(ctx.status_tx, snapshot, &DriverTransition::SourceRecovered);
 }
 
+/// Reads the chain source's reorg window and records it against the driver's minimum.
+///
+/// Runs when the driver starts and each time it reopens the chain-event stream, where a
+/// restarted source with a new configuration first shows. A read that fails or times out
+/// keeps the prior verdict.
+async fn check_source_reorg_window(ctx: &DriverContext<'_>) {
+    let Some(required_blocks) = ctx.options.minimum_source_reorg_window_blocks else {
+        return;
+    };
+    let read = tokio::time::timeout(
+        Duration::from_secs(ctx.options.sync_timeout_seconds),
+        ctx.chain.reorg_window_blocks(),
+    )
+    .await;
+    match read {
+        Ok(Ok(reorg_window_blocks)) => ctx
+            .wallet
+            .record_source_reorg_window(reorg_window_blocks, required_blocks),
+        Ok(Err(error)) => tracing::warn!(
+            target: "zally::sync",
+            event = "wallet_source_reorg_window_unreadable",
+            %error,
+            "could not read the chain source reorg window; keeping the prior verdict"
+        ),
+        Err(_elapsed) => tracing::warn!(
+            target: "zally::sync",
+            event = "wallet_source_reorg_window_unreadable",
+            timeout_seconds = ctx.options.sync_timeout_seconds,
+            "chain source reorg window read timed out; keeping the prior verdict"
+        ),
+    }
+}
+
 async fn close_sync_driver(ctx: &DriverContext<'_>, state: &DriverState) {
     ctx.wallet.set_source_halt(None);
+    ctx.wallet.clear_source_reorg_window();
     let closing = build_snapshot(ctx, SyncDriverPhase::Closing, state).await;
     publish_transition(ctx.status_tx, closing, &DriverTransition::Closing);
     let closed = build_snapshot(ctx, SyncDriverPhase::Closed, state).await;

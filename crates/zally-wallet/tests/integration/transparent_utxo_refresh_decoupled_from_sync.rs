@@ -174,6 +174,10 @@ impl ChainSource for LatentTransparentUtxoChainSource {
     ) -> Result<ChainEventEnvelopeStream, ChainSourceError> {
         self.inner.chain_event_envelopes(start).await
     }
+
+    async fn reorg_window_blocks(&self) -> Result<u32, ChainSourceError> {
+        self.inner.reorg_window_blocks().await
+    }
 }
 
 #[derive(Debug, thiserror::Error)]

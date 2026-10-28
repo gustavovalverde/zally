@@ -267,6 +267,29 @@ pub enum WalletError {
         cause: crate::SourceHalt,
     },
 
+    /// The chain source follows shallower reorgs than the node can produce, so the wallet
+    /// refuses new spends.
+    ///
+    /// The wallet frees an idempotency key once it judges the key's transaction unmineable at
+    /// the settled tip. A reorg deeper than the source's window could still mine that
+    /// transaction after its replacement was paid. Raise the source's reorg window to at
+    /// least `required_blocks` (Zinder's `reorg_window_blocks`), or lower
+    /// [`crate::SyncDriverOptions::minimum_source_reorg_window_blocks`] to accept the weaker
+    /// guarantee.
+    ///
+    /// Posture: [`FailurePosture::RequiresOperator`]: spends resume once the sync driver reads
+    /// a window of at least `required_blocks`.
+    #[error(
+        "chain source reorg window of {reorg_window_blocks} blocks is below the required \
+         {required_blocks}; new spends are refused"
+    )]
+    SourceReorgWindowTooShallow {
+        /// Reorg window the source reported.
+        reorg_window_blocks: u32,
+        /// Minimum window the sync driver requires.
+        required_blocks: u32,
+    },
+
     /// The sync-driver task panicked. Surfaced only by [`crate::SyncHandle::close`]; the
     /// driver task never fails while its handle is alive.
     ///
@@ -302,6 +325,7 @@ impl WalletError {
             | Self::AccountNotFound
             | Self::SubmittedTransactionIdMismatch { .. }
             | Self::TargetExpiryMismatch { .. }
+            | Self::SourceReorgWindowTooShallow { .. }
             | Self::SyncDriverFailed { .. } => FailurePosture::RequiresOperator,
             Self::AccountAlreadyExists
             | Self::MemoOnTransparentRecipient

@@ -25,6 +25,8 @@ use zally_core::{AccountId, BlockHeight, HoldId, IdempotencyKey, TxId};
 /// [`WalletEvent::TransparentUtxoRefreshFaulted`] marks a faulted transparent-UTXO refresh
 /// attempt. [`WalletEvent::PendingBroadcastUnmineable`] names a broadcast to recreate, and
 /// [`WalletEvent::HoldDispenseUnmineable`] names each dispense hold it had finalized.
+/// [`WalletEvent::SourceReorgWindowTooShallow`] and [`WalletEvent::SourceReorgWindowSufficient`]
+/// mark the start and end of a spend refusal over the chain source's reorg window.
 /// [`WalletEvent::Lagged`] is injected by the subscription
 /// stream when a consumer drops events; the sync loop never emits it directly.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -172,6 +174,26 @@ pub enum WalletEvent {
         tx_id: TxId,
         /// The hold is active again; false when it was released instead.
         is_reopened: bool,
+    },
+    /// The sync driver read a chain source reorg window below
+    /// [`crate::SyncDriverOptions::minimum_source_reorg_window_blocks`], so the wallet refuses
+    /// new spends with [`crate::WalletError::SourceReorgWindowTooShallow`].
+    ///
+    /// Emitted when the refusal starts, and again when the reported window changes while it
+    /// stays too shallow. Raise the source's reorg window to at least `required_blocks`.
+    SourceReorgWindowTooShallow {
+        /// Reorg window the source reported.
+        reorg_window_blocks: u32,
+        /// Minimum window the sync driver requires.
+        required_blocks: u32,
+    },
+    /// The sync driver read a chain source reorg window that meets its minimum again, so the
+    /// refusal reported by [`Self::SourceReorgWindowTooShallow`] is lifted.
+    SourceReorgWindowSufficient {
+        /// Reorg window the source reported.
+        reorg_window_blocks: u32,
+        /// Minimum window the sync driver requires.
+        required_blocks: u32,
     },
     /// Consumer fell behind; `dropped_count` events were skipped before this notification.
     Lagged {

@@ -331,6 +331,10 @@ impl ChainSource for QuietCountingChainSource {
             Ok(Box::pin(stream::pending()))
         }
     }
+
+    async fn reorg_window_blocks(&self) -> Result<u32, ChainSourceError> {
+        self.inner.reorg_window_blocks().await
+    }
 }
 
 #[tokio::test]
@@ -479,6 +483,10 @@ impl ChainSource for StalledChainSource {
             Result<ChainEventEnvelope, ChainSourceError>,
         >()))
     }
+
+    async fn reorg_window_blocks(&self) -> Result<u32, ChainSourceError> {
+        Ok(1_000)
+    }
 }
 
 /// `ChainSource` that records every subscription start and scripts the event stream.
@@ -583,6 +591,10 @@ impl ChainSource for RecordingChainSource {
                 Result<ChainEventEnvelope, ChainSourceError>,
             >()))
         }
+    }
+
+    async fn reorg_window_blocks(&self) -> Result<u32, ChainSourceError> {
+        self.inner.reorg_window_blocks().await
     }
 }
 
