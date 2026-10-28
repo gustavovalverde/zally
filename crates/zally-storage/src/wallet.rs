@@ -2,8 +2,8 @@
 
 use async_trait::async_trait;
 use zally_core::{
-    AccountId, BlockHeight, CompactBlockArtifact, HoldId, IdempotencyKey, Network, OutPoint,
-    TreeStateArtifact, TxId, Zatoshis,
+    AccountId, BlockHash, BlockHeight, CompactBlockArtifact, HoldId, IdempotencyKey, Network,
+    OutPoint, TreeStateArtifact, TxId, Zatoshis,
 };
 
 /// The storage backend behind a wallet handle.
@@ -38,6 +38,7 @@ use crate::error::StorageError;
 use crate::exposed_address_row::ExposedAddressRow;
 use crate::hold_row::{HeldNote, HoldRow};
 use crate::pending_broadcast_input_row::PendingBroadcastInputRow;
+use crate::reverted_broadcast_row::RevertedBroadcastRow;
 
 /// Request body for [`WalletStorage::scan_blocks`].
 ///
@@ -435,6 +436,30 @@ pub struct PendingBroadcastTransaction {
     pub mined_height: Option<BlockHeight>,
 }
 
+/// A dispense hold finalized with a transaction [`WalletStorage::record_unmineable_transaction`]
+/// recorded as unmineable.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub struct UnmineableHold {
+    /// The settled hold.
+    pub hold_id: HoldId,
+    /// Request identifier the hold was reserved under.
+    pub request_id: IdempotencyKey,
+    /// True when the hold is active again; false when it was released because another
+    /// active hold holds `request_id`.
+    pub is_reopened: bool,
+}
+
+/// Wallet activity a [`WalletStorage::revert_blocks_above`] call un-mined.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[non_exhaustive]
+pub struct RevertedBlocks {
+    /// Shielded notes received in a reverted block, each with the height it was mined at.
+    pub receives: Vec<ReceivedShieldedNoteRow>,
+    /// Wallet transactions mined in a reverted block, with the height each was mined at.
+    pub transactions: Vec<(TxId, BlockHeight)>,
+}
+
 /// Trait abstracting the wallet database.
 ///
 /// Every implementation returns [`StorageError`]; backends with a native error type translate
@@ -467,18 +492,20 @@ pub trait WalletStorage: Send + Sync + 'static {
         prior_chain_state: TreeStateArtifact,
     ) -> Result<AccountId, StorageError>;
 
-    /// Deletes the wallet database and recreates it with a fresh account for `seed`,
-    /// anchored at `prior_chain_state`, in one atomic storage operation.
+    /// Rebuilds the wallet database with a fresh account for `seed`, anchored at
+    /// `prior_chain_state`, and keeps the payment ledger.
     ///
     /// The deepest rung of the sync driver's repair ladder: wallet chain state is
     /// disposable derived state, so when it can no longer be reconciled with the chain
     /// (for example a note commitment tree conflict that a bounded rewind cannot clear)
     /// the repair is to rebuild from the birthday.
     ///
-    /// This discards ALL wallet-local state, including the zally ledger: send idempotency
-    /// records, holds, and pending broadcasts are gone. Derived chain state is rebuilt by
-    /// rescan; the ledger is not. Hosts that need cross-rebuild idempotency must keep
-    /// their own ledger.
+    /// Every piece of derived chain state starts fresh: scanned blocks, notes, commitment
+    /// trees, the scan queue, recorded chain tips, and the transactions the wallet knew.
+    /// The payment ledger survives: send idempotency records, holds, finalized PCZTs,
+    /// pending PCZT and broadcast inputs, reverted broadcasts awaiting reconciliation, and
+    /// the chain-event cursor. The replacement is built beside the live database and
+    /// swapped in only once complete, so a failure leaves the prior wallet in place.
     ///
     /// The returned [`AccountId`] equals the one the discarded database held for the same
     /// seed: account identity is key identity, not database identity.
@@ -875,6 +902,83 @@ pub trait WalletStorage: Send + Sync + 'static {
         record: PendingBroadcastRecord,
     ) -> Result<(), StorageError>;
 
+    /// Records a send before any of its transactions is submitted: binds `key` to `tx_id`,
+    /// the transaction that pays, records the transactions in `records` as the send's steps in
+    /// the order given, which is submission order, and records each one's pending-broadcast
+    /// inputs, in one storage transaction.
+    ///
+    /// Recording first means a lost submit acknowledgement, or a crash between the broadcast
+    /// and any later write, cannot let a retry with the same key build and pay a second
+    /// transaction: the retry finds the key bound. A binding whose transaction is never
+    /// mined is freed by [`Self::record_unmineable_transaction`]. Rebinding follows
+    /// [`Self::record_idempotent_submission`].
+    ///
+    /// `not_retryable` on `IdempotencyKeyConflict` or schema errors; `retryable` on transient
+    /// I/O.
+    async fn record_pending_submission(
+        &self,
+        key: IdempotencyKey,
+        tx_id: TxId,
+        records: Vec<PendingBroadcastRecord>,
+    ) -> Result<(), StorageError>;
+
+    /// Returns the steps of the send whose idempotency key is bound to `tx_id`, in submission
+    /// order and ending with `tx_id`, or `tx_id` alone when no steps were recorded for it.
+    ///
+    /// `not_retryable` on schema errors; `retryable` on transient I/O.
+    async fn list_send_steps(&self, tx_id: TxId) -> Result<Vec<crate::SendStepRow>, StorageError>;
+
+    /// Records a pending broadcast that the chain source reports mined at
+    /// `confirmed_at_height` although the wallet's scan did not recognize it.
+    ///
+    /// Stores the transaction in `zcash_client_sqlite` as mined at that height, with whatever
+    /// outputs and spends of the wallet it carries, and drops its pending-broadcast and
+    /// reverted-broadcast rows. Its idempotency key stays bound.
+    ///
+    /// `not_retryable` on a transaction that does not parse or on schema errors; `retryable`
+    /// on transient I/O.
+    async fn record_confirmed_broadcast(
+        &self,
+        raw_tx_bytes: Vec<u8>,
+        confirmed_at_height: BlockHeight,
+    ) -> Result<(), StorageError>;
+
+    /// Stores the carried steps of every unsettled send in `zcash_client_sqlite`, in
+    /// submission order, and returns the paying transactions of every send the scan may pass
+    /// without recognizing it mined.
+    ///
+    /// A multi-step send's paying step spends an output of the step before it. A rescan
+    /// recognizes that spend only if it already knows the output, which it does not when both
+    /// steps are mined in the same block, so a mined payment would read as never mined.
+    /// Storing the steps first lets the rescan match it. Every step is stored again on each
+    /// call until the paying step is mined, including one already seen mined.
+    ///
+    /// A send whose earlier steps' outputs a call cannot record as the wallet's is marked, and
+    /// so is one whose steps fail to store or check for a reason a retry would repeat, such as
+    /// bytes that do not parse. The mark stays until the send is released, because the scan
+    /// that followed may already have passed its paying step. A send in the result must never
+    /// be judged unmineable from the wallet's scan.
+    ///
+    /// A transient database failure while storing or checking a send marks nothing; the call
+    /// then fails, after settling the other sends, so the caller does not scan without that
+    /// send's outputs, and the next call tries it again.
+    ///
+    /// `retryable` when the database is busy or locked, out of space or memory, or an I/O
+    /// call fails; `not_retryable` on schema errors.
+    async fn store_carried_send_steps(&self) -> Result<Vec<TxId>, StorageError>;
+
+    /// Undoes [`Self::record_pending_submission`] for transactions that can never be mined:
+    /// drops the idempotency bindings that still name any of `tx_ids`, their
+    /// pending-broadcast inputs, and any reverted-broadcast rows a rebuild carried for them, in
+    /// one storage transaction, so the wallet never submits them again.
+    ///
+    /// The caller passes only transactions no submitter received, or ones a node rejected
+    /// for a reason that holds for every block. Releasing one that may still be mined would
+    /// let its key pay twice.
+    ///
+    /// `not_retryable` on schema errors; `retryable` on transient I/O.
+    async fn release_pending_submission(&self, tx_ids: Vec<TxId>) -> Result<(), StorageError>;
+
     /// Returns every pending broadcast input owned by `account_id` whose `broadcast_at_ms`
     /// is at or after `after_at_ms`. Older rows are filtered out so the caller does not
     /// need to apply the inflight-window cutoff itself.
@@ -902,8 +1006,7 @@ pub trait WalletStorage: Send + Sync + 'static {
     /// Drops every pending-broadcast row whose `broadcast_tx_id` appears in `tx_ids`.
     ///
     /// Called by `Wallet::sync` to retire pending entries whose spending transaction is mined
-    /// at or below the height it judges pending broadcasts at, and by the spend path when a
-    /// submission fails.
+    /// at or below the height it judges pending broadcasts at.
     ///
     /// Returns the number of rows removed.
     ///
@@ -915,16 +1018,22 @@ pub trait WalletStorage: Send + Sync + 'static {
 
     /// Records that `tx_id` can never be mined, as judged at `judged_height`.
     ///
-    /// In one storage transaction, drops the transaction's pending-broadcast rows and moves
-    /// every idempotency key bound to it into a terminal state, so the key's next send creates
-    /// a replacement. Repeating the call changes nothing.
+    /// In one storage transaction, drops the transaction's pending-broadcast and
+    /// reverted-broadcast rows, moves every idempotency key bound to it into a terminal state
+    /// so the key's next send creates a replacement, and undoes the finalization of every
+    /// hold finalized with it: the dispense did not happen. Each such hold becomes active
+    /// again, or is released when another active hold already holds its request identifier.
+    ///
+    /// Returns the holds the call settled, or `None` when the transaction was already recorded
+    /// and the call changed nothing. Callers report the verdict only on `Some`, so concurrent
+    /// judges of one transaction report it once.
     ///
     /// `not_retryable` on schema errors; `retryable` on transient I/O.
     async fn record_unmineable_transaction(
         &self,
         tx_id: TxId,
         judged_height: BlockHeight,
-    ) -> Result<(), StorageError>;
+    ) -> Result<Option<Vec<UnmineableHold>>, StorageError>;
 
     /// Returns the per-pool balance snapshot for `account_id`, anchored to the wallet's last
     /// persisted visible tip.
@@ -942,22 +1051,80 @@ pub trait WalletStorage: Send + Sync + 'static {
         account_id: AccountId,
     ) -> Result<AccountBalanceRow, StorageError>;
 
-    /// Truncates the wallet precisely to the supplied chain state, inserting that frontier
-    /// as a checkpoint at its exact height and rewinding to it.
+    /// Rewinds the wallet to exactly `chain_state`'s height because the blocks above it left
+    /// the chain.
     ///
-    /// Wraps `WalletWrite::truncate_to_chain_state`. It lands the wallet at exactly
-    /// `chain_state.block_height()` (rather than snapping down to the nearest existing wallet
-    /// checkpoint), so reorg recovery does not re-open a gap below the rewind target. The
-    /// caller fetches the chain state for the rewind height from the chain source. The
-    /// librustzcash backend bounds a valid rewind at the `COINBASE_MATURITY` window (100
-    /// blocks); a deeper target fails `NotRetryable` and the caller surfaces it to the
-    /// operator.
+    /// Wraps `WalletWrite::truncate_to_chain_state`, which lands the wallet at exactly
+    /// `chain_state.block_height()` at any depth: when the target lies below the oldest
+    /// retained checkpoint it inserts the supplied frontier as a new checkpoint first. The
+    /// caller fetches the chain state for the target from the chain source.
     ///
-    /// `not_retryable` on schema errors; `retryable` on transient I/O.
-    async fn truncate_to_chain_state(
+    /// The same database transaction records every wallet-sent transaction mined above the
+    /// target in the reverted-broadcast ledger ([`Self::list_reverted_broadcasts`]) and, when
+    /// `applied_cursor` is supplied, records it as the chain-event cursor. A crash therefore
+    /// keeps either the prior wallet and cursor or every effect of the rewind.
+    ///
+    /// Returns the receives and transactions the truncation un-mined. Un-mined receives
+    /// leave [`Self::list_shielded_receives_for_account`] until a scan mines them again.
+    ///
+    /// `not_retryable` on commitment-tree or schema errors; `retryable` on transient I/O.
+    async fn revert_blocks_above(
         &self,
         chain_state: TreeStateArtifact,
+        applied_cursor: Option<Vec<u8>>,
+    ) -> Result<RevertedBlocks, StorageError>;
+
+    /// Returns the highest block height the wallet has scanned, including blocks above a gap
+    /// that [`Self::fully_scanned_height`] still waits on.
+    ///
+    /// `not_retryable` on schema errors; `retryable` on transient I/O.
+    async fn find_highest_scanned_height(&self) -> Result<Option<BlockHeight>, StorageError>;
+
+    /// Returns the hash of the block the wallet scanned at `height`, or `None` when the
+    /// wallet holds no block there.
+    ///
+    /// `not_retryable` on schema errors; `retryable` on transient I/O.
+    async fn find_scanned_block_hash(
+        &self,
+        height: BlockHeight,
+    ) -> Result<Option<BlockHash>, StorageError>;
+
+    /// Returns the opaque chain-event cursor recorded after the most recently applied chain
+    /// event, if any.
+    ///
+    /// `not_retryable` on schema errors; `retryable` on transient I/O.
+    async fn find_chain_event_cursor(&self) -> Result<Option<Vec<u8>>, StorageError>;
+
+    /// Records `cursor_bytes` as the position after the most recently applied chain event.
+    ///
+    /// `not_retryable` on schema errors; `retryable` on transient I/O.
+    async fn record_chain_event_cursor(&self, cursor_bytes: Vec<u8>) -> Result<(), StorageError>;
+
+    /// Forgets the recorded chain-event cursor.
+    ///
+    /// `not_retryable` on schema errors; `retryable` on transient I/O.
+    async fn clear_chain_event_cursor(&self) -> Result<(), StorageError>;
+
+    /// Returns every wallet-sent transaction a rewind removed from the chain that is not yet
+    /// reconciled, oldest reversion first.
+    ///
+    /// `not_retryable` on schema errors; `retryable` on transient I/O.
+    async fn list_reverted_broadcasts(&self) -> Result<Vec<RevertedBroadcastRow>, StorageError>;
+
+    /// Records that the reverted broadcast `tx_id` was submitted again at
+    /// `resubmitted_at_ms`.
+    ///
+    /// `not_retryable` on schema errors; `retryable` on transient I/O.
+    async fn record_reverted_broadcast_resubmitted(
+        &self,
+        tx_id: TxId,
+        resubmitted_at_ms: u64,
     ) -> Result<(), StorageError>;
+
+    /// Removes the reverted broadcast `tx_id` once the wallet has scanned it mined again.
+    ///
+    /// `not_retryable` on schema errors; `retryable` on transient I/O.
+    async fn clear_reverted_broadcast(&self, tx_id: TxId) -> Result<(), StorageError>;
 
     /// Returns every Sapling, Orchard, and Ironwood note received in the inclusive height range
     /// `[from_height, to_height]`, regardless of current spent state.

@@ -33,13 +33,17 @@ Only `retryable` moves the breaker's failure counter, and only a call that compl
 | `InsufficientBalance` | `not_retryable` | The wallet lacks spendable funds for a reservation or a send, including a proposal librustzcash rejected for insufficient funds. |
 | `PaymentRequestParseFailed` | `not_retryable` | ZIP-321 URI parsing failed. |
 | `ProposalRejected` | Follows `ProposalRejectionKind` | The proposal or its transaction could not be built; `kind` says why. |
-| `SubmissionRejected` | `not_retryable` | The node rejected the submitted transaction. |
+| `SubmissionRejected` | `not_retryable` | The node rejected the submitted transaction. The send's idempotency key stays bound to it, so a retry with the same key returns it, until the pending-broadcast verdict records it as unmineable (CORE-5). |
 | `TransactionUnmineable` | `not_retryable` | A PCZT can never be mined, so it was refused before signing, proving, or extraction and its inputs were released; `reason` is the `UnmineableReason`. Recreate it; signing it again cannot repair it. The verdict assumes the wallet is the PCZT's sole broadcaster. |
 | `SubmittedTransactionIdMismatch` | `requires_operator` | A success-kind submitter response returned a transaction ID different from the submitted transaction bytes. |
 | `Pczt` | Mirrors `PcztError` | A PCZT role failed. |
 | `PaymentDisclosureExport` | Mirrors `PaymentDisclosureExportError` | A retained PCZT could not produce the requested disclosure profile. |
 | `PaymentDisclosureSourceMissing` | `not_retryable` | No finalized PCZT was retained for the transaction. |
 | `CircuitBroken` | `retryable` | The wallet IO circuit breaker is open. |
+| `ChainSourceHalted` | `retryable` | The sync driver found the chain source stopped following the chain, so new spends are refused; retry once the driver reports the source recovered. |
+| `SourceReorgWindowTooShallow` | `requires_operator` | The last read of the chain source's reorg window, by a sync or the sync driver, was below `WalletOptions::minimum_source_reorg_window_blocks`, so new spends are refused and no pending broadcast is judged unmineable; raise the source's window (Zinder `reorg_window_blocks`) or lower the minimum. |
+| `SourceReorgWindowUnverified` | `retryable` | The sync driver requires a minimum chain source reorg window and has not yet read the source's window, so new spends are refused; retry once it has, normally right after the driver starts. |
+| `PendingBroadcastUnsettled` | `retryable` | A retried send's idempotency key names a transaction the next block can no longer include, and the pending-broadcast verdict has not settled it. Do not pay again under another key; retry the same key after `PendingBroadcastUnmineable` (the key then builds a replacement) or `TransactionConfirmed`. |
 | `SyncDriverFailed` | Carries `FailurePosture` | The sync driver failed outside a wallet operation. Cancellation surfaces `Retryable`; panic surfaces `RequiresOperator`. |
 
 ## ChainSourceError
@@ -54,6 +58,7 @@ Only `retryable` moves the breaker's failure counter, and only a call that compl
 | `ContractRevisionUnsupported` | `requires_operator` | The endpoint contract revision is older than revision 2. |
 | `ChainEpochPinUnavailable` | `restartable` | The pinned epoch expired; restart the wallet sync against a fresh epoch. |
 | `ChainEventCursorExpired` | `restartable` | Reconcile the wallet against a fresh epoch, then subscribe from the earliest retained event. |
+| `ChainEventCursorInvalid` | `not_retryable` | The source did not issue the resume cursor; discard it and subscribe from the earliest retained event. |
 | `MalformedCompactBlock` | `requires_operator` | The source returned bytes that did not decode; investigate the upstream version. |
 | `CompactBlockStreamOrder` | `requires_operator` | A compact-block range was incomplete, duplicated, or out of order. |
 | `TreeStateAnchorHeightMismatch` | `requires_operator` | A tree-state artifact did not match the exact requested anchor height. |
@@ -97,6 +102,7 @@ Returned by `TransactionHeader::check_mineable` and carried by `WalletError::Tra
 |---------|---------|---------|
 | `NotOpened` | `not_retryable` | Storage was used before `open_or_create`. |
 | `MigrationFailed` | `requires_operator` | SQLite schema migration failed. |
+| `DatabaseLocked` | `requires_operator` | Another storage handle, in this process or another, holds the wallet database open for writing; a database admits one writer (CORE-7). Stop the other writer, or share one handle by cloning it. |
 | `SqliteFailed` | Carries `is_retryable` | SQLite returned an implementation error. |
 | `AccountNotFound` | `not_retryable` | The requested account was absent from storage. |
 | `AccountAlreadyExists` | `not_retryable` | The wallet already has its single supported account. |

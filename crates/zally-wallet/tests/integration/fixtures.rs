@@ -32,28 +32,42 @@ pub(crate) struct TestWalletFixture {
 /// Constructs a fresh wallet at birthday height 1 on a temp regtest store with default
 /// [`WalletOptions`].
 pub(crate) async fn create_test_wallet() -> Result<TestWalletFixture, TestWalletError> {
+    Ok(create_test_wallet_with_options(WalletOptions::default())
+        .await?
+        .0)
+}
+
+/// Same as [`create_test_wallet`], and also returns the wallet's storage handle.
+///
+/// Tests that read or seed the ledger directly share this handle instead of opening another,
+/// because the database admits one writer.
+pub(crate) async fn create_test_wallet_with_storage()
+-> Result<(TestWalletFixture, Sqlite), TestWalletError> {
     create_test_wallet_with_options(WalletOptions::default()).await
 }
 
-/// Same as [`create_test_wallet`] but with caller-supplied [`WalletOptions`]. Used by tests
-/// that need a non-default pending-broadcast window.
+/// Same as [`create_test_wallet_with_storage`] but with caller-supplied [`WalletOptions`].
+/// Used by tests that need a non-default pending-broadcast window.
 pub(crate) async fn create_test_wallet_with_options(
     options: WalletOptions,
-) -> Result<TestWalletFixture, TestWalletError> {
+) -> Result<(TestWalletFixture, Sqlite), TestWalletError> {
     let temp = TempWalletPath::create()?;
     let network = Network::regtest();
     let sealing = AgeFileSealing::new(AgeFileSealingOptions::at_path(temp.seed_path()));
     let storage = Sqlite::new(SqliteOptions::for_network(network, temp.db_path()));
     let chain = MockChainSource::new(network);
-    let (wallet, account_id, _mnemonic) = Wallet::builder(network, sealing, storage)
+    let (wallet, account_id, _mnemonic) = Wallet::builder(network, sealing, storage.clone())
         .with_options(options)
         .create(&chain, BlockHeight::from(1))
         .await?;
-    Ok(TestWalletFixture {
-        temp,
-        wallet,
-        account_id,
-    })
+    Ok((
+        TestWalletFixture {
+            temp,
+            wallet,
+            account_id,
+        },
+        storage,
+    ))
 }
 
 /// Error type returned by the fixture. Captures every error class a test setup can hit.
@@ -66,7 +80,10 @@ pub(crate) enum TestWalletError {
 }
 
 /// Longest any test waits for a sync-driver snapshot before failing.
-const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(5);
+///
+/// A ceiling on liveness, not a speed requirement: a loaded host can take far longer than an
+/// idle one to rebuild and rescan.
+const SNAPSHOT_TIMEOUT: Duration = Duration::from_mins(1);
 
 /// Waits for the first snapshot satisfying `predicate`, bounded by [`SNAPSHOT_TIMEOUT`].
 pub(crate) async fn wait_for_snapshot(

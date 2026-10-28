@@ -1,5 +1,6 @@
 //! `WalletStorage::record_idempotent_submission` + `find_idempotent_submission` integration,
-//! and the terminal state `record_unmineable_transaction` gives a key.
+//! the terminal state `record_unmineable_transaction` gives a key, and the send record
+//! `record_pending_submission` writes before submitting.
 
 use tempfile::TempDir;
 use zally_core::{AccountId, BlockHeight, IdempotencyKey, OutPoint, TxId, Zatoshis};
@@ -76,9 +77,13 @@ async fn a_key_whose_transaction_is_unmineable_binds_its_replacement() -> Result
     storage
         .record_unmineable_transaction(unmineable, BlockHeight::from(20))
         .await?;
-    storage
-        .record_unmineable_transaction(unmineable, BlockHeight::from(21))
-        .await?;
+    assert_eq!(
+        storage
+            .record_unmineable_transaction(unmineable, BlockHeight::from(21))
+            .await?,
+        None,
+        "a repeated verdict changes nothing"
+    );
     assert_eq!(
         storage.find_idempotent_submission(&key).await?,
         None,
@@ -107,6 +112,141 @@ async fn a_key_whose_transaction_is_unmineable_binds_its_replacement() -> Result
     Ok(())
 }
 
+#[tokio::test]
+async fn a_pending_submission_binds_the_paying_transaction_until_released() -> Result<(), TestError>
+{
+    let temp = TempDir::new()?;
+    let storage = Sqlite::new(SqliteOptions::for_network(
+        zally_core::Network::regtest(),
+        temp.path().join("wallet.db"),
+    ));
+    storage.open_or_create().await?;
+    let key = IdempotencyKey::try_from("payout-0002")?;
+    let funding = TxId::from_bytes([0x11_u8; 32]);
+    let paying = TxId::from_bytes([0x22_u8; 32]);
+    let account_id = AccountId::from_uuid(uuid::Uuid::from_bytes([0x33_u8; 16]));
+    let record = |broadcast_tx_id: TxId, outpoint_tx_byte: u8| PendingBroadcastRecord {
+        broadcast_tx_id,
+        account_id,
+        broadcast_at_ms: 1,
+        broadcast_at_height: Some(BlockHeight::from(10)),
+        inputs: vec![(
+            OutPoint::new(TxId::from_bytes([outpoint_tx_byte; 32]), 0),
+            Zatoshis::try_from(1_000_u64).unwrap_or(Zatoshis::zero()),
+        )],
+    };
+    let pending_broadcasts = || async {
+        let mut broadcasts: Vec<TxId> = storage
+            .list_pending_broadcast_inputs(account_id, 0)
+            .await?
+            .into_iter()
+            .map(|row| row.broadcast_tx_id)
+            .collect();
+        broadcasts.sort_by_key(|tx_id| *tx_id.as_bytes());
+        Ok::<_, StorageError>(broadcasts)
+    };
+
+    storage
+        .record_pending_submission(
+            key.clone(),
+            paying,
+            vec![record(funding, 0x44), record(paying, 0x55)],
+        )
+        .await?;
+    assert_eq!(
+        storage.find_idempotent_submission(&key).await?,
+        Some(paying)
+    );
+    assert_eq!(pending_broadcasts().await?, vec![funding, paying]);
+
+    let conflict = storage
+        .record_pending_submission(key.clone(), funding, vec![record(funding, 0x44)])
+        .await;
+    assert!(
+        matches!(conflict, Err(StorageError::IdempotencyKeyConflict)),
+        "a bound key refuses another transaction: {conflict:?}"
+    );
+    assert_eq!(
+        pending_broadcasts().await?,
+        vec![funding, paying],
+        "the refused record writes nothing"
+    );
+
+    let carried_by_a_rebuild = rusqlite::Connection::open(temp.path().join("wallet.db"))?;
+    carried_by_a_rebuild.execute(
+        "INSERT INTO ext_zally_reverted_broadcasts \
+             (tx_id_bytes, raw_tx_bytes, expiry_height, recorded_at_ms) \
+         VALUES (?1, x'00', 100, 1)",
+        [paying.as_bytes().as_slice()],
+    )?;
+    drop(carried_by_a_rebuild);
+
+    storage.release_pending_submission(vec![paying]).await?;
+    assert_eq!(storage.find_idempotent_submission(&key).await?, None);
+    assert!(
+        storage.list_reverted_broadcasts().await?.is_empty(),
+        "a released transaction is never resubmitted from the reverted-broadcast ledger"
+    );
+    assert_eq!(
+        pending_broadcasts().await?,
+        vec![funding],
+        "a step that may be in flight keeps its pending inputs"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_pending_submission_records_every_step_of_its_send() -> Result<(), TestError> {
+    let temp = TempDir::new()?;
+    let storage = Sqlite::new(SqliteOptions::for_network(
+        zally_core::Network::regtest(),
+        temp.path().join("wallet.db"),
+    ));
+    storage.open_or_create().await?;
+    let key = IdempotencyKey::try_from("payout-0003")?;
+    let funding = TxId::from_bytes([0x11_u8; 32]);
+    let paying = TxId::from_bytes([0x22_u8; 32]);
+    let account_id = AccountId::from_uuid(uuid::Uuid::from_bytes([0x33_u8; 16]));
+    let record = |broadcast_tx_id: TxId| PendingBroadcastRecord {
+        broadcast_tx_id,
+        account_id,
+        broadcast_at_ms: 1,
+        broadcast_at_height: Some(BlockHeight::from(10)),
+        inputs: Vec::new(),
+    };
+
+    storage
+        .record_pending_submission(key, paying, vec![record(funding), record(paying)])
+        .await?;
+    assert_eq!(
+        step_ids(&storage, paying).await?,
+        vec![funding, paying],
+        "the binding records every step of the send in submission order"
+    );
+    assert_eq!(
+        step_ids(&storage, funding).await?,
+        vec![funding],
+        "a transaction no key names is its own only step"
+    );
+
+    storage.release_pending_submission(vec![paying]).await?;
+    assert_eq!(
+        step_ids(&storage, paying).await?,
+        vec![paying],
+        "a released send keeps no steps"
+    );
+    Ok(())
+}
+
+async fn step_ids(storage: &Sqlite, tx_id: TxId) -> Result<Vec<TxId>, StorageError> {
+    Ok(storage
+        .list_send_steps(tx_id)
+        .await?
+        .into_iter()
+        .map(|step| step.tx_id)
+        .collect())
+}
+
 #[derive(Debug, thiserror::Error)]
 enum TestError {
     #[error("io error: {0}")]
@@ -115,4 +255,6 @@ enum TestError {
     Storage(#[from] StorageError),
     #[error("idempotency key error: {0}")]
     Key(#[from] zally_core::IdempotencyKeyError),
+    #[error("sqlite error: {0}")]
+    Sqlite(#[from] rusqlite::Error),
 }

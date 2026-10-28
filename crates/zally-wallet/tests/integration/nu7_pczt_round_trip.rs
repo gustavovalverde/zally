@@ -12,7 +12,7 @@
 
 use orchard::tree::MerkleHashOrchard;
 use tempfile::TempDir;
-use zally_chain::UnmineableReason;
+use zally_chain::{SubmitterError, UnmineableReason};
 use zally_core::{
     BlockHash, BlockHeight, CompactBlockArtifact, CompactChainMetadata, CompactShieldedAction,
     CompactTransaction, CompactTransparentInput, Network, PaymentRecipient, TreeStateArtifact,
@@ -24,8 +24,8 @@ use zally_storage::{
     ProposalPaymentRequest, ScanRequest, ShieldTransparentRequest, Sqlite, SqliteOptions,
     StorageError, TransparentUtxoRow, WalletStorage,
 };
-use zally_testkit::InMemorySealing;
-use zally_wallet::{ProposalPlan, Wallet, WalletError};
+use zally_testkit::{InMemorySealing, MockSubmitter};
+use zally_wallet::{ProposalPlan, RetryPolicy, Wallet, WalletError};
 use zcash_client_backend::proto::compact_formats::CompactOrchardAction;
 use zcash_primitives::transaction::builder::default_tx_expiry_delta;
 use zcash_primitives::transaction::{Transaction, TxVersion};
@@ -471,4 +471,69 @@ impl TestError {
     fn fixture(reason: impl Into<String>) -> Self {
         Self::Fixture(reason.into())
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pczt_submission_retried_after_a_lost_acknowledgement_submits_the_same_transaction()
+-> Result<(), TestError> {
+    let network = regtest_with_nu7_at(1);
+    let temp = TempDir::new()?;
+    let seed = SeedMaterial::from_raw_bytes(vec![0x5a; 32])
+        .map_err(|err| TestError::fixture(err.to_string()))?;
+    let IronwoodNoteWallet {
+        storage,
+        account_id,
+        ..
+    } = wallet_with_ironwood_note(network, &temp, &seed).await?;
+    let tip = BlockHeight::from(PCZT_CHAIN_TIP_HEIGHT);
+    storage.record_chain_tips(tip, tip).await?;
+    let sealing = InMemorySealing::new();
+    sealing.seal_seed(&seed).await?;
+    let (wallet, _) = Wallet::builder(network, sealing, storage.clone())
+        .open()
+        .await?;
+    wallet.set_retry_policy(RetryPolicy::none());
+    let payment = ProposalPlan::conventional(
+        account_id,
+        PaymentRecipient::UnifiedAddress {
+            encoded: storage
+                .derive_next_address(account_id)
+                .await?
+                .encode(&network.to_parameters()),
+            network,
+        },
+        zatoshis(PAYMENT_ZAT)?,
+        None,
+    );
+    let created = wallet.propose_pczt(payment, None).await?;
+    let signed = wallet
+        .sign_pczt(&wallet.prove_pczt(&created).await?)
+        .await?;
+    let submitter = MockSubmitter::accepting(network).with_tx_id_derivation(nu7_transaction_id);
+    let submissions = submitter.handle();
+    submissions.fail_submit_next(1, || SubmitterError::Unavailable {
+        reason: "acknowledgement lost".to_owned(),
+    });
+
+    let first = wallet.extract_and_submit_pczt(&signed, &submitter).await;
+    assert!(
+        matches!(&first, Err(error) if error.is_retryable()),
+        "the lost acknowledgement surfaces as a retryable error: {first:?}"
+    );
+    let retried = wallet.extract_and_submit_pczt(&signed, &submitter).await?;
+    let received = submissions.submitted_bytes();
+    assert_eq!(received.len(), 1);
+    assert_eq!(
+        received.first().map(|raw| nu7_transaction_id(raw)),
+        Some(retried.tx_id()),
+        "the retry submits the transaction the PCZT already extracted"
+    );
+    assert_eq!(wallet.extract_pczt(&signed).await?, retried.tx_id());
+    Ok(())
+}
+
+fn nu7_transaction_id(raw_tx: &[u8]) -> TxId {
+    Transaction::read(raw_tx, BranchId::Nu7).map_or(TxId::from_bytes([0; 32]), |transaction| {
+        TxId::from_bytes(*transaction.txid().as_ref())
+    })
 }

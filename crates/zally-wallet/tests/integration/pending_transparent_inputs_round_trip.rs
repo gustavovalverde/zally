@@ -5,11 +5,14 @@
 
 use zally_chain::ChainSource as _;
 use zally_core::{BlockHeight, OutPoint, TxId, Zatoshis};
-use zally_storage::{PendingBroadcastRecord, Sqlite, SqliteOptions, WalletStorage};
+use zally_storage::{PendingBroadcastRecord, WalletStorage};
 use zally_testkit::MockChainSource;
 use zally_wallet::{WalletError, WalletOptions};
 
-use super::fixtures::{TestWalletFixture, create_test_wallet, create_test_wallet_with_options};
+use super::fixtures::{
+    TestWalletFixture, create_test_wallet, create_test_wallet_with_options,
+    create_test_wallet_with_storage,
+};
 
 fn unix_ms_now() -> u64 {
     std::time::SystemTime::now()
@@ -39,14 +42,14 @@ async fn get_pending_transparent_inputs_returns_empty_on_fresh_wallet() -> Resul
 
 #[tokio::test]
 async fn get_pending_transparent_inputs_reports_recorded_rows() -> Result<(), TestError> {
-    let TestWalletFixture {
-        temp,
-        wallet,
-        account_id,
-    } = create_test_wallet().await?;
-    let network = wallet.network();
-    let storage = Sqlite::new(SqliteOptions::for_network(network, temp.db_path()));
-    storage.open_or_create().await?;
+    let (
+        TestWalletFixture {
+            temp: _temp,
+            wallet,
+            account_id,
+        },
+        storage,
+    ) = create_test_wallet_with_storage().await?;
 
     let now_ms = unix_ms_now();
     let broadcast_tx_id = TxId::from_bytes([1_u8; 32]);
@@ -80,14 +83,14 @@ async fn get_pending_transparent_inputs_reports_recorded_rows() -> Result<(), Te
 async fn get_pending_transparent_inputs_flags_rows_outside_window_as_stale() -> Result<(), TestError>
 {
     let options = WalletOptions::default().with_pending_broadcast_window_ms(60_000);
-    let TestWalletFixture {
-        temp,
-        wallet,
-        account_id,
-    } = create_test_wallet_with_options(options).await?;
-    let network = wallet.network();
-    let storage = Sqlite::new(SqliteOptions::for_network(network, temp.db_path()));
-    storage.open_or_create().await?;
+    let (
+        TestWalletFixture {
+            temp: _temp,
+            wallet,
+            account_id,
+        },
+        storage,
+    ) = create_test_wallet_with_options(options).await?;
 
     let stale_at_ms = unix_ms_now().saturating_sub(10 * 60_000);
     storage
@@ -113,14 +116,15 @@ async fn get_pending_transparent_inputs_flags_rows_outside_window_as_stale() -> 
 async fn sync_keeps_old_pending_broadcast_rows_the_chain_has_not_settled() -> Result<(), TestError>
 {
     let options = WalletOptions::default().with_pending_broadcast_window_ms(60_000);
-    let TestWalletFixture {
-        temp,
-        wallet,
-        account_id,
-    } = create_test_wallet_with_options(options).await?;
+    let (
+        TestWalletFixture {
+            temp: _temp,
+            wallet,
+            account_id,
+        },
+        storage,
+    ) = create_test_wallet_with_options(options).await?;
     let network = wallet.network();
-    let storage = Sqlite::new(SqliteOptions::for_network(network, temp.db_path()));
-    storage.open_or_create().await?;
 
     let stale_at_ms = unix_ms_now().saturating_sub(10 * 60_000);
     let tx_id = TxId::from_bytes([5_u8; 32]);

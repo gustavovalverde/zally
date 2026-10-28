@@ -15,7 +15,10 @@ mod pczt;
 mod pending_broadcast_retirement;
 mod pending_transparent_inputs;
 mod received_note;
+mod reorg;
 mod retry;
+mod source_halt;
+mod source_reorg_window;
 mod spend;
 mod status;
 mod sync;
@@ -37,6 +40,7 @@ pub use options::WalletOptions;
 pub use pending_transparent_inputs::{PendingTransparentInput, PendingTransparentInputs};
 pub use received_note::ShieldedReceiveRecord;
 pub use retry::{HasFailurePosture, RetryPolicy, with_retry};
+pub use source_halt::SourceHalt;
 pub use spend::{
     BroadcastOutcome, ParsedPayment, PaymentRequest, Proposal, ProposalPlan, SendOutcome,
     SendPaymentPlan, ShieldTransparentPlan, SignedPczt,

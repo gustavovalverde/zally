@@ -28,4 +28,6 @@ Stop the wallet, replace `wallet.db`, `wallet.db-wal`, and `wallet.db-shm` with 
 
 Never point an older release at an upgraded database. It does not refuse it: its migrator skips migrations it does not know, so it opens the database and then runs against tables and data it does not maintain.
 
-Do not use `Wallet::reset_to_birthday` to undo an upgrade. It deletes the database files, and with them Zally's ledger: send idempotency records, dispense holds, retained finalized PCZTs, and pending broadcasts. The sync driver's last repair rung calls it too, so the backup is the only copy of that ledger.
+Do not use `Wallet::reset_to_birthday` to undo an upgrade. It rebuilds the derived chain state with the release that runs it, so the rebuilt database carries that release's schema. It keeps Zally's payment ledger (send idempotency records, dispense holds, retained finalized PCZTs, pending and reverted broadcasts, and the chain-event cursor), but it discards the transaction records `zcash_client_sqlite` keeps, and nothing in it can return the database to the older schema. Only the backup can.
+
+Zally adds its own ledger tables (`ext_zally_*`) on open without a migration. A release that adds one creates it empty the first time it opens the database; an older release ignores tables it does not know.

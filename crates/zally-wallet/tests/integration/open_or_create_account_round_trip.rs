@@ -71,9 +71,10 @@ async fn open_or_create_account_is_idempotent_on_warm_storage() -> Result<(), Te
     let sealing = AgeFileSealing::new(AgeFileSealingOptions::at_path(temp.seed_path()));
     let storage = Sqlite::new(SqliteOptions::for_network(network, temp.db_path()));
     let chain = zally_testkit::MockChainSource::new(network);
-    let (_wallet, original_account_id, _mnemonic) = Wallet::builder(network, sealing, storage)
+    let (wallet, original_account_id, _mnemonic) = Wallet::builder(network, sealing, storage)
         .create(&chain, BlockHeight::from(1))
         .await?;
+    drop(wallet);
 
     let sealing = AgeFileSealing::new(AgeFileSealingOptions::at_path(temp.seed_path()));
     let storage = Sqlite::new(SqliteOptions::for_network(network, temp.db_path()));

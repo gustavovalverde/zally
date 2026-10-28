@@ -255,6 +255,77 @@ pub enum WalletError {
         source: Box<Self>,
     },
 
+    /// The chain source stopped following the chain, so the wallet refuses new spends: a
+    /// transaction built against a frozen branch could pay from funds the chain no longer
+    /// holds.
+    ///
+    /// Posture: [`FailurePosture::Retryable`]: retry once the sync driver reports the source
+    /// recovered.
+    #[error("chain source halted; new spends are refused: {cause}")]
+    ChainSourceHalted {
+        /// Why the source halted.
+        cause: crate::SourceHalt,
+    },
+
+    /// The chain source follows shallower reorgs than the node can produce, so the wallet
+    /// refuses new spends.
+    ///
+    /// The wallet frees an idempotency key once it judges the key's transaction unmineable at
+    /// the settled tip. A reorg deeper than the source's window could still mine that
+    /// transaction after its replacement was paid. Raise the source's reorg window to at
+    /// least `required_blocks` (Zinder's `reorg_window_blocks`), or lower
+    /// [`crate::WalletOptions::minimum_source_reorg_window_blocks`] to accept the weaker
+    /// guarantee.
+    ///
+    /// Posture: [`FailurePosture::RequiresOperator`]: spends resume once a sync or the sync
+    /// driver reads a window of at least `required_blocks`.
+    #[error(
+        "chain source reorg window of {reorg_window_blocks} blocks is below the required \
+         {required_blocks}; new spends are refused"
+    )]
+    SourceReorgWindowTooShallow {
+        /// Reorg window the source reported.
+        reorg_window_blocks: u32,
+        /// Minimum window the sync driver requires.
+        required_blocks: u32,
+    },
+
+    /// The send's idempotency key names a transaction that the next block can no longer
+    /// include and that the pending-broadcast verdict has not yet settled.
+    ///
+    /// A reorg within the chain source's window could still mine it, so paying again under
+    /// another key could pay twice. Once the wallet reports
+    /// [`crate::WalletEvent::PendingBroadcastUnmineable`] for `tx_id`, the same key builds a
+    /// replacement; a [`crate::WalletEvent::TransactionConfirmed`] for it means it was paid.
+    ///
+    /// Posture: [`FailurePosture::Retryable`]: retry the same key after either event.
+    #[error(
+        "transaction {tx_id} bound to this idempotency key can no longer enter the next block \
+         (expiry height {}) and awaits the pending-broadcast verdict",
+        tx_expiry_height.as_u32()
+    )]
+    PendingBroadcastUnsettled {
+        /// Transaction the key names.
+        tx_id: TxId,
+        /// The transaction's expiry height.
+        tx_expiry_height: BlockHeight,
+    },
+
+    /// The sync driver requires a minimum chain source reorg window and has not yet read the
+    /// source's window, so the wallet refuses new spends until it has.
+    ///
+    /// Posture: [`FailurePosture::Retryable`]: retry once the driver has read the window,
+    /// normally right after it starts. A source whose window cannot be read keeps spends
+    /// refused.
+    #[error(
+        "chain source reorg window not yet verified against the required {required_blocks} \
+         blocks; new spends are refused"
+    )]
+    SourceReorgWindowUnverified {
+        /// Minimum window the sync driver requires.
+        required_blocks: u32,
+    },
+
     /// The sync-driver task panicked. Surfaced only by [`crate::SyncHandle::close`]; the
     /// driver task never fails while its handle is alive.
     ///
@@ -280,7 +351,10 @@ impl WalletError {
             Self::PaymentDisclosureExport(e) => e.posture(),
             Self::ChainSource(e) => e.posture(),
             Self::Submitter(e) => e.posture(),
-            Self::CircuitBroken { .. } => FailurePosture::Retryable,
+            Self::CircuitBroken { .. }
+            | Self::ChainSourceHalted { .. }
+            | Self::SourceReorgWindowUnverified { .. }
+            | Self::PendingBroadcastUnsettled { .. } => FailurePosture::Retryable,
             Self::UnverifiedScanChunk { source, .. } => source.posture(),
             Self::ProposalRejected { kind, .. } => kind.posture(),
             Self::NetworkMismatch { .. }
@@ -288,6 +362,7 @@ impl WalletError {
             | Self::AccountNotFound
             | Self::SubmittedTransactionIdMismatch { .. }
             | Self::TargetExpiryMismatch { .. }
+            | Self::SourceReorgWindowTooShallow { .. }
             | Self::SyncDriverFailed { .. } => FailurePosture::RequiresOperator,
             Self::AccountAlreadyExists
             | Self::MemoOnTransparentRecipient
@@ -424,12 +499,29 @@ mod tests {
                     ChainSourceError::ChainEpochPinUnavailable,
                 )),
             },
+            WalletError::ChainSourceHalted {
+                cause: crate::SourceHalt::VisibleTipStalled {
+                    visible_tip_height: BlockHeight::from(14),
+                    unchanged_since_ms: 0,
+                },
+            },
             WalletError::SyncDriverFailed { reason: "x".into() },
         ];
         for e in variants {
             let _ = e.posture();
             let _ = e.is_retryable();
         }
+    }
+
+    #[test]
+    fn a_halted_source_refuses_spends_until_it_recovers() {
+        let err = WalletError::ChainSourceHalted {
+            cause: crate::SourceHalt::VisibleTipStalled {
+                visible_tip_height: BlockHeight::from(14),
+                unchanged_since_ms: 0,
+            },
+        };
+        assert_eq!(err.posture(), FailurePosture::Retryable);
     }
 
     #[test]

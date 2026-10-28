@@ -121,6 +121,16 @@ pub enum ChainSourceError {
         recovery: crate::ChainEventCursorRecovery,
     },
 
+    /// The source does not recognize the resume cursor: it was issued by another store, for
+    /// another network, or is corrupt.
+    ///
+    /// Posture: [`FailurePosture::NotRetryable`] for the subscription that carried it. The
+    /// sync driver discards the cursor and subscribes from the earliest retained event;
+    /// scan-time continuity checks catch any reorg the discarded position would have
+    /// announced.
+    #[error("chain event cursor is not recognized by the source")]
+    ChainEventCursorInvalid,
+
     /// The source returned a protocol variant this Zally build does not understand.
     ///
     /// Posture: [`FailurePosture::RequiresOperator`]. Upgrade Zally before interpreting the
@@ -133,10 +143,9 @@ pub enum ChainSourceError {
 
     /// The chain source returned a tree-state anchor at a height other than
     /// the one requested. The chain-source contract requires
-    /// `tree_state_at(h)` to land at exactly `h` (or a height within the
-    /// wallet's rewind cap that the wallet can realign to). This variant
-    /// fires when a custom chain source violates the cadence contract from
-    /// ADR-0005 and the wallet cannot recover.
+    /// `tree_state_at(h)` to land at exactly `h`. This variant fires when a
+    /// custom chain source violates the cadence contract from ADR-0005 and the
+    /// wallet cannot recover.
     ///
     /// Posture: [`FailurePosture::RequiresOperator`]. The operator must
     /// investigate the chain source: re-querying yields the same answer.
@@ -245,9 +254,9 @@ impl ChainSourceError {
             Self::ChainEpochPinUnavailable | Self::ChainEventCursorExpired { .. } => {
                 FailurePosture::Restartable
             }
-            Self::BlockHeightBelowFloor { .. } | Self::BlockHeightAboveVisibleTip { .. } => {
-                FailurePosture::NotRetryable
-            }
+            Self::BlockHeightBelowFloor { .. }
+            | Self::BlockHeightAboveVisibleTip { .. }
+            | Self::ChainEventCursorInvalid => FailurePosture::NotRetryable,
             Self::NetworkMismatch { .. }
             | Self::CapabilitiesUnavailable { .. }
             | Self::ContractRevisionUnsupported { .. }
@@ -393,6 +402,10 @@ mod tests {
                     recovery: crate::ChainEventCursorRecovery::EarliestRetained,
                 },
                 FailurePosture::Restartable,
+            ),
+            (
+                ChainSourceError::ChainEventCursorInvalid,
+                FailurePosture::NotRetryable,
             ),
             (
                 ChainSourceError::CapabilitiesUnavailable {

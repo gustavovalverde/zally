@@ -418,7 +418,7 @@ async fn commitment_tree_conflict_heals_by_rewind_and_rescan() -> Result<(), Tes
     let (storage, _temp) = wallet_with_divergent_tree().await?;
 
     storage
-        .truncate_to_chain_state(testnet_chain_state_at(FIXTURE_SCANNED_HEIGHT)?)
+        .revert_blocks_above(testnet_chain_state_at(FIXTURE_SCANNED_HEIGHT)?, None)
         .await?;
     scan(
         &storage,

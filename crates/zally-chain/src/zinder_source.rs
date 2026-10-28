@@ -137,21 +137,27 @@ impl ZinderChainSource {
         )
     }
 
+    /// Reads the server's descriptor, refusing a server older than the supported contract.
+    async fn server_descriptor(&self) -> Result<zinder_client::ServerInfo, ChainSourceError> {
+        let descriptor = self
+            .inner
+            .server_info()
+            .await
+            .map_err(Self::map_indexer_error)?;
+        if descriptor.contract_revision < zinder_client::MIN_SUPPORTED_CONTRACT_REVISION {
+            return Err(ChainSourceError::ContractRevisionUnsupported {
+                minimum_revision: zinder_client::MIN_SUPPORTED_CONTRACT_REVISION,
+                actual_revision: descriptor.contract_revision,
+            });
+        }
+        Ok(descriptor)
+    }
+
     async fn ensure_capabilities(&self, required: &[Capability]) -> Result<(), ChainSourceError> {
         let capabilities = self
             .capabilities
             .get_or_try_init(|| async {
-                let descriptor = self
-                    .inner
-                    .server_info()
-                    .await
-                    .map_err(Self::map_indexer_error)?;
-                if descriptor.contract_revision < zinder_client::MIN_SUPPORTED_CONTRACT_REVISION {
-                    return Err(ChainSourceError::ContractRevisionUnsupported {
-                        minimum_revision: zinder_client::MIN_SUPPORTED_CONTRACT_REVISION,
-                        actual_revision: descriptor.contract_revision,
-                    });
-                }
+                let descriptor = self.server_descriptor().await?;
                 Ok::<_, ChainSourceError>(descriptor.capabilities.into_iter().collect())
             })
             .await?;
@@ -183,6 +189,10 @@ impl ZinderChainSource {
             } => ChainSourceError::ChainEventCursorExpired {
                 recovery: ChainEventCursorRecovery::EarliestRetained,
             },
+            zinder_client::IndexerError::RemoteFailure {
+                reason: zinder_client::ErrorReason::ChainEventCursorInvalid,
+                ..
+            } => ChainSourceError::ChainEventCursorInvalid,
             other => ChainSourceError::Indexer(other),
         }
     }
@@ -294,10 +304,19 @@ impl ChainSource for ZinderChainSource {
             .collect())
     }
 
-    async fn transaction_status(&self, tx_id: TxId) -> Result<TransactionStatus, ChainSourceError> {
+    async fn transaction_status(
+        &self,
+        chain_epoch: ChainEpoch,
+        tx_id: TxId,
+    ) -> Result<TransactionStatus, ChainSourceError> {
         self.ensure_capabilities(&[Capability::Transaction]).await?;
+        let epoch = self.pinned_epoch(chain_epoch)?;
         let zinder_id = ZinderTransactionId::from_bytes(*tx_id.as_bytes());
-        let status = self.inner.transaction_by_id(zinder_id, None).await?;
+        // The pinned zinder-client answers every gRPC NOT_FOUND for an epoch-pinned lookup with
+        // `TxStatus::NotFound`, including server-side unavailable history; the wallet therefore
+        // treats `NotFound` as a second guard behind its own scan, not as proof on its own.
+        let status =
+            Self::pinned_result(self.inner.transaction_by_id(zinder_id, Some(epoch)).await)?;
         #[allow(
             clippy::wildcard_enum_match_arm,
             reason = "non_exhaustive zinder tx statuses fail closed on unknown variants"
@@ -391,6 +410,10 @@ impl ChainSource for ZinderChainSource {
             Err(err) => Err(Self::map_indexer_error(err)),
         });
         Ok(Box::pin(mapped) as ChainEventEnvelopeStream)
+    }
+
+    async fn reorg_window_blocks(&self) -> Result<u32, ChainSourceError> {
+        Ok(self.server_descriptor().await?.reorg_window_blocks)
     }
 }
 
@@ -982,5 +1005,27 @@ mod tests {
                 Err(ChainSourceError::NetworkMismatch { .. })
             ));
         }
+    }
+
+    #[test]
+    fn chain_event_cursor_rejections_map_to_typed_recoveries() {
+        assert!(matches!(
+            ZinderChainSource::map_indexer_error(zinder_client::IndexerError::RemoteFailure {
+                reason: zinder_client::ErrorReason::ChainEventCursorInvalid,
+                message: "cursor issued by another store".to_owned(),
+                retry_policy: zinder_client::RetryPolicy::ClientError,
+            }),
+            ChainSourceError::ChainEventCursorInvalid
+        ));
+        assert!(matches!(
+            ZinderChainSource::map_indexer_error(
+                zinder_client::IndexerError::ChainEventCursorExpired {
+                    recovery: ZinderChainEventCursorRecovery::EarliestRetained,
+                }
+            ),
+            ChainSourceError::ChainEventCursorExpired {
+                recovery: ChainEventCursorRecovery::EarliestRetained,
+            }
+        ));
     }
 }

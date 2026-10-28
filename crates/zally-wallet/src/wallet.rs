@@ -12,13 +12,15 @@ use zally_storage::{ProposalRejectionKind, WalletStorage};
 use zcash_keys::address::UnifiedAddress;
 
 use crate::capabilities::{Capability, SealingCapability, StorageCapability, WalletCapabilities};
-use crate::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig, CircuitBreakerState};
+use crate::circuit_breaker::{CircuitBreaker, CircuitBreakerState};
 use crate::error::WalletError;
 use crate::event::{WalletEvent, WalletEventStream};
 use crate::hold::{Hold, LockedNotesSummary};
 use crate::idempotency_key_locks::IdempotencyKeyLocks;
 use crate::options::WalletOptions;
 use crate::retry::RetryPolicy;
+use crate::source_halt::SourceHalt;
+use crate::source_reorg_window::SourceReorgWindowCheck;
 use crate::sync::fetch_prior_chain_state;
 
 const EVENT_CHANNEL_CAPACITY: usize = 1024;
@@ -44,6 +46,16 @@ pub(crate) struct WalletInner {
     pub(crate) circuit_breaker: CircuitBreaker,
     pub(crate) options: WalletOptions,
     pub(crate) idempotency_key_locks: IdempotencyKeyLocks,
+    /// Set by the sync driver while the chain source has stopped following the chain.
+    pub(crate) source_halt: Mutex<Option<SourceHalt>>,
+    /// What the sync driver last established about the chain source's reorg window.
+    pub(crate) source_reorg_window: Mutex<SourceReorgWindowCheck>,
+    /// Pending broadcasts whose unmineable verdict currently waits, reported once each.
+    pub(crate) withheld_verdicts: Mutex<std::collections::HashSet<TxId>>,
+    /// Paying transactions of sends the scan may have passed without recognizing them mined,
+    /// as of the last scan step; `None`, which holds every verdict, until a scan step in this
+    /// process stores the carried send steps.
+    pub(crate) scan_blind_sends: Mutex<Option<std::collections::HashSet<TxId>>>,
 }
 
 impl Wallet {
@@ -121,16 +133,16 @@ impl Wallet {
         *self.inner.retry_policy.lock() = policy;
     }
 
-    /// Discards the wallet database and rebuilds it from the sealed seed at the account
-    /// birthday.
+    /// Rebuilds the wallet's derived chain state from the sealed seed at the account
+    /// birthday, keeping the payment ledger.
     ///
     /// The deepest repair rung of the sync driver: wallet chain state is disposable derived
     /// state, so when it can no longer be reconciled with the chain the wallet rebuilds it
     /// from first principles. Reads the birthday before any destructive step, then
     /// recreates the database with a fresh account for the unsealed seed and publishes
-    /// [`WalletEvent::DerivedStateReset`] so hosts observe the rebuild. The ledger (send
-    /// idempotency records, holds, pending broadcasts) is dropped with the database; chain
-    /// state rebuilds by rescan.
+    /// [`WalletEvent::DerivedStateReset`] so hosts observe the rebuild. Chain state rebuilds
+    /// by rescan. The payment ledger survives: send idempotency records, holds, finalized
+    /// PCZTs, pending broadcasts, reverted broadcasts, and the chain-event cursor.
     ///
     /// The storage layer derives the [`AccountId`] deterministically from the seed, so the
     /// account id does not change across the rebuild; handles holding the prior id keep
@@ -568,6 +580,35 @@ impl Wallet {
         let _ = self.inner.event_tx.send(event);
     }
 
+    pub(crate) fn set_source_halt(&self, cause: Option<SourceHalt>) {
+        *self.inner.source_halt.lock() = cause;
+    }
+
+    /// Refuses a new spend while the sync driver reports the chain source halted, or its
+    /// reorg window below the driver's minimum or not yet read.
+    pub(crate) fn ensure_source_following(&self) -> Result<(), WalletError> {
+        let source_halt = *self.inner.source_halt.lock();
+        if let Some(cause) = source_halt {
+            return Err(WalletError::ChainSourceHalted { cause });
+        }
+        let Some(required_blocks) = self.inner.options.minimum_source_reorg_window_blocks else {
+            return Ok(());
+        };
+        let reorg_window = *self.inner.source_reorg_window.lock();
+        match reorg_window {
+            SourceReorgWindowCheck::Unverified => {
+                Err(WalletError::SourceReorgWindowUnverified { required_blocks })
+            }
+            SourceReorgWindowCheck::TooShallow {
+                reorg_window_blocks,
+            } => Err(WalletError::SourceReorgWindowTooShallow {
+                reorg_window_blocks,
+                required_blocks,
+            }),
+            SourceReorgWindowCheck::Unchecked | SourceReorgWindowCheck::Sufficient => Ok(()),
+        }
+    }
+
     /// Returns the number of subscribers currently attached to [`Wallet::observe`].
     pub(crate) fn observer_count(&self) -> u32 {
         u32::try_from(self.inner.event_tx.receiver_count()).unwrap_or(u32::MAX)
@@ -751,9 +792,13 @@ where
         base_capabilities: capabilities,
         event_tx,
         retry_policy: Mutex::new(RetryPolicy::default()),
-        circuit_breaker: CircuitBreaker::new(CircuitBreakerConfig::default()),
+        circuit_breaker: CircuitBreaker::new(options.circuit_breaker),
         options,
         idempotency_key_locks: IdempotencyKeyLocks::default(),
+        source_halt: Mutex::new(None),
+        source_reorg_window: Mutex::new(SourceReorgWindowCheck::Unchecked),
+        withheld_verdicts: Mutex::new(std::collections::HashSet::new()),
+        scan_blind_sends: Mutex::new(None),
     });
     Wallet { inner }
 }

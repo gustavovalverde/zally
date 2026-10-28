@@ -5,18 +5,31 @@ use std::pin::Pin;
 use futures_util::Stream;
 use tokio_stream::wrappers::BroadcastStream;
 use zally_chain::ShieldedPool;
-use zally_core::{AccountId, BlockHeight, TxId};
+use zally_core::{AccountId, BlockHeight, HoldId, IdempotencyKey, TxId};
 
 /// Push notification from the wallet's sync loop.
 ///
 /// Every `Wallet::sync` run emits [`WalletEvent::ScanProgress`] at the start and end of
-/// the run; [`WalletEvent::ReorgDetected`] when the upstream chain rolls back; one
-/// [`WalletEvent::TransactionConfirmed`] per newly confirmed wallet transaction; and one
-/// [`WalletEvent::ShieldedReceiveObserved`] per newly observed shielded note that the
-/// wallet owns. [`WalletEvent::DerivedStateReset`] marks a wallet database rebuild from
-/// seed and birthday. [`WalletEvent::TransparentUtxoRefreshFaulted`] marks a faulted
-/// transparent-UTXO refresh attempt. [`WalletEvent::PendingBroadcastUnmineable`] names a
-/// broadcast to recreate. [`WalletEvent::Lagged`] is injected by the subscription
+/// the run; one [`WalletEvent::TransactionConfirmed`] per newly confirmed wallet
+/// transaction; and one [`WalletEvent::ShieldedReceiveObserved`] per newly observed shielded
+/// note that the wallet owns.
+///
+/// A rewind emits [`WalletEvent::ReorgDetected`], then one
+/// [`WalletEvent::TransactionReverted`] per wallet transaction and one
+/// [`WalletEvent::ShieldedReceiveReverted`] per received note that left the chain. A reverted
+/// transaction later produces [`WalletEvent::TransactionConfirmed`] again when the
+/// replacement chain mines it, or [`WalletEvent::PendingBroadcastUnmineable`] once it can
+/// never be mined.
+///
+/// [`WalletEvent::DerivedStateReset`] marks a wallet database rebuild from seed and birthday.
+/// [`WalletEvent::TransparentUtxoRefreshFaulted`] marks a faulted transparent-UTXO refresh
+/// attempt. [`WalletEvent::PendingBroadcastUnmineable`] names a broadcast to recreate, and
+/// [`WalletEvent::HoldDispenseUnmineable`] names each dispense hold it had finalized.
+/// [`WalletEvent::SourceHalted`] and [`WalletEvent::SourceRecovered`] mark the start and end
+/// of a spend refusal over a halted chain source, and
+/// [`WalletEvent::SourceReorgWindowTooShallow`] and [`WalletEvent::SourceReorgWindowSufficient`]
+/// over the chain source's reorg window.
+/// [`WalletEvent::Lagged`] is injected by the subscription
 /// stream when a consumer drops events; the sync loop never emits it directly.
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -29,13 +42,24 @@ pub enum WalletEvent {
         /// Tip the wallet is catching up to.
         target_height: BlockHeight,
     },
-    /// A reorg rolled the wallet back; chain integration emits this when the upstream chain
-    /// source signals a reorg over the wallet's scan range.
+    /// A reorg rolled the wallet back: the chain source announced it, or a scan found the
+    /// wallet's blocks no longer chain onto the source's.
     ReorgDetected {
         /// Height the wallet's scan progress was rolled back to.
         rolled_back_to_height: BlockHeight,
-        /// New visible tip after the reorg.
+        /// Settled tip of the chain epoch the rewind read its fork-point state from.
         new_settled_tip_height: BlockHeight,
+    },
+    /// A wallet transaction mined at `mined_height` left the chain in a rewind.
+    ///
+    /// The counterpart of [`Self::TransactionConfirmed`]. A transaction the wallet sent is
+    /// submitted again while it can still be mined; the replacement chain either confirms it
+    /// again or it becomes [`Self::PendingBroadcastUnmineable`].
+    TransactionReverted {
+        /// Reverted transaction identifier.
+        tx_id: TxId,
+        /// Height the transaction was mined at before the rewind.
+        mined_height: BlockHeight,
     },
     /// A transaction belonging to the wallet was confirmed at `confirmed_at_height`.
     TransactionConfirmed {
@@ -79,9 +103,29 @@ pub enum WalletEvent {
         /// account, across Sapling, Orchard, Ironwood, or transparent pools.
         spent_our_inputs: bool,
     },
-    /// The wallet discarded and recreated its database from the seed and the account
-    /// birthday. The ledger and holds were dropped with the database; chain state rebuilds
-    /// by rescan.
+    /// A shielded note previously reported by [`Self::ShieldedReceiveObserved`] left the
+    /// chain in a rewind.
+    ///
+    /// A host that credited the receive must hold or reverse the credit. If the replacement
+    /// chain mines the producing transaction again, the wallet reports the note again with
+    /// [`Self::ShieldedReceiveObserved`].
+    ShieldedReceiveReverted {
+        /// Account that owned the received note.
+        account_id: AccountId,
+        /// Transaction the note was created in.
+        tx_id: TxId,
+        /// Output index of the note within its transaction's bundle.
+        output_index: u32,
+        /// Note value.
+        value_zat: zally_core::Zatoshis,
+        /// Height the note was mined at before the rewind.
+        mined_height: BlockHeight,
+        /// Shielded pool the note was created on.
+        pool: ShieldedPool,
+    },
+    /// The wallet rebuilt its derived chain state from the seed and the account birthday.
+    /// Chain state rebuilds by rescan; the payment ledger, including idempotency records
+    /// and holds, survives.
     DerivedStateReset {
         /// Account recreated in the fresh database. Equal to the prior id: account
         /// identity is key identity, not database identity.
@@ -114,6 +158,77 @@ pub enum WalletEvent {
         tx_id: TxId,
         /// Why it can never be mined.
         reason: String,
+    },
+    /// A wallet-owned broadcast looks unmineable, but the wallet cannot confirm it, so its
+    /// idempotency key stays bound and no replacement may be paid. Emitted once each time a
+    /// verdict on `tx_id` starts waiting.
+    ///
+    /// Either the chain source could not back the verdict (its reorg window is not verified,
+    /// its epoch does not cover the judged height, or its transaction lookup failed, timed
+    /// out, or is unsupported), or the wallet's scan may have passed a multi-step send without
+    /// the outputs of its earlier steps. The wallet tries again on every sync. A source problem
+    /// clears once the source is fixed; a send the scan may have missed stays held until the
+    /// source reports it mined or its key is released. `reason` says which case applies.
+    PendingBroadcastVerdictWithheld {
+        /// Transaction whose verdict waits.
+        tx_id: TxId,
+        /// Why the verdict waits.
+        reason: String,
+    },
+    /// A dispense hold was finalized with a transaction that can never be mined, so the
+    /// dispense did not happen.
+    ///
+    /// Published right after [`Self::PendingBroadcastUnmineable`] for `tx_id`. When
+    /// `is_reopened` is true the hold is active again and reserves its amount: dispense it
+    /// again (its idempotency key now builds a replacement) and finalize it with the new
+    /// transaction, or release it. When false, another active hold already holds
+    /// `request_id`, so this one was released and that other hold carries the dispense.
+    HoldDispenseUnmineable {
+        /// The hold whose dispense did not happen.
+        hold_id: HoldId,
+        /// Request identifier the hold was reserved under.
+        request_id: IdempotencyKey,
+        /// Transaction the hold had been finalized with.
+        tx_id: TxId,
+        /// The hold is active again; false when it was released instead.
+        is_reopened: bool,
+    },
+    /// The sync driver found that the chain source stopped following the chain, entered
+    /// [`crate::SyncDriverPhase::SourceHalted`], and the wallet refuses new spends with
+    /// [`crate::WalletError::ChainSourceHalted`]. [`Self::SourceRecovered`] follows once the
+    /// source moves again.
+    SourceHalted {
+        /// Why the source is considered halted.
+        cause: crate::SourceHalt,
+        /// Unix milliseconds when the driver halted.
+        since_ms: u64,
+    },
+    /// The chain source halted under [`Self::SourceHalted`] moves again: the driver left
+    /// [`crate::SyncDriverPhase::SourceHalted`] and the wallet accepts new spends.
+    ///
+    /// Closing a halted driver also lifts the refusal, without this event.
+    SourceRecovered,
+    /// A sync or the sync driver read a chain source reorg window below
+    /// [`crate::WalletOptions::minimum_source_reorg_window_blocks`], so the wallet refuses
+    /// new spends with [`crate::WalletError::SourceReorgWindowTooShallow`] and records no
+    /// pending broadcast as unmineable.
+    ///
+    /// Emitted when the refusal starts, and again when the reported window changes while it
+    /// stays too shallow. Raise the source's reorg window to at least `required_blocks`.
+    SourceReorgWindowTooShallow {
+        /// Reorg window the source reported.
+        reorg_window_blocks: u32,
+        /// Minimum window the sync driver requires.
+        required_blocks: u32,
+    },
+    /// A sync or the sync driver read a chain source reorg window that meets the minimum again,
+    /// so the
+    /// hold reported by [`Self::SourceReorgWindowTooShallow`] is lifted.
+    SourceReorgWindowSufficient {
+        /// Reorg window the source reported.
+        reorg_window_blocks: u32,
+        /// Minimum window the sync driver requires.
+        required_blocks: u32,
     },
     /// Consumer fell behind; `dropped_count` events were skipped before this notification.
     Lagged {
