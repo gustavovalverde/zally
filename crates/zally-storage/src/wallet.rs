@@ -944,17 +944,23 @@ pub trait WalletStorage: Send + Sync + 'static {
     ) -> Result<(), StorageError>;
 
     /// Stores the carried steps of every unsettled send in `zcash_client_sqlite`, in
-    /// submission order, after a rebuild discarded them; returns how many it stored.
+    /// submission order, and returns the paying transactions of every send the scan may pass
+    /// without recognizing it mined.
     ///
     /// A multi-step send's paying step spends an output of the step before it. A rescan
     /// recognizes that spend only if it already knows the output, which it does not when both
     /// steps are mined in the same block, so a mined payment would read as never mined.
-    /// Storing the steps first lets the rescan match it. Steps already seen mined are skipped,
-    /// and storing a step again is harmless.
+    /// Storing the steps first lets the rescan match it. Every step is stored again on each
+    /// call until the paying step is mined, including one already seen mined.
+    ///
+    /// A send whose earlier steps' outputs a call cannot record as the wallet's is marked, and
+    /// the mark stays until the send is released, because the scan that followed may already
+    /// have passed its paying step. A send in the result must never be judged unmineable from
+    /// the wallet's scan.
     ///
     /// `not_retryable` on a transaction that does not parse or on schema errors; `retryable`
     /// on transient I/O.
-    async fn store_carried_send_steps(&self) -> Result<u32, StorageError>;
+    async fn store_carried_send_steps(&self) -> Result<Vec<TxId>, StorageError>;
 
     /// Undoes [`Self::record_pending_submission`] for transactions that can never be mined:
     /// drops the idempotency bindings that still name any of `tx_ids`, their

@@ -159,6 +159,19 @@ pub enum WalletEvent {
         /// Why it can never be mined.
         reason: String,
     },
+    /// A wallet-owned broadcast looks unmineable, but the wallet cannot confirm it, so its
+    /// idempotency key stays bound and no replacement may be paid. Emitted once each time a
+    /// verdict on `tx_id` starts waiting.
+    ///
+    /// The wallet's scan may have passed a multi-step send without the outputs of its earlier
+    /// steps. The send stays held until the chain source reports it mined or its key is
+    /// released. `reason` says why the verdict waits.
+    PendingBroadcastVerdictWithheld {
+        /// Transaction whose verdict waits.
+        tx_id: TxId,
+        /// Why the verdict waits.
+        reason: String,
+    },
     /// A dispense hold was finalized with a transaction that can never be mined, so the
     /// dispense did not happen.
     ///

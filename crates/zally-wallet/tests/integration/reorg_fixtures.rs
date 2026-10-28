@@ -13,9 +13,9 @@ use parking_lot::Mutex;
 use zally_chain::{ChainSource, ShieldedPool};
 use zally_core::{
     AccountId, BlockHeight, CompactChainMetadata, CompactSaplingOutput, CompactTransaction,
-    CompactTransparentInput, HoldId, IdempotencyKey, Network, TxId, Zatoshis,
+    CompactTransparentInput, HoldId, IdempotencyKey, Network, TransparentGapLimit, TxId, Zatoshis,
 };
-use zally_keys::{AgeFileSealing, AgeFileSealingOptions};
+use zally_keys::{AgeFileSealing, AgeFileSealingOptions, SeedMaterial};
 use zally_storage::{HoldRecord, Sqlite, SqliteOptions, TransparentUtxoRow, WalletStorage};
 use zally_testkit::{
     MockChainSource, MockChainSourceHandle, MockCommitmentTrees, MockSubmitter, TempWalletPath,
@@ -62,6 +62,8 @@ pub(crate) struct ChainWallet {
     pub chain: Arc<MockChainSource>,
     pub chain_handle: MockChainSourceHandle,
     pub network: Network,
+    /// The wallet's seed, for deriving its keys.
+    pub seed: SeedMaterial,
 }
 
 /// Creates a wallet at birthday 1 on a mock chain whose tip is `tip_height`.
@@ -74,6 +76,15 @@ pub(crate) async fn chain_wallet_with_options(
     tip_height: u32,
     options: WalletOptions,
 ) -> Result<ChainWallet, FixtureError> {
+    chain_wallet_with_gap_limit(tip_height, options, TransparentGapLimit::DEFAULT).await
+}
+
+/// Same as [`chain_wallet_with_options`], with a caller-supplied transparent gap limit.
+pub(crate) async fn chain_wallet_with_gap_limit(
+    tip_height: u32,
+    options: WalletOptions,
+    gap_limit: TransparentGapLimit,
+) -> Result<ChainWallet, FixtureError> {
     let network = regtest_with_nu7_from_height_one();
     let temp = TempWalletPath::create()?;
     let (spend_bytes, output_bytes) = wagyu_zcash_parameters::load_sapling_parameters();
@@ -81,15 +92,15 @@ pub(crate) async fn chain_wallet_with_options(
     let output_path = temp.dir().join(zcash_proofs::SAPLING_OUTPUT_NAME);
     std::fs::write(&spend_path, spend_bytes)?;
     std::fs::write(&output_path, output_bytes)?;
-    let storage = Sqlite::new(
-        SqliteOptions::for_network(network, temp.db_path())
-            .with_sapling_proving_parameters(spend_path, output_path),
-    );
+    let mut storage_options = SqliteOptions::for_network(network, temp.db_path())
+        .with_sapling_proving_parameters(spend_path, output_path);
+    storage_options.gap_limit = gap_limit;
+    let storage = Sqlite::new(storage_options);
     let sealing = AgeFileSealing::new(AgeFileSealingOptions::at_path(temp.seed_path()));
     let chain = Arc::new(MockChainSource::new(network));
     let chain_handle = chain.handle();
     chain_handle.advance_tip(BlockHeight::from(tip_height));
-    let (wallet, account_id, _mnemonic) = Wallet::builder(network, sealing, storage.clone())
+    let (wallet, account_id, mnemonic) = Wallet::builder(network, sealing, storage.clone())
         .with_options(options)
         .create(chain.as_ref(), BlockHeight::from(1))
         .await?;
@@ -101,6 +112,7 @@ pub(crate) async fn chain_wallet_with_options(
         chain,
         chain_handle,
         network,
+        seed: SeedMaterial::from_mnemonic(&mnemonic, ""),
     })
 }
 
@@ -136,7 +148,20 @@ impl FundedChain {
 /// the wallet, and mines the shielding transaction at `pre_funding_tip + 1` with the tip two
 /// blocks above it.
 pub(crate) async fn funded_chain(pre_funding_tip: u32) -> Result<FundedChain, FixtureError> {
-    let base = chain_wallet(pre_funding_tip.saturating_sub(100)).await?;
+    funded_chain_with_gap_limit(pre_funding_tip, TransparentGapLimit::DEFAULT).await
+}
+
+/// Same as [`funded_chain`], with a caller-supplied transparent gap limit.
+pub(crate) async fn funded_chain_with_gap_limit(
+    pre_funding_tip: u32,
+    gap_limit: TransparentGapLimit,
+) -> Result<FundedChain, FixtureError> {
+    let base = chain_wallet_with_gap_limit(
+        pre_funding_tip.saturating_sub(100),
+        WalletOptions::default(),
+        gap_limit,
+    )
+    .await?;
     // A scan chunk ends at a checkpoint; the one at `pre_funding_tip - 100` anchors the
     // shielding proposal's 100-confirmation policy.
     sync_to_tip(&base.wallet, base.chain.as_ref()).await?;

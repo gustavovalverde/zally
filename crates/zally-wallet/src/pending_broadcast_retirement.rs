@@ -4,6 +4,8 @@
 //! until no block above that height can include it. Wall-clock age never retires one: a
 //! settled tip can trail the visible tip by the chain source's whole reorg window.
 
+use std::collections::HashSet;
+
 use zally_chain::{ChainSource, TransactionStatus, UnmineableReason, parse_transaction_header};
 use zally_core::{BlockHeight, TxId};
 use zally_storage::UnmineableHold;
@@ -33,7 +35,9 @@ impl Wallet {
     /// miss a transaction it sent: it records the broadcast unmineable only when the source
     /// reports the transaction not found. One the source reports mined is recorded as mined at
     /// that height, with the earlier steps of its send, and keeps its key; one the source
-    /// still holds, or a failed lookup, leaves it unjudged until a later sync.
+    /// still holds, or a failed lookup, leaves it unjudged until a later sync. A send the scan
+    /// may have passed without the outputs of its earlier steps is never judged unmineable,
+    /// and [`WalletEvent::PendingBroadcastVerdictWithheld`] reports the wait once.
     pub(crate) async fn retire_pending_broadcasts(
         &self,
         chain: &dyn ChainSource,
@@ -46,6 +50,8 @@ impl Wallet {
             return Ok(());
         };
         let judged_height = scanned_height.min(settled_tip_height);
+        let scan_blind_sends = self.inner.scan_blind_sends.lock().clone();
+        let mut withheld = HashSet::new();
         let mut is_window_verified = None;
         for pending in storage.list_pending_broadcast_transactions().await? {
             let tx_id = pending.broadcast_tx_id;
@@ -86,6 +92,11 @@ impl Wallet {
             {
                 continue;
             }
+            if let Some(cause) = scan_blind_cause(scan_blind_sends.as_ref(), tx_id) {
+                self.withhold_verdict(tx_id, cause);
+                withheld.insert(tx_id);
+                continue;
+            }
             if let Some(holds) = storage
                 .record_unmineable_transaction(tx_id, judged_height)
                 .await?
@@ -93,7 +104,30 @@ impl Wallet {
                 self.report_unmineable(tx_id, &reason, judged_height, holds);
             }
         }
+        self.inner
+            .withheld_verdicts
+            .lock()
+            .retain(|tx_id| withheld.contains(tx_id));
         Ok(())
+    }
+
+    /// Publishes [`WalletEvent::PendingBroadcastVerdictWithheld`] the first time a verdict on
+    /// `tx_id` waits, and logs every time.
+    fn withhold_verdict(&self, tx_id: TxId, cause: &str) {
+        tracing::warn!(
+            target: "zally::wallet",
+            event = "pending_broadcast_verdict_withheld",
+            %tx_id,
+            cause,
+            "pending broadcast looks unmineable but the wallet cannot confirm it yet; its key \
+             stays bound"
+        );
+        if self.inner.withheld_verdicts.lock().insert(tx_id) {
+            self.publish_event(WalletEvent::PendingBroadcastVerdictWithheld {
+                tx_id,
+                reason: cause.to_owned(),
+            });
+        }
     }
 
     /// Reports a broadcast just recorded unmineable and each dispense hold it settled.
@@ -248,5 +282,23 @@ impl Wallet {
                 return;
             }
         }
+    }
+}
+
+/// Why `tx_id` may have been passed by the wallet's scan without being recognized, if it may.
+///
+/// `None` for `scan_blind_sends` means no scan step in this process has stored the carried
+/// send steps yet, which holds every verdict.
+fn scan_blind_cause(scan_blind_sends: Option<&HashSet<TxId>>, tx_id: TxId) -> Option<&'static str> {
+    match scan_blind_sends {
+        None => Some(
+            "the wallet has not stored the carried steps of unsettled sends since it opened, so \
+             its scan may not recognize a payment mined",
+        ),
+        Some(blind) if blind.contains(&tx_id) => Some(
+            "the wallet scanned without the outputs of this send's earlier steps, so its scan \
+             may have missed the payment mined",
+        ),
+        Some(_) => None,
     }
 }

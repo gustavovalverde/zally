@@ -2325,14 +2325,10 @@ impl Wallet {
     ) -> Result<SyncOutcome, WalletError> {
         let visible_tip = chain_epoch.visible_tip().height;
         let settled_tip = chain_epoch.settled_tip().height;
-        if let Err(error) = self.inner.storage.store_carried_send_steps().await {
-            tracing::warn!(
-                target: "zally::sync",
-                event = "wallet_carried_send_steps_store_failed",
-                %error,
-                "could not store the carried steps of an unsettled send before scanning"
-            );
-        }
+        // A scan that runs before the carried steps are stored could pass a payment it cannot
+        // recognize, so a failure here fails the attempt instead of scanning blind.
+        let scan_blind_sends = self.inner.storage.store_carried_send_steps().await?;
+        *self.inner.scan_blind_sends.lock() = Some(scan_blind_sends.into_iter().collect());
         let Some((scan_start, scan_end, priority)) = self
             .plan_scan_range(chain, chain_epoch, visible_tip)
             .await?

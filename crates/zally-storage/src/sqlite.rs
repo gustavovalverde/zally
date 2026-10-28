@@ -574,6 +574,10 @@ const LEDGER_SCHEMA_SQL: &str = "CREATE TABLE IF NOT EXISTS ext_zally_idempotenc
                  step_index INTEGER NOT NULL,\
                  tx_id_bytes BLOB NOT NULL,\
                  PRIMARY KEY (idempotency_key, step_index)\
+             ); \
+             CREATE TABLE IF NOT EXISTS ext_zally_scan_blind_sends (\
+                 tx_id_bytes BLOB PRIMARY KEY NOT NULL,\
+                 recorded_at_ms INTEGER NOT NULL\
              );";
 
 fn open_extension_ledger(db_path: &Path) -> Result<rusqlite::Connection, StorageError> {
@@ -621,7 +625,8 @@ fn add_idempotency_unmineable_column(ledger: &rusqlite::Connection) -> Result<()
 /// Ledger tables a wallet rebuild carries into the replacement database.
 ///
 /// `ext_zally_chain_tips` is absent on purpose: chain tips are derived state that the next
-/// sync records again against the rebuilt scan queue.
+/// sync records again against the rebuilt scan queue. So is `ext_zally_scan_blind_sends`: the
+/// rebuilt wallet rescans from its birthday and judges each carried send's coverage afresh.
 const LEDGER_TABLES_KEPT_ACROSS_REBUILD: [&str; 8] = [
     "ext_zally_idempotency",
     "ext_zally_finalized_pczts",
@@ -742,8 +747,15 @@ fn rebuild_database_with_ledger(
     let rebuild_path = sibling_path(&options.db_path, REBUILD_FILE_SUFFIX);
     remove_database_file(&rebuild_path)?;
     remove_database_sidecars(&rebuild_path)?;
+    let prior_ephemeral_high_index = prior_ephemeral_high_index(&options.db_path)?;
     let account_id = {
-        let (mut db, ledger) = open_wallet_db_at(options, &rebuild_path)?;
+        let mut rebuild_options = options.clone();
+        if let Some(high_index) = prior_ephemeral_high_index {
+            rebuild_options.gap_limit.ephemeral = high_index
+                .saturating_add(1)
+                .saturating_add(options.gap_limit.ephemeral);
+        }
+        let (mut db, ledger) = open_wallet_db_at(&rebuild_options, &rebuild_path)?;
         let account_id = create_account_on(
             &mut db,
             options.network,
@@ -751,6 +763,9 @@ fn rebuild_database_with_ledger(
             secret,
             prior_chain_state,
         )?;
+        if let Some(high_index) = prior_ephemeral_high_index {
+            reserve_prior_ephemeral_addresses(&mut db, options.network, account_id, high_index)?;
+        }
         carry_ledger_rows(&ledger, &options.db_path)?;
         account_id
     };
@@ -766,7 +781,68 @@ fn rebuild_database_with_ledger(
     Ok(account_id)
 }
 
+/// Highest ephemeral (ZIP 320) address index the wallet database at `db_path` handed out or
+/// saw used, or `None` when there is none.
+fn prior_ephemeral_high_index(db_path: &Path) -> Result<Option<u32>, StorageError> {
+    if !db_path.exists() {
+        return Ok(None);
+    }
+    let read_failed = |err: rusqlite::Error| StorageError::SqliteFailed {
+        reason: format!("could not read the prior wallet's ephemeral addresses: {err}"),
+        posture: FailurePosture::NotRetryable,
+    };
+    let prior = rusqlite::Connection::open_with_flags(
+        db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(read_failed)?;
+    prior
+        .query_row(
+            "SELECT MAX(transparent_child_index) FROM addresses \
+             WHERE key_scope = ?1 \
+               AND (exposed_at_height IS NOT NULL \
+                    OR id IN (SELECT address_id FROM transparent_received_outputs))",
+            [EPHEMERAL_KEY_SCOPE_CODE],
+            |row| row.get::<_, Option<u32>>(0),
+        )
+        .map_err(read_failed)
+}
+
+/// `zcash_client_sqlite`'s `addresses.key_scope` code for ephemeral (ZIP 320) addresses.
+const EPHEMERAL_KEY_SCOPE_CODE: i64 = 2;
+
+/// Reserves the rebuilt account's ephemeral addresses up to `high_index`.
+///
+/// A rescan recognizes an output to an ephemeral address only when the account already knows
+/// the address, and a rebuilt account knows only its first gap's worth until the rescan meets
+/// earlier uses. The rebuild therefore opens the new database with a gap that reaches past
+/// `high_index`, so account creation derives every address up to it, and reserves them here,
+/// so no new payment reuses an address the prior wallet already handed out.
+fn reserve_prior_ephemeral_addresses(
+    db: &mut Db,
+    network: Network,
+    account_id: AccountId,
+    high_index: u32,
+) -> Result<(), StorageError> {
+    let account_uuid = resolve_account_uuid(db, network, account_id)?;
+    let count = usize::try_from(high_index.saturating_add(1)).unwrap_or(usize::MAX);
+    zcash_client_backend::data_api::WalletWrite::reserve_next_n_ephemeral_addresses(
+        db,
+        account_uuid,
+        count,
+    )
+    .map_err(|err| StorageError::SqliteFailed {
+        reason: format!("could not reserve the prior wallet's ephemeral addresses: {err}"),
+        posture: FailurePosture::NotRetryable,
+    })?;
+    Ok(())
+}
+
 /// Carries every unsettled wallet-created transaction into the rebuilt reverted-broadcast ledger.
+///
+/// The ledger, not `zcash_client_sqlite`'s `created` flag, decides what goes along: a step a
+/// previous rebuild stored again has no creation record, and leaving it behind would strand
+/// its key after a second rebuild.
 ///
 /// A transaction is unsettled when an idempotency key still names it or one of the earlier
 /// steps of the send it pays, it still has pending-broadcast rows, or an active dispense hold
@@ -788,7 +864,7 @@ const UNSETTLED_SENDS_CARRY_SQL: &str = "\
          resubmitted_at_ms) \
     SELECT t.txid, t.raw, IFNULL(t.expiry_height, 0), t.mined_height, ?1, NULL \
     FROM prior.transactions t \
-    WHERE t.created IS NOT NULL AND t.raw IS NOT NULL \
+    WHERE t.raw IS NOT NULL \
       AND (t.txid IN (SELECT tx_id_bytes FROM prior.ext_zally_idempotency \
                       WHERE unmineable_at_height IS NULL) \
            OR t.txid IN (SELECT s.tx_id_bytes FROM prior.ext_zally_send_steps s \
@@ -800,20 +876,33 @@ const UNSETTLED_SENDS_CARRY_SQL: &str = "\
            OR t.txid IN (SELECT finalized_tx_id FROM prior.ext_zally_holds \
                          WHERE finalized_tx_id IS NOT NULL AND released_at_ms IS NULL))";
 
-/// Carried steps of every unsettled multi-step send, in submission order.
+/// Steps of every unsettled carried send, in submission order, with their bytes.
 ///
-/// These are the steps a rebuild carried for a send whose key is still bound and whose paying
-/// step `zcash_client_sqlite` has not seen mined, skipping steps it has seen mined.
+/// A send is carried while any of its steps has a reverted-broadcast row, and unsettled while
+/// its key is bound and `zcash_client_sqlite` has not seen its paying step mined. Every step
+/// is listed, mined or not, so a funding step's outputs are stored again until the paying
+/// step is mined, whichever ledger still holds its bytes.
 const CARRIED_SEND_STEPS_SQL: &str = "\
-    SELECT r.raw_tx_bytes \
+    SELECT s.idempotency_key, i.tx_id_bytes, s.tx_id_bytes, IFNULL(r.raw_tx_bytes, step.raw) \
     FROM ext_zally_send_steps s \
     JOIN ext_zally_idempotency i \
       ON i.idempotency_key = s.idempotency_key AND i.unmineable_at_height IS NULL \
-    JOIN ext_zally_reverted_broadcasts r ON r.tx_id_bytes = s.tx_id_bytes \
-    LEFT JOIN transactions paying ON paying.txid = i.tx_id_bytes \
+    LEFT JOIN ext_zally_reverted_broadcasts r ON r.tx_id_bytes = s.tx_id_bytes \
     LEFT JOIN transactions step ON step.txid = s.tx_id_bytes \
-    WHERE paying.mined_height IS NULL AND step.mined_height IS NULL \
+    LEFT JOIN transactions paying ON paying.txid = i.tx_id_bytes \
+    WHERE paying.mined_height IS NULL \
+      AND s.idempotency_key IN ( \
+          SELECT carried.idempotency_key FROM ext_zally_send_steps carried \
+          JOIN ext_zally_reverted_broadcasts reverted \
+            ON reverted.tx_id_bytes = carried.tx_id_bytes) \
     ORDER BY s.idempotency_key ASC, s.step_index ASC";
+
+/// Whether `zcash_client_sqlite` records the transparent output `outpoint` as the wallet's.
+const RECEIVED_TRANSPARENT_OUTPUT_EXISTS_SQL: &str = "\
+    SELECT EXISTS ( \
+        SELECT 1 FROM transparent_received_outputs tro \
+        JOIN transactions t ON t.id_tx = tro.transaction_id \
+        WHERE t.txid = ?1 AND tro.output_index = ?2)";
 
 /// Parses a transaction the wallet stored. Version 5 and later transactions carry their own
 /// consensus branch, so the branch passed for earlier versions does not apply to them.
@@ -828,6 +917,168 @@ fn read_stored_transaction(
         reason: format!("stored transaction does not parse: {err}"),
         posture: FailurePosture::NotRetryable,
     })
+}
+
+/// One carried send: its paying transaction and its steps in submission order.
+struct CarriedSend {
+    paying_tx_id: TxId,
+    steps: Vec<CarriedStep>,
+}
+
+struct CarriedStep {
+    tx_id: TxId,
+    raw_tx_bytes: Option<Vec<u8>>,
+}
+
+fn list_carried_send_steps(
+    ledger: &rusqlite::Connection,
+) -> Result<Vec<CarriedSend>, StorageError> {
+    let lookup_failed = |err: rusqlite::Error| StorageError::SqliteFailed {
+        reason: format!("carried send-step lookup failed: {err}"),
+        posture: FailurePosture::NotRetryable,
+    };
+    let mut stmt = ledger
+        .prepare(CARRIED_SEND_STEPS_SQL)
+        .map_err(lookup_failed)?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Vec<u8>>(1)?,
+                row.get::<_, Vec<u8>>(2)?,
+                row.get::<_, Option<Vec<u8>>>(3)?,
+            ))
+        })
+        .map_err(lookup_failed)?;
+    let mut sends: Vec<(String, CarriedSend)> = Vec::new();
+    for row in rows {
+        let (key, paying_bytes, step_bytes, raw_tx_bytes) = row.map_err(lookup_failed)?;
+        let step = CarriedStep {
+            tx_id: decode_txid_bytes(step_bytes, "ext_zally_send_steps.tx_id_bytes")?,
+            raw_tx_bytes,
+        };
+        match sends.last_mut() {
+            Some((last_key, send)) if *last_key == key => send.steps.push(step),
+            _ => sends.push((
+                key,
+                CarriedSend {
+                    paying_tx_id: decode_txid_bytes(
+                        paying_bytes,
+                        "ext_zally_idempotency.tx_id_bytes",
+                    )?,
+                    steps: vec![step],
+                },
+            )),
+        }
+    }
+    Ok(sends.into_iter().map(|(_, send)| send).collect())
+}
+
+/// Marks `paying_tx_ids` as sends the scan may pass without recognizing them mined.
+///
+/// The mark stays until the send is released: once a scan ran without the earlier steps'
+/// outputs, it may already have passed the paying step, and outputs recorded later do not
+/// make that scan see it.
+fn record_scan_blind_sends(
+    ledger: &rusqlite::Connection,
+    paying_tx_ids: &[TxId],
+) -> Result<(), StorageError> {
+    let recorded_at_ms = current_unix_ms_for_ledger();
+    for tx_id in paying_tx_ids {
+        ledger
+            .execute(
+                "INSERT OR IGNORE INTO ext_zally_scan_blind_sends (tx_id_bytes, recorded_at_ms) \
+                 VALUES (?1, ?2)",
+                rusqlite::params![tx_id.as_bytes().as_slice(), recorded_at_ms],
+            )
+            .map_err(|err| StorageError::SqliteFailed {
+                reason: format!("scan-blind send record failed: {err}"),
+                posture: FailurePosture::Retryable,
+            })?;
+    }
+    Ok(())
+}
+
+fn list_scan_blind_sends(ledger: &rusqlite::Connection) -> Result<Vec<TxId>, StorageError> {
+    let lookup_failed = |err: rusqlite::Error| StorageError::SqliteFailed {
+        reason: format!("scan-blind send lookup failed: {err}"),
+        posture: FailurePosture::NotRetryable,
+    };
+    let mut stmt = ledger
+        .prepare("SELECT tx_id_bytes FROM ext_zally_scan_blind_sends")
+        .map_err(lookup_failed)?;
+    let rows = stmt
+        .query_map([], |row| row.get::<_, Vec<u8>>(0))
+        .map_err(lookup_failed)?;
+    let mut tx_ids = Vec::new();
+    for row in rows {
+        tx_ids.push(decode_txid_bytes(
+            row.map_err(lookup_failed)?,
+            "ext_zally_scan_blind_sends.tx_id_bytes",
+        )?);
+    }
+    Ok(tx_ids)
+}
+
+/// Stores each step of `send` that still has its bytes, in submission order.
+fn store_send_steps(
+    db: &mut Db,
+    params: &zally_core::NetworkParameters,
+    send: &CarriedSend,
+) -> Result<(), StorageError> {
+    for step in &send.steps {
+        let Some(raw_tx_bytes) = step.raw_tx_bytes.as_deref() else {
+            continue;
+        };
+        let transaction = read_stored_transaction(raw_tx_bytes)?;
+        zcash_client_backend::data_api::wallet::decrypt_and_store_transaction(
+            params,
+            db,
+            &transaction,
+            None,
+        )
+        .map_err(|err| map_sqlite_error(&err))?;
+    }
+    Ok(())
+}
+
+/// Whether every output a later step of `send` spends from an earlier step is recorded as the
+/// wallet's, so a scan recognizes the later step mined even in the same block.
+fn are_funding_outputs_recorded(
+    ledger: &rusqlite::Connection,
+    send: &CarriedSend,
+) -> Result<bool, StorageError> {
+    let step_ids: Vec<TxId> = send.steps.iter().map(|step| step.tx_id).collect();
+    for step in send.steps.iter().skip(1) {
+        let Some(raw_tx_bytes) = step.raw_tx_bytes.as_deref() else {
+            return Ok(false);
+        };
+        let transaction = read_stored_transaction(raw_tx_bytes)?;
+        for input in transaction
+            .transparent_bundle()
+            .map(|bundle| bundle.vin.as_slice())
+            .unwrap_or_default()
+        {
+            let prevout_tx_id = TxId::from_bytes(*input.prevout().hash());
+            if !step_ids.contains(&prevout_tx_id) {
+                continue;
+            }
+            let is_recorded = ledger
+                .query_row(
+                    RECEIVED_TRANSPARENT_OUTPUT_EXISTS_SQL,
+                    rusqlite::params![prevout_tx_id.as_bytes().as_slice(), input.prevout().n()],
+                    |row| row.get::<_, bool>(0),
+                )
+                .map_err(|err| StorageError::SqliteFailed {
+                    reason: format!("funding output lookup failed: {err}"),
+                    posture: FailurePosture::NotRetryable,
+                })?;
+            if !is_recorded {
+                return Ok(false);
+            }
+        }
+    }
+    Ok(true)
 }
 
 /// Columns `table` has in both the rebuilt and the prior database, comma-separated.
@@ -2108,35 +2359,31 @@ impl WalletStorage for Sqlite {
         .await
     }
 
-    async fn store_carried_send_steps(&self) -> Result<u32, StorageError> {
+    async fn store_carried_send_steps(&self) -> Result<Vec<TxId>, StorageError> {
         let params = self.options.network.to_parameters();
         self.with_db_mut_and_ledger(move |db, ledger| {
-            let lookup_failed = |err: rusqlite::Error| StorageError::SqliteFailed {
-                reason: format!("carried send-step lookup failed: {err}"),
-                posture: FailurePosture::NotRetryable,
-            };
-            let carried = {
-                let mut stmt = ledger
-                    .prepare(CARRIED_SEND_STEPS_SQL)
-                    .map_err(lookup_failed)?;
-                let rows = stmt
-                    .query_map([], |row| row.get::<_, Vec<u8>>(0))
-                    .map_err(lookup_failed)?;
-                rows.collect::<Result<Vec<_>, _>>().map_err(lookup_failed)?
-            };
-            let mut stored = 0_u32;
-            for raw_tx_bytes in carried {
-                let transaction = read_stored_transaction(&raw_tx_bytes)?;
-                zcash_client_backend::data_api::wallet::decrypt_and_store_transaction(
-                    &params,
-                    db,
-                    &transaction,
-                    None,
-                )
-                .map_err(|err| map_sqlite_error(&err))?;
-                stored = stored.saturating_add(1);
+            let carried = list_carried_send_steps(ledger)?;
+            let mut uncovered = Vec::new();
+            for send in &carried {
+                let coverage = store_send_steps(db, &params, send)
+                    .and_then(|()| are_funding_outputs_recorded(ledger, send));
+                match coverage {
+                    Ok(true) => {}
+                    Ok(false) => uncovered.push(send.paying_tx_id),
+                    Err(error) => {
+                        tracing::warn!(
+                            target: "zally::storage",
+                            event = "carried_send_steps_store_failed",
+                            paying_tx_id = %send.paying_tx_id,
+                            %error,
+                            "could not store a carried send's steps; its verdict waits"
+                        );
+                        uncovered.push(send.paying_tx_id);
+                    }
+                }
             }
-            Ok(stored)
+            record_scan_blind_sends(ledger, &uncovered)?;
+            list_scan_blind_sends(ledger)
         })
         .await
     }
@@ -2155,6 +2402,7 @@ impl WalletStorage for Sqlite {
                      WHERE tx_id_bytes = ?1 AND unmineable_at_height IS NULL",
                     "DELETE FROM ext_zally_pending_broadcast_inputs WHERE broadcast_tx_id = ?1",
                     "DELETE FROM ext_zally_reverted_broadcasts WHERE tx_id_bytes = ?1",
+                    "DELETE FROM ext_zally_scan_blind_sends WHERE tx_id_bytes = ?1",
                 ] {
                     transaction
                         .execute(statement, [tx_id.as_bytes().as_slice()])

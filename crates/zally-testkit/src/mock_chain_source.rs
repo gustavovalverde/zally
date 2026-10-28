@@ -79,6 +79,7 @@ struct MockState {
     retained_from_sequence: u64,
     subscription_starts: Vec<ChainEventStreamStart>,
     reorg_window_blocks: u32,
+    transaction_status_mode: MockTransactionStatusMode,
 }
 
 /// Commitment trees as they stand after one mined block.
@@ -194,6 +195,23 @@ fn branch_block_hash(height: u32, branch_tag: u8) -> BlockHash {
     BlockHash::from_bytes(bytes)
 }
 
+/// How [`MockChainSource`] answers [`ChainSource::transaction_status`].
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum MockTransactionStatusMode {
+    /// Looks the transaction up in the canonical blocks the epoch makes visible.
+    #[default]
+    Canonical,
+    /// Answers `NotFound` for every transaction, as a source that reports its own missing
+    /// history as absence would.
+    AlwaysNotFound,
+    /// Fails every lookup with [`ChainSourceError::CapabilitiesUnavailable`], as a source
+    /// without transaction lookups does.
+    CapabilityMissing,
+    /// Never answers, as a hung source.
+    Hanging,
+}
+
 /// In-memory `ChainSource` fixture.
 pub struct MockChainSource {
     state: Arc<Mutex<MockState>>,
@@ -229,6 +247,7 @@ impl MockChainSource {
                 retained_from_sequence: 1,
                 subscription_starts: Vec::new(),
                 reorg_window_blocks: DEFAULT_REORG_WINDOW_BLOCKS,
+                transaction_status_mode: MockTransactionStatusMode::Canonical,
             })),
             event_tx,
         }
@@ -581,6 +600,12 @@ impl MockChainSourceHandle {
     pub fn set_reorg_window_blocks(&self, reorg_window_blocks: u32) {
         self.state.lock().reorg_window_blocks = reorg_window_blocks;
     }
+
+    /// Sets how the mock answers [`ChainSource::transaction_status`]. The mock starts at
+    /// [`MockTransactionStatusMode::Canonical`].
+    pub fn set_transaction_status_mode(&self, mode: MockTransactionStatusMode) {
+        self.state.lock().transaction_status_mode = mode;
+    }
 }
 
 fn chain_epoch_from_state(state: &MockState) -> ChainEpoch {
@@ -744,6 +769,17 @@ impl ChainSource for MockChainSource {
     }
 
     async fn transaction_status(&self, tx_id: TxId) -> Result<TransactionStatus, ChainSourceError> {
+        let mode = self.state.lock().transaction_status_mode;
+        match mode {
+            MockTransactionStatusMode::Canonical => {}
+            MockTransactionStatusMode::AlwaysNotFound => return Ok(TransactionStatus::NotFound),
+            MockTransactionStatusMode::CapabilityMissing => {
+                return Err(ChainSourceError::CapabilitiesUnavailable {
+                    capabilities: vec!["transaction".to_owned()],
+                });
+            }
+            MockTransactionStatusMode::Hanging => std::future::pending::<()>().await,
+        }
         let guard = self.state.lock();
         let visible_tip_height = guard.visible_tip_height.as_u32();
         let confirmed_at_height = guard

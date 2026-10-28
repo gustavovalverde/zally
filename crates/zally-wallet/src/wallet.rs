@@ -50,6 +50,12 @@ pub(crate) struct WalletInner {
     pub(crate) source_halt: Mutex<Option<SourceHalt>>,
     /// What the sync driver last established about the chain source's reorg window.
     pub(crate) source_reorg_window: Mutex<SourceReorgWindowCheck>,
+    /// Pending broadcasts whose unmineable verdict currently waits, reported once each.
+    pub(crate) withheld_verdicts: Mutex<std::collections::HashSet<TxId>>,
+    /// Paying transactions of sends the scan may have passed without recognizing them mined,
+    /// as of the last scan step; `None`, which holds every verdict, until a scan step in this
+    /// process stores the carried send steps.
+    pub(crate) scan_blind_sends: Mutex<Option<std::collections::HashSet<TxId>>>,
 }
 
 impl Wallet {
@@ -789,6 +795,8 @@ where
         idempotency_key_locks: IdempotencyKeyLocks::default(),
         source_halt: Mutex::new(None),
         source_reorg_window: Mutex::new(SourceReorgWindowCheck::Unchecked),
+        withheld_verdicts: Mutex::new(std::collections::HashSet::new()),
+        scan_blind_sends: Mutex::new(None),
     });
     Wallet { inner }
 }

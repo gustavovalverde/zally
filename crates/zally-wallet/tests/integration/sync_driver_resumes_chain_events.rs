@@ -62,6 +62,7 @@ async fn reopen(base: ChainWallet) -> Result<ChainWallet, FixtureError> {
         chain,
         chain_handle,
         network,
+        seed,
     } = base;
     drop(wallet);
     drop(storage);
@@ -78,6 +79,7 @@ async fn reopen(base: ChainWallet) -> Result<ChainWallet, FixtureError> {
         chain,
         chain_handle,
         network,
+        seed,
     })
 }
 
