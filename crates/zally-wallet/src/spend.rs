@@ -695,14 +695,15 @@ impl Wallet {
     /// Returns the transaction `key` already names, or `None` when it names none.
     ///
     /// A transaction the wallet holds bytes for and has not seen mined is submitted again
-    /// first: the send that bound the key may have failed before any node received it, and a
-    /// retry that only returned the identifier would report a payment nobody broadcast. The
-    /// same bytes cannot pay twice. A node that already holds or mined the transaction answers
-    /// with a duplicate. A submit error or rejection is returned, and the key stays bound. One
-    /// the next block can no longer include fails with
+    /// first, after every earlier step of its send that the wallet has not seen mined, in
+    /// submission order: the send that bound the key may have failed before any node received
+    /// them, and a retry that only returned the identifier would report a payment nobody
+    /// broadcast. The same bytes cannot pay twice. A node that already holds or mined a
+    /// transaction answers with a duplicate. A submit error or rejection is returned, and the
+    /// key stays bound. A step the next block can no longer include fails the retry with
     /// [`WalletError::PendingBroadcastUnsettled`] until the pending-broadcast verdict settles
-    /// it. A transaction the wallet holds no bytes for is returned as it is: the wallet has
-    /// seen it mined, or the key was recorded outside a send.
+    /// the send. A transaction the wallet holds no bytes for is returned as it is: the wallet
+    /// has seen it mined, or the key was recorded outside a send.
     ///
     /// Runs before the source-health refusal, so a key that already names a transaction keeps
     /// answering with it while new spends are refused.
@@ -715,42 +716,42 @@ impl Wallet {
         let Some(tx_id) = self.inner.storage.find_idempotent_submission(key).await? else {
             return Ok(None);
         };
-        let stored = self
-            .inner
-            .storage
-            .list_pending_broadcast_transactions()
-            .await?
-            .into_iter()
-            .find(|pending| pending.broadcast_tx_id == tx_id);
-        let tx_expiry_height = stored
-            .as_ref()
-            .and_then(|pending| {
-                zally_chain::parse_transaction_expiry_height(&pending.raw_bytes).ok()
-            })
+        let steps = self.inner.storage.list_send_steps(tx_id).await?;
+        let paying = steps.iter().find(|step| step.tx_id == tx_id);
+        let tx_expiry_height = paying
+            .and_then(|step| step.raw_bytes.as_deref())
+            .and_then(|raw_bytes| zally_chain::parse_transaction_expiry_height(raw_bytes).ok())
             .unwrap_or_else(|| BlockHeight::from(0));
         let visible_tip = self.inner.storage.find_visible_tip().await?;
-        let can_enter_next_block = |raw_bytes: &[u8]| {
-            visible_tip.is_none_or(|tip| {
-                zally_chain::parse_transaction_header(raw_bytes)
-                    .is_ok_and(|header| header.check_mineable(self.network(), tip).is_ok())
-            })
-        };
-        if let Some(unmined) = stored.filter(|pending| pending.mined_height.is_none()) {
-            if !can_enter_next_block(&unmined.raw_bytes) {
-                return Err(WalletError::PendingBroadcastUnsettled {
-                    tx_id,
-                    tx_expiry_height,
-                });
+        let is_paying_pending =
+            paying.is_some_and(|step| step.mined_height.is_none() && step.raw_bytes.is_some());
+        if is_paying_pending {
+            let can_enter_next_block = |raw_bytes: &[u8]| {
+                visible_tip.is_none_or(|tip| {
+                    zally_chain::parse_transaction_header(raw_bytes)
+                        .is_ok_and(|header| header.check_mineable(self.network(), tip).is_ok())
+                })
+            };
+            for step in steps.iter().filter(|step| step.mined_height.is_none()) {
+                let Some(raw_bytes) = step.raw_bytes.as_deref() else {
+                    continue;
+                };
+                if !can_enter_next_block(raw_bytes) {
+                    return Err(WalletError::PendingBroadcastUnsettled {
+                        tx_id,
+                        tx_expiry_height,
+                    });
+                }
+                let outcome = crate::retry::with_breaker_and_retry(
+                    &self.inner.circuit_breaker,
+                    self.broadcast_retry_policy(),
+                    operation,
+                    || submitter.submit(raw_bytes),
+                    WalletError::from,
+                )
+                .await?;
+                resolve_send_outcome(outcome, step.tx_id)?;
             }
-            let outcome = crate::retry::with_breaker_and_retry(
-                &self.inner.circuit_breaker,
-                self.broadcast_retry_policy(),
-                operation,
-                || submitter.submit(&unmined.raw_bytes),
-                WalletError::from,
-            )
-            .await?;
-            resolve_send_outcome(outcome, tx_id)?;
         }
         let broadcast_at_height = visible_tip.unwrap_or_else(|| BlockHeight::from(0));
         Ok(Some(SendOutcome {

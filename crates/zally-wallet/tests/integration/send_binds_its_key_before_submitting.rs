@@ -9,7 +9,10 @@
 //! `Wallet::send_payment`: the first step moves the shielded note to an ephemeral transparent
 //! address and the second pays the recipient from it.
 
+use std::sync::Arc;
+
 use parking_lot::Mutex;
+use tokio::sync::Notify;
 use zally_chain::{
     ChainSourceError, RejectionReason, SubmitOutcome, Submitter, SubmitterError,
     parse_transaction_id,
@@ -221,6 +224,36 @@ async fn a_failed_funding_step_frees_the_key_and_is_never_resubmitted() -> Resul
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_retry_after_a_crash_before_the_funding_step_submits_every_step()
+-> Result<(), FixtureError> {
+    let (base, _funding_shielding_tx_id) = wallet_with_spendable_note().await?;
+    let stalling = StallingSubmitter {
+        network: base.network,
+        entered: Arc::new(Notify::new()),
+    };
+    let entered = Arc::clone(&stalling.entered);
+    tokio::select! {
+        _ = pay_tex(&base, &stalling) => {
+            return Err(FixtureError::Fixture("a stalled submission returned"));
+        }
+        () = entered.notified() => {}
+    }
+    // The send ends here, as a crash would, after binding its key and before any node
+    // received the funding step.
+
+    let submitter = ScriptedSubmitter::new(base.network, Vec::new());
+    let retried = pay_tex(&base, &submitter).await?.tx_id();
+    let received = submitter.received();
+    assert_eq!(
+        received.len(),
+        2,
+        "the retry submits the funding step before the paying step: {received:?}"
+    );
+    assert_eq!(received.last().copied(), Some(retried));
+    Ok(())
+}
+
 /// A wallet synced past [`PRE_FUNDING_TIP_HEIGHT`] that owns one transparent UTXO and submits
 /// without retrying, so every submit error reaches the caller.
 async fn shieldable_wallet() -> Result<ChainWallet, FixtureError> {
@@ -314,6 +347,24 @@ async fn pending_inputs_of(
         .collect();
     broadcasts.dedup();
     Ok(broadcasts)
+}
+
+/// Never answers, and signals when a submission reaches it.
+struct StallingSubmitter {
+    network: Network,
+    entered: Arc<Notify>,
+}
+
+#[async_trait::async_trait]
+impl Submitter for StallingSubmitter {
+    fn network(&self) -> Network {
+        self.network
+    }
+
+    async fn submit(&self, _raw_tx: &[u8]) -> Result<SubmitOutcome, SubmitterError> {
+        self.entered.notify_one();
+        std::future::pending().await
+    }
 }
 
 /// One scripted node response.
