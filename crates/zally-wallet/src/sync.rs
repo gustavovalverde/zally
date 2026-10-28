@@ -613,16 +613,7 @@ impl SyncDriver {
             self.options.transparent_utxo_refresh_timeout_seconds,
             transparent_utxo_refresh_close_rx,
         ));
-        let join = tokio::spawn(run_sync_driver(
-            DriverParts {
-                wallet: self.wallet,
-                chain: self.chain,
-                submitter: self.submitter,
-                options: self.options,
-            },
-            close_rx,
-            status_tx,
-        ));
+        let join = tokio::spawn(run_sync_driver(self, close_rx, status_tx));
         SyncHandle {
             close_tx: Some(close_tx),
             join,
@@ -680,13 +671,6 @@ async fn join_driver_task(join: JoinHandle<()>) -> Result<(), WalletError> {
         }),
         Err(_cancelled) => Ok(()),
     }
-}
-
-struct DriverParts {
-    wallet: Wallet,
-    chain: Arc<dyn ChainSource>,
-    submitter: Option<Arc<dyn Submitter>>,
-    options: SyncDriverOptions,
 }
 
 struct DriverContext<'a> {
@@ -995,15 +979,15 @@ enum DriverTransition<'a> {
 }
 
 async fn run_sync_driver(
-    parts: DriverParts,
+    driver: SyncDriver,
     mut close_rx: oneshot::Receiver<()>,
     status_tx: watch::Sender<SyncSnapshot>,
 ) {
     let ctx = DriverContext {
-        wallet: &parts.wallet,
-        chain: parts.chain.as_ref(),
-        submitter: parts.submitter.as_deref(),
-        options: parts.options,
+        wallet: &driver.wallet,
+        chain: driver.chain.as_ref(),
+        submitter: driver.submitter.as_deref(),
+        options: driver.options,
         status_tx: &status_tx,
     };
     let started = ctx.status_tx.borrow().clone();
