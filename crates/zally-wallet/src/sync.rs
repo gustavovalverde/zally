@@ -460,7 +460,8 @@ pub enum SyncDriverPhase {
     },
     /// The chain source stopped following the chain. The driver scans nothing, the wallet
     /// refuses new spends with [`WalletError::ChainSourceHalted`], and the driver resumes on
-    /// its own once the source moves again.
+    /// its own once the source moves again. [`WalletEvent::SourceHalted`] and
+    /// [`WalletEvent::SourceRecovered`] report entering and leaving this phase.
     SourceHalted {
         /// Unix milliseconds when the driver halted.
         since_ms: u64,
@@ -1349,6 +1350,10 @@ async fn watch_source_tip(
 /// chain.
 async fn enter_source_halt(ctx: &DriverContext<'_>, state: &mut DriverState, halted: HaltedSource) {
     ctx.wallet.set_source_halt(Some(halted.cause));
+    ctx.wallet.publish_event(WalletEvent::SourceHalted {
+        cause: halted.cause,
+        since_ms: halted.since_ms,
+    });
     state.last_fault = Some(SyncFault {
         reason: halted.cause.to_string(),
         repair: SyncRepair::Park,
@@ -1376,6 +1381,7 @@ async fn enter_source_halt(ctx: &DriverContext<'_>, state: &mut DriverState, hal
 /// Lifts a source halt once the source's visible tip moves again.
 async fn publish_source_recovered(ctx: &DriverContext<'_>, state: &mut DriverState) {
     ctx.wallet.set_source_halt(None);
+    ctx.wallet.publish_event(WalletEvent::SourceRecovered);
     state.last_fault = None;
     state.catch_up_pending = true;
     let snapshot = build_snapshot(ctx, SyncDriverPhase::Waiting, state).await;

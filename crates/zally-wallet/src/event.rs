@@ -25,8 +25,10 @@ use zally_core::{AccountId, BlockHeight, HoldId, IdempotencyKey, TxId};
 /// [`WalletEvent::TransparentUtxoRefreshFaulted`] marks a faulted transparent-UTXO refresh
 /// attempt. [`WalletEvent::PendingBroadcastUnmineable`] names a broadcast to recreate, and
 /// [`WalletEvent::HoldDispenseUnmineable`] names each dispense hold it had finalized.
+/// [`WalletEvent::SourceHalted`] and [`WalletEvent::SourceRecovered`] mark the start and end
+/// of a spend refusal over a halted chain source, and
 /// [`WalletEvent::SourceReorgWindowTooShallow`] and [`WalletEvent::SourceReorgWindowSufficient`]
-/// mark the start and end of a spend refusal over the chain source's reorg window.
+/// over the chain source's reorg window.
 /// [`WalletEvent::Lagged`] is injected by the subscription
 /// stream when a consumer drops events; the sync loop never emits it directly.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -175,6 +177,21 @@ pub enum WalletEvent {
         /// The hold is active again; false when it was released instead.
         is_reopened: bool,
     },
+    /// The sync driver found that the chain source stopped following the chain, entered
+    /// [`crate::SyncDriverPhase::SourceHalted`], and the wallet refuses new spends with
+    /// [`crate::WalletError::ChainSourceHalted`]. [`Self::SourceRecovered`] follows once the
+    /// source moves again.
+    SourceHalted {
+        /// Why the source is considered halted.
+        cause: crate::SourceHalt,
+        /// Unix milliseconds when the driver halted.
+        since_ms: u64,
+    },
+    /// The chain source halted under [`Self::SourceHalted`] moves again: the driver left
+    /// [`crate::SyncDriverPhase::SourceHalted`] and the wallet accepts new spends.
+    ///
+    /// Closing a halted driver also lifts the refusal, without this event.
+    SourceRecovered,
     /// The sync driver read a chain source reorg window below
     /// [`crate::SyncDriverOptions::minimum_source_reorg_window_blocks`], so the wallet refuses
     /// new spends with [`crate::WalletError::SourceReorgWindowTooShallow`].

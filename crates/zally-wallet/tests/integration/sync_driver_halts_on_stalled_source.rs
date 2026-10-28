@@ -1,15 +1,23 @@
 //! A chain source whose visible tip stops moving halts the sync driver and the wallet's new
 //! spends, and both resume once the tip moves, through a chain event or a fresh epoch read.
+//!
+//! Wallet events report entering and leaving the halt.
 
+use std::time::Duration;
 use zally_core::{BlockHeight, IdempotencyKey, Zatoshis};
 use zally_testkit::MockSubmitter;
-use zally_wallet::{ShieldTransparentPlan, SourceHalt, SyncDriverPhase, SyncSnapshot, WalletError};
+
+use zally_wallet::{
+    ShieldTransparentPlan, SourceHalt, SyncDriverPhase, SyncSnapshot, WalletError, WalletEvent,
+    WalletEventStream,
+};
 
 use super::reorg_fixtures::{
     ChainWallet, FixtureError, chain_wallet, fast_driver_options, start_driver, wait_for_driver,
 };
 
 const STALL_LIMIT_MS: u64 = 300;
+const EVENT_TIMEOUT: Duration = Duration::from_secs(30);
 
 async fn try_shielding(base: &ChainWallet) -> Result<WalletError, FixtureError> {
     let submitter = MockSubmitter::accepting(base.network);
@@ -125,4 +133,55 @@ async fn closing_a_halted_driver_lifts_the_spend_refusal() -> Result<(), Fixture
         "no driver is left to lift the refusal, so closing it must"
     );
     Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_wallet_reports_entering_and_leaving_a_source_halt() -> Result<(), FixtureError> {
+    let base = chain_wallet(10).await?;
+    let mut events = base.wallet.observe();
+    let handle = start_driver(
+        &base.wallet,
+        &base.chain,
+        None,
+        fast_driver_options().with_visible_tip_stall_limit_ms(Some(STALL_LIMIT_MS)),
+    )?;
+
+    let halted = next_source_halt_event(&mut events).await?;
+    assert!(
+        matches!(
+            halted,
+            WalletEvent::SourceHalted {
+                cause: SourceHalt::VisibleTipStalled { visible_tip_height, .. },
+                ..
+            } if visible_tip_height == BlockHeight::from(10)
+        ),
+        "entering the halt is reported with its cause: {halted:?}"
+    );
+    base.chain_handle.advance_tip(BlockHeight::from(11));
+    assert_eq!(
+        next_source_halt_event(&mut events).await?,
+        WalletEvent::SourceRecovered,
+        "leaving the halt is reported"
+    );
+    handle.close().await?;
+    Ok(())
+}
+
+/// Waits for the next [`WalletEvent::SourceHalted`] or [`WalletEvent::SourceRecovered`].
+async fn next_source_halt_event(
+    events: &mut WalletEventStream,
+) -> Result<WalletEvent, FixtureError> {
+    tokio::time::timeout(EVENT_TIMEOUT, async {
+        while let Some(event) = events.next().await {
+            if matches!(
+                event,
+                WalletEvent::SourceHalted { .. } | WalletEvent::SourceRecovered
+            ) {
+                return Ok(event);
+            }
+        }
+        Err(FixtureError::Fixture("the wallet event stream closed"))
+    })
+    .await
+    .map_err(|_elapsed| FixtureError::Fixture("timed out waiting for a source halt event"))?
 }
