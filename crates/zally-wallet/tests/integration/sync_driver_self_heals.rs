@@ -501,8 +501,12 @@ impl ChainSource for ScriptedChain {
             .await
     }
 
-    async fn transaction_status(&self, tx_id: TxId) -> Result<TransactionStatus, ChainSourceError> {
-        self.inner.transaction_status(tx_id).await
+    async fn transaction_status(
+        &self,
+        chain_epoch: ChainEpoch,
+        tx_id: TxId,
+    ) -> Result<TransactionStatus, ChainSourceError> {
+        self.inner.transaction_status(chain_epoch, tx_id).await
     }
 
     async fn transparent_utxos(

@@ -5,14 +5,56 @@
 //! settled tip can trail the visible tip by the chain source's whole reorg window.
 
 use std::collections::HashSet;
+use std::time::Duration;
 
-use zally_chain::{ChainSource, TransactionStatus, UnmineableReason, parse_transaction_header};
+use zally_chain::{
+    ChainEpoch, ChainSource, TransactionStatus, UnmineableReason, parse_transaction_header,
+};
 use zally_core::{BlockHeight, TxId};
 use zally_storage::UnmineableHold;
 
 use crate::error::WalletError;
 use crate::event::WalletEvent;
 use crate::wallet::Wallet;
+
+/// Whether the chain source can back unmineable verdicts in this pass, and on which epoch.
+enum VerdictGate {
+    /// The source's reorg window meets the minimum and `ChainEpoch` covers the judged height.
+    Open(ChainEpoch),
+    /// Verdicts wait, for the reason given.
+    Closed(String),
+}
+
+/// Whether a transaction the wallet judged unmineable is in the chain.
+enum ChainPresence {
+    /// Absent from the canonical chain at the pinned epoch.
+    Absent,
+    /// Mined; the wallet recorded it.
+    Mined,
+    /// Not established, for the reason given.
+    Unknown(String),
+    /// Not established because the source did not answer in time; the rest of the pass
+    /// skips the source rather than wait on it once per broadcast.
+    Unresponsive(String),
+}
+
+/// A chain source pinned to the epoch one verdict pass is judged against.
+#[derive(Clone, Copy)]
+struct PinnedChain<'a> {
+    chain: &'a dyn ChainSource,
+    epoch: ChainEpoch,
+}
+
+/// State one call of [`Wallet::retire_pending_broadcasts`] shares across broadcasts.
+struct VerdictPass<'a> {
+    chain: &'a dyn ChainSource,
+    judged_height: BlockHeight,
+    /// `None` holds every verdict; see `WalletInner::scan_blind_sends`.
+    scan_blind_sends: Option<HashSet<TxId>>,
+    /// Opened on the first broadcast that needs a verdict, then reused.
+    gate: Option<VerdictGate>,
+    withheld: HashSet<TxId>,
+}
 
 impl Wallet {
     /// Retires every pending broadcast whose fate the chain settled.
@@ -24,20 +66,19 @@ impl Wallet {
     /// which drops its pending inputs, frees its idempotency key for a replacement, and
     /// reopens the dispense holds finalized with it; [`WalletEvent::PendingBroadcastUnmineable`]
     /// reports it and [`WalletEvent::HoldDispenseUnmineable`] reports each hold. A
-    /// transaction a rewind removed from the chain is judged the same way. Judging at the visible tip
-    /// instead could report a broadcast that an unscanned or reorged block still mines, and
-    /// its replacement would pay twice. Before the first such verdict in a call, the wallet
-    /// reads the chain source's reorg window, and records nothing unmineable unless the read
-    /// meets [`crate::WalletOptions::minimum_source_reorg_window_blocks`]: a settled tip the
-    /// source can still replace cannot back a verdict.
+    /// transaction a rewind removed from the chain is judged the same way. Judging at the
+    /// visible tip instead could report a broadcast that an unscanned or reorged block still
+    /// mines, and its replacement would pay twice.
     ///
-    /// The verdict also asks `chain` before it frees anything, because the wallet's scan can
-    /// miss a transaction it sent: it records the broadcast unmineable only when the source
-    /// reports the transaction not found. One the source reports mined is recorded as mined at
-    /// that height, with the earlier steps of its send, and keeps its key; one the source
-    /// still holds, or a failed lookup, leaves it unjudged until a later sync. A send the scan
-    /// may have passed without the outputs of its earlier steps is never judged unmineable,
-    /// and [`WalletEvent::PendingBroadcastVerdictWithheld`] reports the wait once.
+    /// The wallet's own scan is the primary evidence; the chain source is a second guard. Before
+    /// the first verdict in a call, the wallet reads the source's reorg window and pins an epoch
+    /// whose visible tip covers the judged height. It records a broadcast unmineable only when
+    /// the window meets [`crate::WalletOptions::minimum_source_reorg_window_blocks`], the source
+    /// reports the transaction not found at that epoch, and the epoch is still current. One the
+    /// source reports mined is recorded mined at that height, with the earlier steps of its
+    /// send, and keeps its key. A send whose earlier steps' outputs the wallet could not record
+    /// is never judged. Every other case leaves the broadcast unjudged until a later sync and
+    /// publishes [`WalletEvent::PendingBroadcastVerdictWithheld`] once.
     pub(crate) async fn retire_pending_broadcasts(
         &self,
         chain: &dyn ChainSource,
@@ -50,9 +91,16 @@ impl Wallet {
             return Ok(());
         };
         let judged_height = scanned_height.min(settled_tip_height);
-        let scan_blind_sends = self.inner.scan_blind_sends.lock().clone();
-        let mut withheld = HashSet::new();
-        let mut is_window_verified = None;
+        if self.is_source_reorg_window_too_shallow() {
+            let _ = self.verify_source_reorg_window(chain).await;
+        }
+        let mut pass = VerdictPass {
+            chain,
+            judged_height,
+            scan_blind_sends: self.inner.scan_blind_sends.lock().clone(),
+            gate: None,
+            withheld: HashSet::new(),
+        };
         for pending in storage.list_pending_broadcast_transactions().await? {
             let tx_id = pending.broadcast_tx_id;
             match pending.mined_height {
@@ -81,34 +129,172 @@ impl Wallet {
             let Err(reason) = header.check_mineable(self.network(), judged_height) else {
                 continue;
             };
-            let is_verdict_allowed = match is_window_verified {
-                Some(is_verified) => is_verified,
-                None => *is_window_verified.insert(self.verify_source_reorg_window(chain).await),
-            };
-            if !is_verdict_allowed
-                || !self
-                    .is_absent_from_chain(chain, tx_id, &pending.raw_bytes)
-                    .await
+            match self
+                .judge_presence(&mut pass, tx_id, &pending.raw_bytes)
+                .await
             {
-                continue;
-            }
-            if let Some(cause) = scan_blind_cause(scan_blind_sends.as_ref(), tx_id) {
-                self.withhold_verdict(tx_id, cause);
-                withheld.insert(tx_id);
-                continue;
-            }
-            if let Some(holds) = storage
-                .record_unmineable_transaction(tx_id, judged_height)
-                .await?
-            {
-                self.report_unmineable(tx_id, &reason, judged_height, holds);
+                ChainPresence::Absent => {
+                    if let Some(holds) = storage
+                        .record_unmineable_transaction(tx_id, judged_height)
+                        .await?
+                    {
+                        self.report_unmineable(tx_id, &reason, judged_height, holds);
+                    }
+                }
+                ChainPresence::Mined => {}
+                ChainPresence::Unknown(cause) | ChainPresence::Unresponsive(cause) => {
+                    self.withhold_verdict(tx_id, &cause);
+                    pass.withheld.insert(tx_id);
+                }
             }
         }
+        let withheld = pass.withheld;
         self.inner
             .withheld_verdicts
             .lock()
             .retain(|tx_id| withheld.contains(tx_id));
         Ok(())
+    }
+
+    /// Establishes whether `tx_id`, which the wallet's scan judged unmineable, is absent from
+    /// the chain, the only answer that lets the verdict record it unmineable.
+    ///
+    /// For a send the scan may have passed blind, absence is never established: the source's
+    /// answer can still record it mined, but `NotFound` alone cannot free its key.
+    async fn judge_presence(
+        &self,
+        pass: &mut VerdictPass<'_>,
+        tx_id: TxId,
+        raw_bytes: &[u8],
+    ) -> ChainPresence {
+        let blind_cause = match pass.scan_blind_sends {
+            None => Some(
+                "the wallet has not stored the carried steps of unsettled sends since it opened, \
+                 so its scan may not recognize a payment mined",
+            ),
+            Some(ref blind) if blind.contains(&tx_id) => Some(
+                "the wallet scanned without the outputs of this send's earlier steps, so its \
+                 scan may have missed the payment mined",
+            ),
+            Some(_) => None,
+        };
+        let gate = match pass.gate {
+            Some(ref gate) => gate,
+            None => pass
+                .gate
+                .insert(self.open_verdict_gate(pass.chain, pass.judged_height).await),
+        };
+        let presence = match gate {
+            VerdictGate::Open(epoch) => {
+                let pinned = PinnedChain {
+                    chain: pass.chain,
+                    epoch: *epoch,
+                };
+                self.find_chain_presence(pinned, tx_id, raw_bytes).await
+            }
+            VerdictGate::Closed(cause) => ChainPresence::Unknown(cause.clone()),
+        };
+        if let ChainPresence::Unresponsive(ref cause) = presence {
+            pass.gate = Some(VerdictGate::Closed(cause.clone()));
+        }
+        match (blind_cause, presence) {
+            (Some(cause), ChainPresence::Absent) => ChainPresence::Unknown(cause.to_owned()),
+            (_, ChainPresence::Unresponsive(cause)) => ChainPresence::Unknown(cause),
+            (_, presence) => presence,
+        }
+    }
+
+    /// Reads the source's reorg window and pins an epoch whose visible tip covers
+    /// `judged_height`.
+    async fn open_verdict_gate(
+        &self,
+        chain: &dyn ChainSource,
+        judged_height: BlockHeight,
+    ) -> VerdictGate {
+        if !self.verify_source_reorg_window(chain).await {
+            return VerdictGate::Closed(
+                "the chain source's reorg window is not verified to meet the minimum".to_owned(),
+            );
+        }
+        match tokio::time::timeout(self.source_lookup_timeout(), chain.current_epoch()).await {
+            Ok(Ok(epoch))
+                if epoch.network() == self.network()
+                    && epoch.visible_tip().height >= judged_height =>
+            {
+                VerdictGate::Open(epoch)
+            }
+            Ok(Ok(epoch)) => VerdictGate::Closed(format!(
+                "the chain source's epoch, visible to height {}, does not cover judged height {}",
+                epoch.visible_tip().height.as_u32(),
+                judged_height.as_u32()
+            )),
+            Ok(Err(error)) => {
+                VerdictGate::Closed(format!("could not pin a chain source epoch: {error}"))
+            }
+            Err(_elapsed) => {
+                VerdictGate::Closed("pinning a chain source epoch timed out".to_owned())
+            }
+        }
+    }
+
+    /// Asks the pinned source whether `tx_id` is in the canonical chain at its epoch.
+    ///
+    /// `NotFound` counts as absent only while `epoch` is still the source's current epoch, so a
+    /// lookup that raced an epoch change cannot pass for absence. A transaction the source
+    /// reports mined is recorded mined.
+    async fn find_chain_presence(
+        &self,
+        pinned: PinnedChain<'_>,
+        tx_id: TxId,
+        raw_bytes: &[u8],
+    ) -> ChainPresence {
+        let PinnedChain { chain, epoch } = pinned;
+        let timeout = self.source_lookup_timeout();
+        #[allow(
+            clippy::wildcard_enum_match_arm,
+            reason = "a status the wallet does not know cannot prove the transaction absent"
+        )]
+        match tokio::time::timeout(timeout, chain.transaction_status(epoch, tx_id)).await {
+            Ok(Ok(TransactionStatus::NotFound)) => {
+                match tokio::time::timeout(timeout, chain.current_epoch()).await {
+                    Ok(Ok(current)) if current.id() == epoch.id() => ChainPresence::Absent,
+                    Ok(Ok(_)) => ChainPresence::Unknown(
+                        "the chain source's epoch changed during the lookup".to_owned(),
+                    ),
+                    Ok(Err(error)) => ChainPresence::Unknown(format!(
+                        "could not confirm the chain source's epoch after the lookup: {error}"
+                    )),
+                    Err(_elapsed) => ChainPresence::Unresponsive(
+                        "confirming the chain source's epoch timed out".to_owned(),
+                    ),
+                }
+            }
+            Ok(Ok(TransactionStatus::Confirmed {
+                confirmed_at_height,
+                ..
+            })) => {
+                tracing::warn!(
+                    target: "zally::wallet",
+                    event = "pending_broadcast_mined_unrecognized",
+                    %tx_id,
+                    confirmed_at_height = confirmed_at_height.as_u32(),
+                    "chain source reports a pending broadcast mined that the wallet's scan did \
+                     not recognize; recording it mined"
+                );
+                self.record_send_confirmed(pinned, tx_id, raw_bytes, confirmed_at_height)
+                    .await;
+                ChainPresence::Mined
+            }
+            Ok(Ok(status)) => {
+                ChainPresence::Unknown(format!("the chain source reports {status:?}"))
+            }
+            Ok(Err(error)) => {
+                ChainPresence::Unknown(format!("the chain source lookup failed: {error}"))
+            }
+            Err(_elapsed) => {
+                ChainPresence::Unresponsive("the chain source lookup timed out".to_owned())
+            }
+        }
     }
 
     /// Publishes [`WalletEvent::PendingBroadcastVerdictWithheld`] the first time a verdict on
@@ -128,6 +314,10 @@ impl Wallet {
                 reason: cause.to_owned(),
             });
         }
+    }
+
+    fn source_lookup_timeout(&self) -> Duration {
+        Duration::from_millis(self.inner.options.source_lookup_timeout_ms)
     }
 
     /// Reports a broadcast just recorded unmineable and each dispense hold it settled.
@@ -168,70 +358,12 @@ impl Wallet {
         }
     }
 
-    /// Whether `chain` reports `tx_id` absent, the only answer that lets the verdict record it
-    /// unmineable.
-    ///
-    /// A transaction the source reports mined is recorded mined, so the wallet stops judging it
-    /// and its key keeps answering with it.
-    async fn is_absent_from_chain(
-        &self,
-        chain: &dyn ChainSource,
-        tx_id: TxId,
-        raw_bytes: &[u8],
-    ) -> bool {
-        #[allow(
-            clippy::wildcard_enum_match_arm,
-            reason = "a status the wallet does not know cannot prove the transaction absent"
-        )]
-        match chain.transaction_status(tx_id).await {
-            Ok(TransactionStatus::NotFound) => true,
-            Ok(TransactionStatus::Confirmed {
-                confirmed_at_height,
-                ..
-            }) => {
-                tracing::warn!(
-                    target: "zally::wallet",
-                    event = "pending_broadcast_mined_unrecognized",
-                    %tx_id,
-                    confirmed_at_height = confirmed_at_height.as_u32(),
-                    "chain source reports a pending broadcast mined that the wallet's scan did \
-                     not recognize; recording it mined"
-                );
-                self.record_send_confirmed(chain, tx_id, raw_bytes, confirmed_at_height)
-                    .await;
-                false
-            }
-            Ok(status) => {
-                tracing::info!(
-                    target: "zally::wallet",
-                    event = "pending_broadcast_still_known",
-                    %tx_id,
-                    ?status,
-                    "chain source still knows a pending broadcast the wallet judged unmineable; \
-                     leaving it unjudged"
-                );
-                false
-            }
-            Err(error) => {
-                tracing::warn!(
-                    target: "zally::wallet",
-                    event = "pending_broadcast_status_unavailable",
-                    %tx_id,
-                    %error,
-                    "could not confirm a pending broadcast is absent from the chain; leaving it \
-                     unjudged"
-                );
-                false
-            }
-        }
-    }
-
     /// Records `tx_id` mined at `confirmed_at_height`, after the earlier steps of its send that
     /// the source also reports mined, so their outputs are known before the step that spends
     /// them. A failure is logged and retried by a later sync, since the broadcast stays pending.
     async fn record_send_confirmed(
         &self,
-        chain: &dyn ChainSource,
+        pinned: PinnedChain<'_>,
         tx_id: TxId,
         raw_bytes: &[u8],
         confirmed_at_height: BlockHeight,
@@ -258,10 +390,14 @@ impl Wallet {
             let Some(step_bytes) = step.raw_bytes else {
                 continue;
             };
-            if let Ok(TransactionStatus::Confirmed {
+            if let Ok(Ok(TransactionStatus::Confirmed {
                 confirmed_at_height: step_height,
                 ..
-            }) = chain.transaction_status(step.tx_id).await
+            })) = tokio::time::timeout(
+                self.source_lookup_timeout(),
+                pinned.chain.transaction_status(pinned.epoch, step.tx_id),
+            )
+            .await
             {
                 confirmed.push((step_bytes, step_height));
             }
@@ -282,23 +418,5 @@ impl Wallet {
                 return;
             }
         }
-    }
-}
-
-/// Why `tx_id` may have been passed by the wallet's scan without being recognized, if it may.
-///
-/// `None` for `scan_blind_sends` means no scan step in this process has stored the carried
-/// send steps yet, which holds every verdict.
-fn scan_blind_cause(scan_blind_sends: Option<&HashSet<TxId>>, tx_id: TxId) -> Option<&'static str> {
-    match scan_blind_sends {
-        None => Some(
-            "the wallet has not stored the carried steps of unsettled sends since it opened, so \
-             its scan may not recognize a payment mined",
-        ),
-        Some(blind) if blind.contains(&tx_id) => Some(
-            "the wallet scanned without the outputs of this send's earlier steps, so its scan \
-             may have missed the payment mined",
-        ),
-        Some(_) => None,
     }
 }

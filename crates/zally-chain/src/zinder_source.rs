@@ -298,10 +298,19 @@ impl ChainSource for ZinderChainSource {
             .collect())
     }
 
-    async fn transaction_status(&self, tx_id: TxId) -> Result<TransactionStatus, ChainSourceError> {
+    async fn transaction_status(
+        &self,
+        chain_epoch: ChainEpoch,
+        tx_id: TxId,
+    ) -> Result<TransactionStatus, ChainSourceError> {
         self.ensure_capabilities(&[Capability::Transaction]).await?;
+        let epoch = self.pinned_epoch(chain_epoch)?;
         let zinder_id = ZinderTransactionId::from_bytes(*tx_id.as_bytes());
-        let status = self.inner.transaction_by_id(zinder_id, None).await?;
+        // The pinned zinder-client answers every gRPC NOT_FOUND for an epoch-pinned lookup with
+        // `TxStatus::NotFound`, including server-side unavailable history; the wallet therefore
+        // treats `NotFound` as a second guard behind its own scan, not as proof on its own.
+        let status =
+            Self::pinned_result(self.inner.transaction_by_id(zinder_id, Some(epoch)).await)?;
         #[allow(
             clippy::wildcard_enum_match_arm,
             reason = "non_exhaustive zinder tx statuses fail closed on unknown variants"

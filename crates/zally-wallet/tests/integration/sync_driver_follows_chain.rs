@@ -295,8 +295,12 @@ impl ChainSource for QuietCountingChainSource {
         self.inner.subtree_roots(epoch, pool, start, count).await
     }
 
-    async fn transaction_status(&self, tx_id: TxId) -> Result<TransactionStatus, ChainSourceError> {
-        self.inner.transaction_status(tx_id).await
+    async fn transaction_status(
+        &self,
+        chain_epoch: ChainEpoch,
+        tx_id: TxId,
+    ) -> Result<TransactionStatus, ChainSourceError> {
+        self.inner.transaction_status(chain_epoch, tx_id).await
     }
 
     async fn transparent_utxos(
@@ -458,6 +462,7 @@ impl ChainSource for StalledChainSource {
 
     async fn transaction_status(
         &self,
+        _chain_epoch: ChainEpoch,
         _tx_id: TxId,
     ) -> Result<TransactionStatus, ChainSourceError> {
         let _ = self.network;
@@ -554,8 +559,12 @@ impl ChainSource for RecordingChainSource {
             .await
     }
 
-    async fn transaction_status(&self, tx_id: TxId) -> Result<TransactionStatus, ChainSourceError> {
-        self.inner.transaction_status(tx_id).await
+    async fn transaction_status(
+        &self,
+        chain_epoch: ChainEpoch,
+        tx_id: TxId,
+    ) -> Result<TransactionStatus, ChainSourceError> {
+        self.inner.transaction_status(chain_epoch, tx_id).await
     }
 
     async fn transparent_utxos(

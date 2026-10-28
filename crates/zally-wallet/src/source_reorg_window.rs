@@ -50,12 +50,25 @@ impl Wallet {
         let Some(required_blocks) = self.inner.options.minimum_source_reorg_window_blocks else {
             return true;
         };
-        match chain.reorg_window_blocks().await {
-            Ok(reorg_window_blocks) => {
+        let read = tokio::time::timeout(
+            std::time::Duration::from_millis(self.inner.options.source_lookup_timeout_ms),
+            chain.reorg_window_blocks(),
+        )
+        .await;
+        match read {
+            Ok(Ok(reorg_window_blocks)) => {
                 self.record_source_reorg_window(reorg_window_blocks, required_blocks);
                 reorg_window_blocks >= required_blocks
             }
-            Err(error) => {
+            Err(_elapsed) => {
+                tracing::warn!(
+                    target: "zally::wallet",
+                    event = "source_reorg_window_unreadable",
+                    "chain source reorg window read timed out; unmineable verdicts wait"
+                );
+                false
+            }
+            Ok(Err(error)) => {
                 tracing::warn!(
                     target: "zally::wallet",
                     event = "source_reorg_window_unreadable",
@@ -121,6 +134,15 @@ impl Wallet {
     /// Forgets the window check when the sync driver that kept it closes.
     pub(crate) fn clear_source_reorg_window(&self) {
         *self.inner.source_reorg_window.lock() = SourceReorgWindowCheck::Unchecked;
+    }
+
+    /// Whether the last read showed a window below the minimum, so a sync reads it again
+    /// even without a verdict to back, and the refusal lifts once the source meets it.
+    pub(crate) fn is_source_reorg_window_too_shallow(&self) -> bool {
+        matches!(
+            *self.inner.source_reorg_window.lock(),
+            SourceReorgWindowCheck::TooShallow { .. }
+        )
     }
 
     /// Whether a sync driver requires a window it has not read yet.

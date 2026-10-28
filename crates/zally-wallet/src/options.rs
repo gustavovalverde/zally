@@ -43,6 +43,14 @@ pub struct WalletOptions {
     /// Default: [`CircuitBreakerConfig::default`], five consecutive retryable failures and a
     /// one-minute cooldown.
     pub circuit_breaker: CircuitBreakerConfig,
+    /// Longest the wallet waits for one chain source read that backs an unmineable verdict:
+    /// the reorg window, the epoch pin, and the transaction lookup.
+    ///
+    /// A read that does not answer in time leaves the verdict for a later sync, so a hung
+    /// source neither hangs [`crate::Wallet::sync`] nor stalls scanning.
+    ///
+    /// Default: 30 seconds.
+    pub source_lookup_timeout_ms: u64,
 }
 
 impl WalletOptions {
@@ -53,6 +61,16 @@ impl WalletOptions {
     /// finalized state only once its best chain is longer than this, so it never presents a
     /// deeper reorg.
     pub const DEFAULT_MINIMUM_SOURCE_REORG_WINDOW_BLOCKS: u32 = 1_000;
+
+    /// Default wait for one chain source read that backs an unmineable verdict: 30 seconds.
+    pub const DEFAULT_SOURCE_LOOKUP_TIMEOUT_MS: u64 = 30_000;
+
+    /// Returns a copy of `self` with `source_lookup_timeout_ms` replaced.
+    #[must_use]
+    pub const fn with_source_lookup_timeout_ms(mut self, source_lookup_timeout_ms: u64) -> Self {
+        self.source_lookup_timeout_ms = source_lookup_timeout_ms;
+        self
+    }
 
     /// Returns a copy of `self` with `circuit_breaker` replaced.
     #[must_use]
@@ -90,6 +108,7 @@ impl Default for WalletOptions {
                 Self::DEFAULT_MINIMUM_SOURCE_REORG_WINDOW_BLOCKS,
             ),
             circuit_breaker: CircuitBreakerConfig::default(),
+            source_lookup_timeout_ms: Self::DEFAULT_SOURCE_LOOKUP_TIMEOUT_MS,
         }
     }
 }

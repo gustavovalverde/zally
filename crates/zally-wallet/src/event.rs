@@ -163,9 +163,12 @@ pub enum WalletEvent {
     /// idempotency key stays bound and no replacement may be paid. Emitted once each time a
     /// verdict on `tx_id` starts waiting.
     ///
-    /// The wallet's scan may have passed a multi-step send without the outputs of its earlier
-    /// steps. The send stays held until the chain source reports it mined or its key is
-    /// released. `reason` says why the verdict waits.
+    /// Either the chain source could not back the verdict (its reorg window is not verified,
+    /// its epoch does not cover the judged height, or its transaction lookup failed, timed
+    /// out, or is unsupported), or the wallet's scan may have passed a multi-step send without
+    /// the outputs of its earlier steps. The wallet tries again on every sync. A source problem
+    /// clears once the source is fixed; a send the scan may have missed stays held until the
+    /// source reports it mined or its key is released. `reason` says which case applies.
     PendingBroadcastVerdictWithheld {
         /// Transaction whose verdict waits.
         tx_id: TxId,

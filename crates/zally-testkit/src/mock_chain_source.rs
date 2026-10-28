@@ -768,7 +768,12 @@ impl ChainSource for MockChainSource {
         Ok(Vec::new())
     }
 
-    async fn transaction_status(&self, tx_id: TxId) -> Result<TransactionStatus, ChainSourceError> {
+    async fn transaction_status(
+        &self,
+        chain_epoch: ChainEpoch,
+        tx_id: TxId,
+    ) -> Result<TransactionStatus, ChainSourceError> {
+        self.validate_epoch(chain_epoch)?;
         let mode = self.state.lock().transaction_status_mode;
         match mode {
             MockTransactionStatusMode::Canonical => {}

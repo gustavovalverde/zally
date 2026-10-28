@@ -387,8 +387,19 @@ pub trait ChainSource: Send + Sync + 'static {
         max_count: u32,
     ) -> Result<Vec<SubtreeRoot>, ChainSourceError>;
 
-    /// Looks up a transaction.
-    async fn transaction_status(&self, tx_id: TxId) -> Result<TransactionStatus, ChainSourceError>;
+    /// Looks up a transaction in the canonical chain visible at `chain_epoch`.
+    ///
+    /// The wallet frees an idempotency key for a payment it judges unmineable only after this
+    /// returns [`TransactionStatus::NotFound`], so `NotFound` must mean that the transaction is
+    /// absent from every block of the canonical chain the epoch makes visible. A source that
+    /// cannot promise that, because the epoch expired, the history the transaction could sit in
+    /// is unavailable, or the lookup failed for any other reason, must return an error instead:
+    /// an error leaves the payment unjudged, while a wrong `NotFound` lets its key pay twice.
+    async fn transaction_status(
+        &self,
+        chain_epoch: ChainEpoch,
+        tx_id: TxId,
+    ) -> Result<TransactionStatus, ChainSourceError>;
 
     /// Returns the complete unspent set for a transparent address at one chain epoch.
     ///

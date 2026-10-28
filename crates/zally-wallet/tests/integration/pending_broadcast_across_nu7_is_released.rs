@@ -20,7 +20,9 @@ use zally_chain::{
 };
 use zally_core::{AccountId, BlockHeight, BranchId, IdempotencyKey, Network, TxId, Zatoshis};
 use zally_storage::{Sqlite, SqliteOptions, StorageError, TransparentUtxoRow, WalletStorage as _};
-use zally_testkit::{InMemorySealing, MockChainSource, MockChainSourceHandle};
+use zally_testkit::{
+    InMemorySealing, MockChainSource, MockChainSourceHandle, MockTransactionStatusMode,
+};
 use zally_wallet::{
     SendOutcome, ShieldTransparentPlan, Wallet, WalletError, WalletEvent, WalletEventStream,
     WalletOptions,
@@ -73,6 +75,24 @@ async fn sync_to(
     Ok(())
 }
 
+/// Drains the events already published and returns the broadcasts whose verdict waits,
+/// failing if any broadcast was judged unmineable.
+async fn withheld_reports(events: &mut WalletEventStream) -> Result<Vec<TxId>, TestError> {
+    let mut reports = Vec::new();
+    while let Ok(Some(event)) =
+        tokio::time::timeout(Duration::from_millis(200), events.next()).await
+    {
+        if let WalletEvent::PendingBroadcastVerdictWithheld { tx_id, .. } = event {
+            reports.push(tx_id);
+        } else if let WalletEvent::PendingBroadcastUnmineable { .. } = event {
+            return Err(TestError::Fixture(
+                "a broadcast was judged unmineable while its verdict should wait",
+            ));
+        }
+    }
+    Ok(reports)
+}
+
 /// Drains the events already published and returns the unmineable-broadcast reports.
 async fn unmineable_reports(events: &mut WalletEventStream) -> Vec<(TxId, String)> {
     let mut reports = Vec::new();
@@ -101,6 +121,13 @@ struct PendingShieldingWallet {
 }
 
 async fn wallet_with_pending_shielding() -> Result<PendingShieldingWallet, TestError> {
+    wallet_with_pending_shielding_using(WalletOptions::default()).await
+}
+
+/// Same as [`wallet_with_pending_shielding`], with caller-supplied [`WalletOptions`].
+async fn wallet_with_pending_shielding_using(
+    options: WalletOptions,
+) -> Result<PendingShieldingWallet, TestError> {
     let network = regtest_with_nu7_at_one_hundred_twenty();
     let temp = TempDir::new()?;
     let (spend_bytes, output_bytes) = wagyu_zcash_parameters::load_sapling_parameters();
@@ -117,7 +144,7 @@ async fn wallet_with_pending_shielding() -> Result<PendingShieldingWallet, TestE
     chain_handle.serve_compact_blocks();
     let (wallet, account_id, _mnemonic) =
         Wallet::builder(network, InMemorySealing::new(), storage.clone())
-            .with_options(WalletOptions::default().with_pending_broadcast_window_ms(1))
+            .with_options(options.with_pending_broadcast_window_ms(1))
             .create(&chain, BlockHeight::from(1))
             .await?;
     sync_block_by_block(
@@ -393,6 +420,188 @@ async fn a_sync_without_a_driver_holds_verdicts_under_a_shallow_source_reorg_win
         "the next sync reads the raised window and judges the broadcast"
     );
     Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_verdict_the_source_cannot_check_waits_and_is_reported_once() -> Result<(), TestError> {
+    let PendingShieldingWallet {
+        wallet,
+        storage,
+        chain,
+        chain_handle,
+        pending_tx_id,
+        temp: _temp,
+        ..
+    } = wallet_with_pending_shielding().await?;
+    chain_handle.set_transaction_status_mode(MockTransactionStatusMode::CapabilityMissing);
+    let mut events = wallet.observe();
+    let settled = NU7_ACTIVATION_HEIGHT - 1;
+    sync_to(&wallet, &chain, &chain_handle, settled + 6, settled).await?;
+    wallet.sync(&chain).await?;
+
+    assert_eq!(
+        withheld_reports(&mut events).await?,
+        vec![pending_tx_id],
+        "every pass withholds the verdict, and the wallet reports it once"
+    );
+    assert_eq!(
+        storage.find_idempotent_submission(&shield_key()?).await?,
+        Some(pending_tx_id)
+    );
+
+    chain_handle.set_transaction_status_mode(MockTransactionStatusMode::Canonical);
+    wallet.sync(&chain).await?;
+    let reports = unmineable_reports(&mut events).await;
+    assert_eq!(
+        reports.iter().map(|(tx_id, _)| *tx_id).collect::<Vec<_>>(),
+        vec![pending_tx_id],
+        "the verdict runs once the source can check the broadcast"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_hung_status_lookup_neither_hangs_the_sync_nor_frees_the_key() -> Result<(), TestError> {
+    let PendingShieldingWallet {
+        wallet,
+        storage,
+        chain,
+        chain_handle,
+        pending_tx_id,
+        temp: _temp,
+        ..
+    } = wallet_with_pending_shielding_using(
+        WalletOptions::default().with_source_lookup_timeout_ms(200),
+    )
+    .await?;
+    chain_handle.set_transaction_status_mode(MockTransactionStatusMode::Hanging);
+    let mut events = wallet.observe();
+    let settled = NU7_ACTIVATION_HEIGHT - 1;
+    tokio::time::timeout(
+        Duration::from_mins(1),
+        sync_to(&wallet, &chain, &chain_handle, settled + 6, settled),
+    )
+    .await
+    .map_err(|_| TestError::Fixture("a hung status lookup hung the sync"))??;
+
+    assert_eq!(withheld_reports(&mut events).await?, vec![pending_tx_id]);
+    assert_eq!(
+        storage.find_idempotent_submission(&shield_key()?).await?,
+        Some(pending_tx_id),
+        "a lookup that never answers frees nothing"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_verdict_waits_for_a_source_epoch_that_covers_the_judged_height() -> Result<(), TestError>
+{
+    let PendingShieldingWallet {
+        wallet,
+        chain,
+        chain_handle,
+        pending_tx_id,
+        temp: _temp,
+        ..
+    } = wallet_with_pending_shielding().await?;
+    let mut events = wallet.observe();
+    let settled = NU7_ACTIVATION_HEIGHT - 1;
+    // The wallet records the settled tip while the source cannot check the broadcast.
+    chain_handle.set_transaction_status_mode(MockTransactionStatusMode::CapabilityMissing);
+    sync_to(&wallet, &chain, &chain_handle, settled + 6, settled).await?;
+    assert_eq!(withheld_reports(&mut events).await?, vec![pending_tx_id]);
+
+    // The source can check it now, but serves an epoch that ends below the judged height,
+    // as a lagging replica would.
+    chain_handle.set_transaction_status_mode(MockTransactionStatusMode::Canonical);
+    if !chain_handle.set_chain_tips(
+        BlockHeight::from(settled - 4),
+        BlockHeight::from(settled - 9),
+    ) {
+        return Err(TestError::Fixture("settled tip above visible tip"));
+    }
+    let _ = wallet.scan_queued_range(&chain).await?;
+    assert!(
+        unmineable_reports(&mut events).await.is_empty(),
+        "a lookup no epoch covering the judged height backs judges nothing"
+    );
+
+    if !chain_handle.set_chain_tips(BlockHeight::from(settled + 6), BlockHeight::from(settled)) {
+        return Err(TestError::Fixture("settled tip above visible tip"));
+    }
+    let _ = wallet.scan_queued_range(&chain).await?;
+    let reports = unmineable_reports(&mut events).await;
+    assert_eq!(
+        reports.iter().map(|(tx_id, _)| *tx_id).collect::<Vec<_>>(),
+        vec![pending_tx_id],
+        "the verdict runs once the source attests an epoch that covers the judged height"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_shallow_source_window_a_sync_read_lifts_once_the_source_meets_the_minimum()
+-> Result<(), TestError> {
+    let PendingShieldingWallet {
+        wallet,
+        account_id,
+        storage,
+        chain,
+        chain_handle,
+        submitter,
+        pending_tx_id,
+        temp: _temp,
+    } = wallet_with_pending_shielding().await?;
+    chain_handle.set_reorg_window_blocks(100);
+    let mut events = wallet.observe();
+    let settled = NU7_ACTIVATION_HEIGHT - 1;
+    sync_to(&wallet, &chain, &chain_handle, settled + 6, settled).await?;
+    record_transparent_utxo(&wallet, &storage, account_id, REPLACEMENT_FUNDING_TX_ID).await?;
+    let replacement_key = IdempotencyKey::try_from("shield-after-window-lifts")
+        .map_err(|_| TestError::Fixture("invalid idempotency key"))?;
+    let shield_replacement = || {
+        wallet.shield_transparent_funds(ShieldTransparentPlan::new(
+            account_id,
+            replacement_key.clone(),
+            zatoshis(SHIELDING_THRESHOLD_ZAT).unwrap_or(Zatoshis::zero()),
+            &submitter,
+        ))
+    };
+    assert!(
+        matches!(
+            shield_replacement().await,
+            Err(WalletError::SourceReorgWindowTooShallow { .. })
+        ),
+        "a sync that read a shallow source window refuses new spends"
+    );
+
+    // Nothing is left to judge, so no verdict reads the window again.
+    storage
+        .release_pending_submission(vec![pending_tx_id])
+        .await?;
+    chain_handle.set_reorg_window_blocks(1_000);
+    wallet.sync(&chain).await?;
+
+    let mut is_sufficient_reported = false;
+    while let Ok(Some(event)) =
+        tokio::time::timeout(Duration::from_millis(200), events.next()).await
+    {
+        is_sufficient_reported |= matches!(event, WalletEvent::SourceReorgWindowSufficient { .. });
+    }
+    assert!(
+        is_sufficient_reported,
+        "the next sync reads the raised window and reports it sufficient"
+    );
+    let shielded = shield_replacement().await;
+    assert!(
+        shielded.is_ok(),
+        "spends resume once the source meets the minimum: {shielded:?}"
+    );
+    Ok(())
+}
+
+fn shield_key() -> Result<IdempotencyKey, TestError> {
+    IdempotencyKey::try_from(SHIELD_KEY).map_err(|_| TestError::Fixture("invalid idempotency key"))
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
