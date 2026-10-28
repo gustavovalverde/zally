@@ -16,7 +16,7 @@ use super::reorg_fixtures::{
     ChainWallet, FixtureError, chain_wallet, fast_driver_options, start_driver, wait_for_driver,
 };
 
-const STALL_LIMIT_MS: u64 = 300;
+const STALL_LIMIT_MS: u64 = 2_000;
 const EVENT_TIMEOUT: Duration = Duration::from_secs(30);
 
 async fn try_shielding(base: &ChainWallet) -> Result<WalletError, FixtureError> {
