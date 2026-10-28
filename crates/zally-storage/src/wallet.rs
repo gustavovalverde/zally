@@ -954,12 +954,17 @@ pub trait WalletStorage: Send + Sync + 'static {
     /// call until the paying step is mined, including one already seen mined.
     ///
     /// A send whose earlier steps' outputs a call cannot record as the wallet's is marked, and
-    /// the mark stays until the send is released, because the scan that followed may already
-    /// have passed its paying step. A send in the result must never be judged unmineable from
-    /// the wallet's scan.
+    /// so is one whose steps fail to store or check for a reason a retry would repeat, such as
+    /// bytes that do not parse. The mark stays until the send is released, because the scan
+    /// that followed may already have passed its paying step. A send in the result must never
+    /// be judged unmineable from the wallet's scan.
     ///
-    /// `not_retryable` on a transaction that does not parse or on schema errors; `retryable`
-    /// on transient I/O.
+    /// A transient database failure while storing or checking a send marks nothing; the call
+    /// then fails, after settling the other sends, so the caller does not scan without that
+    /// send's outputs, and the next call tries it again.
+    ///
+    /// `retryable` when the database is busy or locked, out of space or memory, or an I/O
+    /// call fails; `not_retryable` on schema errors.
     async fn store_carried_send_steps(&self) -> Result<Vec<TxId>, StorageError>;
 
     /// Undoes [`Self::record_pending_submission`] for transactions that can never be mined:

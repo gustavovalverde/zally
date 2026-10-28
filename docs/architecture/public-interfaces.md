@@ -254,7 +254,7 @@ Pinning the verdict's lookup to an epoch made this breaking change to `ChainSour
 Binding the idempotency key before submission made these breaking changes:
 
 - Added `record_pending_submission`, which binds a key to the transaction that pays and records every transaction of the send as its steps, with their pending-broadcast inputs, in one storage transaction, and `release_pending_submission`, which undoes it for transactions that can never be mined.
-- Added `list_send_steps`, `record_confirmed_broadcast`, and `store_carried_send_steps`, which return a bound send's steps, record a broadcast the chain source reports mined, and store a rebuilt wallet's carried steps before each scan step. `store_carried_send_steps` returns the paying transactions of the sends the scan may pass without recognizing them mined, which the verdict never judges unmineable.
+- Added `list_send_steps`, `record_confirmed_broadcast`, and `store_carried_send_steps`, which return a bound send's steps, record a broadcast the chain source reports mined, and store a rebuilt wallet's carried steps before each scan step. `store_carried_send_steps` returns the paying transactions of the sends the scan may pass without recognizing them mined, which the verdict never judges unmineable. A send is marked when its earlier steps' outputs cannot be recorded or its steps fail to store for a reason a retry would repeat; a transient database failure marks nothing and fails the call with a retryable error.
 
 ## Capability surface
 
