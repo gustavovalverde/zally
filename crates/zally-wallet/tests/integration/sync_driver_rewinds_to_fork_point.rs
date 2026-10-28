@@ -81,7 +81,16 @@ async fn announced_reorg_keeps_the_ledger(depth: u32) -> Result<(), FixtureError
         funded.shielding_tx_id,
         "a withdrawal that can still be mined must not be paid twice"
     );
-    assert_eq!(funded.submitter.handle().submission_count(), 2);
+    let raw_withdrawal = raw_shielding(&funded)?;
+    assert!(
+        funded
+            .submitter
+            .handle()
+            .submitted_bytes()
+            .iter()
+            .all(|raw_tx| *raw_tx == raw_withdrawal),
+        "a retry submits the same withdrawal again and builds nothing new"
+    );
 
     let remined_height = new_tip + 1;
     funded.mine_shielding_at(remined_height)?;

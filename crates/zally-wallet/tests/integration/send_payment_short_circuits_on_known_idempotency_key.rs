@@ -1,5 +1,7 @@
-//! Regression: `Wallet::send_payment` returns the prior `tx_id` and skips the submitter
-//! when the supplied `IdempotencyKey` is already recorded in the ledger.
+//! Regression: `Wallet::send_payment` returns the prior `tx_id` for a recorded key.
+//!
+//! It builds nothing when the supplied `IdempotencyKey` is already recorded in the ledger. The
+//! wallet holds no bytes for this prior transaction, so it has nothing to submit again either.
 
 use zally_core::{
     IdempotencyKey, IdempotencyKeyError, PaymentRecipient, TxId, Zatoshis, ZatoshisError,

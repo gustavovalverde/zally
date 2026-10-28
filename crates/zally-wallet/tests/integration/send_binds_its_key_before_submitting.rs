@@ -45,12 +45,36 @@ async fn a_lost_acknowledgement_never_pays_twice() -> Result<(), FixtureError> {
     assert_eq!(
         submitter.received(),
         vec![retried],
-        "the node received one transaction, and the retry returns it without resubmitting"
+        "the node received one transaction, and the retry returns it"
     );
     assert_eq!(
         pending_inputs_of(&base.wallet, base.account_id).await?,
         vec![retried],
         "the in-flight broadcast keeps its pending inputs"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_retry_broadcasts_a_bound_transaction_no_node_received() -> Result<(), FixtureError> {
+    let base = shieldable_wallet().await?;
+    let submitter = ScriptedSubmitter::new(base.network, vec![NodeResponse::Unreachable]);
+
+    let first = shield(&base, &submitter).await;
+    assert!(
+        matches!(&first, Err(error) if error.is_retryable()),
+        "the unreachable node surfaces as a retryable error: {first:?}"
+    );
+    assert!(submitter.received().is_empty());
+    let retried = shield(&base, &submitter).await?;
+    assert_eq!(
+        submitter.received(),
+        vec![retried.tx_id()],
+        "the retry broadcasts the bound transaction instead of only returning its identifier"
+    );
+    assert!(
+        retried.signed.tx_expiry_height.as_u32() > PRE_FUNDING_TIP_HEIGHT,
+        "the retry reports the bound transaction's expiry"
     );
     Ok(())
 }
@@ -84,7 +108,7 @@ async fn a_rejection_keeps_the_key_bound() -> Result<(), FixtureError> {
     assert_eq!(
         Some(shield(&base, &submitter).await?.tx_id()),
         rejected.first().copied(),
-        "a retry returns the rejected transaction instead of building another"
+        "a retry submits the rejected transaction again instead of building another"
     );
     assert_eq!(submitter.received(), rejected);
     Ok(())
@@ -148,7 +172,7 @@ async fn a_lost_acknowledgement_of_the_paying_step_never_pays_twice() -> Result<
     assert_eq!(
         submitter.received(),
         received,
-        "the retry builds and submits nothing"
+        "the retry builds nothing new"
     );
     Ok(())
 }
@@ -299,6 +323,8 @@ enum NodeResponse {
     Accept,
     /// The node accepts the transaction but its acknowledgement never arrives.
     LoseAcknowledgement,
+    /// The submission never reaches the node.
+    Unreachable,
     /// The node rejects the transaction.
     Reject(RejectionReason),
 }
@@ -337,6 +363,19 @@ impl Submitter for ScriptedSubmitter {
             parse_transaction_id(raw_tx).map_err(|err| SubmitterError::RequestRejected {
                 reason: err.to_string(),
             })?;
+        let is_unreachable = {
+            let mut script = self.script.lock();
+            let is_unreachable = matches!(script.first(), Some(NodeResponse::Unreachable));
+            if is_unreachable {
+                script.remove(0);
+            }
+            is_unreachable
+        };
+        if is_unreachable {
+            return Err(SubmitterError::Unavailable {
+                reason: "node unreachable".to_owned(),
+            });
+        }
         let is_duplicate = {
             let mut received = self.received.lock();
             let is_duplicate = received.contains(&tx_id);
@@ -357,10 +396,12 @@ impl Submitter for ScriptedSubmitter {
                 reason,
                 detail: "scripted rejection".to_owned(),
             }),
-            Some(NodeResponse::Accept) | None if is_duplicate => {
+            Some(NodeResponse::Accept | NodeResponse::Unreachable) | None if is_duplicate => {
                 Ok(SubmitOutcome::Duplicate { tx_id })
             }
-            Some(NodeResponse::Accept) | None => Ok(SubmitOutcome::Accepted { tx_id }),
+            Some(NodeResponse::Accept | NodeResponse::Unreachable) | None => {
+                Ok(SubmitOutcome::Accepted { tx_id })
+            }
         }
     }
 }

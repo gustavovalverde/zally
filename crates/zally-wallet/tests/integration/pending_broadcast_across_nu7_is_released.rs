@@ -284,12 +284,12 @@ async fn unmineable_broadcast_frees_its_idempotency_key_for_one_replacement()
         temp: _temp,
     } = wallet_with_pending_shielding().await?;
 
-    // While the broadcast can still be mined, its key answers with it.
+    // While the broadcast can still be mined, its key answers with it, submitted again.
     assert_eq!(
         shield(&wallet, account_id, &submitter).await?.tx_id(),
         pending_tx_id
     );
-    assert_eq!(submitter.submission_count(), 1);
+    assert_eq!(submitter.distinct_transaction_count(), 1);
 
     let mut events = wallet.observe();
     let settled = NU7_ACTIVATION_HEIGHT - 1;
@@ -313,7 +313,7 @@ async fn unmineable_broadcast_frees_its_idempotency_key_for_one_replacement()
         "a concurrent retry with the same key gets the same replacement"
     );
     assert_eq!(
-        submitter.submission_count(),
+        submitter.distinct_transaction_count(),
         2,
         "the concurrent retries broadcast one replacement"
     );
@@ -332,7 +332,7 @@ async fn unmineable_broadcast_frees_its_idempotency_key_for_one_replacement()
         replacement_tx_id,
         "the key answers with the pending replacement"
     );
-    assert_eq!(submitter.submission_count(), 2);
+    assert_eq!(submitter.distinct_transaction_count(), 2);
     Ok(())
 }
 
@@ -420,8 +420,16 @@ impl AcceptingSubmitter {
         }
     }
 
-    fn submission_count(&self) -> usize {
-        self.submitted.lock().len()
+    /// Number of distinct transactions submitted; a retry submits the same bytes again.
+    fn distinct_transaction_count(&self) -> usize {
+        let submitted = self.submitted.lock().clone();
+        let mut distinct: Vec<Vec<u8>> = Vec::new();
+        for raw_tx in submitted {
+            if !distinct.contains(&raw_tx) {
+                distinct.push(raw_tx);
+            }
+        }
+        distinct.len()
     }
 
     fn last_submission(&self) -> Option<Vec<u8>> {

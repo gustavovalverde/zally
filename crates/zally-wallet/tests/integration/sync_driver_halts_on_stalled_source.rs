@@ -4,12 +4,13 @@
 //! Wallet events report entering and leaving the halt.
 
 use std::time::Duration;
-use zally_core::{BlockHeight, IdempotencyKey, Zatoshis};
+use zally_core::{BlockHeight, IdempotencyKey, TxId, Zatoshis};
+use zally_storage::WalletStorage as _;
 use zally_testkit::MockSubmitter;
 
 use zally_wallet::{
-    ShieldTransparentPlan, SourceHalt, SyncDriverPhase, SyncSnapshot, WalletError, WalletEvent,
-    WalletEventStream,
+    SendOutcome, ShieldTransparentPlan, SourceHalt, SyncDriverPhase, SyncSnapshot, WalletError,
+    WalletEvent, WalletEventStream,
 };
 
 use super::reorg_fixtures::{
@@ -20,20 +21,31 @@ const STALL_LIMIT_MS: u64 = 2_000;
 const EVENT_TIMEOUT: Duration = Duration::from_secs(30);
 
 async fn try_shielding(base: &ChainWallet) -> Result<WalletError, FixtureError> {
-    let submitter = MockSubmitter::accepting(base.network);
-    let outcome = base
-        .wallet
-        .shield_transparent_funds(ShieldTransparentPlan::new(
-            base.account_id,
-            IdempotencyKey::try_from("shield-during-halt".to_owned())
-                .map_err(|_| FixtureError::Fixture("idempotency key"))?,
-            Zatoshis::try_from(1_000_u64).map_err(|_| FixtureError::Fixture("zatoshis"))?,
-            &submitter,
-        ))
-        .await;
-    outcome
+    let key = IdempotencyKey::try_from("shield-during-halt".to_owned())
+        .map_err(|_| FixtureError::Fixture("idempotency key"))?;
+    shield_with_key(base, key)
+        .await
         .err()
         .ok_or(FixtureError::Fixture("an unfunded wallet cannot shield"))
+}
+
+async fn shield_with_key(
+    base: &ChainWallet,
+    key: IdempotencyKey,
+) -> Result<SendOutcome, WalletError> {
+    let submitter = MockSubmitter::accepting(base.network);
+    let threshold =
+        Zatoshis::try_from(1_000_u64).map_err(|err| WalletError::PaymentRequestParseFailed {
+            reason: err.to_string(),
+        })?;
+    base.wallet
+        .shield_transparent_funds(ShieldTransparentPlan::new(
+            base.account_id,
+            key,
+            threshold,
+            &submitter,
+        ))
+        .await
 }
 
 fn is_halted_at(snapshot: &SyncSnapshot, height: u32) -> bool {
@@ -83,6 +95,17 @@ async fn a_stalled_source_halts_spends_until_its_tip_moves() -> Result<(), Fixtu
             cause: SourceHalt::VisibleTipStalled { .. }
         }
     ));
+    let bound_key = IdempotencyKey::try_from("shield-bound-before-halt".to_owned())
+        .map_err(|_| FixtureError::Fixture("idempotency key"))?;
+    let bound_tx_id = TxId::from_bytes([0x5b; 32]);
+    base.storage
+        .record_idempotent_submission(bound_key.clone(), bound_tx_id)
+        .await?;
+    assert_eq!(
+        shield_with_key(&base, bound_key).await?.tx_id(),
+        bound_tx_id,
+        "a key that already names a transaction answers with it while new spends are refused"
+    );
 
     if !base
         .chain_handle

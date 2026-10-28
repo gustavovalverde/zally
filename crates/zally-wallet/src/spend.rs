@@ -353,7 +353,8 @@ impl Wallet {
     /// transaction before anything is submitted. A key that already names a transaction
     /// returns that transaction instead of building another, while the transaction is pending
     /// or mined, including after a submit error that may have reached the node or a node
-    /// rejection. Once [`Wallet::sync`] judges it unmineable and reports
+    /// rejection; one the wallet has not seen mined is submitted again first, so `Ok` means a
+    /// node accepted, holds, or mined it. Once [`Wallet::sync`] judges it unmineable and reports
     /// [`WalletEvent::PendingBroadcastUnmineable`](crate::WalletEvent::PendingBroadcastUnmineable),
     /// the same key builds one replacement. Sends that share a key through one wallet handle
     /// run one at a time, so concurrent retries return the same transaction.
@@ -371,7 +372,6 @@ impl Wallet {
         validate_recipient_network(&plan.recipient, self.network())?;
         validate_memo_against_recipient(plan.memo.as_ref(), &plan.recipient)?;
         validate_non_zero(plan.amount_zat)?;
-        self.ensure_source_following()?;
         if plan.submitter.network() != self.network() {
             return Err(WalletError::NetworkMismatch {
                 storage: self.network(),
@@ -384,25 +384,13 @@ impl Wallet {
             .idempotency_key_locks
             .lock(&plan.idempotency)
             .await;
-        if let Some(prior_tx_id) = self
-            .inner
-            .storage
-            .find_idempotent_submission(&plan.idempotency)
+        if let Some(bound) = self
+            .resubmit_bound_send(&plan.idempotency, plan.submitter, "send_payment.resubmit")
             .await?
         {
-            let broadcast_at_height = self.visible_tip_or_zero().await?;
-            return Ok(SendOutcome {
-                signed: SignedPczt {
-                    tx_id: prior_tx_id,
-                    fee_zat: zally_core::Zatoshis::zero(),
-                    tx_expiry_height: BlockHeight::from(0),
-                },
-                broadcast: BroadcastOutcome {
-                    tx_id: prior_tx_id,
-                    broadcast_at_height,
-                },
-            });
+            return Ok(bound);
         }
+        self.ensure_source_following()?;
 
         let prepared = if let Some(target) = plan.target_expiry_height {
             self.prepare_send_with_target_expiry(&plan, target).await?
@@ -534,8 +522,9 @@ impl Wallet {
     ///
     /// `plan.idempotency` makes the send idempotent, as for [`Wallet::send_payment`]: the key
     /// is bound to the shielding transaction before it is submitted, and a key that already
-    /// names a transaction returns that transaction instead of building another, while the
-    /// transaction is pending or mined. Once [`Wallet::sync`] judges it unmineable and reports
+    /// names a transaction returns that transaction instead of building another, submitting
+    /// it again while the wallet has not seen it mined. Once [`Wallet::sync`] judges it
+    /// unmineable and reports
     /// [`WalletEvent::PendingBroadcastUnmineable`](crate::WalletEvent::PendingBroadcastUnmineable),
     /// the same key builds one replacement. Sends that share a key through one wallet handle
     /// run one at a time, so concurrent retries return the same transaction.
@@ -547,7 +536,6 @@ impl Wallet {
         plan: ShieldTransparentPlan<'_>,
     ) -> Result<SendOutcome, WalletError> {
         validate_non_zero(plan.shielding_threshold_zat)?;
-        self.ensure_source_following()?;
         if plan.submitter.network() != self.network() {
             return Err(WalletError::NetworkMismatch {
                 storage: self.network(),
@@ -560,25 +548,17 @@ impl Wallet {
             .idempotency_key_locks
             .lock(&plan.idempotency)
             .await;
-        if let Some(prior_tx_id) = self
-            .inner
-            .storage
-            .find_idempotent_submission(&plan.idempotency)
+        if let Some(bound) = self
+            .resubmit_bound_send(
+                &plan.idempotency,
+                plan.submitter,
+                "shield_transparent_funds.resubmit",
+            )
             .await?
         {
-            let broadcast_at_height = self.visible_tip_or_zero().await?;
-            return Ok(SendOutcome {
-                signed: SignedPczt {
-                    tx_id: prior_tx_id,
-                    fee_zat: zally_core::Zatoshis::zero(),
-                    tx_expiry_height: BlockHeight::from(0),
-                },
-                broadcast: BroadcastOutcome {
-                    tx_id: prior_tx_id,
-                    broadcast_at_height,
-                },
-            });
+            return Ok(bound);
         }
+        self.ensure_source_following()?;
 
         let seed = self
             .inner
@@ -710,6 +690,74 @@ impl Wallet {
             return Err(error);
         }
         Ok(paying_result)
+    }
+
+    /// Returns the transaction `key` already names, or `None` when it names none.
+    ///
+    /// A transaction the wallet holds bytes for, has not seen mined, and that the next block
+    /// can include is submitted again first: the send that bound the key may have failed
+    /// before any node received it, and a retry that only returned the identifier would report
+    /// a payment nobody broadcast. The same bytes cannot pay twice. A node that already holds or
+    /// mined the transaction answers with a duplicate. A submit error or rejection is returned,
+    /// and the key stays bound. One the next block cannot include is returned with its expiry
+    /// height until the pending-broadcast verdict frees its key.
+    ///
+    /// Runs before the source-health refusal, so a key that already names a transaction keeps
+    /// answering with it while new spends are refused.
+    async fn resubmit_bound_send(
+        &self,
+        key: &IdempotencyKey,
+        submitter: &dyn Submitter,
+        operation: &'static str,
+    ) -> Result<Option<SendOutcome>, WalletError> {
+        let Some(tx_id) = self.inner.storage.find_idempotent_submission(key).await? else {
+            return Ok(None);
+        };
+        let stored = self
+            .inner
+            .storage
+            .list_pending_broadcast_transactions()
+            .await?
+            .into_iter()
+            .find(|pending| pending.broadcast_tx_id == tx_id);
+        let tx_expiry_height = stored
+            .as_ref()
+            .and_then(|pending| {
+                zally_chain::parse_transaction_expiry_height(&pending.raw_bytes).ok()
+            })
+            .unwrap_or_else(|| BlockHeight::from(0));
+        let visible_tip = self.inner.storage.find_visible_tip().await?;
+        let can_enter_next_block = |raw_bytes: &[u8]| {
+            visible_tip.is_none_or(|tip| {
+                zally_chain::parse_transaction_header(raw_bytes)
+                    .is_ok_and(|header| header.check_mineable(self.network(), tip).is_ok())
+            })
+        };
+        if let Some(unmined) = stored.filter(|pending| {
+            pending.mined_height.is_none() && can_enter_next_block(&pending.raw_bytes)
+        }) {
+            let outcome = crate::retry::with_breaker_and_retry(
+                &self.inner.circuit_breaker,
+                self.broadcast_retry_policy(),
+                operation,
+                || submitter.submit(&unmined.raw_bytes),
+                WalletError::from,
+            )
+            .await?;
+            resolve_send_outcome(outcome, tx_id)?;
+        }
+        let broadcast_at_height = visible_tip.unwrap_or_else(|| BlockHeight::from(0));
+        Ok(Some(SendOutcome {
+            signed: SignedPczt {
+                tx_id,
+                fee_zat: zally_core::Zatoshis::zero(),
+                tx_expiry_height,
+            },
+            broadcast: BroadcastOutcome {
+                tx_id,
+                broadcast_at_height,
+            },
+        }))
     }
 
     async fn visible_tip_or_zero(&self) -> Result<BlockHeight, WalletError> {
