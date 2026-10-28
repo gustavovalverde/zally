@@ -184,14 +184,23 @@ impl Wallet {
             else {
                 continue;
             };
-            let can_enter_next_block = parse_transaction_header(&reverted.raw_tx_bytes)
-                .is_ok_and(|header| header.check_mineable(self.network(), visible_tip).is_ok());
-            if can_enter_next_block {
+            if self.can_enter_next_block(&reverted.raw_tx_bytes, visible_tip) {
                 self.resubmit_reverted_broadcast(submitter, reverted.tx_id, &reverted.raw_tx_bytes)
                     .await?;
             }
         }
         Ok(())
+    }
+
+    /// Whether `raw_tx_bytes` parse as a transaction the block after `tip_height` can include,
+    /// judged by [`zally_chain::TransactionHeader::check_mineable`].
+    pub(crate) fn can_enter_next_block(
+        &self,
+        raw_tx_bytes: &[u8],
+        tip_height: BlockHeight,
+    ) -> bool {
+        parse_transaction_header(raw_tx_bytes)
+            .is_ok_and(|header| header.check_mineable(self.network(), tip_height).is_ok())
     }
 
     async fn resubmit_reverted_broadcast(

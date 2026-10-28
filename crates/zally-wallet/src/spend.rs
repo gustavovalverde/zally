@@ -726,17 +726,11 @@ impl Wallet {
         let is_paying_pending =
             paying.is_some_and(|step| step.mined_height.is_none() && step.raw_bytes.is_some());
         if is_paying_pending {
-            let can_enter_next_block = |raw_bytes: &[u8]| {
-                visible_tip.is_none_or(|tip| {
-                    zally_chain::parse_transaction_header(raw_bytes)
-                        .is_ok_and(|header| header.check_mineable(self.network(), tip).is_ok())
-                })
-            };
             for step in steps.iter().filter(|step| step.mined_height.is_none()) {
                 let Some(raw_bytes) = step.raw_bytes.as_deref() else {
                     continue;
                 };
-                if !can_enter_next_block(raw_bytes) {
+                if visible_tip.is_some_and(|tip| !self.can_enter_next_block(raw_bytes, tip)) {
                     return Err(WalletError::PendingBroadcastUnsettled {
                         tx_id,
                         tx_expiry_height,
