@@ -903,8 +903,9 @@ pub trait WalletStorage: Send + Sync + 'static {
     ) -> Result<(), StorageError>;
 
     /// Records a send before any of its transactions is submitted: binds `key` to `tx_id`,
-    /// the transaction that pays, and records the pending-broadcast inputs of every
-    /// transaction in `records`, in one storage transaction.
+    /// the transaction that pays, records the transactions in `records` as the send's steps in
+    /// the order given, which is submission order, and records each one's pending-broadcast
+    /// inputs, in one storage transaction.
     ///
     /// Recording first means a lost submit acknowledgement, or a crash between the broadcast
     /// and any later write, cannot let a retry with the same key build and pay a second
@@ -920,6 +921,40 @@ pub trait WalletStorage: Send + Sync + 'static {
         tx_id: TxId,
         records: Vec<PendingBroadcastRecord>,
     ) -> Result<(), StorageError>;
+
+    /// Returns the steps of the send whose idempotency key is bound to `tx_id`, in submission
+    /// order and ending with `tx_id`, or `tx_id` alone when no steps were recorded for it.
+    ///
+    /// `not_retryable` on schema errors; `retryable` on transient I/O.
+    async fn list_send_steps(&self, tx_id: TxId) -> Result<Vec<crate::SendStepRow>, StorageError>;
+
+    /// Records a pending broadcast that the chain source reports mined at
+    /// `confirmed_at_height` although the wallet's scan did not recognize it.
+    ///
+    /// Stores the transaction in `zcash_client_sqlite` as mined at that height, with whatever
+    /// outputs and spends of the wallet it carries, and drops its pending-broadcast and
+    /// reverted-broadcast rows. Its idempotency key stays bound.
+    ///
+    /// `not_retryable` on a transaction that does not parse or on schema errors; `retryable`
+    /// on transient I/O.
+    async fn record_confirmed_broadcast(
+        &self,
+        raw_tx_bytes: Vec<u8>,
+        confirmed_at_height: BlockHeight,
+    ) -> Result<(), StorageError>;
+
+    /// Stores the carried steps of every unsettled send in `zcash_client_sqlite`, in
+    /// submission order, after a rebuild discarded them; returns how many it stored.
+    ///
+    /// A multi-step send's paying step spends an output of the step before it. A rescan
+    /// recognizes that spend only if it already knows the output, which it does not when both
+    /// steps are mined in the same block, so a mined payment would read as never mined.
+    /// Storing the steps first lets the rescan match it. Steps already seen mined are skipped,
+    /// and storing a step again is harmless.
+    ///
+    /// `not_retryable` on a transaction that does not parse or on schema errors; `retryable`
+    /// on transient I/O.
+    async fn store_carried_send_steps(&self) -> Result<u32, StorageError>;
 
     /// Undoes [`Self::record_pending_submission`] for transactions that can never be mined:
     /// drops the idempotency bindings that still name any of `tx_ids`, their

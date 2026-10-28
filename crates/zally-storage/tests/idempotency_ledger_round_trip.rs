@@ -195,6 +195,58 @@ async fn a_pending_submission_binds_the_paying_transaction_until_released() -> R
     Ok(())
 }
 
+#[tokio::test]
+async fn a_pending_submission_records_every_step_of_its_send() -> Result<(), TestError> {
+    let temp = TempDir::new()?;
+    let storage = Sqlite::new(SqliteOptions::for_network(
+        zally_core::Network::regtest(),
+        temp.path().join("wallet.db"),
+    ));
+    storage.open_or_create().await?;
+    let key = IdempotencyKey::try_from("payout-0003")?;
+    let funding = TxId::from_bytes([0x11_u8; 32]);
+    let paying = TxId::from_bytes([0x22_u8; 32]);
+    let account_id = AccountId::from_uuid(uuid::Uuid::from_bytes([0x33_u8; 16]));
+    let record = |broadcast_tx_id: TxId| PendingBroadcastRecord {
+        broadcast_tx_id,
+        account_id,
+        broadcast_at_ms: 1,
+        broadcast_at_height: Some(BlockHeight::from(10)),
+        inputs: Vec::new(),
+    };
+
+    storage
+        .record_pending_submission(key, paying, vec![record(funding), record(paying)])
+        .await?;
+    assert_eq!(
+        step_ids(&storage, paying).await?,
+        vec![funding, paying],
+        "the binding records every step of the send in submission order"
+    );
+    assert_eq!(
+        step_ids(&storage, funding).await?,
+        vec![funding],
+        "a transaction no key names is its own only step"
+    );
+
+    storage.release_pending_submission(vec![paying]).await?;
+    assert_eq!(
+        step_ids(&storage, paying).await?,
+        vec![paying],
+        "a released send keeps no steps"
+    );
+    Ok(())
+}
+
+async fn step_ids(storage: &Sqlite, tx_id: TxId) -> Result<Vec<TxId>, StorageError> {
+    Ok(storage
+        .list_send_steps(tx_id)
+        .await?
+        .into_iter()
+        .map(|step| step.tx_id)
+        .collect())
+}
+
 #[derive(Debug, thiserror::Error)]
 enum TestError {
     #[error("io error: {0}")]

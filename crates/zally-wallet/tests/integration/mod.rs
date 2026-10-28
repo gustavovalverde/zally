@@ -50,6 +50,7 @@ mod sync_observes_committed_progress;
 mod sync_retries_retryable_chain_failures;
 mod sync_skips_tree_root_check_for_empty_pools;
 mod sync_survives_epoch_rotation;
+mod tex_payment_mined_after_a_rebuild;
 mod to_uri_round_trips_through_propose;
 mod transparent_utxo_refresh_decoupled_from_sync;
 #[cfg(feature = "unsafe_plaintext_seed")]

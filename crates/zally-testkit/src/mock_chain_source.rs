@@ -15,7 +15,10 @@
 //! - resume chain events from a cursor over a retained event window whose floor
 //!   [`MockChainSourceHandle::expire_chain_events_through`] raises,
 //! - report a reorg window other than 1,000 blocks via
-//!   [`MockChainSourceHandle::set_reorg_window_blocks`].
+//!   [`MockChainSourceHandle::set_reorg_window_blocks`],
+//! - report a transaction mined at the lowest canonical block, at or below the visible tip,
+//!   that [`MockChainSourceHandle::mine_transactions`] put it in, and every other transaction
+//!   not found.
 //!
 //! Blocks on the original branch carry all-zero hashes, so tests that serve their own
 //! all-zero tree states keep chaining. Every block a reorg replaces carries a hash derived
@@ -740,11 +743,30 @@ impl ChainSource for MockChainSource {
         Ok(Vec::new())
     }
 
-    async fn transaction_status(
-        &self,
-        _tx_id: TxId,
-    ) -> Result<TransactionStatus, ChainSourceError> {
-        Ok(TransactionStatus::NotFound)
+    async fn transaction_status(&self, tx_id: TxId) -> Result<TransactionStatus, ChainSourceError> {
+        let guard = self.state.lock();
+        let visible_tip_height = guard.visible_tip_height.as_u32();
+        let confirmed_at_height = guard
+            .mined_blocks
+            .range(..=visible_tip_height)
+            .map(|(height, _)| *height)
+            .find(|height| {
+                guard.canonical_mined_block(*height).is_some_and(|block| {
+                    block
+                        .transactions
+                        .iter()
+                        .any(|transaction| transaction.tx_id == tx_id)
+                })
+            });
+        drop(guard);
+        Ok(
+            confirmed_at_height.map_or(TransactionStatus::NotFound, |height| {
+                TransactionStatus::Confirmed {
+                    tx_id,
+                    confirmed_at_height: BlockHeight::from(height),
+                }
+            }),
+        )
     }
 
     async fn transparent_utxos(

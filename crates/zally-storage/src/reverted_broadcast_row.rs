@@ -7,11 +7,11 @@ use zally_core::{BlockHeight, TxId};
 ///
 /// Rows live in the Zally-owned `ext_zally_reverted_broadcasts` table. A rewind writes one,
 /// in the same database transaction, for each wallet-sent transaction mined in a block it
-/// removed. A rebuild from the birthday writes one for each wallet-created transaction that
-/// was unmined, still named by an idempotency key, or still had pending-broadcast rows. The
-/// row keeps the raw transaction and its expiry so the wallet can resubmit it, notice it mined
-/// again, or judge it unmineable, even though the rebuild discarded the transaction records
-/// `zcash_client_sqlite` keeps.
+/// removed. A rebuild from the birthday writes one for each wallet-created transaction the
+/// ledger still names: through an active idempotency key or a step of the send it pays,
+/// pending-broadcast rows, or an active finalized hold. The row keeps the raw transaction and
+/// its expiry so the wallet can resubmit it, notice it mined again, or judge it unmineable,
+/// even though the rebuild discarded the transaction records `zcash_client_sqlite` keeps.
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub struct RevertedBroadcastRow {

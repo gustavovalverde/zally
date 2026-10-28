@@ -4,7 +4,9 @@
 //! until no block above that height can include it. Wall-clock age never retires one: a
 //! settled tip can trail the visible tip by the chain source's whole reorg window.
 
-use zally_chain::parse_transaction_header;
+use zally_chain::{ChainSource, TransactionStatus, UnmineableReason, parse_transaction_header};
+use zally_core::{BlockHeight, TxId};
+use zally_storage::UnmineableHold;
 
 use crate::error::WalletError;
 use crate::event::WalletEvent;
@@ -25,7 +27,16 @@ impl Wallet {
     /// its replacement would pay twice. No broadcast is recorded unmineable while the sync
     /// driver holds verdicts over the chain source's reorg window, because a settled tip the
     /// source can still replace cannot back one.
-    pub(crate) async fn retire_pending_broadcasts(&self) -> Result<(), WalletError> {
+    ///
+    /// The verdict also asks `chain` before it frees anything, because the wallet's scan can
+    /// miss a transaction it sent: it records the broadcast unmineable only when the source
+    /// reports the transaction not found. One the source reports mined is recorded as mined at
+    /// that height, with the earlier steps of its send, and keeps its key; one the source
+    /// still holds, or a failed lookup, leaves it unjudged until a later sync.
+    pub(crate) async fn retire_pending_broadcasts(
+        &self,
+        chain: &dyn ChainSource,
+    ) -> Result<(), WalletError> {
         let storage = &self.inner.storage;
         let (Some(scanned_height), Some(settled_tip_height)) = (
             storage.fully_scanned_height().await?,
@@ -64,41 +75,173 @@ impl Wallet {
             let Err(reason) = header.check_mineable(self.network(), judged_height) else {
                 continue;
             };
-            let Some(holds) = storage
+            if !self
+                .is_absent_from_chain(chain, tx_id, &pending.raw_bytes)
+                .await
+            {
+                continue;
+            }
+            if let Some(holds) = storage
                 .record_unmineable_transaction(tx_id, judged_height)
                 .await?
-            else {
-                continue;
-            };
-            tracing::warn!(
-                target: "zally::wallet",
-                event = "pending_broadcast_unmineable",
-                %tx_id,
-                %reason,
-                judged_height = judged_height.as_u32(),
-                "pending broadcast can never be mined; recreate it"
-            );
-            self.publish_event(WalletEvent::PendingBroadcastUnmineable {
-                tx_id,
-                reason: reason.to_string(),
-            });
-            for hold in holds {
-                tracing::warn!(
-                    target: "zally::wallet",
-                    event = "hold_dispense_unmineable",
-                    hold_id = %hold.hold_id.as_uuid(),
-                    %tx_id,
-                    is_reopened = hold.is_reopened,
-                    "dispense hold was finalized with a transaction that can never be mined"
-                );
-                self.publish_event(WalletEvent::HoldDispenseUnmineable {
-                    hold_id: hold.hold_id,
-                    request_id: hold.request_id,
-                    tx_id,
-                    is_reopened: hold.is_reopened,
-                });
+            {
+                self.report_unmineable(tx_id, &reason, judged_height, holds);
             }
         }
         Ok(())
+    }
+
+    /// Reports a broadcast just recorded unmineable and each dispense hold it settled.
+    fn report_unmineable(
+        &self,
+        tx_id: TxId,
+        reason: &UnmineableReason,
+        judged_height: BlockHeight,
+        holds: Vec<UnmineableHold>,
+    ) {
+        tracing::warn!(
+            target: "zally::wallet",
+            event = "pending_broadcast_unmineable",
+            %tx_id,
+            %reason,
+            judged_height = judged_height.as_u32(),
+            "pending broadcast can never be mined; recreate it"
+        );
+        self.publish_event(WalletEvent::PendingBroadcastUnmineable {
+            tx_id,
+            reason: reason.to_string(),
+        });
+        for hold in holds {
+            tracing::warn!(
+                target: "zally::wallet",
+                event = "hold_dispense_unmineable",
+                hold_id = %hold.hold_id.as_uuid(),
+                %tx_id,
+                is_reopened = hold.is_reopened,
+                "dispense hold was finalized with a transaction that can never be mined"
+            );
+            self.publish_event(WalletEvent::HoldDispenseUnmineable {
+                hold_id: hold.hold_id,
+                request_id: hold.request_id,
+                tx_id,
+                is_reopened: hold.is_reopened,
+            });
+        }
+    }
+
+    /// Whether `chain` reports `tx_id` absent, the only answer that lets the verdict record it
+    /// unmineable.
+    ///
+    /// A transaction the source reports mined is recorded mined, so the wallet stops judging it
+    /// and its key keeps answering with it.
+    async fn is_absent_from_chain(
+        &self,
+        chain: &dyn ChainSource,
+        tx_id: TxId,
+        raw_bytes: &[u8],
+    ) -> bool {
+        #[allow(
+            clippy::wildcard_enum_match_arm,
+            reason = "a status the wallet does not know cannot prove the transaction absent"
+        )]
+        match chain.transaction_status(tx_id).await {
+            Ok(TransactionStatus::NotFound) => true,
+            Ok(TransactionStatus::Confirmed {
+                confirmed_at_height,
+                ..
+            }) => {
+                tracing::warn!(
+                    target: "zally::wallet",
+                    event = "pending_broadcast_mined_unrecognized",
+                    %tx_id,
+                    confirmed_at_height = confirmed_at_height.as_u32(),
+                    "chain source reports a pending broadcast mined that the wallet's scan did \
+                     not recognize; recording it mined"
+                );
+                self.record_send_confirmed(chain, tx_id, raw_bytes, confirmed_at_height)
+                    .await;
+                false
+            }
+            Ok(status) => {
+                tracing::info!(
+                    target: "zally::wallet",
+                    event = "pending_broadcast_still_known",
+                    %tx_id,
+                    ?status,
+                    "chain source still knows a pending broadcast the wallet judged unmineable; \
+                     leaving it unjudged"
+                );
+                false
+            }
+            Err(error) => {
+                tracing::warn!(
+                    target: "zally::wallet",
+                    event = "pending_broadcast_status_unavailable",
+                    %tx_id,
+                    %error,
+                    "could not confirm a pending broadcast is absent from the chain; leaving it \
+                     unjudged"
+                );
+                false
+            }
+        }
+    }
+
+    /// Records `tx_id` mined at `confirmed_at_height`, after the earlier steps of its send that
+    /// the source also reports mined, so their outputs are known before the step that spends
+    /// them. A failure is logged and retried by a later sync, since the broadcast stays pending.
+    async fn record_send_confirmed(
+        &self,
+        chain: &dyn ChainSource,
+        tx_id: TxId,
+        raw_bytes: &[u8],
+        confirmed_at_height: BlockHeight,
+    ) {
+        let storage = &self.inner.storage;
+        let earlier_steps = match storage.list_send_steps(tx_id).await {
+            Ok(steps) => steps,
+            Err(error) => {
+                tracing::warn!(
+                    target: "zally::wallet",
+                    event = "pending_broadcast_steps_unreadable",
+                    %tx_id,
+                    %error,
+                    "could not read the steps of a send the chain source reports mined"
+                );
+                Vec::new()
+            }
+        };
+        let mut confirmed = Vec::new();
+        for step in earlier_steps
+            .into_iter()
+            .filter(|step| step.tx_id != tx_id && step.mined_height.is_none())
+        {
+            let Some(step_bytes) = step.raw_bytes else {
+                continue;
+            };
+            if let Ok(TransactionStatus::Confirmed {
+                confirmed_at_height: step_height,
+                ..
+            }) = chain.transaction_status(step.tx_id).await
+            {
+                confirmed.push((step_bytes, step_height));
+            }
+        }
+        confirmed.push((raw_bytes.to_vec(), confirmed_at_height));
+        for (step_bytes, step_height) in confirmed {
+            if let Err(error) = storage
+                .record_confirmed_broadcast(step_bytes, step_height)
+                .await
+            {
+                tracing::warn!(
+                    target: "zally::wallet",
+                    event = "pending_broadcast_confirmation_record_failed",
+                    %tx_id,
+                    %error,
+                    "could not record a send the chain source reports mined; a later sync retries"
+                );
+                return;
+            }
+        }
     }
 }
