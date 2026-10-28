@@ -1020,40 +1020,32 @@ fn list_scan_blind_sends(ledger: &rusqlite::Connection) -> Result<Vec<TxId>, Sto
     Ok(tx_ids)
 }
 
-/// Why storing a carried send's steps, or checking that the wallet records their outputs,
-/// failed.
-enum SendStepFailure {
-    /// The database could not serve the call: it was busy or locked, out of space or memory,
-    /// or an I/O call failed. Nothing is known about the send, so it is not marked.
-    Transient(StorageError),
-    /// The send's own data cannot be stored or checked, and a retry would fail the same way.
-    Deterministic(StorageError),
+/// Storing a carried send's steps, or checking that the wallet records their outputs, failed.
+///
+/// The failure is `Retryable` when the database could not serve the call (busy or locked, out
+/// of space or memory, or an I/O call failed) and nothing is known about the send. It is
+/// `NotRetryable` when the send's own data cannot be stored or checked and a retry would fail
+/// the same way.
+fn send_step_failure_from_sqlite(error: &rusqlite::Error, context: &str) -> StorageError {
+    StorageError::SqliteFailed {
+        reason: format!("{context}: {error}"),
+        posture: sqlite_failure_posture(error),
+    }
 }
 
-impl SendStepFailure {
-    fn from_sqlite(error: &rusqlite::Error, context: &str) -> Self {
-        Self::classified(sqlite_failure_posture(error), format!("{context}: {error}"))
+/// [`send_step_failure_from_sqlite`] for a failure `zcash_client_sqlite` reports.
+fn send_step_failure_from_client(error: &SqliteClientError, context: &str) -> StorageError {
+    if let SqliteClientError::DbError(sqlite_error) = error {
+        return send_step_failure_from_sqlite(sqlite_error, context);
     }
-
-    fn from_client(error: &SqliteClientError, context: &str) -> Self {
-        if let SqliteClientError::DbError(sqlite_error) = error {
-            return Self::from_sqlite(sqlite_error, context);
-        }
-        let posture = if matches!(error, SqliteClientError::Io(_)) {
-            FailurePosture::Retryable
-        } else {
-            FailurePosture::NotRetryable
-        };
-        Self::classified(posture, format!("{context}: {error}"))
-    }
-
-    fn classified(posture: FailurePosture, reason: String) -> Self {
-        let error = StorageError::SqliteFailed { reason, posture };
-        if posture == FailurePosture::Retryable {
-            Self::Transient(error)
-        } else {
-            Self::Deterministic(error)
-        }
+    let posture = if matches!(error, SqliteClientError::Io(_)) {
+        FailurePosture::Retryable
+    } else {
+        FailurePosture::NotRetryable
+    };
+    StorageError::SqliteFailed {
+        reason: format!("{context}: {error}"),
+        posture,
     }
 }
 
@@ -1075,14 +1067,14 @@ fn sqlite_failure_posture(error: &rusqlite::Error) -> FailurePosture {
 /// Records which of `carried` the scan may pass blind, from each send's coverage as
 /// `store_and_check` reports it, and returns every send marked so far.
 ///
-/// A send without coverage, or whose steps fail to store or check deterministically, is
-/// marked. A transient failure marks nothing for that send and fails the call after the other
-/// sends are settled, so the caller does not scan without that send's outputs and no verdict
-/// judges it in that pass; the next call tries it again.
+/// A send without coverage, or whose steps fail to store or check with a `NotRetryable`
+/// failure, is marked. A `Retryable` failure marks nothing for that send and fails the call
+/// after the other sends are settled, so the caller does not scan without that send's outputs
+/// and no verdict judges it in that pass; the next call tries it again.
 fn settle_scan_blind_sends(
     ledger: &rusqlite::Connection,
     carried: &[CarriedSend],
-    mut store_and_check: impl FnMut(&CarriedSend) -> Result<bool, SendStepFailure>,
+    mut store_and_check: impl FnMut(&CarriedSend) -> Result<bool, StorageError>,
 ) -> Result<Vec<TxId>, StorageError> {
     let mut blind = Vec::new();
     let mut transient_failure = None;
@@ -1090,17 +1082,7 @@ fn settle_scan_blind_sends(
         match store_and_check(send) {
             Ok(true) => {}
             Ok(false) => blind.push(send.paying_tx_id),
-            Err(SendStepFailure::Deterministic(error)) => {
-                tracing::warn!(
-                    target: "zally::storage",
-                    event = "carried_send_steps_unstorable",
-                    paying_tx_id = %send.paying_tx_id,
-                    %error,
-                    "could not store or check a carried send's steps; it is held as scan-blind"
-                );
-                blind.push(send.paying_tx_id);
-            }
-            Err(SendStepFailure::Transient(error)) => {
+            Err(error) if error.posture() == FailurePosture::Retryable => {
                 tracing::warn!(
                     target: "zally::storage",
                     event = "carried_send_steps_store_interrupted",
@@ -1111,6 +1093,16 @@ fn settle_scan_blind_sends(
                 if transient_failure.is_none() {
                     transient_failure = Some(error);
                 }
+            }
+            Err(error) => {
+                tracing::warn!(
+                    target: "zally::storage",
+                    event = "carried_send_steps_unstorable",
+                    paying_tx_id = %send.paying_tx_id,
+                    %error,
+                    "could not store or check a carried send's steps; it is held as scan-blind"
+                );
+                blind.push(send.paying_tx_id);
             }
         }
     }
@@ -1126,20 +1118,19 @@ fn store_send_steps(
     db: &mut Db,
     params: &zally_core::NetworkParameters,
     send: &CarriedSend,
-) -> Result<(), SendStepFailure> {
+) -> Result<(), StorageError> {
     for step in &send.steps {
         let Some(raw_tx_bytes) = step.raw_tx_bytes.as_deref() else {
             continue;
         };
-        let transaction =
-            read_stored_transaction(raw_tx_bytes).map_err(SendStepFailure::Deterministic)?;
+        let transaction = read_stored_transaction(raw_tx_bytes)?;
         zcash_client_backend::data_api::wallet::decrypt_and_store_transaction(
             params,
             db,
             &transaction,
             None,
         )
-        .map_err(|err| SendStepFailure::from_client(&err, "storing a carried step failed"))?;
+        .map_err(|err| send_step_failure_from_client(&err, "storing a carried step failed"))?;
     }
     Ok(())
 }
@@ -1149,14 +1140,13 @@ fn store_send_steps(
 fn are_funding_outputs_recorded(
     ledger: &rusqlite::Connection,
     send: &CarriedSend,
-) -> Result<bool, SendStepFailure> {
+) -> Result<bool, StorageError> {
     let step_ids: Vec<TxId> = send.steps.iter().map(|step| step.tx_id).collect();
     for step in send.steps.iter().skip(1) {
         let Some(raw_tx_bytes) = step.raw_tx_bytes.as_deref() else {
             return Ok(false);
         };
-        let transaction =
-            read_stored_transaction(raw_tx_bytes).map_err(SendStepFailure::Deterministic)?;
+        let transaction = read_stored_transaction(raw_tx_bytes)?;
         for input in transaction
             .transparent_bundle()
             .map(|bundle| bundle.vin.as_slice())
@@ -1173,7 +1163,7 @@ fn are_funding_outputs_recorded(
                     |row| row.get::<_, bool>(0),
                 )
                 .map_err(|err| {
-                    SendStepFailure::from_sqlite(&err, "funding output lookup failed")
+                    send_step_failure_from_sqlite(&err, "funding output lookup failed")
                 })?;
             if !is_recorded {
                 return Ok(false);
@@ -5639,27 +5629,28 @@ mod tests {
             rusqlite::ffi::SQLITE_IOERR,
             rusqlite::ffi::SQLITE_FULL,
         ] {
-            assert!(matches!(
-                SendStepFailure::from_sqlite(&sqlite_failure(code), "store"),
-                SendStepFailure::Transient(_)
-            ));
+            assert_eq!(
+                send_step_failure_from_sqlite(&sqlite_failure(code), "store").posture(),
+                FailurePosture::Retryable
+            );
         }
         for code in [
             rusqlite::ffi::SQLITE_CONSTRAINT,
             rusqlite::ffi::SQLITE_CORRUPT,
         ] {
-            assert!(matches!(
-                SendStepFailure::from_sqlite(&sqlite_failure(code), "store"),
-                SendStepFailure::Deterministic(_)
-            ));
+            assert_eq!(
+                send_step_failure_from_sqlite(&sqlite_failure(code), "store").posture(),
+                FailurePosture::NotRetryable
+            );
         }
-        assert!(matches!(
-            SendStepFailure::from_client(
+        assert_eq!(
+            send_step_failure_from_client(
                 &SqliteClientError::Io(std::io::Error::other("disk gone")),
                 "store"
-            ),
-            SendStepFailure::Transient(_)
-        ));
+            )
+            .posture(),
+            FailurePosture::Retryable
+        );
     }
 
     #[test]
@@ -5669,7 +5660,7 @@ mod tests {
         let carried = vec![carried_send(0x51)];
 
         let interrupted = settle_scan_blind_sends(&ledger, &carried, |_| {
-            Err(SendStepFailure::from_sqlite(
+            Err(send_step_failure_from_sqlite(
                 &sqlite_failure(rusqlite::ffi::SQLITE_BUSY),
                 "storing a carried step failed",
             ))
@@ -5699,9 +5690,7 @@ mod tests {
 
         let blind = settle_scan_blind_sends(&ledger, &carried, |send| {
             if send.paying_tx_id == unparseable {
-                read_stored_transaction(&[0xff])
-                    .map(|_| true)
-                    .map_err(SendStepFailure::Deterministic)
+                read_stored_transaction(&[0xff]).map(|_| true)
             } else {
                 Ok(true)
             }
