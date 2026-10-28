@@ -761,13 +761,18 @@ fn rebuild_database_with_ledger(
 
 /// Carries every unsettled wallet-created transaction into the rebuilt reverted-broadcast ledger.
 ///
-/// A transaction is unsettled when it is unmined, an idempotency key still names it, or it
-/// still has pending-broadcast rows.
+/// A transaction is unsettled when an idempotency key still names it, it still has
+/// pending-broadcast rows, or an active dispense hold was finalized with it.
 ///
 /// The rebuild discards the transaction records `zcash_client_sqlite` keeps, so without its
 /// raw bytes and expiry the rebuilt wallet could neither judge nor resubmit such a
 /// transaction, and its idempotency key would stay bound forever. One that the rescan finds
 /// mined leaves the ledger through the usual join on `transactions`.
+///
+/// An unmined transaction the ledger does not name is left behind: no submitter received it
+/// from the send path, or its key was released because it can never be mined. The driver
+/// resubmits what this ledger holds, so carrying such a transaction would broadcast a
+/// payment whose key may already have paid a replacement.
 const UNSETTLED_SENDS_CARRY_SQL: &str = "\
     INSERT OR IGNORE INTO main.ext_zally_reverted_broadcasts \
         (tx_id_bytes, raw_tx_bytes, expiry_height, reverted_from_height, recorded_at_ms, \
@@ -775,11 +780,12 @@ const UNSETTLED_SENDS_CARRY_SQL: &str = "\
     SELECT t.txid, t.raw, IFNULL(t.expiry_height, 0), t.mined_height, ?1, NULL \
     FROM prior.transactions t \
     WHERE t.created IS NOT NULL AND t.raw IS NOT NULL \
-      AND (t.mined_height IS NULL \
-           OR t.txid IN (SELECT tx_id_bytes FROM prior.ext_zally_idempotency \
-                         WHERE unmineable_at_height IS NULL) \
+      AND (t.txid IN (SELECT tx_id_bytes FROM prior.ext_zally_idempotency \
+                      WHERE unmineable_at_height IS NULL) \
            OR t.txid IN (SELECT broadcast_tx_id \
-                         FROM prior.ext_zally_pending_broadcast_inputs))";
+                         FROM prior.ext_zally_pending_broadcast_inputs) \
+           OR t.txid IN (SELECT finalized_tx_id FROM prior.ext_zally_holds \
+                         WHERE finalized_tx_id IS NOT NULL AND released_at_ms IS NULL))";
 
 /// Columns `table` has in both the rebuilt and the prior database, comma-separated.
 ///
@@ -1957,6 +1963,7 @@ impl WalletStorage for Sqlite {
                     "DELETE FROM ext_zally_idempotency \
                      WHERE tx_id_bytes = ?1 AND unmineable_at_height IS NULL",
                     "DELETE FROM ext_zally_pending_broadcast_inputs WHERE broadcast_tx_id = ?1",
+                    "DELETE FROM ext_zally_reverted_broadcasts WHERE tx_id_bytes = ?1",
                 ] {
                     transaction
                         .execute(statement, [tx_id.as_bytes().as_slice()])

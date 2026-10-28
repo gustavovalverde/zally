@@ -126,7 +126,7 @@ async fn a_send_the_open_circuit_breaker_stopped_frees_its_key() -> Result<(), F
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_lost_acknowledgement_of_the_paying_step_never_pays_twice() -> Result<(), FixtureError> {
-    let base = wallet_with_spendable_note().await?;
+    let (base, _funding_shielding_tx_id) = wallet_with_spendable_note().await?;
     let submitter = ScriptedSubmitter::new(
         base.network,
         vec![NodeResponse::Accept, NodeResponse::LoseAcknowledgement],
@@ -154,8 +154,9 @@ async fn a_lost_acknowledgement_of_the_paying_step_never_pays_twice() -> Result<
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_failed_funding_step_frees_the_key() -> Result<(), FixtureError> {
-    let base = wallet_with_spendable_note().await?;
+async fn a_failed_funding_step_frees_the_key_and_is_never_resubmitted() -> Result<(), FixtureError>
+{
+    let (base, funding_shielding_tx_id) = wallet_with_spendable_note().await?;
     let submitter = ScriptedSubmitter::new(base.network, vec![NodeResponse::LoseAcknowledgement]);
 
     let first = pay_tex(&base, &submitter).await;
@@ -178,6 +179,21 @@ async fn a_failed_funding_step_frees_the_key() -> Result<(), FixtureError> {
             .is_empty(),
         "the paying step's pending input is released"
     );
+
+    base.wallet.reset_to_birthday(base.chain.as_ref()).await?;
+    let carried: Vec<TxId> = base
+        .storage
+        .list_reverted_broadcasts()
+        .await?
+        .into_iter()
+        .map(|reverted| reverted.tx_id)
+        .collect();
+    assert_eq!(
+        carried,
+        vec![funding_shielding_tx_id],
+        "a rebuild carries only what the ledger names, so the driver never broadcasts the \
+         released payment after its key may have paid a replacement"
+    );
     Ok(())
 }
 
@@ -196,15 +212,16 @@ async fn shieldable_wallet() -> Result<ChainWallet, FixtureError> {
     Ok(base)
 }
 
-/// A wallet with one mined Sapling note it can spend, submitting without retrying.
-async fn wallet_with_spendable_note() -> Result<ChainWallet, FixtureError> {
+/// A wallet with one mined Sapling note it can spend, submitting without retrying, and the
+/// transaction that funded the note.
+async fn wallet_with_spendable_note() -> Result<(ChainWallet, TxId), FixtureError> {
     let funded = funded_chain(PRE_FUNDING_TIP_HEIGHT).await?;
     let base = funded.base;
     base.chain_handle
         .advance_tip(BlockHeight::from(SPEND_TIP_HEIGHT));
     sync_to_tip(&base.wallet, base.chain.as_ref()).await?;
     base.wallet.set_retry_policy(RetryPolicy::none());
-    Ok(base)
+    Ok((base, funded.shielding_tx_id))
 }
 
 fn send_key() -> Result<IdempotencyKey, FixtureError> {

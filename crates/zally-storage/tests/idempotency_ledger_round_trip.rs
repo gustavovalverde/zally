@@ -172,8 +172,21 @@ async fn a_pending_submission_binds_the_paying_transaction_until_released() -> R
         "the refused record writes nothing"
     );
 
+    let carried_by_a_rebuild = rusqlite::Connection::open(temp.path().join("wallet.db"))?;
+    carried_by_a_rebuild.execute(
+        "INSERT INTO ext_zally_reverted_broadcasts \
+             (tx_id_bytes, raw_tx_bytes, expiry_height, recorded_at_ms) \
+         VALUES (?1, x'00', 100, 1)",
+        [paying.as_bytes().as_slice()],
+    )?;
+    drop(carried_by_a_rebuild);
+
     storage.release_pending_submission(vec![paying]).await?;
     assert_eq!(storage.find_idempotent_submission(&key).await?, None);
+    assert!(
+        storage.list_reverted_broadcasts().await?.is_empty(),
+        "a released transaction is never resubmitted from the reverted-broadcast ledger"
+    );
     assert_eq!(
         pending_broadcasts().await?,
         vec![funding],
@@ -190,4 +203,6 @@ enum TestError {
     Storage(#[from] StorageError),
     #[error("idempotency key error: {0}")]
     Key(#[from] zally_core::IdempotencyKeyError),
+    #[error("sqlite error: {0}")]
+    Sqlite(#[from] rusqlite::Error),
 }

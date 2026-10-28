@@ -922,8 +922,9 @@ pub trait WalletStorage: Send + Sync + 'static {
     ) -> Result<(), StorageError>;
 
     /// Undoes [`Self::record_pending_submission`] for transactions that can never be mined:
-    /// drops the idempotency bindings that still name any of `tx_ids` and their
-    /// pending-broadcast inputs, in one storage transaction.
+    /// drops the idempotency bindings that still name any of `tx_ids`, their
+    /// pending-broadcast inputs, and any reverted-broadcast rows a rebuild carried for them, in
+    /// one storage transaction, so the wallet never submits them again.
     ///
     /// The caller passes only transactions no submitter received, or ones a node rejected
     /// for a reason that holds for every block. Releasing one that may still be mined would
