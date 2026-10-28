@@ -23,6 +23,7 @@ use zally_testkit::{
 use zally_wallet::{
     ExportPaymentDisclosurePlan, ProposalPlan, SendPaymentPlan, ShieldTransparentPlan, SyncDriver,
     SyncDriverOptions, SyncHandle, SyncSnapshotStream, SyncStatus, Wallet, WalletError,
+    WalletOptions,
 };
 use zcash_keys::address::{Address, Receiver};
 use zcash_payment_disclosure::{PaymentDisclosureProfile, verify_disclosure};
@@ -159,10 +160,7 @@ impl FundedZinderRoundTrip {
             chain_source,
             SyncDriverOptions::default()
                 .with_poll_interval_ms(250)
-                .with_max_sync_iterations_per_wake_count(16)
-                // The live Zinder pair keeps its default 100-block reorg window; the
-                // integration suite covers the window check.
-                .with_minimum_source_reorg_window_blocks(None),
+                .with_max_sync_iterations_per_wake_count(16),
         )?;
         let sync_handle = driver.sync_continuously();
         let sync_snapshots = sync_handle.observe_status();
@@ -436,7 +434,11 @@ async fn create_wallet_at_tip(
     let sealing = AgeFileSealing::new(AgeFileSealingOptions::at_path(temp.seed_path()));
     let storage = Sqlite::new(SqliteOptions::for_network(network, temp.db_path()));
     let birthday = BlockHeight::from(tip_height.as_u32().saturating_sub(10).max(1));
+    // The live Zinder pair keeps its default 100-block reorg window; the integration suite
+    // covers the window check.
+    let options = WalletOptions::default().with_minimum_source_reorg_window_blocks(None);
     let (wallet, account_id, _mnemonic) = Wallet::builder(network, sealing, storage)
+        .with_options(options)
         .create(chain, birthday)
         .await?;
     Ok((temp, wallet, account_id))

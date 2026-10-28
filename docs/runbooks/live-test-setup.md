@@ -98,7 +98,7 @@ password = "zebra"
 path = ".tmp/regtest.zinder-store"
 ```
 
-This configuration keeps Zinder's default 100-block reorg window, which is enough for a Regtest chain the test mines itself. The funded round trip therefore disables the `SyncDriver`'s minimum-window check; a deployment runs Zinder with `reorg_window_blocks` of at least 1,000 instead (see [Bootstrap an operator wallet](bootstrap-operator-wallet.md)).
+This configuration keeps Zinder's default 100-block reorg window, which is enough for a Regtest chain the test mines itself. The funded round trip therefore disables the wallet's minimum-window check (`WalletOptions::minimum_source_reorg_window_blocks`); a deployment runs Zinder with `reorg_window_blocks` of at least 1,000 instead (see [Bootstrap an operator wallet](bootstrap-operator-wallet.md)).
 
 Start the writer (`zinder-ingest tip-follow`):
 

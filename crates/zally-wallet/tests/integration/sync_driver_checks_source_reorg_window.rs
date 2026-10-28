@@ -20,12 +20,12 @@ use zally_storage::WalletStorage as _;
 use zally_testkit::{MockChainSource, MockSubmitter};
 use zally_wallet::{
     ShieldTransparentPlan, SyncDriver, SyncDriverOptions, SyncDriverPhase, SyncHandle,
-    SyncSnapshot, WalletError, WalletEvent, WalletEventStream,
+    SyncSnapshot, WalletError, WalletEvent, WalletEventStream, WalletOptions,
 };
 
 use super::reorg_fixtures::{
-    ChainWallet, EventLog, FixtureError, chain_wallet, fast_driver_options, funded_chain,
-    wait_for_driver,
+    ChainWallet, EventLog, FixtureError, chain_wallet, chain_wallet_with_options,
+    fast_driver_options, funded_chain, wait_for_driver,
 };
 
 const SHALLOW_WINDOW_BLOCKS: u32 = 100;
@@ -85,15 +85,15 @@ async fn a_shallow_source_reorg_window_refuses_spends_until_it_is_raised()
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_disabled_check_accepts_a_shallow_source_reorg_window() -> Result<(), FixtureError> {
-    let base = chain_wallet(10).await?;
+    let base = chain_wallet_with_options(
+        10,
+        WalletOptions::default().with_minimum_source_reorg_window_blocks(None),
+    )
+    .await?;
     base.chain_handle
         .set_reorg_window_blocks(SHALLOW_WINDOW_BLOCKS);
     let mut events = base.wallet.observe();
-    let handle = start_driver(
-        &base,
-        Arc::new(Notify::new()),
-        fast_driver_options().with_minimum_source_reorg_window_blocks(None),
-    )?;
+    let handle = start_driver(&base, Arc::new(Notify::new()), fast_driver_options())?;
     let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
     while let Ok(Some(event)) = tokio::time::timeout_at(deadline, events.next()).await {
         assert!(

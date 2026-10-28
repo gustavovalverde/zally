@@ -22,7 +22,7 @@ use zally_testkit::{
 };
 use zally_wallet::{
     ShieldTransparentPlan, SyncDriver, SyncDriverOptions, SyncHandle, SyncRecoveryPolicy,
-    SyncSnapshot, Wallet, WalletEvent, WalletEventStream,
+    SyncSnapshot, Wallet, WalletEvent, WalletEventStream, WalletOptions,
 };
 use zcash_primitives::transaction::Transaction;
 use zcash_protocol::consensus::BranchId;
@@ -66,6 +66,14 @@ pub(crate) struct ChainWallet {
 
 /// Creates a wallet at birthday 1 on a mock chain whose tip is `tip_height`.
 pub(crate) async fn chain_wallet(tip_height: u32) -> Result<ChainWallet, FixtureError> {
+    chain_wallet_with_options(tip_height, WalletOptions::default()).await
+}
+
+/// Same as [`chain_wallet`], with caller-supplied [`WalletOptions`].
+pub(crate) async fn chain_wallet_with_options(
+    tip_height: u32,
+    options: WalletOptions,
+) -> Result<ChainWallet, FixtureError> {
     let network = regtest_with_nu7_from_height_one();
     let temp = TempWalletPath::create()?;
     let (spend_bytes, output_bytes) = wagyu_zcash_parameters::load_sapling_parameters();
@@ -82,6 +90,7 @@ pub(crate) async fn chain_wallet(tip_height: u32) -> Result<ChainWallet, Fixture
     let chain_handle = chain.handle();
     chain_handle.advance_tip(BlockHeight::from(tip_height));
     let (wallet, account_id, _mnemonic) = Wallet::builder(network, sealing, storage.clone())
+        .with_options(options)
         .create(chain.as_ref(), BlockHeight::from(1))
         .await?;
     Ok(ChainWallet {

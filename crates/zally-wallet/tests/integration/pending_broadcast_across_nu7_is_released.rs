@@ -336,6 +336,65 @@ async fn unmineable_broadcast_frees_its_idempotency_key_for_one_replacement()
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_sync_without_a_driver_holds_verdicts_under_a_shallow_source_reorg_window()
+-> Result<(), TestError> {
+    let PendingShieldingWallet {
+        wallet,
+        account_id,
+        storage,
+        chain,
+        chain_handle,
+        submitter,
+        pending_tx_id,
+        temp: _temp,
+    } = wallet_with_pending_shielding().await?;
+    chain_handle.set_reorg_window_blocks(100);
+    let mut events = wallet.observe();
+    let settled = NU7_ACTIVATION_HEIGHT - 1;
+    sync_to(&wallet, &chain, &chain_handle, settled + 6, settled).await?;
+    assert!(
+        unmineable_reports(&mut events).await.is_empty(),
+        "a sync that read a shallow source window judges nothing unmineable"
+    );
+    let shield_key = IdempotencyKey::try_from(SHIELD_KEY)
+        .map_err(|_| TestError::Fixture("invalid idempotency key"))?;
+    assert_eq!(
+        storage.find_idempotent_submission(&shield_key).await?,
+        Some(pending_tx_id)
+    );
+    record_transparent_utxo(&wallet, &storage, account_id, REPLACEMENT_FUNDING_TX_ID).await?;
+    let refused = wallet
+        .shield_transparent_funds(ShieldTransparentPlan::new(
+            account_id,
+            IdempotencyKey::try_from("shield-under-shallow-window")
+                .map_err(|_| TestError::Fixture("invalid idempotency key"))?,
+            zatoshis(SHIELDING_THRESHOLD_ZAT)?,
+            &submitter,
+        ))
+        .await;
+    assert!(
+        matches!(
+            refused,
+            Err(WalletError::SourceReorgWindowTooShallow {
+                reorg_window_blocks: 100,
+                ..
+            })
+        ),
+        "a sync that read a shallow source window refuses new spends: {refused:?}"
+    );
+
+    chain_handle.set_reorg_window_blocks(1_000);
+    wallet.sync(&chain).await?;
+    let reports = unmineable_reports(&mut events).await;
+    assert_eq!(
+        reports.iter().map(|(tx_id, _)| *tx_id).collect::<Vec<_>>(),
+        vec![pending_tx_id],
+        "the next sync reads the raised window and judges the broadcast"
+    );
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_syncs_report_an_unmineable_broadcast_once() -> Result<(), TestError> {
     let PendingShieldingWallet {

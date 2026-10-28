@@ -241,22 +241,6 @@ pub struct SyncDriverOptions {
     ///
     /// Default: 30 minutes, at least 24 block intervals at the longest Zcash target spacing.
     pub visible_tip_stall_limit_ms: Option<u64>,
-    /// Smallest chain source reorg window, in blocks, under which the wallet still accepts new
-    /// spends. `None` disables the check.
-    ///
-    /// The wallet frees an idempotency key once it judges the key's transaction unmineable at
-    /// the source's settled tip, so the promise never to pay twice holds only while the source
-    /// follows every reorg the node can produce. The driver reads
-    /// [`ChainSource::reorg_window_blocks`] when it starts and each time it reopens the
-    /// chain-event stream. Until a read meets the minimum, the wallet records no pending
-    /// broadcast as unmineable, so no key is freed and no hold reopened, and new spends fail:
-    /// with [`WalletError::SourceReorgWindowUnverified`] before the first successful read, and
-    /// with [`WalletError::SourceReorgWindowTooShallow`] while the window is smaller, which
-    /// [`WalletEvent::SourceReorgWindowTooShallow`](crate::WalletEvent::SourceReorgWindowTooShallow)
-    /// reports. Scanning continues. Closing the driver lifts the hold.
-    ///
-    /// Default: 1,000 blocks, the deepest reorg Zebra produces.
-    pub minimum_source_reorg_window_blocks: Option<u32>,
 }
 
 impl SyncDriverOptions {
@@ -332,18 +316,6 @@ impl SyncDriverOptions {
         }
     }
 
-    /// Returns options with `minimum_source_reorg_window_blocks` replaced.
-    #[must_use]
-    pub const fn with_minimum_source_reorg_window_blocks(
-        self,
-        minimum_source_reorg_window_blocks: Option<u32>,
-    ) -> Self {
-        Self {
-            minimum_source_reorg_window_blocks,
-            ..self
-        }
-    }
-
     fn normalized(self) -> Self {
         Self {
             poll_interval_ms: self.poll_interval_ms.max(1),
@@ -357,7 +329,6 @@ impl SyncDriverOptions {
             visible_tip_stall_limit_ms: self
                 .visible_tip_stall_limit_ms
                 .map(|limit_ms| limit_ms.max(1)),
-            minimum_source_reorg_window_blocks: self.minimum_source_reorg_window_blocks,
         }
     }
 }
@@ -372,14 +343,9 @@ impl Default for SyncDriverOptions {
             transparent_utxo_refresh_interval_ms: 5_000,
             transparent_utxo_refresh_timeout_seconds: 120,
             visible_tip_stall_limit_ms: Some(30 * 60 * 1_000),
-            minimum_source_reorg_window_blocks: Some(ZEBRA_MAX_REORG_DEPTH_BLOCKS),
         }
     }
 }
-
-/// Deepest reorg Zebra produces: it commits a block to finalized state only once its best
-/// chain is longer than this.
-const ZEBRA_MAX_REORG_DEPTH_BLOCKS: u32 = 1_000;
 
 /// Repair rung the sync driver applies before its next sync attempt.
 ///
@@ -632,7 +598,8 @@ impl SyncDriver {
     /// or retry ladder affects the other's.
     #[must_use]
     pub fn sync_continuously(self) -> SyncHandle {
-        if let Some(required_blocks) = self.options.minimum_source_reorg_window_blocks {
+        if let Some(required_blocks) = self.wallet.inner.options.minimum_source_reorg_window_blocks
+        {
             self.wallet.start_source_reorg_window_check(required_blocks);
         }
         let (close_tx, close_rx) = oneshot::channel();
@@ -1402,7 +1369,7 @@ async fn publish_source_recovered(ctx: &DriverContext<'_>, state: &mut DriverSta
 /// succeeded yet. A read that fails or times out keeps the prior result, so a window never
 /// read keeps spends and unmineable verdicts held.
 async fn check_source_reorg_window(ctx: &DriverContext<'_>) {
-    let Some(required_blocks) = ctx.options.minimum_source_reorg_window_blocks else {
+    let Some(required_blocks) = ctx.wallet.inner.options.minimum_source_reorg_window_blocks else {
         return;
     };
     let read = tokio::time::timeout(

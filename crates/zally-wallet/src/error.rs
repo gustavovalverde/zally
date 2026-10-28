@@ -274,11 +274,11 @@ pub enum WalletError {
     /// the settled tip. A reorg deeper than the source's window could still mine that
     /// transaction after its replacement was paid. Raise the source's reorg window to at
     /// least `required_blocks` (Zinder's `reorg_window_blocks`), or lower
-    /// [`crate::SyncDriverOptions::minimum_source_reorg_window_blocks`] to accept the weaker
+    /// [`crate::WalletOptions::minimum_source_reorg_window_blocks`] to accept the weaker
     /// guarantee.
     ///
-    /// Posture: [`FailurePosture::RequiresOperator`]: spends resume once the sync driver reads
-    /// a window of at least `required_blocks`.
+    /// Posture: [`FailurePosture::RequiresOperator`]: spends resume once a sync or the sync
+    /// driver reads a window of at least `required_blocks`.
     #[error(
         "chain source reorg window of {reorg_window_blocks} blocks is below the required \
          {required_blocks}; new spends are refused"

@@ -24,9 +24,10 @@ impl Wallet {
     /// reports it and [`WalletEvent::HoldDispenseUnmineable`] reports each hold. A
     /// transaction a rewind removed from the chain is judged the same way. Judging at the visible tip
     /// instead could report a broadcast that an unscanned or reorged block still mines, and
-    /// its replacement would pay twice. No broadcast is recorded unmineable while the sync
-    /// driver holds verdicts over the chain source's reorg window, because a settled tip the
-    /// source can still replace cannot back one.
+    /// its replacement would pay twice. Before the first such verdict in a call, the wallet
+    /// reads the chain source's reorg window, and records nothing unmineable unless the read
+    /// meets [`crate::WalletOptions::minimum_source_reorg_window_blocks`]: a settled tip the
+    /// source can still replace cannot back a verdict.
     ///
     /// The verdict also asks `chain` before it frees anything, because the wallet's scan can
     /// miss a transaction it sent: it records the broadcast unmineable only when the source
@@ -45,7 +46,7 @@ impl Wallet {
             return Ok(());
         };
         let judged_height = scanned_height.min(settled_tip_height);
-        let is_verdict_held = self.is_source_reorg_window_holding();
+        let mut is_window_verified = None;
         for pending in storage.list_pending_broadcast_transactions().await? {
             let tx_id = pending.broadcast_tx_id;
             match pending.mined_height {
@@ -56,7 +57,6 @@ impl Wallet {
                     continue;
                 }
                 Some(_) => continue,
-                None if is_verdict_held => continue,
                 None => {}
             }
             let header = match parse_transaction_header(&pending.raw_bytes) {
@@ -75,9 +75,14 @@ impl Wallet {
             let Err(reason) = header.check_mineable(self.network(), judged_height) else {
                 continue;
             };
-            if !self
-                .is_absent_from_chain(chain, tx_id, &pending.raw_bytes)
-                .await
+            let is_verdict_allowed = match is_window_verified {
+                Some(is_verified) => is_verified,
+                None => *is_window_verified.insert(self.verify_source_reorg_window(chain).await),
+            };
+            if !is_verdict_allowed
+                || !self
+                    .is_absent_from_chain(chain, tx_id, &pending.raw_bytes)
+                    .await
             {
                 continue;
             }
