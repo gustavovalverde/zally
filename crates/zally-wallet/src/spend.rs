@@ -611,11 +611,11 @@ impl Wallet {
     ///
     /// A failed step releases the binding only when the paying transaction can no longer be
     /// mined: the failure stopped the send before the paying transaction reached a submitter
-    /// (an open circuit breaker never calls it), or a node rejected a step for a reason that
-    /// holds for every block ([`is_definitive_rejection`]). The released transactions lose
-    /// their pending rows, while an earlier step a node may hold keeps them. Any other
-    /// failure of the paying transaction may have reached the node and keeps everything; the
-    /// pending-broadcast verdict frees the key if that transaction is never mined.
+    /// (an open circuit breaker never calls it, see [`is_unsubmitted`]). The released
+    /// transactions lose their pending rows, while an earlier step a node may hold keeps them.
+    /// Any other failure of the paying transaction, a node rejection included, may have
+    /// reached the node and keeps everything; the pending-broadcast verdict frees the key if
+    /// that transaction is never mined.
     ///
     /// Returns the paying transaction's `(tx_id, tx_expiry_height)` pair so callers can
     /// pass expiry through to consumers that need to bound their wait for confirmation.
@@ -661,7 +661,7 @@ impl Wallet {
             let Err(error) = submitted else {
                 continue;
             };
-            let never_mined_from = if is_unsubmitted_or_definitively_rejected(&error) {
+            let never_mined_from = if is_unsubmitted(&error) {
                 step_index
             } else {
                 step_index.saturating_add(1)
@@ -777,30 +777,17 @@ impl Wallet {
     }
 }
 
-/// Whether a failed submission proves its transaction can never be mined.
+/// Whether a failed submission never reached a submitter, so its transaction can never be
+/// mined.
 ///
 /// An open circuit breaker fails the call before any submitter sees the transaction. A node
-/// rejection proves it only when its reason holds for every block
-/// ([`is_definitive_rejection`]).
-fn is_unsubmitted_or_definitively_rejected(error: &WalletError) -> bool {
+/// rejection never counts: the chain source types a rejection by matching the node's
+/// free-form message, a reason such as an expired or wrong-branch verdict describes the
+/// node's tip at one attempt rather than every block, and an earlier attempt whose
+/// acknowledgement was lost may already have been accepted. A rejection therefore keeps the
+/// key bound until the pending-broadcast verdict frees it.
+const fn is_unsubmitted(error: &WalletError) -> bool {
     matches!(error, WalletError::CircuitBroken { .. })
-        || matches!(
-            error,
-            WalletError::SubmissionRejected { reason, .. } if is_definitive_rejection(*reason)
-        )
-}
-
-/// Whether a node rejection proves that no copy of the transaction can ever be mined, so its
-/// idempotency key may build a replacement at once.
-///
-/// No rejection proves it yet. The chain source types a rejection by matching the node's
-/// free-form message, and a reason such as an expired or wrong-branch verdict describes the
-/// node's tip at one attempt rather than every block, while an earlier attempt whose
-/// acknowledgement was lost may already have been accepted. Every rejection therefore keeps
-/// the key bound until the pending-broadcast verdict frees it. Once the chain source reports
-/// rejection reasons that hold for every block, this is where they release the key.
-const fn is_definitive_rejection(_reason: zally_chain::RejectionReason) -> bool {
-    false
 }
 
 fn resolve_shielding_request(
