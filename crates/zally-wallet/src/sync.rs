@@ -2343,7 +2343,8 @@ impl Wallet {
         self.scan_one_range(chain, chain_epoch).await
     }
 
-    /// Pins one source epoch, failing closed when the source serves another network.
+    /// Pins one source epoch, failing closed when the source serves another network, and
+    /// records its visible tip as the source's latest.
     pub(crate) async fn pin_chain_epoch(
         &self,
         chain: &dyn ChainSource,
@@ -2354,7 +2355,9 @@ impl Wallet {
                 requested: chain.network(),
             });
         }
-        Ok(chain.current_epoch().await?)
+        let chain_epoch = chain.current_epoch().await?;
+        self.record_source_visible_tip(chain_epoch.visible_tip().height);
+        Ok(chain_epoch)
     }
 
     async fn scan_one_range(

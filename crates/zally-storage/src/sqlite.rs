@@ -2004,6 +2004,7 @@ impl WalletStorage for Sqlite {
         let network = self.options.network;
         let account_id = request.account_id;
         let destination_pool = request.destination_pool;
+        let source_tip_height = request.source_tip_height;
 
         self.with_db_mut(move |db| {
             let account_uuid = resolve_account_uuid(db, network, account_id)?;
@@ -2014,13 +2015,21 @@ impl WalletStorage for Sqlite {
                 .map_err(|e| map_sqlite_error(&e))?
                 .into_keys()
                 .collect();
-            let change_pool = match destination_pool {
-                Some(destination_pool) => destination_pool,
-                None => fallback_change_pool(
-                    &params,
-                    db.chain_height().map_err(|e| map_sqlite_error(&e))?,
-                ),
-            };
+            let chain_height = db.chain_height().map_err(|e| map_sqlite_error(&e))?;
+            let change_pool =
+                destination_pool.unwrap_or_else(|| fallback_change_pool(&params, chain_height));
+            let source_lag_blocks = compute_source_lag_blocks(chain_height, source_tip_height);
+            if source_lag_blocks > 0 {
+                tracing::warn!(
+                    target: "zally::storage",
+                    event = "shielding_maturity_judged_at_source_tip",
+                    wallet_tip_height = chain_height.map(u32::from),
+                    source_tip_height = source_tip_height.map(BlockHeight::as_u32),
+                    source_lag_blocks,
+                    "the chain source's tip is below the wallet's; transparent inputs must be \
+                     mature at the source's tip"
+                );
+            }
 
             let lock_request = proposal_lock_request();
             let input_selector = GreedyInputSelector::<Db>::new();
@@ -2044,7 +2053,7 @@ impl WalletStorage for Sqlite {
                 shielding_threshold,
                 &from_addrs,
                 account_uuid,
-                coinbase_safe_shielding_policy(),
+                coinbase_safe_shielding_policy(source_lag_blocks),
                 zcash_client_backend::data_api::CoinbaseFilter::AllTransparentOutputs,
                 Some(lock_request),
             )
@@ -4880,7 +4889,13 @@ fn release_proposal_inputs_after_failure<T, FeeRuleT, NoteRefT>(
 /// `trusted` is kept at the upstream default (3) because shielded-note
 /// confirmation policy takes a separate code path and is unaffected by
 /// this helper.
-pub(crate) fn coinbase_safe_shielding_policy() -> ConfirmationsPolicy {
+///
+/// The SQL clause counts confirmations from the wallet's chain tip, but the
+/// shielding transaction is mined above the chain source's tip. When the
+/// source's tip sits `source_lag_blocks` below the wallet's, `untrusted`
+/// grows by that many blocks, so an output is selected only when it is
+/// mature at the source's tip too.
+pub(crate) fn coinbase_safe_shielding_policy(source_lag_blocks: u32) -> ConfirmationsPolicy {
     const COINBASE_MATURITY_CONFIRMATIONS: u32 = 100;
     const TRUSTED_DEFAULT_CONFIRMATIONS: u32 = 3;
     #[allow(
@@ -4891,16 +4906,31 @@ pub(crate) fn coinbase_safe_shielding_policy() -> ConfirmationsPolicy {
         .expect("TRUSTED_DEFAULT_CONFIRMATIONS is non-zero");
     #[allow(
         clippy::expect_used,
-        reason = "constants are non-zero by construction; the conversion cannot fail"
+        reason = "the maturity constant is non-zero and saturating addition never lowers it"
     )]
-    let untrusted = NonZeroU32::new(COINBASE_MATURITY_CONFIRMATIONS)
-        .expect("COINBASE_MATURITY_CONFIRMATIONS is non-zero");
+    let untrusted =
+        NonZeroU32::new(COINBASE_MATURITY_CONFIRMATIONS.saturating_add(source_lag_blocks))
+            .expect("COINBASE_MATURITY_CONFIRMATIONS is non-zero");
     #[allow(
         clippy::expect_used,
         reason = "trusted <= untrusted by construction; the policy invariant is upheld"
     )]
     ConfirmationsPolicy::new(trusted, untrusted, false)
-        .expect("trusted=3 <= untrusted=100 satisfies the policy invariant")
+        .expect("trusted=3 <= untrusted>=100 satisfies the policy invariant")
+}
+
+/// Blocks the wallet's chain tip sits above the chain source's tip; zero when either is
+/// unknown or the source is at or above the wallet.
+fn compute_source_lag_blocks(
+    wallet_tip_height: Option<zcash_protocol::consensus::BlockHeight>,
+    source_tip_height: Option<BlockHeight>,
+) -> u32 {
+    match (wallet_tip_height, source_tip_height) {
+        (Some(wallet_tip), Some(source_tip)) => {
+            u32::from(wallet_tip).saturating_sub(source_tip.as_u32())
+        }
+        _ => 0,
+    }
 }
 
 /// Classifies a librustzcash proposal or transaction-construction error.
@@ -6176,7 +6206,7 @@ mod tests {
 
     #[test]
     fn coinbase_safe_shielding_policy_requires_100_confirmations_with_no_zero_conf() {
-        let policy = coinbase_safe_shielding_policy();
+        let policy = coinbase_safe_shielding_policy(0);
         assert!(
             !policy.allow_zero_conf_shielding(),
             "shielding policy must disable zero-conf so the min_confirmations SQL filter actually fires; otherwise the immature-coinbase tx_index check is the only line of defense and it silently no-ops when chain-source-ingested UTXOs leave tx_index NULL"
@@ -6185,6 +6215,37 @@ mod tests {
             u32::from(policy.untrusted()),
             100,
             "untrusted confirmations must equal Zcash's COINBASE_MATURITY (100) so the SQL clause target_height - mined_height >= :min_confirmations rejects any immature coinbase even when the per-row tx_index filter is unreliable"
+        );
+    }
+
+    #[test]
+    fn coinbase_safe_shielding_policy_counts_maturity_from_the_lower_source_tip() {
+        assert_eq!(
+            u32::from(coinbase_safe_shielding_policy(255).untrusted()),
+            355
+        );
+        assert_eq!(
+            u32::from(coinbase_safe_shielding_policy(u32::MAX).untrusted()),
+            u32::MAX
+        );
+        assert_eq!(u32::from(coinbase_safe_shielding_policy(255).trusted()), 3);
+    }
+
+    #[test]
+    fn source_lag_counts_only_a_source_below_the_wallet_tip() {
+        let wallet_tip = Some(zcash_protocol::consensus::BlockHeight::from_u32(4_602_663));
+        assert_eq!(
+            compute_source_lag_blocks(wallet_tip, Some(BlockHeight::from(4_602_408))),
+            255
+        );
+        assert_eq!(
+            compute_source_lag_blocks(wallet_tip, Some(BlockHeight::from(4_602_700))),
+            0
+        );
+        assert_eq!(compute_source_lag_blocks(wallet_tip, None), 0);
+        assert_eq!(
+            compute_source_lag_blocks(None, Some(BlockHeight::from(10))),
+            0
         );
     }
 

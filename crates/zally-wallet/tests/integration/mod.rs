@@ -35,6 +35,7 @@ mod reserve_hold_round_trip;
 mod send_binds_its_key_before_submitting;
 mod send_payment_rejects_stale_target_expiry;
 mod send_payment_short_circuits_on_known_idempotency_key;
+mod shield_judges_maturity_at_the_source_tip;
 mod sync_catches_up_to_tip;
 mod sync_drains_bulk_ranges;
 mod sync_driver_checks_source_reorg_window;

@@ -50,6 +50,9 @@ pub(crate) struct WalletInner {
     pub(crate) source_halt: Mutex<Option<SourceHalt>>,
     /// What the sync driver last established about the chain source's reorg window.
     pub(crate) source_reorg_window: Mutex<SourceReorgWindowCheck>,
+    /// Visible tip of the chain source epoch the wallet pinned most recently; `None` until
+    /// this process pins one.
+    pub(crate) source_visible_tip_height: Mutex<Option<BlockHeight>>,
     /// Pending broadcasts whose unmineable verdict currently waits, reported once each.
     pub(crate) withheld_verdicts: Mutex<std::collections::HashSet<TxId>>,
     /// Paying transactions of sends the scan may have passed without recognizing them mined,
@@ -584,6 +587,14 @@ impl Wallet {
         *self.inner.source_halt.lock() = cause;
     }
 
+    pub(crate) fn record_source_visible_tip(&self, visible_tip_height: BlockHeight) {
+        *self.inner.source_visible_tip_height.lock() = Some(visible_tip_height);
+    }
+
+    pub(crate) fn source_visible_tip_height(&self) -> Option<BlockHeight> {
+        *self.inner.source_visible_tip_height.lock()
+    }
+
     /// Refuses a new spend while the sync driver reports the chain source halted, or its
     /// reorg window below the driver's minimum or not yet read.
     pub(crate) fn ensure_source_following(&self) -> Result<(), WalletError> {
@@ -797,6 +808,7 @@ where
         idempotency_key_locks: IdempotencyKeyLocks::default(),
         source_halt: Mutex::new(None),
         source_reorg_window: Mutex::new(SourceReorgWindowCheck::Unchecked),
+        source_visible_tip_height: Mutex::new(None),
         withheld_verdicts: Mutex::new(std::collections::HashSet::new()),
         scan_blind_sends: Mutex::new(None),
     });

@@ -520,6 +520,14 @@ impl Wallet {
     /// caller should run [`Wallet::sync`] first so transparent UTXOs have been refreshed from
     /// the configured [`zally_chain::ChainSource`].
     ///
+    /// Every transparent input needs 100 confirmations at the lower of the wallet's chain tip
+    /// and the visible tip of the chain-source epoch the wallet pinned most recently. A source
+    /// that fell below the tip the wallet recorded, for example a node restarted onto a
+    /// shorter branch, mines the shielding transaction above its own tip, so an output mature
+    /// only against the wallet's tip waits for a later call. When what remains is below
+    /// `plan.shielding_threshold_zat`, the call fails with [`WalletError::InsufficientBalance`]
+    /// and submits nothing.
+    ///
     /// `plan.idempotency` makes the send idempotent, as for [`Wallet::send_payment`]: the key
     /// is bound to the shielding transaction before it is submitted, and a key that already
     /// names a transaction returns that transaction instead of building another, submitting
@@ -566,7 +574,10 @@ impl Wallet {
             .unseal_seed()
             .await
             .map_err(WalletError::from)?;
-        let shielding_request = resolve_shielding_request(&plan)?;
+        let mut shielding_request = resolve_shielding_request(&plan)?;
+        if let Some(source_tip_height) = self.source_visible_tip_height() {
+            shielding_request = shielding_request.with_source_tip_height(source_tip_height);
+        }
         let prepared = self
             .inner
             .storage

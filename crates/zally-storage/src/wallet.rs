@@ -163,6 +163,14 @@ pub struct ShieldTransparentRequest {
     ///
     /// `None` preserves the storage backend's activation-aware default.
     pub destination_pool: Option<ShieldedPool>,
+    /// The chain source's latest visible tip, when the caller has read one.
+    ///
+    /// Transparent maturity is judged at the lower of this and the wallet's chain tip. A
+    /// source that regressed below the tip the wallet recorded, for example a node restarted
+    /// onto a shorter branch, mines the shielding transaction above its own tip, so an
+    /// output counted mature only against the wallet's higher tip would be rejected there.
+    /// `None` judges maturity at the wallet's chain tip alone.
+    pub source_tip_height: Option<BlockHeight>,
 }
 
 impl ShieldTransparentRequest {
@@ -173,6 +181,7 @@ impl ShieldTransparentRequest {
             account_id,
             shielding_threshold_zat,
             destination_pool: None,
+            source_tip_height: None,
         }
     }
 
@@ -187,6 +196,14 @@ impl ShieldTransparentRequest {
     #[must_use]
     pub const fn destination_pool(&self) -> Option<ShieldedPool> {
         self.destination_pool
+    }
+
+    /// Returns the request with the chain source's latest visible tip, so transparent
+    /// maturity is judged at the lower of it and the wallet's chain tip.
+    #[must_use]
+    pub const fn with_source_tip_height(mut self, source_tip_height: BlockHeight) -> Self {
+        self.source_tip_height = Some(source_tip_height);
+        self
     }
 }
 
@@ -685,6 +702,8 @@ pub trait WalletStorage: Send + Sync + 'static {
     /// conventional fees and the default ZIP-315 confirmations policy. The storage layer
     /// selects from the account's known transparent receivers; the wallet layer is responsible
     /// for refreshing transparent UTXOs from a chain source before calling this method.
+    /// Every transparent input needs 100 confirmations at the lower of the wallet's chain tip
+    /// and [`ShieldTransparentRequest::source_tip_height`].
     ///
     /// `not_retryable` on insufficient transparent funds, unknown account, or missing
     /// transparent receivers; `requires_operator` on missing Sapling params; `retryable` on

@@ -181,23 +181,10 @@ pub(crate) async fn funded_chain_with_gap_limit(
     sync_to_tip(&base.wallet, base.chain.as_ref()).await?;
     record_transparent_utxo(&base, TRANSPARENT_FUNDING_TX_ID).await?;
 
-    let submitter = Arc::new(
-        MockSubmitter::accepting(base.network).with_tx_id_derivation(parsed_transaction_id),
-    );
+    let submitter = Arc::new(transaction_id_submitter(base.network));
     let shielding_key = IdempotencyKey::try_from(SHIELDING_KEY.to_owned())
         .map_err(|_| FixtureError::Fixture("idempotency key"))?;
-    let outcome = base
-        .wallet
-        .shield_transparent_funds(
-            ShieldTransparentPlan::new(
-                base.account_id,
-                shielding_key.clone(),
-                zatoshis(1_000)?,
-                submitter.as_ref(),
-            )
-            .with_destination_pool(ShieldedPool::Sapling),
-        )
-        .await?;
+    let outcome = shield_into_sapling(&base, shielding_key.clone(), submitter.as_ref()).await?;
     let raw = submitter
         .handle()
         .submitted_bytes()
@@ -235,6 +222,15 @@ pub(crate) async fn record_transparent_utxo(
     base: &ChainWallet,
     funding_tx_id: [u8; 32],
 ) -> Result<(), FixtureError> {
+    record_transparent_utxo_at(base, funding_tx_id, 1).await
+}
+
+/// Records a transparent UTXO the wallet owns, created by `funding_tx_id` at `mined_height`.
+pub(crate) async fn record_transparent_utxo_at(
+    base: &ChainWallet,
+    funding_tx_id: [u8; 32],
+    mined_height: u32,
+) -> Result<(), FixtureError> {
     let address = base
         .storage
         .derive_next_address_with_transparent(base.account_id)
@@ -249,7 +245,7 @@ pub(crate) async fn record_transparent_utxo(
                 TxId::from_bytes(funding_tx_id),
                 0,
                 zatoshis(TRANSPARENT_UTXO_ZAT)?,
-                BlockHeight::from(1),
+                BlockHeight::from(mined_height),
                 Script::from(transparent.script()).0.0,
             )],
         )
@@ -278,6 +274,27 @@ pub(crate) async fn record_hold(
         })
         .await?;
     Ok(hold_id)
+}
+
+/// A submitter that accepts every transaction and answers with its parsed id.
+pub(crate) fn transaction_id_submitter(network: Network) -> MockSubmitter {
+    MockSubmitter::accepting(network).with_tx_id_derivation(parsed_transaction_id)
+}
+
+/// Shields the wallet's mature transparent funds into Sapling under `key`.
+pub(crate) async fn shield_into_sapling(
+    base: &ChainWallet,
+    key: IdempotencyKey,
+    submitter: &dyn Submitter,
+) -> Result<SendOutcome, FixtureError> {
+    let outcome = base
+        .wallet
+        .shield_transparent_funds(
+            ShieldTransparentPlan::new(base.account_id, key, zatoshis(1_000)?, submitter)
+                .with_destination_pool(ShieldedPool::Sapling),
+        )
+        .await?;
+    Ok(outcome)
 }
 
 /// Shields with a wallet that has nothing to shield; returns the error that refused it.
