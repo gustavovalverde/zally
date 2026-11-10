@@ -40,6 +40,7 @@ mod sync_drains_bulk_ranges;
 mod sync_driver_checks_source_reorg_window;
 mod sync_driver_follows_chain;
 mod sync_driver_halts_on_stalled_source;
+mod sync_driver_keeps_publishing;
 mod sync_driver_keeps_the_ledger;
 mod sync_driver_resumes_chain_events;
 mod sync_driver_rewinds_to_fork_point;

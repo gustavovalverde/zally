@@ -78,6 +78,7 @@ struct MockState {
     next_event_sequence: u64,
     retained_from_sequence: u64,
     subscription_starts: Vec<ChainEventStreamStart>,
+    hanging_subscription_count: u32,
     reorg_window_blocks: u32,
     transaction_status_mode: MockTransactionStatusMode,
 }
@@ -246,6 +247,7 @@ impl MockChainSource {
                 next_event_sequence: 1,
                 retained_from_sequence: 1,
                 subscription_starts: Vec::new(),
+                hanging_subscription_count: 0,
                 reorg_window_blocks: DEFAULT_REORG_WINDOW_BLOCKS,
                 transaction_status_mode: MockTransactionStatusMode::Canonical,
             })),
@@ -464,6 +466,14 @@ impl MockChainSourceHandle {
     #[must_use]
     pub fn chain_event_subscription_starts(&self) -> Vec<ChainEventStreamStart> {
         self.state.lock().subscription_starts.clone()
+    }
+
+    /// Makes the next `count` chain-event subscriptions never answer, as a source whose
+    /// stream endpoint hangs while its other reads still work. Later subscriptions open
+    /// normally.
+    pub fn hang_chain_event_subscriptions_next(&self, count: u32) {
+        let mut guard = self.state.lock();
+        guard.hanging_subscription_count = guard.hanging_subscription_count.saturating_add(count);
     }
 
     /// Queues `count` consecutive failures for `current_epoch` calls. Each subsequent call pops
@@ -834,10 +844,19 @@ impl ChainSource for MockChainSource {
         &self,
         start: ChainEventStreamStart,
     ) -> Result<ChainEventEnvelopeStream, ChainSourceError> {
-        let receiver = self.event_tx.subscribe();
-        let (replay, last_replayed_sequence) = {
+        let is_hanging = {
             let mut guard = self.state.lock();
             guard.subscription_starts.push(start.clone());
+            let is_hanging = guard.hanging_subscription_count > 0;
+            guard.hanging_subscription_count = guard.hanging_subscription_count.saturating_sub(1);
+            is_hanging
+        };
+        if is_hanging {
+            std::future::pending::<()>().await;
+        }
+        let receiver = self.event_tx.subscribe();
+        let (replay, last_replayed_sequence) = {
+            let guard = self.state.lock();
             let latest_sequence = guard.next_event_sequence.saturating_sub(1);
             let resume_after_sequence = match &start {
                 ChainEventStreamStart::AfterCursor(cursor) => {

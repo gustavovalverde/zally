@@ -210,10 +210,18 @@ impl Default for SyncRecoveryPolicy {
 #[non_exhaustive]
 pub struct SyncDriverOptions {
     /// Milliseconds between polling wakeups when no chain event is received.
+    ///
+    /// Every polling wakeup republishes the driver's current [`SyncSnapshot`], whatever its
+    /// phase.
     pub poll_interval_ms: u64,
     /// Maximum [`Wallet::sync`] calls made for one wakeup.
     pub max_sync_iterations_per_wake_count: u32,
     /// Maximum seconds one [`Wallet::sync`] call may run before the driver retries later.
+    ///
+    /// The same bound applies to every other chain-source and submitter call the driver
+    /// awaits: opening the chain-event stream, the visible-tip stall probe, the reorg-window
+    /// read, repairs, and resubmitting reverted withdrawals. A call that outruns it faults like
+    /// an unavailable source, so a source that never answers cannot silence the driver.
     pub sync_timeout_seconds: u64,
     /// Self-healing policy for the driver's repair ladder.
     pub recovery: SyncRecoveryPolicy,
@@ -466,6 +474,12 @@ pub struct SyncSnapshot {
     /// Most recent fault; `None` while healthy.
     pub last_fault: Option<SyncFault>,
     /// Unix milliseconds when this snapshot was published.
+    ///
+    /// While the driver task runs, consecutive snapshots are never further apart than the
+    /// longer of [`SyncDriverOptions::poll_interval_ms`] and
+    /// [`SyncDriverOptions::sync_timeout_seconds`] plus
+    /// [`SyncRecoveryPolicy::fault_backoff_cap_ms`], whatever the phase, so a longer silence
+    /// means the task stopped.
     pub published_at_ms: u64,
 }
 
@@ -871,6 +885,15 @@ impl ClassifiedFault {
             repair: repair_for(error),
         }
     }
+
+    /// A step that outran [`SyncDriverOptions::sync_timeout_seconds`]: a stalled source or
+    /// storage says nothing about the wallet's state, so the step retries.
+    fn timed_out(step_label: &str, timeout_seconds: u64) -> Self {
+        Self {
+            reason: format!("{step_label} exceeded {timeout_seconds} seconds"),
+            repair: SyncRepair::Retry,
+        }
+    }
 }
 
 /// Whether an attempt's committed blocks carry a comparison against the chain.
@@ -1169,22 +1192,34 @@ async fn drain_ready_chain_events(
 
 /// Applies a pending announced reorg, or the ladder's repair while recovering; returns
 /// whether either ran.
+///
+/// Bounded by [`SyncDriverOptions::sync_timeout_seconds`] like a scan attempt, so a repair
+/// whose chain reads never answer faults instead of wedging the driver.
 async fn repair_before_scan(
     ctx: &DriverContext<'_>,
     state: &mut DriverState,
     recovering: bool,
-) -> Result<bool, WalletError> {
-    if is_fork_rewind_due(state, recovering) {
-        if recovering && let Some(recovery) = state.recovery.as_mut() {
-            recovery.attempts_at_rung = recovery.attempts_at_rung.saturating_add(1);
+) -> Result<bool, ClassifiedFault> {
+    let timeout_seconds = ctx.options.sync_timeout_seconds;
+    let repair = async {
+        if is_fork_rewind_due(state, recovering) {
+            if recovering && let Some(recovery) = state.recovery.as_mut() {
+                recovery.attempts_at_rung = recovery.attempts_at_rung.saturating_add(1);
+            }
+            republish_snapshot(ctx.status_tx);
+            apply_pending_reorg(ctx, state).await?;
+            Ok(true)
+        } else if recovering {
+            apply_repair(ctx, state).await?;
+            Ok(true)
+        } else {
+            Ok(false)
         }
-        apply_pending_reorg(ctx, state).await?;
-        Ok(true)
-    } else if recovering {
-        apply_repair(ctx, state).await?;
-        Ok(true)
-    } else {
-        Ok(false)
+    };
+    match timeout(Duration::from_secs(timeout_seconds), repair).await {
+        Ok(Ok(ran)) => Ok(ran),
+        Ok(Err(error)) => Err(ClassifiedFault::from_error(&error)),
+        Err(_elapsed) => Err(ClassifiedFault::timed_out("repair", timeout_seconds)),
     }
 }
 
@@ -1230,16 +1265,17 @@ async fn apply_pending_reorg(
 
 /// Handles one polling wakeup; returns whether the driver should sync.
 ///
-/// While parked this republishes the current snapshot (refreshed `published_at_ms`) so
-/// observers keep receiving the parked reason, and re-arms the full ladder once the reprobe
-/// deadline passes. It also checks a source whose visible tip has not moved for the stall
-/// limit, halting the driver when a fresh epoch read confirms the stall and resuming it
-/// when the tip moves.
+/// Every wakeup first republishes the current snapshot with a fresh `published_at_ms`, in
+/// every phase, so observers can tell a driver idling at the tip from one whose task stopped.
+/// While parked it re-arms the full ladder once the reprobe deadline passes. It also checks a
+/// source whose visible tip has not moved for the stall limit, halting the driver when a
+/// fresh epoch read confirms the stall and resuming it when the tip moves.
 async fn handle_poll_tick(
     ctx: &DriverContext<'_>,
     state: &mut DriverState,
     feed: &mut ChainEventFeed,
 ) -> bool {
+    republish_snapshot(ctx.status_tx);
     if let Some(parked) = state.parked() {
         if parked
             .reprobe_at_ms
@@ -1250,8 +1286,6 @@ async fn handle_poll_tick(
             publish_transition(ctx.status_tx, snapshot, &DriverTransition::ParkReprobe);
             return true;
         }
-        let refreshed = ctx.status_tx.borrow().clone();
-        publish_snapshot(ctx.status_tx, refreshed);
         return false;
     }
     let tip_moved = match ctx.options.visible_tip_stall_limit_ms {
@@ -1267,8 +1301,6 @@ async fn handle_poll_tick(
         check_source_reorg_window(ctx).await;
     }
     if state.source_tip.halted().is_some() {
-        let refreshed = ctx.status_tx.borrow().clone();
-        publish_snapshot(ctx.status_tx, refreshed);
         return false;
     }
     std::mem::take(&mut state.catch_up_pending) || tip_moved
@@ -1286,7 +1318,9 @@ async fn watch_source_tip(
     if !was_halted && !state.source_tip.is_due_for_probe(now_ms, stall_limit_ms) {
         return false;
     }
-    let Ok(chain_epoch) = ctx.chain.current_epoch().await else {
+    let Ok(chain_epoch) =
+        within_call_bound(ctx, "the stall probe", ctx.chain.current_epoch()).await
+    else {
         return false;
     };
     if state.source_tip.observe(chain_epoch.visible_tip(), now_ms) == SourceTipChange::Moved {
@@ -1350,6 +1384,7 @@ async fn publish_source_recovered(ctx: &DriverContext<'_>, state: &mut DriverSta
 /// succeeded yet. A read that fails or times out keeps the prior result, so a window never
 /// read keeps spends and unmineable verdicts held.
 async fn check_source_reorg_window(ctx: &DriverContext<'_>) {
+    republish_snapshot(ctx.status_tx);
     let _ = ctx
         .wallet
         .verify_source_reorg_window(
@@ -1415,8 +1450,8 @@ async fn run_sync_wakeup(
         match repair_before_scan(ctx, state, recovering).await {
             Ok(true) => chain_tip = ChainTipRecord::Stale,
             Ok(false) => {}
-            Err(repair_error) => {
-                record_fault(ctx, state, ClassifiedFault::from_error(&repair_error), None).await;
+            Err(repair_fault) => {
+                record_fault(ctx, state, repair_fault, None).await;
                 continue;
             }
         }
@@ -1483,18 +1518,26 @@ async fn complete_sync(
     state.observe_completed_run(outcome);
     state.last_fault = None;
     let should_continue = should_continue_syncing(outcome, recorded_tip);
-    if !should_continue
-        && let Err(error) = ctx
-            .wallet
-            .reconcile_reverted_broadcasts(ctx.submitter)
-            .await
-    {
-        tracing::warn!(
-            target: "zally::sync",
-            event = "wallet_reverted_broadcast_reconcile_failed",
-            %error,
-            "could not reconcile reverted broadcasts; the next caught-up sync retries"
+    if !should_continue {
+        republish_snapshot(ctx.status_tx);
+        let timeout_seconds = ctx.options.sync_timeout_seconds;
+        let reconcile = timeout(
+            Duration::from_secs(timeout_seconds),
+            ctx.wallet.reconcile_reverted_broadcasts(ctx.submitter),
         );
+        let failure = match reconcile.await {
+            Ok(Ok(())) => None,
+            Ok(Err(error)) => Some(error.to_string()),
+            Err(_elapsed) => Some(format!("reconcile exceeded {timeout_seconds} seconds")),
+        };
+        if let Some(reason) = failure {
+            tracing::warn!(
+                target: "zally::sync",
+                event = "wallet_reverted_broadcast_reconcile_failed",
+                error = %reason,
+                "could not reconcile reverted broadcasts; the next caught-up sync retries"
+            );
+        }
     }
     let phase = if should_continue {
         SyncDriverPhase::Syncing
@@ -1851,10 +1894,7 @@ async fn run_one_sync(
         },
         // A deadline can cut between a chunk reaching storage and the comparison checking it.
         Err(_elapsed) => SyncRunAttempt::Faulted {
-            fault: ClassifiedFault {
-                reason: format!("sync exceeded {} seconds", options.sync_timeout_seconds),
-                repair: SyncRepair::Retry,
-            },
+            fault: ClassifiedFault::timed_out("sync", options.sync_timeout_seconds),
             committed: CommittedChunk::Unchecked,
         },
     }
@@ -2086,12 +2126,48 @@ fn publish_snapshot(status_tx: &watch::Sender<SyncSnapshot>, mut snapshot: SyncS
     let _ = status_tx.send(snapshot);
 }
 
+/// Publishes the current snapshot again with a fresh `published_at_ms`.
+///
+/// Runs on every polling wakeup and before the bounded chain-source and submitter calls that
+/// would otherwise follow one another without a publish, so no wait stretches the gap between
+/// snapshots past one bound.
+fn republish_snapshot(status_tx: &watch::Sender<SyncSnapshot>) {
+    let current = status_tx.borrow().clone();
+    publish_snapshot(status_tx, current);
+}
+
+/// Bounds one chain-source call the driver loop awaits.
+///
+/// A call that outruns [`SyncDriverOptions::sync_timeout_seconds`] fails as
+/// [`ChainSourceError::Unavailable`], so a source that never answers cannot silence the
+/// driver.
+async fn within_call_bound<T>(
+    ctx: &DriverContext<'_>,
+    call_label: &str,
+    call: impl Future<Output = Result<T, ChainSourceError>>,
+) -> Result<T, ChainSourceError> {
+    republish_snapshot(ctx.status_tx);
+    let timeout_seconds = ctx.options.sync_timeout_seconds;
+    timeout(Duration::from_secs(timeout_seconds), call)
+        .await
+        .unwrap_or_else(|_elapsed| {
+            Err(ChainSourceError::Unavailable {
+                reason: format!("{call_label} did not answer within {timeout_seconds} seconds"),
+            })
+        })
+}
+
 async fn open_chain_events(
     ctx: &DriverContext<'_>,
     state: &mut DriverState,
     start: &mut ChainEventStreamStart,
 ) -> Option<ChainEventEnvelopeStream> {
-    match ctx.chain.chain_event_envelopes(start.clone()).await {
+    let subscription = within_call_bound(
+        ctx,
+        "the chain-event subscription",
+        ctx.chain.chain_event_envelopes(start.clone()),
+    );
+    match subscription.await {
         Ok(stream) => {
             let recovered_stream = state.stream_consecutive_faults > 0;
             if recovered_stream {
