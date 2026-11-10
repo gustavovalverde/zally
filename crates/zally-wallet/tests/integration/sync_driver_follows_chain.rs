@@ -295,8 +295,12 @@ impl ChainSource for QuietCountingChainSource {
         self.inner.subtree_roots(epoch, pool, start, count).await
     }
 
-    async fn transaction_status(&self, tx_id: TxId) -> Result<TransactionStatus, ChainSourceError> {
-        self.inner.transaction_status(tx_id).await
+    async fn transaction_status(
+        &self,
+        chain_epoch: ChainEpoch,
+        tx_id: TxId,
+    ) -> Result<TransactionStatus, ChainSourceError> {
+        self.inner.transaction_status(chain_epoch, tx_id).await
     }
 
     async fn transparent_utxos(
@@ -330,6 +334,10 @@ impl ChainSource for QuietCountingChainSource {
         } else {
             Ok(Box::pin(stream::pending()))
         }
+    }
+
+    async fn reorg_window_blocks(&self) -> Result<u32, ChainSourceError> {
+        self.inner.reorg_window_blocks().await
     }
 }
 
@@ -454,6 +462,7 @@ impl ChainSource for StalledChainSource {
 
     async fn transaction_status(
         &self,
+        _chain_epoch: ChainEpoch,
         _tx_id: TxId,
     ) -> Result<TransactionStatus, ChainSourceError> {
         let _ = self.network;
@@ -478,6 +487,10 @@ impl ChainSource for StalledChainSource {
         Ok(Box::pin(stream::pending::<
             Result<ChainEventEnvelope, ChainSourceError>,
         >()))
+    }
+
+    async fn reorg_window_blocks(&self) -> Result<u32, ChainSourceError> {
+        Ok(1_000)
     }
 }
 
@@ -546,8 +559,12 @@ impl ChainSource for RecordingChainSource {
             .await
     }
 
-    async fn transaction_status(&self, tx_id: TxId) -> Result<TransactionStatus, ChainSourceError> {
-        self.inner.transaction_status(tx_id).await
+    async fn transaction_status(
+        &self,
+        chain_epoch: ChainEpoch,
+        tx_id: TxId,
+    ) -> Result<TransactionStatus, ChainSourceError> {
+        self.inner.transaction_status(chain_epoch, tx_id).await
     }
 
     async fn transparent_utxos(
@@ -583,6 +600,10 @@ impl ChainSource for RecordingChainSource {
                 Result<ChainEventEnvelope, ChainSourceError>,
             >()))
         }
+    }
+
+    async fn reorg_window_blocks(&self) -> Result<u32, ChainSourceError> {
+        self.inner.reorg_window_blocks().await
     }
 }
 

@@ -6,10 +6,16 @@
 //! `Wallet::extract_pczt` extracts a finalized PCZT and persists the transaction
 //! in the wallet DB. `Wallet::extract_and_submit_pczt` additionally broadcasts it
 //! via the supplied `Submitter`.
+//!
+//! Each role refuses a PCZT that can never be mined, such as one created before a network
+//! upgrade activated, and releases its inputs. That verdict is safe only while this wallet is
+//! the PCZT's sole broadcaster: a copy extracted and broadcast elsewhere may already be mined,
+//! and recreating its payment would pay twice.
 
 use zally_chain::Submitter;
 use zally_core::{BlockHeight, Network, TxId};
 use zally_pczt::{PcztBytes, Prover, Signer};
+use zally_storage::ProposalRejectionKind;
 
 use crate::error::WalletError;
 use crate::spend::{ProposalPlan, SendOutcome, storage_proposal_request};
@@ -23,17 +29,22 @@ impl Wallet {
     /// storage layer. When `target_expiry_height` is set, the caller-supplied value lands
     /// on `Global::expiry_height` before the upstream IO Finalizer runs, which is the only
     /// stage that can pin a value without invalidating the dummy spends the finalizer
-    /// signs. The returned bytes carry the wallet's network and must be proven and
-    /// authorized via [`Wallet::prove_pczt`] and [`Wallet::sign_pczt`] before submission.
+    /// signs. A ZIP 318 canonical crossing takes its expiry from the ZIP 318 rolling window,
+    /// so a target expiry for one fails with [`WalletError::ProposalRejected`] of kind
+    /// [`ExpiryConflictsWithCanonicalCrossing`](ProposalRejectionKind::ExpiryConflictsWithCanonicalCrossing).
+    /// The returned bytes carry the wallet's network and must be proven and authorized via
+    /// [`Wallet::prove_pczt`] and [`Wallet::sign_pczt`] before submission.
     ///
     /// `not_retryable` on validation failure or insufficient balance; `retryable` on
-    /// transient I/O against the wallet database.
+    /// transient I/O against the wallet database or on inputs locked by a concurrent
+    /// proposal.
     pub async fn propose_pczt(
         &self,
         plan: ProposalPlan,
         target_expiry_height: Option<BlockHeight>,
     ) -> Result<PcztBytes, WalletError> {
         validate_proposal_plan(&plan, self.network())?;
+        self.ensure_source_following()?;
         let raw = self
             .inner
             .storage
@@ -50,10 +61,16 @@ impl Wallet {
     /// [`zally_pczt::PcztError::NoMatchingKeys`] when the wallet's seed cannot authorize any
     /// spend in the PCZT.
     ///
-    /// `not_retryable` on no-matching-keys or upstream signer error; `retryable` on transient
-    /// sealing I/O.
+    /// A PCZT that can never be mined, such as one created before a network upgrade that has
+    /// since activated, fails with [`WalletError::TransactionUnmineable`] before the seed is
+    /// unsealed, and the inputs held for it are released.
+    /// The verdict is safe only while this wallet is the PCZT's sole broadcaster.
+    ///
+    /// `not_retryable` on no-matching-keys, an unmineable PCZT, or upstream signer error;
+    /// `retryable` on transient sealing I/O.
     pub async fn sign_pczt(&self, pczt: &PcztBytes) -> Result<PcztBytes, WalletError> {
         validate_pczt_network(pczt.network(), self.network())?;
+        self.reject_unmineable_pczt(pczt).await?;
         let seed = self
             .inner
             .sealing
@@ -73,10 +90,15 @@ impl Wallet {
     /// with PCZT's distributed-proving model while still giving in-process embedders a
     /// complete path.
     ///
+    /// A PCZT that can never be mined fails with [`WalletError::TransactionUnmineable`]
+    /// before any proof is created, and the inputs held for it are released.
+    /// The verdict is safe only while this wallet is the PCZT's sole broadcaster.
+    ///
     /// `requires_operator` on missing Sapling proving parameters; `not_retryable` on
-    /// malformed PCZT contents; `retryable` on transient sealing I/O.
+    /// malformed PCZT contents or an unmineable PCZT; `retryable` on transient sealing I/O.
     pub async fn prove_pczt(&self, pczt: &PcztBytes) -> Result<PcztBytes, WalletError> {
         validate_pczt_network(pczt.network(), self.network())?;
+        self.reject_unmineable_pczt(pczt).await?;
         let seed = self
             .inner
             .sealing
@@ -131,10 +153,15 @@ impl Wallet {
     /// finalized PCZT as payment-disclosure source material. The returned transaction ID can
     /// be compared with the external submitter's response.
     ///
-    /// `not_retryable` on malformed or incomplete PCZTs; `requires_operator` when Sapling
-    /// verifying parameters are unavailable; `retryable` on transient storage I/O.
+    /// A PCZT that can never be mined fails with [`WalletError::TransactionUnmineable`]
+    /// before its transaction is stored, and the inputs held for it are released.
+    /// The verdict is safe only while this wallet is the PCZT's sole broadcaster.
+    ///
+    /// `not_retryable` on malformed, incomplete, or unmineable PCZTs; `requires_operator` when
+    /// Sapling verifying parameters are unavailable; `retryable` on transient storage I/O.
     pub async fn extract_pczt(&self, pczt: &PcztBytes) -> Result<TxId, WalletError> {
         validate_pczt_network(pczt.network(), self.network())?;
+        self.reject_unmineable_pczt(pczt).await?;
         let extracted = self
             .inner
             .storage
@@ -151,20 +178,26 @@ impl Wallet {
     /// records the spend immediately; the returned `SendOutcome` carries the txid the
     /// submitter accepted after validating that it matches the extracted transaction id.
     ///
-    /// `not_retryable` on malformed PCZTs, missing prover params, or submitter rejection;
-    /// `retryable` on transient submitter or storage I/O.
+    /// A PCZT that can never be mined fails with [`WalletError::TransactionUnmineable`]
+    /// before its transaction is stored or submitted, and the inputs held for it are released.
+    /// The verdict is safe only while this wallet is the PCZT's sole broadcaster.
+    ///
+    /// `not_retryable` on malformed or unmineable PCZTs, missing prover params, or submitter
+    /// rejection; `retryable` on transient submitter or storage I/O.
     pub async fn extract_and_submit_pczt(
         &self,
         pczt: &PcztBytes,
         submitter: &dyn Submitter,
     ) -> Result<SendOutcome, WalletError> {
         validate_pczt_network(pczt.network(), self.network())?;
+        self.ensure_source_following()?;
         if submitter.network() != self.network() {
             return Err(WalletError::NetworkMismatch {
                 storage: self.network(),
                 requested: submitter.network(),
             });
         }
+        self.reject_unmineable_pczt(pczt).await?;
         let prepared = self
             .inner
             .storage
@@ -199,6 +232,7 @@ fn validate_proposal_plan(plan: &ProposalPlan, wallet_network: Network) -> Resul
     }
     if plan.amount_zat.as_u64() == 0 {
         return Err(WalletError::ProposalRejected {
+            kind: ProposalRejectionKind::Other,
             reason: "amount must be positive".into(),
         });
     }

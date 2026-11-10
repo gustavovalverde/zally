@@ -5,6 +5,11 @@
     reason = "fixture helpers are consumed test-by-test; not every test uses every helper"
 )]
 mod fixtures;
+#[allow(
+    dead_code,
+    reason = "reorg fixture helpers are consumed test-by-test; not every test uses every helper"
+)]
+mod reorg_fixtures;
 
 mod capabilities_reports;
 mod circuit_breaker_opens_after_threshold;
@@ -18,18 +23,28 @@ mod list_exposed_addresses_round_trip;
 mod list_unspent_shielded_notes_round_trip;
 mod metrics_snapshot_round_trip;
 mod network_mismatch_fails_closed;
+mod nu7_pczt_round_trip;
 mod observe_emits_scan_progress;
 mod open_or_create_account_round_trip;
 mod open_without_seal_returns_no_sealed_seed;
+mod pending_broadcast_across_nu7_is_released;
 mod pending_transparent_inputs_round_trip;
 mod propose_rejects_memo_on_transparent;
 mod propose_rejects_network_mismatch;
 mod reserve_hold_round_trip;
+mod send_binds_its_key_before_submitting;
 mod send_payment_rejects_stale_target_expiry;
 mod send_payment_short_circuits_on_known_idempotency_key;
+mod shield_judges_maturity_at_the_source_tip;
 mod sync_catches_up_to_tip;
 mod sync_drains_bulk_ranges;
+mod sync_driver_checks_source_reorg_window;
 mod sync_driver_follows_chain;
+mod sync_driver_halts_on_stalled_source;
+mod sync_driver_keeps_publishing;
+mod sync_driver_keeps_the_ledger;
+mod sync_driver_resumes_chain_events;
+mod sync_driver_rewinds_to_fork_point;
 mod sync_driver_self_heals;
 mod sync_driver_slow_progress;
 mod sync_network_mismatch;
@@ -37,6 +52,7 @@ mod sync_observes_committed_progress;
 mod sync_retries_retryable_chain_failures;
 mod sync_skips_tree_root_check_for_empty_pools;
 mod sync_survives_epoch_rotation;
+mod tex_payment_mined_after_a_rebuild;
 mod to_uri_round_trips_through_propose;
 mod transparent_utxo_refresh_decoupled_from_sync;
 #[cfg(feature = "unsafe_plaintext_seed")]

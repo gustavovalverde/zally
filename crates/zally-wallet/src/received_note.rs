@@ -36,6 +36,11 @@ pub struct ShieldedReceiveRecord {
     /// table does not retain the row (e.g., dropped by a reorg rewind).
     pub block_timestamp_ms: u64,
     /// `zcash_client_sqlite` marked this note as change for the receiving account.
+    ///
+    /// The flag only moves from false to true: a wallet migration or a later transaction
+    /// write can flag a note as change after an earlier read or
+    /// `WalletEvent::ShieldedReceiveObserved` reported it as not change. Replays should
+    /// take the latest value.
     pub is_change: bool,
     /// The producing transaction spent at least one input owned by the receiving account,
     /// across Sapling, Orchard, Ironwood, or transparent pools.

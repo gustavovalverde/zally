@@ -41,7 +41,8 @@ The driver:
 - subscribes to `ChainSource::chain_event_envelopes` with an explicit `ChainEventStreamStart`: `EarliestRetained` until the first event is delivered, then `AfterCursor` so a stream reconnect resumes strictly after the last applied cursor;
 - falls back to polling with `poll_interval_ms`;
 - calls `Wallet::sync` repeatedly until the observed tip is reached or `max_sync_iterations_per_wake_count` is exhausted;
-- publishes `SyncSnapshot` values through `SyncHandle::observe_status`;
+- publishes `SyncSnapshot` values through `SyncHandle::observe_status` on every lifecycle transition, and republishes the current one on every polling wakeup in every phase, so consecutive snapshots are never further apart than the longer of `poll_interval_ms` and `sync_timeout_seconds` plus the fault backoff cap while the driver task runs;
+- bounds every chain-source and submitter call it awaits by `sync_timeout_seconds`, so a source that never answers faults instead of silencing the driver;
 - stamps `SyncSnapshot::last_observation` whenever an iteration commits chain state and compares its commitment-tree roots against the chain, whether or not the iteration then faulted in the rest of its post-commit tail;
 - stops through `SyncHandle::close`.
 

@@ -1,12 +1,12 @@
-//! Regression: `Wallet::sync`'s wall-clock cost must not scale with the transparent-UTXO
-//! walk's cost.
+//! Regression: `Wallet::sync` must not wait on the transparent-UTXO walk.
 //!
 //! The transparent-UTXO refresh runs on its own cadence; a slow or numerous-receiver walk
-//! must not slow a scan attempt. This proves the two are decoupled by injecting real
-//! latency into `transparent_utxos` and showing `Wallet::sync`
-//! finishes almost immediately regardless, while `Wallet::refresh_transparent_utxos` still
-//! pays the latency in full when called directly (proving the latency is real, not an
-//! artifact of an empty receiver list).
+//! must not slow a scan attempt. This proves the two are decoupled by injecting real latency
+//! into `transparent_utxos` and showing that `Wallet::sync` scans the whole tip without calling
+//! it, while `Wallet::refresh_transparent_utxos` still pays the latency in full when called
+//! directly (proving the latency is real, not an artifact of an empty receiver list). The proof
+//! counts calls rather than timing `Wallet::sync`, whose own duration depends on the host's
+//! load.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -32,10 +32,6 @@ use super::fixtures::{TestWalletError, TestWalletFixture, create_test_wallet};
 /// this test slow.
 const PER_CALL_LATENCY: Duration = Duration::from_millis(30);
 
-/// Comfortably above what `wallet.sync` should ever take for one chunk on an in-memory mock;
-/// comfortably below what the walk takes once it visits more than a handful of receivers.
-const SYNC_WALL_CLOCK_CEILING: Duration = Duration::from_millis(400);
-
 #[tokio::test]
 async fn sync_wall_clock_is_independent_of_transparent_utxo_latency() -> Result<(), TestError> {
     let TestWalletFixture {
@@ -57,17 +53,11 @@ async fn sync_wall_clock_is_independent_of_transparent_utxo_latency() -> Result<
         transparent_utxos_calls: Arc::clone(&transparent_utxos_calls),
     };
 
-    let started = Instant::now();
     let outcome = wallet.sync(&chain).await?;
-    let elapsed = started.elapsed();
 
     assert_eq!(
         outcome.block_count, 50,
         "the whole tip must scan in one chunk"
-    );
-    assert!(
-        elapsed < SYNC_WALL_CLOCK_CEILING,
-        "wallet.sync must not wait on the transparent-UTXO walk's latency, took {elapsed:?}"
     );
     assert_eq!(
         transparent_utxos_calls.load(Ordering::SeqCst),
@@ -93,11 +83,6 @@ async fn sync_wall_clock_is_independent_of_transparent_utxo_latency() -> Result<
         refresh_elapsed >= PER_CALL_LATENCY * u32::try_from(receivers_visited).unwrap_or(u32::MAX),
         "the walk itself must still pay every receiver's latency when run directly, visited \
          {receivers_visited} receivers in {refresh_elapsed:?}"
-    );
-    assert!(
-        refresh_elapsed > SYNC_WALL_CLOCK_CEILING,
-        "the walk's real cost must exceed what wallet.sync was proven to stay under, took \
-         {refresh_elapsed:?}"
     );
 
     Ok(())
@@ -152,8 +137,12 @@ impl ChainSource for LatentTransparentUtxoChainSource {
             .await
     }
 
-    async fn transaction_status(&self, tx_id: TxId) -> Result<TransactionStatus, ChainSourceError> {
-        self.inner.transaction_status(tx_id).await
+    async fn transaction_status(
+        &self,
+        chain_epoch: ChainEpoch,
+        tx_id: TxId,
+    ) -> Result<TransactionStatus, ChainSourceError> {
+        self.inner.transaction_status(chain_epoch, tx_id).await
     }
 
     async fn transparent_utxos(
@@ -173,6 +162,10 @@ impl ChainSource for LatentTransparentUtxoChainSource {
         start: ChainEventStreamStart,
     ) -> Result<ChainEventEnvelopeStream, ChainSourceError> {
         self.inner.chain_event_envelopes(start).await
+    }
+
+    async fn reorg_window_blocks(&self) -> Result<u32, ChainSourceError> {
+        self.inner.reorg_window_blocks().await
     }
 }
 

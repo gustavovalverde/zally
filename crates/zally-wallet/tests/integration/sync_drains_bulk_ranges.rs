@@ -14,12 +14,12 @@
 //! the tip the opening record captured, which the chain may have passed while the drain ran.
 
 use zally_core::BlockHeight;
-use zally_storage::{Sqlite, SqliteOptions, StorageError, WalletStorage as _};
+use zally_storage::{StorageError, WalletStorage as _};
 use zally_testkit::MockChainSource;
 use zally_wallet::WalletError;
 use zcash_protocol::ShieldedPool;
 
-use super::fixtures::{TestWalletFixture, create_test_wallet};
+use super::fixtures::{TestWalletFixture, create_test_wallet, create_test_wallet_with_storage};
 
 /// `zcash_client_sqlite::VERIFY_LOOKAHEAD`: the width of the `Verify` range that recording a
 /// chain tip queues above the scanned frontier.
@@ -34,11 +34,14 @@ const DISTANT_TIP: u32 = 5_000;
 
 #[tokio::test]
 async fn one_wakeup_drains_a_range_wider_than_the_verify_lookahead() -> Result<(), TestError> {
-    let TestWalletFixture {
-        temp,
-        wallet,
-        account_id: _account_id,
-    } = create_test_wallet().await?;
+    let (
+        TestWalletFixture {
+            temp: _temp,
+            wallet,
+            account_id: _account_id,
+        },
+        storage,
+    ) = create_test_wallet_with_storage().await?;
     let network = wallet.network();
     let chain = MockChainSource::new(network);
 
@@ -47,16 +50,13 @@ async fn one_wakeup_drains_a_range_wider_than_the_verify_lookahead() -> Result<(
         .advance_tip(BlockHeight::from(SETTLED_HEIGHT));
     while wallet.sync(&chain).await?.block_count > 0 {}
 
-    let shards = Sqlite::new(SqliteOptions::for_network(network, temp.db_path()));
-    shards.open_or_create().await?;
-    shards
+    storage
         .put_subtree_roots(
             ShieldedPool::Sapling,
             0,
             vec![(BlockHeight::from(SETTLED_HEIGHT / 2), [0_u8; 32])],
         )
         .await?;
-    drop(shards);
 
     chain.handle().advance_tip(BlockHeight::from(DISTANT_TIP));
 

@@ -21,7 +21,8 @@ use zally_wallet::{
 };
 
 use super::fixtures::{
-    SnapshotWaitError, TestWalletError, TestWalletFixture, create_test_wallet, wait_for_snapshot,
+    SnapshotWaitError, TestWalletError, TestWalletFixture, capture_sync_events, create_test_wallet,
+    wait_for_snapshot,
 };
 
 fn fast_recovery_policy() -> SyncRecoveryPolicy {
@@ -42,11 +43,12 @@ async fn fault_ladder_escalates_through_rewind_to_rescan_then_recovers() -> Resu
     } = create_test_wallet().await?;
     let mut wallet_events = wallet.observe();
     let network = wallet.network();
+    let (_capture_guard, transitions) = capture_sync_events();
 
     let chain = Arc::new(MockChainSource::new(network));
     let chain_handle = chain.handle();
     chain_handle.advance_tip(BlockHeight::from(40));
-    chain_handle.fail_current_epoch_next(3, || ChainSourceError::BlockHeightBelowFloor {
+    chain_handle.fail_current_epoch_next(4, || ChainSourceError::BlockHeightBelowFloor {
         requested_height: BlockHeight::from(10),
         earliest_height: BlockHeight::from(20),
     });
@@ -62,36 +64,26 @@ async fn fault_ladder_escalates_through_rewind_to_rescan_then_recovers() -> Resu
     let handle = driver.sync_continuously();
     let mut snapshots = handle.observe_status();
 
-    let mut saw_rewind = false;
-    let mut saw_rescan = false;
+    // The snapshot stream keeps only the latest snapshot, so a loaded host can skip a
+    // transient rung; the captured transitions record every one.
     let healthy = wait_for_snapshot(&mut snapshots, |snapshot| {
-        if matches!(
-            snapshot.phase,
-            SyncDriverPhase::Recovering {
-                repair: SyncRepair::Rewind,
-                ..
-            }
-        ) {
-            saw_rewind = true;
-        }
-        if matches!(
-            snapshot.phase,
-            SyncDriverPhase::Recovering {
-                repair: SyncRepair::RescanFromBirthday,
-                ..
-            }
-        ) {
-            saw_rescan = true;
-        }
-        saw_rescan && snapshot.phase == SyncDriverPhase::Waiting && snapshot.last_fault.is_none()
+        chain_handle.failures_consumed() == 4
+            && snapshot.phase == SyncDriverPhase::Waiting
+            && snapshot.last_fault.is_none()
     })
     .await?;
 
-    assert!(saw_rewind, "the ladder must pass through the rewind rung");
-    assert!(saw_rescan, "the ladder must reach the rescan rung");
+    assert!(
+        transitions.contains(&format!("repair={}", SyncRepair::Rewind.label())),
+        "the ladder must pass through the rewind rung"
+    );
+    assert!(
+        transitions.contains(SyncRepair::RescanFromBirthday.label()),
+        "the ladder must reach the rescan rung"
+    );
     assert_eq!(healthy.last_fault, None);
     assert!(healthy.last_observation.is_some());
-    assert_eq!(chain_handle.failures_consumed(), 3);
+    assert_eq!(chain_handle.failures_consumed(), 4);
 
     let reset_observed = tokio::time::timeout(Duration::from_secs(2), async {
         while let Some(event) = wallet_events.next().await {
@@ -509,8 +501,12 @@ impl ChainSource for ScriptedChain {
             .await
     }
 
-    async fn transaction_status(&self, tx_id: TxId) -> Result<TransactionStatus, ChainSourceError> {
-        self.inner.transaction_status(tx_id).await
+    async fn transaction_status(
+        &self,
+        chain_epoch: ChainEpoch,
+        tx_id: TxId,
+    ) -> Result<TransactionStatus, ChainSourceError> {
+        self.inner.transaction_status(chain_epoch, tx_id).await
     }
 
     async fn transparent_utxos(
@@ -537,6 +533,10 @@ impl ChainSource for ScriptedChain {
             });
         }
         self.inner.chain_event_envelopes(start).await
+    }
+
+    async fn reorg_window_blocks(&self) -> Result<u32, ChainSourceError> {
+        self.inner.reorg_window_blocks().await
     }
 }
 

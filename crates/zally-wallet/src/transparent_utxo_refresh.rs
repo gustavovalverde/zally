@@ -507,9 +507,10 @@ mod tests {
 
         async fn transaction_status(
             &self,
+            chain_epoch: ChainEpoch,
             tx_id: TxId,
         ) -> Result<TransactionStatus, ChainSourceError> {
-            self.inner.transaction_status(tx_id).await
+            self.inner.transaction_status(chain_epoch, tx_id).await
         }
 
         async fn transparent_utxos(
@@ -533,6 +534,10 @@ mod tests {
             start: ChainEventStreamStart,
         ) -> Result<ChainEventEnvelopeStream, ChainSourceError> {
             self.inner.chain_event_envelopes(start).await
+        }
+
+        async fn reorg_window_blocks(&self) -> Result<u32, ChainSourceError> {
+            self.inner.reorg_window_blocks().await
         }
     }
 }

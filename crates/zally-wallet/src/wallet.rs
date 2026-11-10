@@ -8,16 +8,19 @@ use tokio::sync::broadcast;
 use zally_chain::ChainSource;
 use zally_core::{AccountId, BlockHeight, HoldId, IdempotencyKey, Network, TxId, Zatoshis};
 use zally_keys::{Mnemonic, SealingError, SeedMaterial, SeedSealing};
-use zally_storage::WalletStorage;
+use zally_storage::{ProposalRejectionKind, WalletStorage};
 use zcash_keys::address::UnifiedAddress;
 
 use crate::capabilities::{Capability, SealingCapability, StorageCapability, WalletCapabilities};
-use crate::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig, CircuitBreakerState};
+use crate::circuit_breaker::{CircuitBreaker, CircuitBreakerState};
 use crate::error::WalletError;
 use crate::event::{WalletEvent, WalletEventStream};
 use crate::hold::{Hold, LockedNotesSummary};
+use crate::idempotency_key_locks::IdempotencyKeyLocks;
 use crate::options::WalletOptions;
 use crate::retry::RetryPolicy;
+use crate::source_halt::SourceHalt;
+use crate::source_reorg_window::SourceReorgWindowCheck;
 use crate::sync::fetch_prior_chain_state;
 
 const EVENT_CHANNEL_CAPACITY: usize = 1024;
@@ -42,6 +45,20 @@ pub(crate) struct WalletInner {
     pub(crate) retry_policy: Mutex<RetryPolicy>,
     pub(crate) circuit_breaker: CircuitBreaker,
     pub(crate) options: WalletOptions,
+    pub(crate) idempotency_key_locks: IdempotencyKeyLocks,
+    /// Set by the sync driver while the chain source has stopped following the chain.
+    pub(crate) source_halt: Mutex<Option<SourceHalt>>,
+    /// What the sync driver last established about the chain source's reorg window.
+    pub(crate) source_reorg_window: Mutex<SourceReorgWindowCheck>,
+    /// Visible tip of the chain source epoch the wallet pinned most recently; `None` until
+    /// this process pins one.
+    pub(crate) source_visible_tip_height: Mutex<Option<BlockHeight>>,
+    /// Pending broadcasts whose unmineable verdict currently waits, reported once each.
+    pub(crate) withheld_verdicts: Mutex<std::collections::HashSet<TxId>>,
+    /// Paying transactions of sends the scan may have passed without recognizing them mined,
+    /// as of the last scan step; `None`, which holds every verdict, until a scan step in this
+    /// process stores the carried send steps.
+    pub(crate) scan_blind_sends: Mutex<Option<std::collections::HashSet<TxId>>>,
 }
 
 impl Wallet {
@@ -119,16 +136,16 @@ impl Wallet {
         *self.inner.retry_policy.lock() = policy;
     }
 
-    /// Discards the wallet database and rebuilds it from the sealed seed at the account
-    /// birthday.
+    /// Rebuilds the wallet's derived chain state from the sealed seed at the account
+    /// birthday, keeping the payment ledger.
     ///
     /// The deepest repair rung of the sync driver: wallet chain state is disposable derived
     /// state, so when it can no longer be reconciled with the chain the wallet rebuilds it
     /// from first principles. Reads the birthday before any destructive step, then
     /// recreates the database with a fresh account for the unsealed seed and publishes
-    /// [`WalletEvent::DerivedStateReset`] so hosts observe the rebuild. The ledger (send
-    /// idempotency records, holds, pending broadcasts) is dropped with the database; chain
-    /// state rebuilds by rescan.
+    /// [`WalletEvent::DerivedStateReset`] so hosts observe the rebuild. Chain state rebuilds
+    /// by rescan. The payment ledger survives: send idempotency records, holds, finalized
+    /// PCZTs, pending broadcasts, reverted broadcasts, and the chain-event cursor.
     ///
     /// The storage layer derives the [`AccountId`] deterministically from the seed, so the
     /// account id does not change across the rebuild; handles holding the prior id keep
@@ -224,11 +241,14 @@ impl Wallet {
             .collect())
     }
 
-    /// Returns the snapshot of transparent outpoints recorded for recent wallet-owned
-    /// broadcasts that have not yet been observed mined.
+    /// Returns the snapshot of transparent outpoints recorded for wallet-owned broadcasts whose
+    /// fate the chain has not settled.
     ///
-    /// The snapshot honours [`WalletOptions::pending_broadcast_window_ms`]: entries whose
-    /// `broadcast_at_ms` falls outside the window is excluded from this operator read view.
+    /// An entry stays until [`Wallet::sync`] sees its broadcast mined at a settled height, or
+    /// judges it unmineable and reports it through
+    /// [`WalletEvent::PendingBroadcastUnmineable`]. An entry broadcast longer ago than
+    /// [`WalletOptions::pending_broadcast_window_ms`] is flagged
+    /// [`is_stale`](crate::PendingTransparentInput::is_stale), never dropped.
     /// librustzcash's lock, persisted-spend, and transaction-expiry state independently
     /// determines whether an outpoint is eligible for selection.
     ///
@@ -237,12 +257,12 @@ impl Wallet {
         &self,
         account_id: AccountId,
     ) -> Result<crate::pending_transparent_inputs::PendingTransparentInputs, WalletError> {
-        let after_at_ms =
+        let stale_before_ms =
             current_unix_ms().saturating_sub(self.inner.options.pending_broadcast_window_ms);
         let rows = self
             .inner
             .storage
-            .list_pending_broadcast_inputs(account_id, after_at_ms)
+            .list_pending_broadcast_inputs(account_id, 0)
             .await
             .map_err(WalletError::from)?;
         let as_of_height = self
@@ -253,7 +273,7 @@ impl Wallet {
             .map_err(WalletError::from)?;
         let inputs = rows
             .into_iter()
-            .map(translate_pending_broadcast_input)
+            .map(|row| translate_pending_broadcast_input(row, stale_before_ms))
             .collect();
         Ok(
             crate::pending_transparent_inputs::PendingTransparentInputs {
@@ -420,6 +440,7 @@ impl Wallet {
         } = plan;
         if amount_zat.as_u64() == 0 {
             return Err(WalletError::ProposalRejected {
+                kind: ProposalRejectionKind::Other,
                 reason: "reservation amount must be greater than zero zatoshis".into(),
             });
         }
@@ -560,6 +581,43 @@ impl Wallet {
     /// Publishes an event. Best-effort: silently no-ops if no observers are attached.
     pub(crate) fn publish_event(&self, event: WalletEvent) {
         let _ = self.inner.event_tx.send(event);
+    }
+
+    pub(crate) fn set_source_halt(&self, cause: Option<SourceHalt>) {
+        *self.inner.source_halt.lock() = cause;
+    }
+
+    pub(crate) fn record_source_visible_tip(&self, visible_tip_height: BlockHeight) {
+        *self.inner.source_visible_tip_height.lock() = Some(visible_tip_height);
+    }
+
+    pub(crate) fn source_visible_tip_height(&self) -> Option<BlockHeight> {
+        *self.inner.source_visible_tip_height.lock()
+    }
+
+    /// Refuses a new spend while the sync driver reports the chain source halted, or its
+    /// reorg window below the driver's minimum or not yet read.
+    pub(crate) fn ensure_source_following(&self) -> Result<(), WalletError> {
+        let source_halt = *self.inner.source_halt.lock();
+        if let Some(cause) = source_halt {
+            return Err(WalletError::ChainSourceHalted { cause });
+        }
+        let Some(required_blocks) = self.inner.options.minimum_source_reorg_window_blocks else {
+            return Ok(());
+        };
+        let reorg_window = *self.inner.source_reorg_window.lock();
+        match reorg_window {
+            SourceReorgWindowCheck::Unverified => {
+                Err(WalletError::SourceReorgWindowUnverified { required_blocks })
+            }
+            SourceReorgWindowCheck::TooShallow {
+                reorg_window_blocks,
+            } => Err(WalletError::SourceReorgWindowTooShallow {
+                reorg_window_blocks,
+                required_blocks,
+            }),
+            SourceReorgWindowCheck::Unchecked | SourceReorgWindowCheck::Sufficient => Ok(()),
+        }
     }
 
     /// Returns the number of subscribers currently attached to [`Wallet::observe`].
@@ -745,8 +803,14 @@ where
         base_capabilities: capabilities,
         event_tx,
         retry_policy: Mutex::new(RetryPolicy::default()),
-        circuit_breaker: CircuitBreaker::new(CircuitBreakerConfig::default()),
+        circuit_breaker: CircuitBreaker::new(options.circuit_breaker),
         options,
+        idempotency_key_locks: IdempotencyKeyLocks::default(),
+        source_halt: Mutex::new(None),
+        source_reorg_window: Mutex::new(SourceReorgWindowCheck::Unchecked),
+        source_visible_tip_height: Mutex::new(None),
+        withheld_verdicts: Mutex::new(std::collections::HashSet::new()),
+        scan_blind_sends: Mutex::new(None),
     });
     Wallet { inner }
 }
@@ -881,6 +945,7 @@ fn select_locked_notes(
 
 fn translate_pending_broadcast_input(
     row: zally_storage::PendingBroadcastInputRow,
+    stale_before_ms: u64,
 ) -> crate::pending_transparent_inputs::PendingTransparentInput {
     crate::pending_transparent_inputs::PendingTransparentInput {
         outpoint: row.outpoint,
@@ -888,6 +953,7 @@ fn translate_pending_broadcast_input(
         broadcast_tx_id: row.broadcast_tx_id,
         broadcast_at_ms: row.broadcast_at_ms,
         broadcast_at_height: row.broadcast_at_height,
+        is_stale: row.broadcast_at_ms < stale_before_ms,
     }
 }
 

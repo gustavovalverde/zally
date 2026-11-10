@@ -7,9 +7,10 @@
 
 use zally_chain::{ShieldedPool, Submitter};
 use zally_core::{
-    AccountId, BlockHeight, IdempotencyKey, Memo, MemoBytes, Network, OutPoint, PaymentRecipient,
-    TxId, Zatoshis,
+    AccountId, BlockHeight, IdempotencyKey, Memo, MemoBytes, Network, PaymentRecipient, TxId,
+    Zatoshis,
 };
+use zally_storage::ProposalRejectionKind;
 
 use crate::error::WalletError;
 use crate::wallet::{Wallet, current_unix_ms};
@@ -24,14 +25,7 @@ struct SubmissionContext<'a> {
     submitter: &'a dyn Submitter,
     account_id: AccountId,
     visible_tip: Option<BlockHeight>,
-}
-
-/// Pending-broadcast row contents derived from one prepared transaction.
-struct PendingBroadcastSnapshot {
-    broadcast_tx_id: TxId,
-    broadcast_at_ms: u64,
-    visible_tip: Option<BlockHeight>,
-    inputs: Vec<(OutPoint, Zatoshis)>,
+    idempotency: &'a IdempotencyKey,
 }
 
 /// Parsed ZIP-321 payment request.
@@ -136,32 +130,50 @@ impl ParsedPayment {
 }
 
 fn classify_recipient(encoded: &str, network: Network) -> PaymentRecipient {
-    // Best-effort classification by encoded prefix. Authoritative disambiguation happens
-    // in `zcash_address` at proposal time; the Zally guards distinguish the four shapes
-    // below based on the encoded prefix.
-    if encoded.starts_with("tex") {
-        PaymentRecipient::TexAddress {
+    let parsed_kind = encoded
+        .parse::<zcash_address::ZcashAddress>()
+        .ok()
+        .and_then(|address| address.convert::<zcash_keys::address::Address>().ok());
+    match parsed_kind {
+        Some(zcash_keys::address::Address::Unified(_)) => PaymentRecipient::UnifiedAddress {
             encoded: encoded.to_owned(),
             network,
-        }
-    } else if encoded.starts_with('u') {
-        PaymentRecipient::UnifiedAddress {
+        },
+        Some(zcash_keys::address::Address::Sapling(_)) => PaymentRecipient::SaplingAddress {
             encoded: encoded.to_owned(),
             network,
+        },
+        Some(zcash_keys::address::Address::Transparent(_)) => {
+            PaymentRecipient::TransparentAddress {
+                encoded: encoded.to_owned(),
+                network,
+            }
         }
-    } else if encoded.starts_with("zs")
-        || encoded.starts_with("ztestsapling")
-        || encoded.starts_with("zregtestsapling")
-    {
-        PaymentRecipient::SaplingAddress {
+        Some(zcash_keys::address::Address::Tex(_)) => PaymentRecipient::TexAddress {
             encoded: encoded.to_owned(),
             network,
-        }
-    } else {
-        PaymentRecipient::TransparentAddress {
+        },
+        None if encoded.starts_with("tex") => PaymentRecipient::TexAddress {
             encoded: encoded.to_owned(),
             network,
+        },
+        None if encoded.starts_with('u') => PaymentRecipient::UnifiedAddress {
+            encoded: encoded.to_owned(),
+            network,
+        },
+        None if encoded.starts_with("zs")
+            || encoded.starts_with("ztestsapling")
+            || encoded.starts_with("zregtestsapling") =>
+        {
+            PaymentRecipient::SaplingAddress {
+                encoded: encoded.to_owned(),
+                network,
+            }
         }
+        None => PaymentRecipient::TransparentAddress {
+            encoded: encoded.to_owned(),
+            network,
+        },
     }
 }
 
@@ -333,8 +345,19 @@ impl Wallet {
     /// Calls `WalletStorage::prepare_payment` to run `propose_transfer` +
     /// `create_proposed_transactions` against the live `WalletDb` using a `LocalTxProver`
     /// loaded from the platform-default Sapling params location, then submits the raw
-    /// transaction bytes through the supplied `Submitter`. Returns the first txid; multi-step
-    /// proposals submit each step in order and return the first.
+    /// transaction bytes through the supplied `Submitter`. Multi-step proposals (ZIP 320)
+    /// submit each step in order; the returned transaction is the last one, which pays the
+    /// recipient.
+    ///
+    /// `plan.idempotency` makes the send idempotent. The key is bound to the paying
+    /// transaction before anything is submitted. A key that already names a transaction
+    /// returns that transaction instead of building another, while the transaction is pending
+    /// or mined, including after a submit error that may have reached the node or a node
+    /// rejection; one the wallet has not seen mined is submitted again first, so `Ok` means a
+    /// node accepted, holds, or mined it. Once [`Wallet::sync`] judges it unmineable and reports
+    /// [`WalletEvent::PendingBroadcastUnmineable`](crate::WalletEvent::PendingBroadcastUnmineable),
+    /// the same key builds one replacement. Sends that share a key through one wallet handle
+    /// run one at a time, so concurrent retries return the same transaction.
     ///
     /// `not_retryable` on validation failure, insufficient balance, or missing prover
     /// params; `retryable` on transient submitter failures.
@@ -356,25 +379,18 @@ impl Wallet {
             });
         }
 
-        if let Some(prior_tx_id) = self
+        let _key_guard = self
             .inner
-            .storage
-            .find_idempotent_submission(&plan.idempotency)
+            .idempotency_key_locks
+            .lock(&plan.idempotency)
+            .await;
+        if let Some(bound) = self
+            .resubmit_bound_send(&plan.idempotency, plan.submitter, "send_payment.resubmit")
             .await?
         {
-            let broadcast_at_height = self.visible_tip_or_zero().await?;
-            return Ok(SendOutcome {
-                signed: SignedPczt {
-                    tx_id: prior_tx_id,
-                    fee_zat: zally_core::Zatoshis::zero(),
-                    tx_expiry_height: BlockHeight::from(0),
-                },
-                broadcast: BroadcastOutcome {
-                    tx_id: prior_tx_id,
-                    broadcast_at_height,
-                },
-            });
+            return Ok(bound);
         }
+        self.ensure_source_following()?;
 
         let prepared = if let Some(target) = plan.target_expiry_height {
             self.prepare_send_with_target_expiry(&plan, target).await?
@@ -409,14 +425,10 @@ impl Wallet {
                     submitter: plan.submitter,
                     account_id: plan.account_id,
                     visible_tip,
+                    idempotency: &plan.idempotency,
                 },
                 prepared,
             )
-            .await?;
-
-        self.inner
-            .storage
-            .record_idempotent_submission(plan.idempotency, result_tx_id)
             .await?;
 
         Ok(SendOutcome {
@@ -508,6 +520,23 @@ impl Wallet {
     /// caller should run [`Wallet::sync`] first so transparent UTXOs have been refreshed from
     /// the configured [`zally_chain::ChainSource`].
     ///
+    /// Every transparent input needs 100 confirmations at the lower of the wallet's chain tip
+    /// and the visible tip of the chain-source epoch the wallet pinned most recently. A source
+    /// that fell below the tip the wallet recorded, for example a node restarted onto a
+    /// shorter branch, mines the shielding transaction above its own tip, so an output mature
+    /// only against the wallet's tip waits for a later call. When what remains is below
+    /// `plan.shielding_threshold_zat`, the call fails with [`WalletError::InsufficientBalance`]
+    /// and submits nothing.
+    ///
+    /// `plan.idempotency` makes the send idempotent, as for [`Wallet::send_payment`]: the key
+    /// is bound to the shielding transaction before it is submitted, and a key that already
+    /// names a transaction returns that transaction instead of building another, submitting
+    /// it again while the wallet has not seen it mined. Once [`Wallet::sync`] judges it
+    /// unmineable and reports
+    /// [`WalletEvent::PendingBroadcastUnmineable`](crate::WalletEvent::PendingBroadcastUnmineable),
+    /// the same key builds one replacement. Sends that share a key through one wallet handle
+    /// run one at a time, so concurrent retries return the same transaction.
+    ///
     /// `not_retryable` on insufficient transparent funds or missing prover params;
     /// `retryable` on transient submitter failures.
     pub async fn shield_transparent_funds(
@@ -522,25 +551,22 @@ impl Wallet {
             });
         }
 
-        if let Some(prior_tx_id) = self
+        let _key_guard = self
             .inner
-            .storage
-            .find_idempotent_submission(&plan.idempotency)
+            .idempotency_key_locks
+            .lock(&plan.idempotency)
+            .await;
+        if let Some(bound) = self
+            .resubmit_bound_send(
+                &plan.idempotency,
+                plan.submitter,
+                "shield_transparent_funds.resubmit",
+            )
             .await?
         {
-            let broadcast_at_height = self.visible_tip_or_zero().await?;
-            return Ok(SendOutcome {
-                signed: SignedPczt {
-                    tx_id: prior_tx_id,
-                    fee_zat: zally_core::Zatoshis::zero(),
-                    tx_expiry_height: BlockHeight::from(0),
-                },
-                broadcast: BroadcastOutcome {
-                    tx_id: prior_tx_id,
-                    broadcast_at_height,
-                },
-            });
+            return Ok(bound);
         }
+        self.ensure_source_following()?;
 
         let seed = self
             .inner
@@ -548,7 +574,10 @@ impl Wallet {
             .unseal_seed()
             .await
             .map_err(WalletError::from)?;
-        let shielding_request = resolve_shielding_request(&plan)?;
+        let mut shielding_request = resolve_shielding_request(&plan)?;
+        if let Some(source_tip_height) = self.source_visible_tip_height() {
+            shielding_request = shielding_request.with_source_tip_height(source_tip_height);
+        }
         let prepared = self
             .inner
             .storage
@@ -563,14 +592,10 @@ impl Wallet {
                     submitter: plan.submitter,
                     account_id: plan.account_id,
                     visible_tip,
+                    idempotency: &plan.idempotency,
                 },
                 prepared,
             )
-            .await?;
-
-        self.inner
-            .storage
-            .record_idempotent_submission(plan.idempotency, result_tx_id)
             .await?;
 
         Ok(SendOutcome {
@@ -586,94 +611,165 @@ impl Wallet {
         })
     }
 
-    /// Submits each prepared transaction, recording its outpoints in the pending-broadcast
-    /// filter **before** the submit call so a crash between submit-accept and
-    /// row-persistence cannot leave an in-flight broadcast unrecorded. On submit rejection
-    /// the just-recorded row is removed so the outpoints become spendable again.
+    /// Submits the prepared transactions in order, after durably recording the send.
     ///
-    /// Returns the first transaction's `(tx_id, tx_expiry_height)` pair so callers can
+    /// The last transaction is the one that pays; earlier steps of a multi-step proposal
+    /// (ZIP 320) only fund it. Before anything is submitted, one storage transaction binds
+    /// the idempotency key to the paying transaction and records every transaction's
+    /// transparent inputs as pending. A lost submit acknowledgement or a crash after the
+    /// broadcast therefore leaves the key bound, and a retry with the same key returns the
+    /// paying transaction instead of building and paying a second one.
+    ///
+    /// A failed step releases the binding only when the paying transaction can no longer be
+    /// mined: the failure stopped the send before the paying transaction reached a submitter
+    /// (an open circuit breaker never calls it, see [`is_unsubmitted`]). The released
+    /// transactions lose their pending rows, while an earlier step a node may hold keeps them.
+    /// Any other failure of the paying transaction, a node rejection included, may have
+    /// reached the node and keeps everything; the pending-broadcast verdict frees the key if
+    /// that transaction is never mined.
+    ///
+    /// Returns the paying transaction's `(tx_id, tx_expiry_height)` pair so callers can
     /// pass expiry through to consumers that need to bound their wait for confirmation.
     async fn submit_and_record_pending(
         &self,
         submission: SubmissionContext<'_>,
         prepared: Vec<zally_storage::PreparedTransaction>,
     ) -> Result<(TxId, BlockHeight), WalletError> {
-        let mut first_result = None;
+        let Some(paying) = prepared.last() else {
+            return Err(WalletError::ProposalRejected {
+                kind: ProposalRejectionKind::Other,
+                reason: "transaction construction returned no transactions".into(),
+            });
+        };
+        let paying_result = (paying.tx_id, paying.tx_expiry_height);
         let broadcast_at_ms = current_unix_ms();
-        for transaction in prepared {
-            let tx_expiry_height = transaction.tx_expiry_height;
-            self.record_broadcast_inputs(
-                submission.account_id,
-                PendingBroadcastSnapshot {
-                    broadcast_tx_id: transaction.tx_id,
-                    broadcast_at_ms,
-                    visible_tip: submission.visible_tip,
-                    inputs: transaction.transparent_inputs.clone(),
-                },
-            )
+        let records = prepared
+            .iter()
+            .map(|transaction| zally_storage::PendingBroadcastRecord {
+                broadcast_tx_id: transaction.tx_id,
+                account_id: submission.account_id,
+                broadcast_at_ms,
+                broadcast_at_height: submission.visible_tip,
+                inputs: transaction.transparent_inputs.clone(),
+            })
+            .collect();
+        self.inner
+            .storage
+            .record_pending_submission(submission.idempotency.clone(), paying_result.0, records)
             .await?;
 
+        for (step_index, transaction) in prepared.iter().enumerate() {
             let policy = self.broadcast_retry_policy();
-            let outcome = crate::retry::with_breaker_and_retry(
+            let submitted = crate::retry::with_breaker_and_retry(
                 &self.inner.circuit_breaker,
                 policy,
                 submission.operation,
                 || submission.submitter.submit(&transaction.raw_bytes),
                 WalletError::from,
             )
-            .await;
-            let outcome = match outcome {
-                Ok(outcome) => outcome,
-                Err(err) => {
-                    self.clear_pending_after_failed_submit(transaction.tx_id)
-                        .await;
-                    return Err(err);
-                }
+            .await
+            .and_then(|outcome| resolve_send_outcome(outcome, transaction.tx_id));
+            let Err(error) = submitted else {
+                continue;
             };
-            let tx_id = match resolve_send_outcome(outcome, transaction.tx_id) {
-                Ok(tx_id) => tx_id,
-                Err(err) => {
-                    self.clear_pending_after_failed_submit(transaction.tx_id)
-                        .await;
-                    return Err(err);
-                }
+            let never_mined_from = if is_unsubmitted(&error) {
+                step_index
+            } else {
+                step_index.saturating_add(1)
             };
-            if first_result.is_none() {
-                first_result = Some((tx_id, tx_expiry_height));
+            let never_mined: Vec<TxId> = prepared
+                .get(never_mined_from..)
+                .unwrap_or_default()
+                .iter()
+                .map(|step| step.tx_id)
+                .collect();
+            if !never_mined.is_empty()
+                && let Err(release_error) = self
+                    .inner
+                    .storage
+                    .release_pending_submission(never_mined)
+                    .await
+            {
+                tracing::error!(
+                    target: "zally::wallet",
+                    event = "pending_submission_release_failed",
+                    %release_error,
+                    %error,
+                    "send failed and its idempotency key stays bound until the pending-broadcast verdict"
+                );
+            }
+            return Err(error);
+        }
+        Ok(paying_result)
+    }
+
+    /// Returns the transaction `key` already names, or `None` when it names none.
+    ///
+    /// A transaction the wallet holds bytes for and has not seen mined is submitted again
+    /// first, after every earlier step of its send that the wallet has not seen mined, in
+    /// submission order: the send that bound the key may have failed before any node received
+    /// them, and a retry that only returned the identifier would report a payment nobody
+    /// broadcast. The same bytes cannot pay twice. A node that already holds or mined a
+    /// transaction answers with a duplicate. A submit error or rejection is returned, and the
+    /// key stays bound. A step the next block can no longer include fails the retry with
+    /// [`WalletError::PendingBroadcastUnsettled`] until the pending-broadcast verdict settles
+    /// the send. A transaction the wallet holds no bytes for is returned as it is: the wallet
+    /// has seen it mined, or the key was recorded outside a send.
+    ///
+    /// Runs before the source-health refusal, so a key that already names a transaction keeps
+    /// answering with it while new spends are refused.
+    async fn resubmit_bound_send(
+        &self,
+        key: &IdempotencyKey,
+        submitter: &dyn Submitter,
+        operation: &'static str,
+    ) -> Result<Option<SendOutcome>, WalletError> {
+        let Some(tx_id) = self.inner.storage.find_idempotent_submission(key).await? else {
+            return Ok(None);
+        };
+        let steps = self.inner.storage.list_send_steps(tx_id).await?;
+        let paying = steps.iter().find(|step| step.tx_id == tx_id);
+        let tx_expiry_height = paying
+            .and_then(|step| step.raw_bytes.as_deref())
+            .and_then(|raw_bytes| zally_chain::parse_transaction_expiry_height(raw_bytes).ok())
+            .unwrap_or_else(|| BlockHeight::from(0));
+        let visible_tip = self.inner.storage.find_visible_tip().await?;
+        let is_paying_pending =
+            paying.is_some_and(|step| step.mined_height.is_none() && step.raw_bytes.is_some());
+        if is_paying_pending {
+            for step in steps.iter().filter(|step| step.mined_height.is_none()) {
+                let Some(raw_bytes) = step.raw_bytes.as_deref() else {
+                    continue;
+                };
+                if visible_tip.is_some_and(|tip| !self.can_enter_next_block(raw_bytes, tip)) {
+                    return Err(WalletError::PendingBroadcastUnsettled {
+                        tx_id,
+                        tx_expiry_height,
+                    });
+                }
+                let outcome = crate::retry::with_breaker_and_retry(
+                    &self.inner.circuit_breaker,
+                    self.broadcast_retry_policy(),
+                    operation,
+                    || submitter.submit(raw_bytes),
+                    WalletError::from,
+                )
+                .await?;
+                resolve_send_outcome(outcome, step.tx_id)?;
             }
         }
-        first_result.ok_or_else(|| WalletError::ProposalRejected {
-            reason: "transaction construction returned no transactions".into(),
-        })
-    }
-
-    async fn record_broadcast_inputs(
-        &self,
-        account_id: AccountId,
-        snapshot: PendingBroadcastSnapshot,
-    ) -> Result<(), WalletError> {
-        if snapshot.inputs.is_empty() {
-            return Ok(());
-        }
-        self.inner
-            .storage
-            .record_pending_broadcast_inputs(zally_storage::PendingBroadcastRecord {
-                broadcast_tx_id: snapshot.broadcast_tx_id,
-                account_id,
-                broadcast_at_ms: snapshot.broadcast_at_ms,
-                broadcast_at_height: snapshot.visible_tip,
-                inputs: snapshot.inputs,
-            })
-            .await
-            .map_err(WalletError::from)
-    }
-
-    async fn clear_pending_after_failed_submit(&self, broadcast_tx_id: TxId) {
-        let _ = self
-            .inner
-            .storage
-            .clear_pending_broadcast_inputs_for_mined(&[broadcast_tx_id])
-            .await;
+        let broadcast_at_height = visible_tip.unwrap_or_else(|| BlockHeight::from(0));
+        Ok(Some(SendOutcome {
+            signed: SignedPczt {
+                tx_id,
+                fee_zat: zally_core::Zatoshis::zero(),
+                tx_expiry_height,
+            },
+            broadcast: BroadcastOutcome {
+                tx_id,
+                broadcast_at_height,
+            },
+        }))
     }
 
     async fn visible_tip_or_zero(&self) -> Result<BlockHeight, WalletError> {
@@ -684,6 +780,19 @@ impl Wallet {
             .await?
             .unwrap_or_else(|| BlockHeight::from(0)))
     }
+}
+
+/// Whether a failed submission never reached a submitter, so its transaction can never be
+/// mined.
+///
+/// An open circuit breaker fails the call before any submitter sees the transaction. A node
+/// rejection never counts: the chain source types a rejection by matching the node's
+/// free-form message, a reason such as an expired or wrong-branch verdict describes the
+/// node's tip at one attempt rather than every block, and an earlier attempt whose
+/// acknowledgement was lost may already have been accepted. A rejection therefore keeps the
+/// key bound until the pending-broadcast verdict frees it.
+const fn is_unsubmitted(error: &WalletError) -> bool {
+    matches!(error, WalletError::CircuitBroken { .. })
 }
 
 fn resolve_shielding_request(
@@ -710,6 +819,7 @@ pub(crate) fn protocol_shielded_pool(
         ShieldedPool::Ironwood => zcash_protocol::ShieldedPool::Ironwood,
         _ => {
             return Err(WalletError::ProposalRejected {
+                kind: ProposalRejectionKind::Other,
                 reason: "shielded pool is not supported by this release".into(),
             });
         }
@@ -851,7 +961,9 @@ pub struct SendPaymentPlan<'submitter> {
     ///
     /// When set, the wallet builds the transaction through the PCZT path and sets
     /// `global.expiry_height` before the IO Finalizer, prover, and signer run. When
-    /// `None`, the wallet uses its own chain-tip-derived default.
+    /// `None`, the wallet uses its own chain-tip-derived default. A ZIP 318 canonical
+    /// crossing refuses a target with [`WalletError::ProposalRejected`] of kind
+    /// [`ExpiryConflictsWithCanonicalCrossing`](ProposalRejectionKind::ExpiryConflictsWithCanonicalCrossing).
     pub target_expiry_height: Option<BlockHeight>,
     /// Submitter that delivers the signed transaction.
     pub submitter: &'submitter dyn Submitter,
@@ -970,16 +1082,45 @@ fn validate_memo_against_recipient(
     if matches!(memo, Memo::Empty) {
         return Ok(());
     }
-    if recipient.is_transparent() {
+    if recipient.is_transparent() || is_transparent_only_unified_address(recipient) {
         Err(WalletError::MemoOnTransparentRecipient)
     } else {
         Ok(())
     }
 }
 
+/// Whether `recipient` is a Unified Address whose only receivers are transparent.
+///
+/// `zcash_client_backend` pays a Unified Address through its transparent receiver when it
+/// has no shielded one, so a memo cannot be delivered. ZIP 316 Revision 2 makes such
+/// addresses encodable (`tu…`).
+fn is_transparent_only_unified_address(recipient: &PaymentRecipient) -> bool {
+    let PaymentRecipient::UnifiedAddress { encoded, network } = recipient else {
+        return false;
+    };
+    encoded
+        .parse::<zcash_address::ZcashAddress>()
+        .ok()
+        .and_then(|address| {
+            address
+                .convert_if_network::<zcash_keys::address::Address>(
+                    zcash_protocol::consensus::Parameters::network_type(&network.to_parameters()),
+                )
+                .ok()
+        })
+        .is_some_and(|address| {
+            matches!(
+                address,
+                zcash_keys::address::Address::Unified(unified)
+                    if !unified.has_orchard() && !unified.has_sapling()
+            )
+        })
+}
+
 fn validate_non_zero(amount_zat: Zatoshis) -> Result<(), WalletError> {
     if amount_zat.as_u64() == 0 {
         Err(WalletError::ProposalRejected {
+            kind: ProposalRejectionKind::Other,
             reason: "amount must be greater than zero zatoshis".into(),
         })
     } else {
@@ -1049,6 +1190,129 @@ mod tests {
                 encoded: recipient_encoded,
                 network: Network::Testnet,
             } if recipient_encoded == encoded
+        ));
+    }
+
+    fn golden_ufvk(
+        network: Network,
+    ) -> Result<zcash_keys::keys::UnifiedFullViewingKey, WalletError> {
+        let seed = zally_keys::SeedMaterial::from_raw_bytes(vec![0x5a; 32]).map_err(|err| {
+            WalletError::PaymentRequestParseFailed {
+                reason: err.to_string(),
+            }
+        })?;
+        Ok(zally_keys::derive_ufvk(
+            network,
+            &seed,
+            zip32::AccountId::ZERO,
+        )?)
+    }
+
+    fn encode_revision_2(
+        network: Network,
+        address: &zcash_keys::address::UnifiedAddress,
+    ) -> Result<String, WalletError> {
+        address
+            .encode_revision(
+                &network.to_parameters(),
+                zcash_address::unified::Revision::R2,
+            )
+            .map_err(|err| WalletError::PaymentRequestParseFailed {
+                reason: err.to_string(),
+            })
+    }
+
+    fn default_address(
+        network: Network,
+        request: zcash_keys::keys::UnifiedAddressRequest,
+    ) -> Result<zcash_keys::address::UnifiedAddress, WalletError> {
+        golden_ufvk(network)?
+            .default_address(request)
+            .map(|(address, _index)| address)
+            .map_err(|err| WalletError::PaymentRequestParseFailed {
+                reason: format!("{err:?}"),
+            })
+    }
+
+    #[test]
+    fn classify_recipient_recognizes_revision_2_unified_addresses() -> Result<(), WalletError> {
+        use zcash_keys::keys::UnifiedAddressRequest;
+        for (network, shielded_hrp, transparent_hrp) in [
+            (Network::Mainnet, "zu1", "tu1"),
+            (Network::Testnet, "zutest1", "tutest1"),
+            (regtest(), "zuregtest1", "turegtest1"),
+        ] {
+            let shielded = encode_revision_2(
+                network,
+                &default_address(network, UnifiedAddressRequest::SHIELDED)?,
+            )?;
+            let with_transparent = encode_revision_2(
+                network,
+                &default_address(network, UnifiedAddressRequest::AllAvailableKeys)?,
+            )?;
+            assert!(shielded.starts_with(shielded_hrp), "{shielded}");
+            assert!(
+                with_transparent.starts_with(transparent_hrp),
+                "{with_transparent}"
+            );
+            for encoded in [shielded, with_transparent] {
+                assert!(matches!(
+                    classify_recipient(&encoded, network),
+                    PaymentRecipient::UnifiedAddress { encoded: classified, .. }
+                        if classified == encoded
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn validate_memo_rejects_text_memo_on_transparent_only_unified_address()
+    -> Result<(), WalletError> {
+        let network = regtest();
+        let full = default_address(
+            network,
+            zcash_keys::keys::UnifiedAddressRequest::AllAvailableKeys,
+        )?;
+        let transparent_only = zcash_keys::address::UnifiedAddress::from_receivers(
+            None,
+            None,
+            full.transparent().copied(),
+            None,
+            None,
+        )
+        .ok_or_else(|| WalletError::PaymentRequestParseFailed {
+            reason: "transparent-only unified address".into(),
+        })?;
+        let memo =
+            Memo::from_bytes(b"hello").map_err(|err| WalletError::PaymentRequestParseFailed {
+                reason: err.to_string(),
+            })?;
+
+        let transparent_recipient = PaymentRecipient::UnifiedAddress {
+            encoded: transparent_only.encode(&network.to_parameters()),
+            network,
+        };
+        assert!(matches!(
+            validate_memo_against_recipient(Some(&memo), &transparent_recipient),
+            Err(WalletError::MemoOnTransparentRecipient)
+        ));
+
+        let full_recipient = PaymentRecipient::UnifiedAddress {
+            encoded: full.encode(&network.to_parameters()),
+            network,
+        };
+        validate_memo_against_recipient(Some(&memo), &full_recipient)?;
+        Ok(())
+    }
+
+    #[test]
+    fn payment_request_rejects_sprout_recipient() {
+        let uri = "zcash:zc8E5gYid86n4bo2Usdq1cpr7PpfoJGzttwBHEEgGhGkLUg7SPPVFNB2AkRFXZ7usfphup5426dt1buMmY3fkYeRrQGLa8y?amount=1";
+        let outcome = PaymentRequest::from_uri(uri, Network::Mainnet);
+        assert!(matches!(
+            outcome,
+            Err(WalletError::PaymentRequestParseFailed { reason }) if reason.contains("Sprout")
         ));
     }
 

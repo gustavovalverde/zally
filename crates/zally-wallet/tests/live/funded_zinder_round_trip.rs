@@ -5,8 +5,8 @@ use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
 
-use rand::rngs::OsRng;
-use secp256k1::{PublicKey, Secp256k1};
+use rand::rng;
+use secp256k1::PublicKey;
 use serde_json::{Value, json};
 use zally_chain::{
     ChainSource, ShieldedPool, SubmitOutcome, Submitter, ZinderChainSource, ZinderRemoteOptions,
@@ -23,8 +23,9 @@ use zally_testkit::{
 use zally_wallet::{
     ExportPaymentDisclosurePlan, ProposalPlan, SendPaymentPlan, ShieldTransparentPlan, SyncDriver,
     SyncDriverOptions, SyncHandle, SyncSnapshotStream, SyncStatus, Wallet, WalletError,
+    WalletOptions,
 };
-use zcash_keys::address::Address;
+use zcash_keys::address::{Address, Receiver};
 use zcash_payment_disclosure::{PaymentDisclosureProfile, verify_disclosure};
 use zcash_primitives::transaction::builder::{BuildConfig, Builder};
 use zcash_proofs::prover::LocalTxProver;
@@ -128,7 +129,8 @@ async fn shielding_does_not_reselect_a_pending_spend() -> Result<(), TestError> 
 }
 
 struct FundedZinderRoundTrip {
-    wallet_path: TempWalletPath,
+    /// Keeps the wallet's files on disk for the round trip's lifetime.
+    _wallet_path: TempWalletPath,
     miner: JsonRpcClient,
     wallet: Wallet,
     account_id: AccountId,
@@ -164,7 +166,7 @@ impl FundedZinderRoundTrip {
         let sync_snapshots = sync_handle.observe_status();
 
         Ok(Self {
-            wallet_path,
+            _wallet_path: wallet_path,
             miner,
             wallet,
             account_id,
@@ -269,18 +271,10 @@ impl FundedZinderRoundTrip {
                 None,
             )
             .await?;
-        let reopened_sealing =
-            AgeFileSealing::new(AgeFileSealingOptions::at_path(self.wallet_path.seed_path()));
-        let reopened_storage = Sqlite::new(SqliteOptions::for_network(
-            self.network,
-            self.wallet_path.db_path(),
-        ));
-        let (reopened_wallet, reopened_account_id) =
-            Wallet::builder(self.network, reopened_sealing, reopened_storage)
-                .open()
-                .await?;
-        assert_eq!(reopened_account_id, self.account_id);
-        reopened_wallet.abandon_pczt(&first_pczt).await?;
+        // The database admits one writer, so another handle abandons the PCZT through a clone
+        // of the open wallet rather than a second open.
+        let other_handle = self.wallet.clone();
+        other_handle.abandon_pczt(&first_pczt).await?;
 
         let second_recipient =
             derive_unified_recipient(&self.wallet, self.account_id, self.network).await?;
@@ -440,7 +434,11 @@ async fn create_wallet_at_tip(
     let sealing = AgeFileSealing::new(AgeFileSealingOptions::at_path(temp.seed_path()));
     let storage = Sqlite::new(SqliteOptions::for_network(network, temp.db_path()));
     let birthday = BlockHeight::from(tip_height.as_u32().saturating_sub(10).max(1));
+    // The live Zinder pair keeps its default 100-block reorg window; the integration suite
+    // covers the window check.
+    let options = WalletOptions::default().with_minimum_source_reorg_window_blocks(None);
     let (wallet, account_id, _mnemonic) = Wallet::builder(network, sealing, storage)
+        .with_options(options)
         .create(chain, birthday)
         .await?;
     Ok((temp, wallet, account_id))
@@ -527,9 +525,8 @@ fn build_regtest_funding_transaction(
         .map_err(|error| TestError::TransparentFunding {
             reason: format!("could not derive funding secret key: {error}"),
         })?;
-    let secp = Secp256k1::new();
-    let public_key = PublicKey::from_secret_key(&secp, &secret_key);
-    let funding_address = ZallyTransparentAddress::from_pubkey(&public_key)
+    let public_key = PublicKey::from_secret_key(&secret_key);
+    let funding_address = Receiver::Transparent(ZallyTransparentAddress::from_pubkey(&public_key))
         .to_zcash_address(NetworkType::Regtest)
         .encode();
     let coinbase = miner.locate_spendable_coinbase(&funding_address)?;
@@ -583,7 +580,7 @@ fn build_regtest_funding_transaction(
             reason: format!("could not add funding output: {error}"),
         })?;
     let built = builder
-        .mock_build(&signing_set, &[], &[], OsRng)
+        .mock_build(&signing_set, &[], &[], rng())
         .map_err(|error| TestError::TransparentFunding {
             reason: format!("could not build funding transaction: {error}"),
         })?;
@@ -872,6 +869,7 @@ fn zally_local_network_from_upgrades(upgrades: &[NodeUpgrade]) -> ZallyLocalNetw
         nu6_1: activation_height("NU6.1"),
         nu6_2: activation_height("NU6.2"),
         nu6_3: activation_height("NU6.3"),
+        nu7: activation_height("NU7"),
     }
 }
 

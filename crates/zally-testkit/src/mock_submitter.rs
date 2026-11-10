@@ -25,6 +25,7 @@ struct MockState {
     submitted: Vec<Vec<u8>>,
     submit_failures: Vec<SubmitterError>,
     failures_consumed: u32,
+    derive_tx_id: fn(&[u8]) -> TxId,
 }
 
 /// Programmable [`Submitter`] for tests.
@@ -78,8 +79,17 @@ impl MockSubmitter {
                 submitted: Vec::new(),
                 submit_failures: Vec::new(),
                 failures_consumed: 0,
+                derive_tx_id: derive_txid,
             })),
         }
+    }
+
+    /// Returns the submitter with `derive_tx_id` computing the transaction id it reports for
+    /// each submission, so a test that submits real transactions sees their real ids.
+    #[must_use]
+    pub fn with_tx_id_derivation(self, derive_tx_id: fn(&[u8]) -> TxId) -> Self {
+        self.state.lock().derive_tx_id = derive_tx_id;
+        self
     }
 
     /// Returns a handle that lets the test inspect submitted bytes.
@@ -144,9 +154,10 @@ impl Submitter for MockSubmitter {
                 return Err(injected);
             }
             guard.submitted.push(raw_tx.to_vec());
-            guard.outcome.clone()
+            (guard.outcome.clone(), guard.derive_tx_id)
         };
-        let tx_id = derive_txid(raw_tx);
+        let (outcome, derive_tx_id) = outcome;
+        let tx_id = derive_tx_id(raw_tx);
         Ok(match outcome {
             MockOutcome::Accepting => SubmitOutcome::Accepted { tx_id },
             MockOutcome::Duplicating => SubmitOutcome::Duplicate { tx_id },

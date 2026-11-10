@@ -13,26 +13,30 @@
 //! anchors each chunk, so work is proportional to the new scan range rather than the full
 //! chain height.
 //!
-//! The long-lived [`SyncDriver`] wraps the loop in a self-healing lifecycle. Wallet chain
-//! state is disposable derived state: every fault is classified onto an escalating repair
-//! ladder ([`SyncRepair`]) that retries, rewinds below the divergence, rebuilds from the
-//! seed and birthday, or parks when no software action cures it. The driver task is
-//! infallible while its handle is alive; it exits only through [`SyncHandle::close`].
+//! The long-lived [`SyncDriver`] wraps the loop in a self-healing lifecycle. A reorg the
+//! chain source announces is rewound at its fork point before the next scan, and the
+//! driver persists the chain-event cursor it has applied so a restart replays what it missed.
+//! Wallet chain state is disposable derived state: every other fault is classified onto an
+//! escalating repair ladder ([`SyncRepair`]) that retries, rewinds below the divergence,
+//! rebuilds from the seed and birthday while keeping the payment ledger, or parks when no
+//! software action cures it. A source whose visible tip stops moving halts the driver and
+//! the wallet's new spends until it moves again. The driver task is infallible while its
+//! handle is alive; it exits only through [`SyncHandle::close`].
 
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use futures_util::{Stream, StreamExt as _, future};
+use futures_util::{FutureExt as _, Stream, StreamExt as _, future};
 use tokio::sync::{oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio::time::{MissedTickBehavior, interval, sleep, timeout};
 use tokio_stream::wrappers::WatchStream;
 use zally_chain::{
-    BlockHeightRange, ChainEventCursorRecovery, ChainEventEnvelope, ChainEventEnvelopeStream,
-    ChainEventStreamStart, ChainSource, ChainSourceError, FailurePosture, ShieldedPool,
-    SubtreeIndex,
+    BlockHeightRange, ChainEvent, ChainEventCursor, ChainEventCursorRecovery, ChainEventEnvelope,
+    ChainEventEnvelopeStream, ChainEventStreamStart, ChainSource, ChainSourceError, FailurePosture,
+    ShieldedPool, Submitter, SubtreeIndex,
 };
 use zally_core::{BlockHeight, CompactBlockArtifact, Network, TreeStateArtifact};
 use zally_storage::{ScanRequest, StorageError};
@@ -40,7 +44,9 @@ use zcash_client_backend::data_api::scanning::ScanPriority;
 
 use crate::error::WalletError;
 use crate::event::WalletEvent;
+use crate::reorg::ForkPointRewind;
 use crate::retry::with_breaker_and_retry;
+use crate::source_halt::{HaltedSource, SourceHalt, SourceTipChange, SourceTipWatch};
 use crate::status::{SyncStatus, WalletStatus};
 use crate::transparent_utxo_refresh::run_transparent_utxo_refresh_driver;
 use crate::wallet::{Wallet, current_unix_ms};
@@ -54,11 +60,12 @@ const SUBTREE_ROOT_PAGE: u32 = 128;
 
 /// Rewind depths the repair ladder walks before escalating to a rebuild.
 ///
-/// The deepest rung rewinds 100 blocks: nodes never apply a reorg deeper than coinbase
-/// maturity minus one (both zcashd and zebra enforce the cap), so a 100-block rewind clears
-/// any divergence the chain can serve. Deeper rewinds are pointless; the next rung is a
-/// rebuild from the birthday.
-const REWIND_LADDER_BLOCKS: [u32; 2] = [10, 100];
+/// The ladder only meets divergences no chain event announced; an announced reorg is
+/// rewound at its fork point instead. The deepest rung matches the deepest reorg Zebra can
+/// present: it commits a block to its finalized state only once its best chain is more than
+/// 1,000 blocks longer (`MAX_BLOCK_REORG_HEIGHT`), so a 1,000-block rewind clears any
+/// divergence a Zebra-backed source can serve. The storage rewind works at any depth.
+const REWIND_LADDER_BLOCKS: [u32; 3] = [10, 100, 1_000];
 
 struct ScanContext {
     blocks: Vec<CompactBlockArtifact>,
@@ -203,10 +210,18 @@ impl Default for SyncRecoveryPolicy {
 #[non_exhaustive]
 pub struct SyncDriverOptions {
     /// Milliseconds between polling wakeups when no chain event is received.
+    ///
+    /// Every polling wakeup republishes the driver's current [`SyncSnapshot`], whatever its
+    /// phase.
     pub poll_interval_ms: u64,
     /// Maximum [`Wallet::sync`] calls made for one wakeup.
     pub max_sync_iterations_per_wake_count: u32,
     /// Maximum seconds one [`Wallet::sync`] call may run before the driver retries later.
+    ///
+    /// The same bound applies to every other chain-source and submitter call the driver
+    /// awaits: opening the chain-event stream, the visible-tip stall probe, the reorg-window
+    /// read, repairs, and resubmitting reverted withdrawals. A call that outruns it faults like
+    /// an unavailable source, so a source that never answers cannot silence the driver.
     pub sync_timeout_seconds: u64,
     /// Self-healing policy for the driver's repair ladder.
     pub recovery: SyncRecoveryPolicy,
@@ -223,6 +238,17 @@ pub struct SyncDriverOptions {
     /// scan attempt: without this, a source that never returns wedges the refresh loop
     /// silently forever, since the loop has no repair ladder of its own to notice.
     pub transparent_utxo_refresh_timeout_seconds: u64,
+    /// How long the chain source's visible tip may stay unchanged before the driver halts
+    /// with [`SourceHalt::VisibleTipStalled`] and the wallet refuses new spends. `None`
+    /// disables the check.
+    ///
+    /// A source that cannot follow a reorg keeps serving its last chain, so a tip that stops
+    /// moving is the visible sign of a halted source. The driver confirms the stall with a
+    /// fresh epoch read before halting, and resumes as soon as the tip moves. Regtest chains
+    /// that mine only on demand stall by design; disable the check there.
+    ///
+    /// Default: 30 minutes, at least 24 block intervals at the longest Zcash target spacing.
+    pub visible_tip_stall_limit_ms: Option<u64>,
 }
 
 impl SyncDriverOptions {
@@ -286,6 +312,18 @@ impl SyncDriverOptions {
         }
     }
 
+    /// Returns options with `visible_tip_stall_limit_ms` replaced.
+    #[must_use]
+    pub const fn with_visible_tip_stall_limit_ms(
+        self,
+        visible_tip_stall_limit_ms: Option<u64>,
+    ) -> Self {
+        Self {
+            visible_tip_stall_limit_ms,
+            ..self
+        }
+    }
+
     fn normalized(self) -> Self {
         Self {
             poll_interval_ms: self.poll_interval_ms.max(1),
@@ -296,6 +334,9 @@ impl SyncDriverOptions {
             transparent_utxo_refresh_timeout_seconds: self
                 .transparent_utxo_refresh_timeout_seconds
                 .max(1),
+            visible_tip_stall_limit_ms: self
+                .visible_tip_stall_limit_ms
+                .map(|limit_ms| limit_ms.max(1)),
         }
     }
 }
@@ -309,6 +350,7 @@ impl Default for SyncDriverOptions {
             recovery: SyncRecoveryPolicy::default(),
             transparent_utxo_refresh_interval_ms: 5_000,
             transparent_utxo_refresh_timeout_seconds: 120,
+            visible_tip_stall_limit_ms: Some(30 * 60 * 1_000),
         }
     }
 }
@@ -392,6 +434,16 @@ pub enum SyncDriverPhase {
         /// Unix milliseconds when the driver re-arms the ladder, if reprobing is enabled.
         reprobe_at_ms: Option<u64>,
     },
+    /// The chain source stopped following the chain. The driver scans nothing, the wallet
+    /// refuses new spends with [`WalletError::ChainSourceHalted`], and the driver resumes on
+    /// its own once the source moves again. [`WalletEvent::SourceHalted`] and
+    /// [`WalletEvent::SourceRecovered`] report entering and leaving this phase.
+    SourceHalted {
+        /// Unix milliseconds when the driver halted.
+        since_ms: u64,
+        /// Why the source is considered halted.
+        cause: SourceHalt,
+    },
     /// The driver is closing after the caller requested shutdown.
     Closing,
     /// The driver closed cleanly.
@@ -422,6 +474,12 @@ pub struct SyncSnapshot {
     /// Most recent fault; `None` while healthy.
     pub last_fault: Option<SyncFault>,
     /// Unix milliseconds when this snapshot was published.
+    ///
+    /// While the driver task runs, consecutive snapshots are never further apart than the
+    /// longer of [`SyncDriverOptions::poll_interval_ms`] and
+    /// [`SyncDriverOptions::sync_timeout_seconds`] plus
+    /// [`SyncRecoveryPolicy::fault_backoff_cap_ms`], whatever the phase, so a longer silence
+    /// means the task stopped.
     pub published_at_ms: u64,
 }
 
@@ -487,6 +545,13 @@ impl SyncSnapshotStream {
 /// falls back to polling, repeatedly calls [`Wallet::sync`] until the observed tip is
 /// reached, and publishes [`SyncSnapshot`] values.
 ///
+/// The driver records the cursor of every chain event it has applied and resumes after it,
+/// so a reorg announced while the host was stopped is applied on the next start. A
+/// `ChainReorged` event rewinds the wallet to its fork point before the next scan. Once
+/// caught up, the driver reconciles what rewinds reverted: it resubmits reverted
+/// withdrawals through the submitter given to [`SyncDriver::with_submitter`] and releases
+/// the idempotency keys of reverted transactions that can never be mined.
+///
 /// The driver task is infallible while its handle is alive. Faults engage the escalating
 /// repair ladder ([`SyncRepair`]) instead of killing the task; the task exits only through
 /// [`SyncHandle::close`].
@@ -494,6 +559,7 @@ pub struct SyncDriver {
     wallet: Wallet,
     chain: Arc<dyn ChainSource>,
     options: SyncDriverOptions,
+    submitter: Option<Arc<dyn Submitter>>,
 }
 
 impl SyncDriver {
@@ -515,7 +581,26 @@ impl SyncDriver {
             wallet,
             chain,
             options: options.normalized(),
+            submitter: None,
         })
+    }
+
+    /// Lets the driver submit again the wallet-sent transactions a reorg removed from the
+    /// chain, while they can still be mined.
+    ///
+    /// Without a submitter the driver still reports reverted transactions and retires them
+    /// once the chain mines them again or they expire, but never broadcasts them itself.
+    ///
+    /// Fails closed on network mismatch. `requires_operator` on mismatch.
+    pub fn with_submitter(mut self, submitter: Arc<dyn Submitter>) -> Result<Self, WalletError> {
+        if submitter.network() != self.wallet.network() {
+            return Err(WalletError::NetworkMismatch {
+                storage: self.wallet.network(),
+                requested: submitter.network(),
+            });
+        }
+        self.submitter = Some(submitter);
+        Ok(self)
     }
 
     /// Starts continuous wallet sync and returns a handle for observation and shutdown.
@@ -527,6 +612,7 @@ impl SyncDriver {
     /// or retry ladder affects the other's.
     #[must_use]
     pub fn sync_continuously(self) -> SyncHandle {
+        self.wallet.start_source_reorg_window_check();
         let (close_tx, close_rx) = oneshot::channel();
         let (status_tx, status_rx) = watch::channel(SyncSnapshot::starting(self.wallet.network()));
         let (transparent_utxo_refresh_close_tx, transparent_utxo_refresh_close_rx) =
@@ -538,13 +624,7 @@ impl SyncDriver {
             self.options.transparent_utxo_refresh_timeout_seconds,
             transparent_utxo_refresh_close_rx,
         ));
-        let join = tokio::spawn(run_sync_driver(
-            self.wallet,
-            self.chain,
-            self.options,
-            close_rx,
-            status_tx,
-        ));
+        let join = tokio::spawn(run_sync_driver(self, close_rx, status_tx));
         SyncHandle {
             close_tx: Some(close_tx),
             join,
@@ -607,6 +687,7 @@ async fn join_driver_task(join: JoinHandle<()>) -> Result<(), WalletError> {
 struct DriverContext<'a> {
     wallet: &'a Wallet,
     chain: &'a dyn ChainSource,
+    submitter: Option<&'a dyn Submitter>,
     options: SyncDriverOptions,
     status_tx: &'a watch::Sender<SyncSnapshot>,
 }
@@ -619,11 +700,32 @@ struct DriverState {
     catch_up_pending: bool,
     stream_consecutive_faults: u32,
     stream_next_attempt_at_ms: u64,
+    /// An announced reorg not yet applied, and the cursor to record once it is.
+    pending_reorg: Option<PendingReorg>,
+    source_tip: SourceTipWatch,
+}
+
+/// The deepest announced fork point the driver has not yet rewound to.
+#[derive(Clone)]
+struct PendingReorg {
+    fork_height: BlockHeight,
+    cursor: ChainEventCursor,
+}
+
+/// Where a driver's chain-event stream stands.
+struct ChainEventFeed {
+    stream: Option<ChainEventEnvelopeStream>,
+    start: ChainEventStreamStart,
 }
 
 impl DriverState {
     fn parked(&self) -> Option<ParkedAt> {
         self.recovery.as_ref().and_then(|recovery| recovery.parked)
+    }
+
+    /// Whether the driver holds off scanning: a parked ladder or a halted source.
+    fn is_holding(&self) -> bool {
+        self.parked().is_some() || self.source_tip.halted().is_some()
     }
 
     /// Settles the active recovery after a completed or excused sync iteration.
@@ -783,6 +885,15 @@ impl ClassifiedFault {
             repair: repair_for(error),
         }
     }
+
+    /// A step that outran [`SyncDriverOptions::sync_timeout_seconds`]: a stalled source or
+    /// storage says nothing about the wallet's state, so the step retries.
+    fn timed_out(step_label: &str, timeout_seconds: u64) -> Self {
+        Self {
+            reason: format!("{step_label} exceeded {timeout_seconds} seconds"),
+            repair: SyncRepair::Retry,
+        }
+    }
 }
 
 /// Whether an attempt's committed blocks carry a comparison against the chain.
@@ -872,36 +983,53 @@ enum DriverTransition<'a> {
         reprobe_at_ms: Option<u64>,
     },
     ParkReprobe,
+    ForkPointApplied {
+        fork_height: BlockHeight,
+        outcome: ForkPointRewind,
+    },
+    ChainEventCursorDiscarded {
+        error: &'a ChainSourceError,
+    },
+    SourceHalted {
+        cause: SourceHalt,
+    },
+    SourceRecovered,
     Closing,
     Closed,
 }
 
 async fn run_sync_driver(
-    wallet: Wallet,
-    chain: Arc<dyn ChainSource>,
-    options: SyncDriverOptions,
+    driver: SyncDriver,
     mut close_rx: oneshot::Receiver<()>,
     status_tx: watch::Sender<SyncSnapshot>,
 ) {
     let ctx = DriverContext {
-        wallet: &wallet,
-        chain: chain.as_ref(),
-        options,
+        wallet: &driver.wallet,
+        chain: driver.chain.as_ref(),
+        submitter: driver.submitter.as_deref(),
+        options: driver.options,
         status_tx: &status_tx,
     };
     let started = ctx.status_tx.borrow().clone();
     publish_transition(ctx.status_tx, started, &DriverTransition::DriverStarted);
+    check_source_reorg_window(&ctx).await;
 
-    let mut poll = interval(Duration::from_millis(options.poll_interval_ms));
+    let mut poll = interval(Duration::from_millis(ctx.options.poll_interval_ms));
     poll.set_missed_tick_behavior(MissedTickBehavior::Delay);
-    let mut state = DriverState::default();
-    let mut chain_events_start = ChainEventStreamStart::EarliestRetained;
-    let mut chain_events = open_chain_events(&ctx, &mut state, &mut chain_events_start).await;
+    let mut state = DriverState {
+        source_tip: SourceTipWatch::started_at(current_unix_ms()),
+        ..DriverState::default()
+    };
+    let mut feed = ChainEventFeed {
+        stream: None,
+        start: resume_position(ctx.wallet).await,
+    };
+    feed.stream = open_chain_events(&ctx, &mut state, &mut feed.start).await;
     let mut should_sync = true;
 
     loop {
-        if should_sync && state.parked().is_none() {
-            match run_sync_wakeup(&ctx, &mut close_rx, &mut state).await {
+        if should_sync && !state.is_holding() {
+            match run_sync_wakeup(&ctx, &mut close_rx, &mut state, &mut feed).await {
                 SyncWakeupExit::CloseRequested => {
                     return close_sync_driver(&ctx, &state).await;
                 }
@@ -919,51 +1047,235 @@ async fn run_sync_driver(
                     _ = &mut close_rx => {
                         return close_sync_driver(&ctx, &state).await;
                     }
-                    wake = handle_poll_tick(
-                        &ctx,
-                        &mut state,
-                        &mut chain_events,
-                        &mut chain_events_start,
-                    ) => should_sync = wake,
+                    wake = handle_poll_tick(&ctx, &mut state, &mut feed) => should_sync = wake,
                 }
             }
-            chain_event = next_chain_event_envelope(&mut chain_events) => {
-                match chain_event {
-                    Some(Ok(envelope)) => {
-                        chain_events_start = ChainEventStreamStart::AfterCursor(envelope.cursor);
-                        state.stream_consecutive_faults = 0;
-                        state.stream_next_attempt_at_ms = 0;
-                        should_sync = state.parked().is_none();
-                    }
-                    Some(Err(err)) => {
-                        chain_events = None;
-                        if is_expired_cursor(&err) {
-                            chain_events_start = ChainEventStreamStart::EarliestRetained;
-                            should_sync = state.parked().is_none();
-                        } else if state.parked().is_none() {
-                            record_stream_fault(&ctx, &mut state, &err).await;
-                        }
-                    }
-                    None => {
-                        chain_events = None;
-                    }
+            delivery = next_chain_event_envelope(&mut feed.stream) => {
+                if observe_chain_event_delivery(&ctx, &mut state, &mut feed, delivery).await {
+                    should_sync = true;
                 }
             }
         }
     }
 }
 
+/// Where the chain-event subscription resumes: after the cursor the wallet recorded for the
+/// last chain event it applied, or from the source's retained window when it holds none.
+async fn resume_position(wallet: &Wallet) -> ChainEventStreamStart {
+    match wallet.inner.storage.find_chain_event_cursor().await {
+        Ok(Some(cursor_bytes)) => {
+            ChainEventStreamStart::AfterCursor(ChainEventCursor::from_bytes(cursor_bytes))
+        }
+        Ok(None) => ChainEventStreamStart::EarliestRetained,
+        Err(error) => {
+            tracing::warn!(
+                target: "zally::sync",
+                event = "wallet_chain_event_cursor_unreadable",
+                %error,
+                "could not read the recorded chain-event cursor; replaying the retained window"
+            );
+            ChainEventStreamStart::EarliestRetained
+        }
+    }
+}
+
+/// Folds one chain-event stream delivery into the driver; returns whether the driver should
+/// sync.
+async fn observe_chain_event_delivery(
+    ctx: &DriverContext<'_>,
+    state: &mut DriverState,
+    feed: &mut ChainEventFeed,
+    delivery: Option<Result<ChainEventEnvelope, ChainSourceError>>,
+) -> bool {
+    match delivery {
+        Some(Ok(envelope)) => {
+            feed.start = ChainEventStreamStart::AfterCursor(envelope.cursor.clone());
+            state.stream_consecutive_faults = 0;
+            state.stream_next_attempt_at_ms = 0;
+            let was_halted = state.source_tip.halted().is_some();
+            let tip_change = state
+                .source_tip
+                .observe(envelope.chain_epoch.visible_tip(), current_unix_ms());
+            if was_halted && tip_change == SourceTipChange::Moved {
+                publish_source_recovered(ctx, state).await;
+            }
+            record_chain_event(ctx, state, envelope).await;
+            true
+        }
+        Some(Err(error)) => {
+            feed.stream = None;
+            if is_replaced_cursor(&error) {
+                discard_chain_event_cursor(ctx, &mut feed.start, &error).await;
+                true
+            } else {
+                if !state.is_holding() {
+                    record_stream_fault(ctx, state, &error).await;
+                }
+                false
+            }
+        }
+        None => {
+            feed.stream = None;
+            false
+        }
+    }
+}
+
+/// Queues an announced reorg for rewinding, or records the cursor of an event that needs no
+/// wallet action.
+///
+/// A cursor that follows an unapplied reorg waits with it: recording it first would let a
+/// restart skip the reorg.
+async fn record_chain_event(
+    ctx: &DriverContext<'_>,
+    state: &mut DriverState,
+    envelope: ChainEventEnvelope,
+) {
+    if let ChainEvent::ChainReorged { reverted, .. } = &envelope.event {
+        let reverted_range = reverted.block_range;
+        let fork_height =
+            BlockHeight::from(reverted_range.start_height().as_u32().saturating_sub(1));
+        let fork_height = state
+            .pending_reorg
+            .as_ref()
+            .map_or(fork_height, |prior| prior.fork_height.min(fork_height));
+        tracing::info!(
+            target: "zally::sync",
+            event = "wallet_chain_reorg_announced",
+            reverted_from_height = reverted_range.start_height().as_u32(),
+            reverted_to_height = reverted_range.end_height().as_u32(),
+            fork_height = fork_height.as_u32(),
+            "chain source announced a reorg; rewinding to its fork point before the next scan"
+        );
+        state.pending_reorg = Some(PendingReorg {
+            fork_height,
+            cursor: envelope.cursor,
+        });
+    } else if let Some(pending) = state.pending_reorg.as_mut() {
+        pending.cursor = envelope.cursor;
+    } else if let Err(error) = ctx
+        .wallet
+        .inner
+        .storage
+        .record_chain_event_cursor(envelope.cursor.into_bytes())
+        .await
+    {
+        tracing::warn!(
+            target: "zally::sync",
+            event = "wallet_chain_event_cursor_record_failed",
+            %error,
+            "could not record the chain-event cursor; a restart replays from the prior one"
+        );
+    }
+}
+
+/// Folds every chain event the stream has already delivered, without waiting for more.
+///
+/// Runs between scan iterations so a reorg announced mid-drain is rewound at its fork point
+/// before the ladder could meet it as an unexplained continuity error. The running wakeup
+/// already ends only on a fresh tip record, so a drained event needs no further wakeup.
+async fn drain_ready_chain_events(
+    ctx: &DriverContext<'_>,
+    state: &mut DriverState,
+    feed: &mut ChainEventFeed,
+) {
+    loop {
+        let Some(stream) = feed.stream.as_mut() else {
+            return;
+        };
+        let Some(delivery) = stream.next().now_or_never() else {
+            return;
+        };
+        let _ = observe_chain_event_delivery(ctx, state, feed, delivery).await;
+    }
+}
+
+/// Applies a pending announced reorg, or the ladder's repair while recovering; returns
+/// whether either ran.
+///
+/// Bounded by [`SyncDriverOptions::sync_timeout_seconds`] like a scan attempt, so a repair
+/// whose chain reads never answer faults instead of wedging the driver.
+async fn repair_before_scan(
+    ctx: &DriverContext<'_>,
+    state: &mut DriverState,
+    recovering: bool,
+) -> Result<bool, ClassifiedFault> {
+    let timeout_seconds = ctx.options.sync_timeout_seconds;
+    let repair = async {
+        if is_fork_rewind_due(state, recovering) {
+            if recovering && let Some(recovery) = state.recovery.as_mut() {
+                recovery.attempts_at_rung = recovery.attempts_at_rung.saturating_add(1);
+            }
+            republish_snapshot(ctx.status_tx);
+            apply_pending_reorg(ctx, state).await?;
+            Ok(true)
+        } else if recovering {
+            apply_repair(ctx, state).await?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    };
+    match timeout(Duration::from_secs(timeout_seconds), repair).await {
+        Ok(Ok(ran)) => Ok(ran),
+        Ok(Err(error)) => Err(ClassifiedFault::from_error(&error)),
+        Err(_elapsed) => Err(ClassifiedFault::timed_out("repair", timeout_seconds)),
+    }
+}
+
+/// Whether this iteration applies a pending announced reorg instead of the ladder's repair.
+///
+/// The fork-point rewind stands in for the ladder's rewind rungs and counts as their
+/// attempt, so a fork-point rewind that keeps failing still escalates. Once the ladder
+/// reaches a rebuild, the rebuild runs first; the pending reorg then finds nothing to rewind
+/// and only records its cursor.
+fn is_fork_rewind_due(state: &DriverState, recovering: bool) -> bool {
+    state.pending_reorg.is_some()
+        && state
+            .recovery
+            .as_ref()
+            .filter(|_| recovering)
+            .is_none_or(|recovery| recovery.rung < SyncRepair::RescanFromBirthday)
+}
+
+/// Rewinds to the pending announced fork point and records the cursor that announced it.
+async fn apply_pending_reorg(
+    ctx: &DriverContext<'_>,
+    state: &mut DriverState,
+) -> Result<(), WalletError> {
+    let Some(pending) = state.pending_reorg.clone() else {
+        return Ok(());
+    };
+    let outcome = ctx
+        .wallet
+        .rewind_to_fork_point(ctx.chain, pending.fork_height, pending.cursor)
+        .await?;
+    state.pending_reorg = None;
+    let snapshot = build_snapshot(ctx, SyncDriverPhase::Syncing, state).await;
+    publish_transition(
+        ctx.status_tx,
+        snapshot,
+        &DriverTransition::ForkPointApplied {
+            fork_height: pending.fork_height,
+            outcome,
+        },
+    );
+    Ok(())
+}
+
 /// Handles one polling wakeup; returns whether the driver should sync.
 ///
-/// While parked this republishes the current snapshot (refreshed `published_at_ms`) so
-/// observers keep receiving the parked reason, and re-arms the full ladder once the reprobe
-/// deadline passes.
+/// Every wakeup first republishes the current snapshot with a fresh `published_at_ms`, in
+/// every phase, so observers can tell a driver idling at the tip from one whose task stopped.
+/// While parked it re-arms the full ladder once the reprobe deadline passes. It also checks a
+/// source whose visible tip has not moved for the stall limit, halting the driver when a
+/// fresh epoch read confirms the stall and resuming it when the tip moves.
 async fn handle_poll_tick(
     ctx: &DriverContext<'_>,
     state: &mut DriverState,
-    chain_events: &mut Option<ChainEventEnvelopeStream>,
-    start: &mut ChainEventStreamStart,
+    feed: &mut ChainEventFeed,
 ) -> bool {
+    republish_snapshot(ctx.status_tx);
     if let Some(parked) = state.parked() {
         if parked
             .reprobe_at_ms
@@ -974,17 +1286,117 @@ async fn handle_poll_tick(
             publish_transition(ctx.status_tx, snapshot, &DriverTransition::ParkReprobe);
             return true;
         }
-        let refreshed = ctx.status_tx.borrow().clone();
-        publish_snapshot(ctx.status_tx, refreshed);
         return false;
     }
-    if chain_events.is_none() && current_unix_ms() >= state.stream_next_attempt_at_ms {
-        *chain_events = open_chain_events(ctx, state, start).await;
+    let tip_moved = match ctx.options.visible_tip_stall_limit_ms {
+        Some(stall_limit_ms) => watch_source_tip(ctx, state, stall_limit_ms).await,
+        None => false,
+    };
+    if feed.stream.is_none() && current_unix_ms() >= state.stream_next_attempt_at_ms {
+        feed.stream = open_chain_events(ctx, state, &mut feed.start).await;
+        if feed.stream.is_some() {
+            check_source_reorg_window(ctx).await;
+        }
+    } else if ctx.wallet.is_source_reorg_window_unverified() {
+        check_source_reorg_window(ctx).await;
     }
-    std::mem::take(&mut state.catch_up_pending)
+    if state.source_tip.halted().is_some() {
+        return false;
+    }
+    std::mem::take(&mut state.catch_up_pending) || tip_moved
+}
+
+/// Reads a fresh epoch when the source's visible tip is due for a stall check, or while the
+/// driver is halted; returns whether the tip moved.
+async fn watch_source_tip(
+    ctx: &DriverContext<'_>,
+    state: &mut DriverState,
+    stall_limit_ms: u64,
+) -> bool {
+    let now_ms = current_unix_ms();
+    let was_halted = state.source_tip.halted().is_some();
+    if !was_halted && !state.source_tip.is_due_for_probe(now_ms, stall_limit_ms) {
+        return false;
+    }
+    let Ok(chain_epoch) =
+        within_call_bound(ctx, "the stall probe", ctx.chain.current_epoch()).await
+    else {
+        return false;
+    };
+    if state.source_tip.observe(chain_epoch.visible_tip(), now_ms) == SourceTipChange::Moved {
+        if was_halted {
+            publish_source_recovered(ctx, state).await;
+        }
+        return true;
+    }
+    if let Some(halted) = state.source_tip.halt_if_stalled(now_ms, stall_limit_ms) {
+        enter_source_halt(ctx, state, halted).await;
+    }
+    false
+}
+
+/// Halts the driver and the wallet's new spends on a source that stopped following the
+/// chain.
+async fn enter_source_halt(ctx: &DriverContext<'_>, state: &mut DriverState, halted: HaltedSource) {
+    ctx.wallet.set_source_halt(Some(halted.cause));
+    ctx.wallet.publish_event(WalletEvent::SourceHalted {
+        cause: halted.cause,
+        since_ms: halted.since_ms,
+    });
+    state.last_fault = Some(SyncFault {
+        reason: halted.cause.to_string(),
+        repair: SyncRepair::Park,
+        occurred_at_ms: halted.since_ms,
+        consecutive_faults: 1,
+    });
+    let snapshot = build_snapshot(
+        ctx,
+        SyncDriverPhase::SourceHalted {
+            since_ms: halted.since_ms,
+            cause: halted.cause,
+        },
+        state,
+    )
+    .await;
+    publish_transition(
+        ctx.status_tx,
+        snapshot,
+        &DriverTransition::SourceHalted {
+            cause: halted.cause,
+        },
+    );
+}
+
+/// Lifts a source halt once the source's visible tip moves again.
+async fn publish_source_recovered(ctx: &DriverContext<'_>, state: &mut DriverState) {
+    ctx.wallet.set_source_halt(None);
+    ctx.wallet.publish_event(WalletEvent::SourceRecovered);
+    state.last_fault = None;
+    state.catch_up_pending = true;
+    let snapshot = build_snapshot(ctx, SyncDriverPhase::Waiting, state).await;
+    publish_transition(ctx.status_tx, snapshot, &DriverTransition::SourceRecovered);
+}
+
+/// Reads the chain source's reorg window and records it against the driver's minimum.
+///
+/// Runs when the driver starts, each time it reopens the chain-event stream, where a restarted
+/// source with a new configuration first shows, and on every polling wakeup while no read has
+/// succeeded yet. A read that fails or times out keeps the prior result, so a window never
+/// read keeps spends and unmineable verdicts held.
+async fn check_source_reorg_window(ctx: &DriverContext<'_>) {
+    republish_snapshot(ctx.status_tx);
+    let _ = ctx
+        .wallet
+        .verify_source_reorg_window(
+            ctx.chain,
+            Duration::from_secs(ctx.options.sync_timeout_seconds),
+        )
+        .await;
 }
 
 async fn close_sync_driver(ctx: &DriverContext<'_>, state: &DriverState) {
+    ctx.wallet.set_source_halt(None);
+    ctx.wallet.clear_source_reorg_window();
     let closing = build_snapshot(ctx, SyncDriverPhase::Closing, state).await;
     publish_transition(ctx.status_tx, closing, &DriverTransition::Closing);
     let closed = build_snapshot(ctx, SyncDriverPhase::Closed, state).await;
@@ -1013,12 +1425,15 @@ async fn run_sync_wakeup(
     ctx: &DriverContext<'_>,
     close_rx: &mut oneshot::Receiver<()>,
     state: &mut DriverState,
+    feed: &mut ChainEventFeed,
 ) -> SyncWakeupExit {
     let mut chain_tip = ChainTipRecord::Stale;
     for _ in 0..ctx.options.max_sync_iterations_per_wake_count {
-        if let Some(recovery) = &state.recovery
-            && !recovery.dormant
-        {
+        let recovering = state
+            .recovery
+            .as_ref()
+            .is_some_and(|recovery| !recovery.dormant);
+        if let Some(recovery) = state.recovery.as_ref().filter(|_| recovering) {
             if recovery.rung == SyncRepair::Park {
                 enter_park(ctx, state).await;
                 return SyncWakeupExit::Pending;
@@ -1030,8 +1445,13 @@ async fn run_sync_wakeup(
                 () = sleep(Duration::from_millis(backoff_ms)) => {}
             }
             chain_tip = ChainTipRecord::Stale;
-            if let Err(repair_error) = apply_repair(ctx, state).await {
-                record_fault(ctx, state, ClassifiedFault::from_error(&repair_error), None).await;
+        }
+        drain_ready_chain_events(ctx, state, feed).await;
+        match repair_before_scan(ctx, state, recovering).await {
+            Ok(true) => chain_tip = ChainTipRecord::Stale,
+            Ok(false) => {}
+            Err(repair_fault) => {
+                record_fault(ctx, state, repair_fault, None).await;
                 continue;
             }
         }
@@ -1098,6 +1518,27 @@ async fn complete_sync(
     state.observe_completed_run(outcome);
     state.last_fault = None;
     let should_continue = should_continue_syncing(outcome, recorded_tip);
+    if !should_continue {
+        republish_snapshot(ctx.status_tx);
+        let timeout_seconds = ctx.options.sync_timeout_seconds;
+        let reconcile = timeout(
+            Duration::from_secs(timeout_seconds),
+            ctx.wallet.reconcile_reverted_broadcasts(ctx.submitter),
+        );
+        let failure = match reconcile.await {
+            Ok(Ok(())) => None,
+            Ok(Err(error)) => Some(error.to_string()),
+            Err(_elapsed) => Some(format!("reconcile exceeded {timeout_seconds} seconds")),
+        };
+        if let Some(reason) = failure {
+            tracing::warn!(
+                target: "zally::sync",
+                event = "wallet_reverted_broadcast_reconcile_failed",
+                error = %reason,
+                "could not reconcile reverted broadcasts; the next caught-up sync retries"
+            );
+        }
+    }
     let phase = if should_continue {
         SyncDriverPhase::Syncing
     } else {
@@ -1453,10 +1894,7 @@ async fn run_one_sync(
         },
         // A deadline can cut between a chunk reaching storage and the comparison checking it.
         Err(_elapsed) => SyncRunAttempt::Faulted {
-            fault: ClassifiedFault {
-                reason: format!("sync exceeded {} seconds", options.sync_timeout_seconds),
-                repair: SyncRepair::Retry,
-            },
+            fault: ClassifiedFault::timed_out("sync", options.sync_timeout_seconds),
             committed: CommittedChunk::Unchecked,
         },
     }
@@ -1634,6 +2072,42 @@ fn emit_transition_event(snapshot: &SyncSnapshot, transition: &DriverTransition<
             event = "wallet_sync_park_reprobe",
             "park hold elapsed; repair ladder re-armed"
         ),
+        DriverTransition::ForkPointApplied {
+            fork_height,
+            outcome: ForkPointRewind::Rewound { to_height },
+        } => tracing::warn!(
+            target: "zally::sync",
+            event = "wallet_sync_fork_point_rewound",
+            fork_height = fork_height.as_u32(),
+            rewound_to_height = to_height.as_u32(),
+            "rewound to an announced fork point"
+        ),
+        DriverTransition::ForkPointApplied {
+            fork_height,
+            outcome: ForkPointRewind::Unaffected,
+        } => tracing::info!(
+            target: "zally::sync",
+            event = "wallet_sync_fork_point_unaffected",
+            fork_height = fork_height.as_u32(),
+            "announced reorg replaced no block the wallet holds"
+        ),
+        DriverTransition::ChainEventCursorDiscarded { error } => tracing::warn!(
+            target: "zally::sync",
+            event = "wallet_sync_chain_event_cursor_discarded",
+            reason = %error,
+            "chain source refused the resume cursor; replaying its retained window"
+        ),
+        DriverTransition::SourceHalted { cause } => tracing::error!(
+            target: "zally::sync",
+            event = "wallet_sync_source_halted",
+            reason = %cause,
+            "chain source stopped following the chain; new spends are refused"
+        ),
+        DriverTransition::SourceRecovered => tracing::info!(
+            target: "zally::sync",
+            event = "wallet_sync_source_recovered",
+            "chain source is following the chain again; spends resume"
+        ),
         DriverTransition::Closing => tracing::info!(
             target: "zally::sync",
             event = "wallet_sync_driver_closing",
@@ -1652,12 +2126,48 @@ fn publish_snapshot(status_tx: &watch::Sender<SyncSnapshot>, mut snapshot: SyncS
     let _ = status_tx.send(snapshot);
 }
 
+/// Publishes the current snapshot again with a fresh `published_at_ms`.
+///
+/// Runs on every polling wakeup and before the bounded chain-source and submitter calls that
+/// would otherwise follow one another without a publish, so no wait stretches the gap between
+/// snapshots past one bound.
+fn republish_snapshot(status_tx: &watch::Sender<SyncSnapshot>) {
+    let current = status_tx.borrow().clone();
+    publish_snapshot(status_tx, current);
+}
+
+/// Bounds one chain-source call the driver loop awaits.
+///
+/// A call that outruns [`SyncDriverOptions::sync_timeout_seconds`] fails as
+/// [`ChainSourceError::Unavailable`], so a source that never answers cannot silence the
+/// driver.
+async fn within_call_bound<T>(
+    ctx: &DriverContext<'_>,
+    call_label: &str,
+    call: impl Future<Output = Result<T, ChainSourceError>>,
+) -> Result<T, ChainSourceError> {
+    republish_snapshot(ctx.status_tx);
+    let timeout_seconds = ctx.options.sync_timeout_seconds;
+    timeout(Duration::from_secs(timeout_seconds), call)
+        .await
+        .unwrap_or_else(|_elapsed| {
+            Err(ChainSourceError::Unavailable {
+                reason: format!("{call_label} did not answer within {timeout_seconds} seconds"),
+            })
+        })
+}
+
 async fn open_chain_events(
     ctx: &DriverContext<'_>,
     state: &mut DriverState,
     start: &mut ChainEventStreamStart,
 ) -> Option<ChainEventEnvelopeStream> {
-    match ctx.chain.chain_event_envelopes(start.clone()).await {
+    let subscription = within_call_bound(
+        ctx,
+        "the chain-event subscription",
+        ctx.chain.chain_event_envelopes(start.clone()),
+    );
+    match subscription.await {
         Ok(stream) => {
             let recovered_stream = state.stream_consecutive_faults > 0;
             if recovered_stream {
@@ -1668,8 +2178,8 @@ async fn open_chain_events(
             }
             Some(stream)
         }
-        Err(err) if is_expired_cursor(&err) => {
-            *start = ChainEventStreamStart::EarliestRetained;
+        Err(err) if is_replaced_cursor(&err) => {
+            discard_chain_event_cursor(ctx, start, &err).await;
             state.catch_up_pending = true;
             None
         }
@@ -1680,13 +2190,44 @@ async fn open_chain_events(
     }
 }
 
-fn is_expired_cursor(error: &ChainSourceError) -> bool {
+/// Whether the source refused the subscription's cursor in a way the driver recovers from by
+/// replaying the source's retained window: the cursor fell out of retention, or the source
+/// never issued it.
+fn is_replaced_cursor(error: &ChainSourceError) -> bool {
     matches!(
         error,
         ChainSourceError::ChainEventCursorExpired {
             recovery: ChainEventCursorRecovery::EarliestRetained,
-        }
+        } | ChainSourceError::ChainEventCursorInvalid
     )
+}
+
+/// Replaces a refused cursor with the source's retained window and forgets the recorded one.
+///
+/// Every retained reorg the replay delivers is checked against the wallet's own blocks, so
+/// the replay rewinds only what left the chain. A reorg that fell out of retention before the
+/// wallet applied it surfaces as a continuity error on the next scan and reaches the repair
+/// ladder.
+async fn discard_chain_event_cursor(
+    ctx: &DriverContext<'_>,
+    start: &mut ChainEventStreamStart,
+    error: &ChainSourceError,
+) {
+    *start = ChainEventStreamStart::EarliestRetained;
+    if let Err(clear_error) = ctx.wallet.inner.storage.clear_chain_event_cursor().await {
+        tracing::warn!(
+            target: "zally::sync",
+            event = "wallet_chain_event_cursor_clear_failed",
+            error = %clear_error,
+            "could not forget a refused chain-event cursor"
+        );
+    }
+    let snapshot = ctx.status_tx.borrow().clone();
+    publish_transition(
+        ctx.status_tx,
+        snapshot,
+        &DriverTransition::ChainEventCursorDiscarded { error },
+    );
 }
 
 async fn next_chain_event_envelope(
@@ -1719,7 +2260,8 @@ impl Wallet {
     ///
     /// Reorg safety comes from the spend-time confirmation depth (ZIP 315); scan-time
     /// divergences (`ChainReorgDetected`, `CommitmentTreeConflict`,
-    /// [`WalletError::TreeRootsDiverged`]) surface as errors that the [`SyncDriver`] repairs
+    /// [`WalletError::TreeRootsDiverged`]) surface as errors. The [`SyncDriver`] rewinds an
+    /// announced reorg at its fork point before scanning, and repairs any other divergence
     /// by rewinding or rebuilding derived state.
     ///
     /// Fails closed on network mismatch. Emits `ScanProgress` events at the start and end of
@@ -1728,7 +2270,7 @@ impl Wallet {
     /// `requires_operator` on network mismatch. `retryable` on transient chain-source
     /// failures.
     pub async fn sync(&self, chain: &dyn ChainSource) -> Result<SyncOutcome, WalletError> {
-        self.run_scan_attempt("sync.attempt", || self.sync_inner(chain))
+        self.run_scan_attempt("sync.attempt", chain, || self.sync_inner(chain))
             .await
     }
 
@@ -1748,13 +2290,14 @@ impl Wallet {
         &self,
         chain: &dyn ChainSource,
     ) -> Result<SyncOutcome, WalletError> {
-        self.run_scan_attempt("sync.scan_queued_range", || {
+        self.run_scan_attempt("sync.scan_queued_range", chain, || {
             self.scan_queued_range_inner(chain)
         })
         .await
     }
 
-    /// Runs one breaker-guarded scan attempt and retires the broadcasts it aged out.
+    /// Runs one breaker-guarded scan attempt and retires the pending broadcasts the chain
+    /// settled.
     ///
     /// One attempt is one unit of breaker accounting: splitting the chain-tip read into its
     /// own guarded call would record a success for every attempt whose scan then failed,
@@ -1762,6 +2305,7 @@ impl Wallet {
     async fn run_scan_attempt<F, Fut>(
         &self,
         operation_label: &'static str,
+        chain: &dyn ChainSource,
         attempt: F,
     ) -> Result<SyncOutcome, WalletError>
     where
@@ -1776,18 +2320,8 @@ impl Wallet {
             std::convert::identity,
         )
         .await?;
-        self.retire_expired_pending_broadcasts().await?;
+        self.retire_pending_broadcasts(chain).await?;
         Ok(outcome)
-    }
-
-    async fn retire_expired_pending_broadcasts(&self) -> Result<(), WalletError> {
-        let before_at_ms =
-            current_unix_ms().saturating_sub(self.inner.options.pending_broadcast_window_ms);
-        self.inner
-            .storage
-            .clear_expired_pending_broadcast_inputs(before_at_ms)
-            .await?;
-        Ok(())
     }
 
     async fn sync_inner(&self, chain: &dyn ChainSource) -> Result<SyncOutcome, WalletError> {
@@ -1809,7 +2343,8 @@ impl Wallet {
         self.scan_one_range(chain, chain_epoch).await
     }
 
-    /// Pins one source epoch, failing closed when the source serves another network.
+    /// Pins one source epoch, failing closed when the source serves another network, and
+    /// records its visible tip as the source's latest.
     pub(crate) async fn pin_chain_epoch(
         &self,
         chain: &dyn ChainSource,
@@ -1820,7 +2355,9 @@ impl Wallet {
                 requested: chain.network(),
             });
         }
-        Ok(chain.current_epoch().await?)
+        let chain_epoch = chain.current_epoch().await?;
+        self.record_source_visible_tip(chain_epoch.visible_tip().height);
+        Ok(chain_epoch)
     }
 
     async fn scan_one_range(
@@ -1830,6 +2367,10 @@ impl Wallet {
     ) -> Result<SyncOutcome, WalletError> {
         let visible_tip = chain_epoch.visible_tip().height;
         let settled_tip = chain_epoch.settled_tip().height;
+        // A scan that runs before the carried steps are stored could pass a payment it cannot
+        // recognize, so a failure here fails the attempt instead of scanning blind.
+        let scan_blind_sends = self.inner.storage.store_carried_send_steps().await?;
+        *self.inner.scan_blind_sends.lock() = Some(scan_blind_sends.into_iter().collect());
         let Some((scan_start, scan_end, priority)) = self
             .plan_scan_range(chain, chain_epoch, visible_tip)
             .await?
@@ -1990,28 +2531,21 @@ impl Wallet {
         Ok(())
     }
 
-    /// Rewinds the wallet's derived state to exactly `rewind_to` using the chain's tree
-    /// state at that height.
+    /// Rewinds the wallet's derived state to exactly `rewind_to`, at any depth, using the
+    /// chain's tree state at that height.
     ///
-    /// One rung of the sync driver's repair ladder: truncates below a divergence via
-    /// [`WalletStorage::truncate_to_chain_state`] (which lands the wallet at exactly the
-    /// target height) and publishes [`WalletEvent::ReorgDetected`] so hosts observe the
-    /// rollback. The next sync re-plans from the rewound frontier.
+    /// One rung of the sync driver's repair ladder for divergences no chain event
+    /// announced. It goes through [`Wallet::revert_to_height`], so the rewind reports what
+    /// left the chain and records the reverted broadcasts. The next sync re-plans from the
+    /// rewound frontier.
     pub(crate) async fn rewind_to_height(
         &self,
         chain: &dyn ChainSource,
         rewind_to: BlockHeight,
     ) -> Result<(), WalletError> {
-        let chain_epoch = chain.current_epoch().await?;
-        let chain_state = chain_state_at(chain, chain_epoch, rewind_to).await?;
-        self.inner
-            .storage
-            .truncate_to_chain_state(chain_state)
+        let chain_epoch = self.pin_chain_epoch(chain).await?;
+        self.revert_to_height(chain, chain_epoch, rewind_to, None)
             .await?;
-        self.publish_event(WalletEvent::ReorgDetected {
-            rolled_back_to_height: rewind_to,
-            new_settled_tip_height: rewind_to,
-        });
         Ok(())
     }
 
@@ -2067,8 +2601,6 @@ impl Wallet {
             .inner
             .storage
             .wallet_tx_ids_mined_in_range(scanned_from, outcome.scanned_to_height)
-            .await?;
-        self.retire_pending_broadcasts_for_mined(&newly_confirmed)
             .await?;
         for (tx_id, confirmed_at_height) in newly_confirmed {
             self.publish_event(WalletEvent::TransactionConfirmed {
@@ -2196,21 +2728,6 @@ impl Wallet {
             }
         }
     }
-
-    async fn retire_pending_broadcasts_for_mined(
-        &self,
-        newly_confirmed: &[(zally_core::TxId, BlockHeight)],
-    ) -> Result<(), WalletError> {
-        if newly_confirmed.is_empty() {
-            return Ok(());
-        }
-        let confirmed_tx_ids: Vec<_> = newly_confirmed.iter().map(|(tx_id, _)| *tx_id).collect();
-        self.inner
-            .storage
-            .clear_pending_broadcast_inputs_for_mined(&confirmed_tx_ids)
-            .await?;
-        Ok(())
-    }
 }
 
 fn block_timestamp_index(blocks: &[CompactBlockArtifact]) -> HashMap<u32, u64> {
@@ -2224,7 +2741,7 @@ fn block_timestamp_index(blocks: &[CompactBlockArtifact]) -> HashMap<u32, u64> {
         .collect()
 }
 
-const fn shielded_pool_for(protocol: zcash_protocol::ShieldedPool) -> ShieldedPool {
+pub(crate) const fn shielded_pool_for(protocol: zcash_protocol::ShieldedPool) -> ShieldedPool {
     match protocol {
         zcash_protocol::ShieldedPool::Sapling => ShieldedPool::Sapling,
         zcash_protocol::ShieldedPool::Orchard => ShieldedPool::Orchard,
@@ -2864,11 +3381,13 @@ mod tests {
 
     #[test]
     fn state_fault_streak_walks_rewind_then_rescan_to_park() {
-        let ladder = drive_ladder([SyncRepair::Rewind; 5], one_strike_policy());
+        let ladder = drive_ladder([SyncRepair::Rewind; 6], one_strike_policy());
         assert_eq!(ladder[0].0, SyncRepair::Rewind);
         assert_eq!(REWIND_LADDER_BLOCKS[ladder[0].1], 10);
         assert_eq!(ladder[1].0, SyncRepair::Rewind);
         assert_eq!(REWIND_LADDER_BLOCKS[ladder[1].1], 100);
+        assert_eq!(ladder[2].0, SyncRepair::Rewind);
+        assert_eq!(REWIND_LADDER_BLOCKS[ladder[2].1], 1_000);
         assert!(
             ladder
                 .iter()
@@ -2882,6 +3401,7 @@ mod tests {
         let ladder = drive_ladder(
             [
                 SyncRepair::Retry,
+                SyncRepair::Rewind,
                 SyncRepair::Rewind,
                 SyncRepair::Rewind,
                 SyncRepair::Rewind,

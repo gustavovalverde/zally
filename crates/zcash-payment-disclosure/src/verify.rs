@@ -1,7 +1,7 @@
 use std::{fmt, io::Cursor};
 
-use bellman::groth16::Proof;
 use bls12_381::Bls12;
+use groth16::Proof;
 use orchard::{
     Address as IronwoodAddress,
     note_encryption::IronwoodDomain,

@@ -2,8 +2,8 @@
 
 use zally_core::{AccountId, BlockHeight, Network, OutPoint, TxId, Zatoshis};
 
-/// One transparent outpoint locked by a wallet-owned transaction that has been broadcast
-/// but not yet observed mined.
+/// One transparent outpoint spent by a wallet-owned broadcast whose fate the chain has not
+/// settled.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[non_exhaustive]
@@ -18,10 +18,14 @@ pub struct PendingTransparentInput {
     pub broadcast_at_ms: u64,
     /// Chain tip the wallet had observed at broadcast time. `None` when no tip was recorded.
     pub broadcast_at_height: Option<BlockHeight>,
+    /// The broadcast is older than [`crate::WalletOptions::pending_broadcast_window_ms`] and
+    /// the chain has neither mined it at a settled height nor ruled it out. Worth an
+    /// operator's look; the entry stays until the chain settles it.
+    pub is_stale: bool,
 }
 
-/// Snapshot of every transparent outpoint currently locked by wallet-owned broadcasts for
-/// one account, anchored to the wallet's persisted visible tip.
+/// Snapshot of every transparent outpoint spent by wallet-owned broadcasts the chain has not
+/// settled, for one account, anchored to the wallet's persisted visible tip.
 ///
 /// Returned by [`crate::Wallet::get_pending_transparent_inputs`]. Operators use this view to
 /// reason about "what funds are in flight right now?" without inspecting the spending

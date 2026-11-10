@@ -10,6 +10,9 @@ use zally_keys::{AgeFileSealing, AgeFileSealingOptions};
 use zally_storage::{Sqlite, SqliteOptions};
 use zally_testkit::TempWalletPath;
 use zally_wallet::{Wallet, WalletError};
+use zcash_address::ZcashAddress;
+use zcash_keys::address::Address;
+use zcash_protocol::consensus::Parameters as _;
 
 const SIDECAR_SUFFIX: &str = ".age-identity";
 
@@ -49,8 +52,13 @@ async fn open_or_create_account_recovers_account_on_fresh_storage() -> Result<()
         .await?
         .encode(&network.to_parameters());
     assert!(
-        ua.starts_with("uregtest1"),
-        "restored wallet must be capable of deriving a Unified Address: got {ua}"
+        matches!(
+            ua.parse::<ZcashAddress>().ok().and_then(|address| address
+                .convert_if_network::<Address>(network.to_parameters().network_type())
+                .ok()),
+            Some(Address::Unified(_))
+        ),
+        "restored wallet must derive a parseable Unified Address for its network: got {ua}"
     );
     Ok(())
 }
@@ -63,9 +71,10 @@ async fn open_or_create_account_is_idempotent_on_warm_storage() -> Result<(), Te
     let sealing = AgeFileSealing::new(AgeFileSealingOptions::at_path(temp.seed_path()));
     let storage = Sqlite::new(SqliteOptions::for_network(network, temp.db_path()));
     let chain = zally_testkit::MockChainSource::new(network);
-    let (_wallet, original_account_id, _mnemonic) = Wallet::builder(network, sealing, storage)
+    let (wallet, original_account_id, _mnemonic) = Wallet::builder(network, sealing, storage)
         .create(&chain, BlockHeight::from(1))
         .await?;
+    drop(wallet);
 
     let sealing = AgeFileSealing::new(AgeFileSealingOptions::at_path(temp.seed_path()));
     let storage = Sqlite::new(SqliteOptions::for_network(network, temp.db_path()));

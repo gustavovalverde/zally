@@ -37,7 +37,8 @@ fn real_sapling_round_trip() -> Result<(), Box<dyn std::error::Error>> {
     let (spend_verifying_key, _) = prover.verifying_keys();
     let prepared_spend_verifying_key = spend_verifying_key.prepare();
 
-    let spending_key = ExtendedSpendingKey::master(&[7; 32]);
+    let spending_key =
+        ExtendedSpendingKey::master(&[7; 32]).ok_or("invalid fixture spending key")?;
     let full_viewing_key = spending_key.to_diversifiable_full_viewing_key();
     let recipient = full_viewing_key.default_address().1;
     let input_rseed = Rseed::AfterZip212([9; 32]);
@@ -70,7 +71,7 @@ fn real_sapling_round_trip() -> Result<(), Box<dyn std::error::Error>> {
         merkle_path.clone(),
     )?;
     builder.add_sapling_output::<Infallible>(
-        Some(spending_key.expsk.ovk),
+        Some(*spending_key.expsk().ovk()),
         recipient,
         Zatoshis::const_from_u64(OUTPUT_AMOUNT_ZAT),
         MemoBytes::empty(),
@@ -98,7 +99,7 @@ fn real_sapling_round_trip() -> Result<(), Box<dyn std::error::Error>> {
         .ok_or("synthetic output index missing")?;
     let on_chain_output = &sapling_bundle.shielded_outputs()[output_index];
     let ock = prf_ock(
-        &spending_key.expsk.ovk,
+        spending_key.expsk().ovk(),
         on_chain_output.cv(),
         &on_chain_output.cmu().to_bytes(),
         on_chain_output.ephemeral_key(),
@@ -113,7 +114,7 @@ fn real_sapling_round_trip() -> Result<(), Box<dyn std::error::Error>> {
             recipient,
             INPUT_AMOUNT_ZAT,
             input_rseed,
-            spending_key.expsk.proof_generation_key(),
+            spending_key.expsk().proof_generation_key(),
             witness_root.into(),
             merkle_path,
         )],
@@ -124,7 +125,7 @@ fn real_sapling_round_trip() -> Result<(), Box<dyn std::error::Error>> {
     )?;
     let disclosure = prove_disclosure(
         plan,
-        &spending_key.expsk.ask,
+        spending_key.expsk().ask(),
         &prover,
         &mut StdRng::from_seed([2; 32]),
     )?;

@@ -49,6 +49,23 @@ async fn zinder_chain_source_reports_tip_and_streams_blocks() -> Result<(), Test
     }
 }
 
+#[tokio::test]
+#[ignore = "live test; see CLAUDE.md §Live Node Tests"]
+async fn zinder_chain_source_reports_its_reorg_window() -> Result<(), TestError> {
+    let _guard = init();
+    require_live()?;
+
+    let network = require_network()?;
+    let endpoint = require_zinder_endpoint()?;
+    let chain = ZinderChainSource::connect_remote(ZinderRemoteOptions { endpoint, network })?;
+    let reorg_window_blocks = chain.reorg_window_blocks().await?;
+    assert!(
+        reorg_window_blocks > 0,
+        "live zinder reported a zero-block reorg window"
+    );
+    Ok(())
+}
+
 async fn acquire_epoch_and_drain_tip_range(chain: &ZinderChainSource) -> Result<usize, TestError> {
     let chain_epoch = chain.current_epoch().await?;
     let tip = chain_epoch.settled_tip().height;

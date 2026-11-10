@@ -1,13 +1,18 @@
-//! Regression: `Wallet::get_pending_transparent_inputs` reflects rows recorded directly via
-//! storage, honours the configured inflight window, and clears on confirmation.
+//! Regression: `Wallet::get_pending_transparent_inputs` reflects rows recorded via storage.
+//!
+//! It flags rows older than the configured window as stale and keeps every row that the chain
+//! has not settled, however old.
 
 use zally_chain::ChainSource as _;
 use zally_core::{BlockHeight, OutPoint, TxId, Zatoshis};
-use zally_storage::{PendingBroadcastRecord, Sqlite, SqliteOptions, WalletStorage};
+use zally_storage::{PendingBroadcastRecord, WalletStorage};
 use zally_testkit::MockChainSource;
 use zally_wallet::{WalletError, WalletOptions};
 
-use super::fixtures::{TestWalletFixture, create_test_wallet, create_test_wallet_with_options};
+use super::fixtures::{
+    TestWalletFixture, create_test_wallet, create_test_wallet_with_options,
+    create_test_wallet_with_storage,
+};
 
 fn unix_ms_now() -> u64 {
     std::time::SystemTime::now()
@@ -37,14 +42,14 @@ async fn get_pending_transparent_inputs_returns_empty_on_fresh_wallet() -> Resul
 
 #[tokio::test]
 async fn get_pending_transparent_inputs_reports_recorded_rows() -> Result<(), TestError> {
-    let TestWalletFixture {
-        temp,
-        wallet,
-        account_id,
-    } = create_test_wallet().await?;
-    let network = wallet.network();
-    let storage = Sqlite::new(SqliteOptions::for_network(network, temp.db_path()));
-    storage.open_or_create().await?;
+    let (
+        TestWalletFixture {
+            temp: _temp,
+            wallet,
+            account_id,
+        },
+        storage,
+    ) = create_test_wallet_with_storage().await?;
 
     let now_ms = unix_ms_now();
     let broadcast_tx_id = TxId::from_bytes([1_u8; 32]);
@@ -70,20 +75,22 @@ async fn get_pending_transparent_inputs_reports_recorded_rows() -> Result<(), Te
     assert_eq!(entry.broadcast_at_ms, now_ms);
     assert_eq!(entry.broadcast_at_height, Some(BlockHeight::from(42)));
     assert_eq!(entry.value_zat.as_u64(), 12_345);
+    assert!(!entry.is_stale);
     Ok(())
 }
 
 #[tokio::test]
-async fn get_pending_transparent_inputs_drops_rows_outside_window() -> Result<(), TestError> {
+async fn get_pending_transparent_inputs_flags_rows_outside_window_as_stale() -> Result<(), TestError>
+{
     let options = WalletOptions::default().with_pending_broadcast_window_ms(60_000);
-    let TestWalletFixture {
-        temp,
-        wallet,
-        account_id,
-    } = create_test_wallet_with_options(options).await?;
-    let network = wallet.network();
-    let storage = Sqlite::new(SqliteOptions::for_network(network, temp.db_path()));
-    storage.open_or_create().await?;
+    let (
+        TestWalletFixture {
+            temp: _temp,
+            wallet,
+            account_id,
+        },
+        storage,
+    ) = create_test_wallet_with_options(options).await?;
 
     let stale_at_ms = unix_ms_now().saturating_sub(10 * 60_000);
     storage
@@ -100,24 +107,24 @@ async fn get_pending_transparent_inputs_drops_rows_outside_window() -> Result<()
         .await?;
 
     let snapshot = wallet.get_pending_transparent_inputs(account_id).await?;
-    assert!(
-        snapshot.inputs.is_empty(),
-        "stale rows must fall outside the window"
-    );
+    assert_eq!(snapshot.inputs.len(), 1, "stale rows stay in the snapshot");
+    assert!(snapshot.inputs[0].is_stale);
     Ok(())
 }
 
 #[tokio::test]
-async fn sync_clears_expired_pending_broadcast_rows() -> Result<(), TestError> {
+async fn sync_keeps_old_pending_broadcast_rows_the_chain_has_not_settled() -> Result<(), TestError>
+{
     let options = WalletOptions::default().with_pending_broadcast_window_ms(60_000);
-    let TestWalletFixture {
-        temp,
-        wallet,
-        account_id,
-    } = create_test_wallet_with_options(options).await?;
+    let (
+        TestWalletFixture {
+            temp: _temp,
+            wallet,
+            account_id,
+        },
+        storage,
+    ) = create_test_wallet_with_options(options).await?;
     let network = wallet.network();
-    let storage = Sqlite::new(SqliteOptions::for_network(network, temp.db_path()));
-    storage.open_or_create().await?;
 
     let stale_at_ms = unix_ms_now().saturating_sub(10 * 60_000);
     let tx_id = TxId::from_bytes([5_u8; 32]);
@@ -143,9 +150,9 @@ async fn sync_clears_expired_pending_broadcast_rows() -> Result<(), TestError> {
     let _ = chain.current_epoch().await;
 
     let after_sync = storage.list_pending_broadcast_inputs(account_id, 0).await?;
-    assert!(
-        after_sync.is_empty(),
-        "sync must drop expired rows via clear_expired_pending_broadcast_inputs"
+    assert_eq!(
+        after_sync, direct_rows,
+        "wall-clock age never retires a pending broadcast"
     );
     Ok(())
 }

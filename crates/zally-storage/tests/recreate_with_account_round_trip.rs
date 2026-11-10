@@ -1,8 +1,7 @@
 //! `WalletStorage::recreate_with_account` rebuilds the wallet database in place while
 //! the deterministic account identity survives: the same seed yields the same
 //! `AccountId` before and after the rebuild, handles holding the pre-rebuild id keep
-//! working, and every piece of wallet-local state (derived chain state and the zally
-//! ledger alike) starts fresh.
+//! working, derived chain state starts fresh, and the payment ledger is kept.
 
 use tempfile::TempDir;
 use zally_core::{
@@ -62,7 +61,7 @@ async fn account_id_survives_database_rebuild() -> Result<(), TestError> {
 }
 
 #[tokio::test]
-async fn recreate_drops_derived_and_ledger_state() -> Result<(), TestError> {
+async fn recreate_keeps_the_ledger_and_drops_derived_state() -> Result<(), TestError> {
     let temp = TempDir::new()?;
     let storage = open_storage(&temp);
     storage.open_or_create().await?;
@@ -91,6 +90,9 @@ async fn recreate_drops_derived_and_ledger_state() -> Result<(), TestError> {
             reserved_at_ms: 1_700_000_000_000,
         })
         .await?;
+    storage
+        .record_chain_event_cursor(b"cursor-before-rebuild".to_vec())
+        .await?;
 
     let mut rebuilt_anchor =
         scan_artifact::genesis_tree_state(zally_core::Network::regtest(), 9, [1; 32]);
@@ -106,12 +108,27 @@ async fn recreate_drops_derived_and_ledger_state() -> Result<(), TestError> {
     );
     assert_eq!(
         storage.find_idempotent_submission(&key).await?,
+        Some(TxId::from_bytes([0xAB; 32])),
+        "send idempotency records must survive a rebuild so a retried payout is refused"
+    );
+    assert_eq!(
+        storage.list_active_holds(rebuilt_id).await?.len(),
+        1,
+        "holds must survive a rebuild"
+    );
+    assert_eq!(
+        storage.find_chain_event_cursor().await?,
+        Some(b"cursor-before-rebuild".to_vec()),
+        "the chain-event cursor must survive a rebuild"
+    );
+    assert_eq!(
+        storage.find_highest_scanned_height().await?,
         None,
-        "send idempotency records live in the discarded ledger"
+        "scanned blocks are derived state and must not survive a rebuild"
     );
     assert!(
-        storage.list_active_holds(rebuilt_id).await?.is_empty(),
-        "holds live in the discarded ledger"
+        !temp.path().join("wallet.db.rebuild").exists(),
+        "the rebuild must not leave its sibling file behind"
     );
     assert_eq!(
         storage.account_birthday().await?,

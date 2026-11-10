@@ -25,8 +25,8 @@ use zally_core::{
 };
 use zally_keys::{Mnemonic, SeedMaterial};
 use zally_storage::{
-    ScanRequest, ShieldTransparentRequest, Sqlite, SqliteOptions, StorageError, TransparentUtxoRow,
-    WalletStorage,
+    ProposalRejectionKind, ScanRequest, ShieldTransparentRequest, Sqlite, SqliteOptions,
+    StorageError, TransparentUtxoRow, WalletStorage,
 };
 use zcash_client_backend::proto::compact_formats::CompactBlock;
 use zcash_client_backend::proto::service::TreeState;
@@ -113,7 +113,13 @@ async fn shielding_does_not_reselect_an_input_spent_by_a_pending_transaction()
         .shield_transparent_funds(ShieldTransparentRequest::new(account_id, threshold), &seed)
         .await;
     assert!(
-        matches!(second_attempt, Err(StorageError::InsufficientFunds { .. })),
+        matches!(
+            second_attempt,
+            Err(StorageError::ProposalRejected {
+                kind: ProposalRejectionKind::InsufficientFunds { .. },
+                ..
+            })
+        ),
         "the pending wallet transaction must make its input unavailable: {second_attempt:?}"
     );
     Ok(())

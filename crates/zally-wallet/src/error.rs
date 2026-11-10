@@ -1,10 +1,10 @@
 //! Operator-facing wallet error.
 
-use zally_chain::{ChainSourceError, FailurePosture, SubmitterError};
+use zally_chain::{ChainSourceError, FailurePosture, SubmitterError, UnmineableReason};
 use zally_core::{BlockHeight, Network, TxId, Zatoshis};
 use zally_keys::{KeyDerivationError, SealingError};
 use zally_pczt::{PaymentDisclosureExportError, PcztError};
-use zally_storage::StorageError;
+use zally_storage::{ProposalRejectionKind, StorageError};
 
 /// Error returned by [`crate::Wallet`] operations.
 #[derive(Debug, thiserror::Error)]
@@ -63,6 +63,9 @@ pub enum WalletError {
 
     /// A memo was provided for a transparent recipient.
     ///
+    /// Also returned for a Unified Address whose only receiver is transparent, which is
+    /// paid through that receiver.
+    ///
     /// Posture: [`FailurePosture::NotRetryable`]: ZIP-302 prohibits memos on transparent
     /// outputs.
     #[error("memos are not permitted on transparent recipients (ZIP-302)")]
@@ -75,14 +78,18 @@ pub enum WalletError {
     #[error("TEX recipients (ZIP-320) require an all-transparent input set")]
     ShieldedInputsOnTexRecipient,
 
-    /// The wallet does not have enough spendable balance for the requested send.
+    /// The wallet does not have enough spendable balance for the requested reservation or
+    /// send.
+    ///
+    /// librustzcash rejecting a proposal for insufficient funds also surfaces here, never as
+    /// [`WalletError::ProposalRejected`].
     ///
     /// Posture: [`FailurePosture::NotRetryable`] until balance is replenished.
     #[error("insufficient spendable balance: requested {requested_zat}, spendable {spendable_zat}")]
     InsufficientBalance {
-        /// Amount the caller asked to send.
+        /// Value the call needed: the reservation amount, or the payment total plus fee.
         requested_zat: Zatoshis,
-        /// Spendable balance reported by storage at proposal time.
+        /// Spendable balance at the time of the check.
         spendable_zat: Zatoshis,
     },
 
@@ -95,12 +102,17 @@ pub enum WalletError {
         reason: String,
     },
 
-    /// The proposal could not be built (e.g., unsupported recipient combination, missing
-    /// anchor, fee constraint).
+    /// The proposal or its transaction could not be built.
     ///
-    /// Posture: [`FailurePosture::NotRetryable`] for malformed input.
-    #[error("proposal rejected: {reason}")]
+    /// `kind` says what the caller can do next, for example retry when a concurrent proposal
+    /// locked a selected input, or retry without a target expiry height. Insufficient funds
+    /// surface as [`WalletError::InsufficientBalance`] instead.
+    ///
+    /// Posture follows [`ProposalRejectionKind::posture`].
+    #[error("proposal rejected ({kind:?}): {reason}")]
     ProposalRejected {
+        /// Why the proposal was rejected.
+        kind: ProposalRejectionKind,
         /// Underlying error description.
         reason: String,
     },
@@ -117,6 +129,22 @@ pub enum WalletError {
         reason: zally_chain::RejectionReason,
         /// Operator-facing detail describing the rejection.
         detail: String,
+    },
+
+    /// The transaction or PCZT can never be mined: it expired, or it was signed for a
+    /// consensus branch or with a version that the next block does not accept, for example
+    /// because a network upgrade activated after it was created.
+    ///
+    /// Signatures commit to the consensus branch, so signing it again cannot repair it:
+    /// recreate it from a new proposal. Before returning, the wallet released the inputs it
+    /// held for a PCZT it created. For a PCZT, the verdict assumes this wallet is its sole
+    /// broadcaster; a copy broadcast elsewhere may already be mined.
+    ///
+    /// Posture: [`FailurePosture::NotRetryable`].
+    #[error("transaction can never be mined ({reason}); recreate it, do not sign it again")]
+    TransactionUnmineable {
+        /// Why the transaction can never be mined.
+        reason: UnmineableReason,
     },
 
     /// A success-kind submitter response named a transaction other than the bytes submitted.
@@ -227,6 +255,77 @@ pub enum WalletError {
         source: Box<Self>,
     },
 
+    /// The chain source stopped following the chain, so the wallet refuses new spends: a
+    /// transaction built against a frozen branch could pay from funds the chain no longer
+    /// holds.
+    ///
+    /// Posture: [`FailurePosture::Retryable`]: retry once the sync driver reports the source
+    /// recovered.
+    #[error("chain source halted; new spends are refused: {cause}")]
+    ChainSourceHalted {
+        /// Why the source halted.
+        cause: crate::SourceHalt,
+    },
+
+    /// The chain source follows shallower reorgs than the node can produce, so the wallet
+    /// refuses new spends.
+    ///
+    /// The wallet frees an idempotency key once it judges the key's transaction unmineable at
+    /// the settled tip. A reorg deeper than the source's window could still mine that
+    /// transaction after its replacement was paid. Raise the source's reorg window to at
+    /// least `required_blocks` (Zinder's `reorg_window_blocks`), or lower
+    /// [`crate::WalletOptions::minimum_source_reorg_window_blocks`] to accept the weaker
+    /// guarantee.
+    ///
+    /// Posture: [`FailurePosture::RequiresOperator`]: spends resume once a sync or the sync
+    /// driver reads a window of at least `required_blocks`.
+    #[error(
+        "chain source reorg window of {reorg_window_blocks} blocks is below the required \
+         {required_blocks}; new spends are refused"
+    )]
+    SourceReorgWindowTooShallow {
+        /// Reorg window the source reported.
+        reorg_window_blocks: u32,
+        /// Minimum window the sync driver requires.
+        required_blocks: u32,
+    },
+
+    /// The send's idempotency key names a transaction that the next block can no longer
+    /// include and that the pending-broadcast verdict has not yet settled.
+    ///
+    /// A reorg within the chain source's window could still mine it, so paying again under
+    /// another key could pay twice. Once the wallet reports
+    /// [`crate::WalletEvent::PendingBroadcastUnmineable`] for `tx_id`, the same key builds a
+    /// replacement; a [`crate::WalletEvent::TransactionConfirmed`] for it means it was paid.
+    ///
+    /// Posture: [`FailurePosture::Retryable`]: retry the same key after either event.
+    #[error(
+        "transaction {tx_id} bound to this idempotency key can no longer enter the next block \
+         (expiry height {}) and awaits the pending-broadcast verdict",
+        tx_expiry_height.as_u32()
+    )]
+    PendingBroadcastUnsettled {
+        /// Transaction the key names.
+        tx_id: TxId,
+        /// The transaction's expiry height.
+        tx_expiry_height: BlockHeight,
+    },
+
+    /// The sync driver requires a minimum chain source reorg window and has not yet read the
+    /// source's window, so the wallet refuses new spends until it has.
+    ///
+    /// Posture: [`FailurePosture::Retryable`]: retry once the driver has read the window,
+    /// normally right after it starts. A source whose window cannot be read keeps spends
+    /// refused.
+    #[error(
+        "chain source reorg window not yet verified against the required {required_blocks} \
+         blocks; new spends are refused"
+    )]
+    SourceReorgWindowUnverified {
+        /// Minimum window the sync driver requires.
+        required_blocks: u32,
+    },
+
     /// The sync-driver task panicked. Surfaced only by [`crate::SyncHandle::close`]; the
     /// driver task never fails while its handle is alive.
     ///
@@ -252,21 +351,26 @@ impl WalletError {
             Self::PaymentDisclosureExport(e) => e.posture(),
             Self::ChainSource(e) => e.posture(),
             Self::Submitter(e) => e.posture(),
-            Self::CircuitBroken { .. } => FailurePosture::Retryable,
+            Self::CircuitBroken { .. }
+            | Self::ChainSourceHalted { .. }
+            | Self::SourceReorgWindowUnverified { .. }
+            | Self::PendingBroadcastUnsettled { .. } => FailurePosture::Retryable,
             Self::UnverifiedScanChunk { source, .. } => source.posture(),
+            Self::ProposalRejected { kind, .. } => kind.posture(),
             Self::NetworkMismatch { .. }
             | Self::NoSealedSeed
             | Self::AccountNotFound
             | Self::SubmittedTransactionIdMismatch { .. }
             | Self::TargetExpiryMismatch { .. }
+            | Self::SourceReorgWindowTooShallow { .. }
             | Self::SyncDriverFailed { .. } => FailurePosture::RequiresOperator,
             Self::AccountAlreadyExists
             | Self::MemoOnTransparentRecipient
             | Self::ShieldedInputsOnTexRecipient
             | Self::InsufficientBalance { .. }
             | Self::PaymentRequestParseFailed { .. }
-            | Self::ProposalRejected { .. }
             | Self::SubmissionRejected { .. }
+            | Self::TransactionUnmineable { .. }
             | Self::PaymentDisclosureSourceMissing { .. }
             | Self::TargetExpiryStale { .. }
             | Self::TreeRootsDiverged { .. } => FailurePosture::NotRetryable,
@@ -308,14 +412,21 @@ impl From<StorageError> for WalletError {
             StorageError::InsufficientFunds {
                 required_zat,
                 available_zat,
+            }
+            | StorageError::ProposalRejected {
+                kind:
+                    ProposalRejectionKind::InsufficientFunds {
+                        required_zat,
+                        available_zat,
+                    },
+                ..
             } => Self::InsufficientBalance {
                 requested_zat: required_zat,
                 spendable_zat: available_zat,
             },
-            StorageError::ProposalBuildFailed {
-                reason,
-                posture: FailurePosture::NotRetryable,
-            } => Self::ProposalRejected { reason },
+            StorageError::ProposalRejected { kind, reason } => {
+                Self::ProposalRejected { kind, reason }
+            }
             other => Self::Storage(other),
         }
     }
@@ -347,10 +458,19 @@ mod tests {
                 spendable_zat: Zatoshis::zero(),
             },
             WalletError::PaymentRequestParseFailed { reason: "x".into() },
-            WalletError::ProposalRejected { reason: "x".into() },
+            WalletError::ProposalRejected {
+                kind: ProposalRejectionKind::Other,
+                reason: "x".into(),
+            },
             WalletError::SubmissionRejected {
                 reason: zally_chain::RejectionReason::Unknown,
                 detail: "x".into(),
+            },
+            WalletError::TransactionUnmineable {
+                reason: UnmineableReason::Expired {
+                    expiry_height: BlockHeight::from(10),
+                    next_height: BlockHeight::from(11),
+                },
             },
             WalletError::SubmittedTransactionIdMismatch {
                 expected: TxId::from_bytes([1; 32]),
@@ -379,12 +499,29 @@ mod tests {
                     ChainSourceError::ChainEpochPinUnavailable,
                 )),
             },
+            WalletError::ChainSourceHalted {
+                cause: crate::SourceHalt::VisibleTipStalled {
+                    visible_tip_height: BlockHeight::from(14),
+                    unchanged_since_ms: 0,
+                },
+            },
             WalletError::SyncDriverFailed { reason: "x".into() },
         ];
         for e in variants {
             let _ = e.posture();
             let _ = e.is_retryable();
         }
+    }
+
+    #[test]
+    fn a_halted_source_refuses_spends_until_it_recovers() {
+        let err = WalletError::ChainSourceHalted {
+            cause: crate::SourceHalt::VisibleTipStalled {
+                visible_tip_height: BlockHeight::from(14),
+                unchanged_since_ms: 0,
+            },
+        };
+        assert_eq!(err.posture(), FailurePosture::Retryable);
     }
 
     #[test]
@@ -397,14 +534,82 @@ mod tests {
         assert!(!err.is_retryable());
     }
 
+    fn storage_rejection(kind: ProposalRejectionKind) -> WalletError {
+        WalletError::from(StorageError::ProposalRejected {
+            kind,
+            reason: "upstream detail".to_owned(),
+        })
+    }
+
     #[test]
-    fn retryable_proposal_failure_preserves_storage_posture() {
-        let err = WalletError::from(StorageError::ProposalBuildFailed {
-            reason: "InputsLocked".to_owned(),
-            posture: FailurePosture::Retryable,
+    fn storage_proposal_rejections_keep_their_kind_and_posture() {
+        let expected = [
+            (
+                ProposalRejectionKind::InputsLocked,
+                FailurePosture::Retryable,
+            ),
+            (
+                ProposalRejectionKind::TransactionTooLarge,
+                FailurePosture::NotRetryable,
+            ),
+            (
+                ProposalRejectionKind::ExpiryConflictsWithCanonicalCrossing {
+                    requested_expiry_height: BlockHeight::from(4_500_000),
+                },
+                FailurePosture::NotRetryable,
+            ),
+            (
+                ProposalRejectionKind::RecipientAddressExpired,
+                FailurePosture::NotRetryable,
+            ),
+            (
+                ProposalRejectionKind::OrchardRecipientNeedsIronwood,
+                FailurePosture::NotRetryable,
+            ),
+            (
+                ProposalRejectionKind::SelectionContractViolated,
+                FailurePosture::RequiresOperator,
+            ),
+            (ProposalRejectionKind::Other, FailurePosture::NotRetryable),
+        ];
+        for (kind, posture) in expected {
+            let err = storage_rejection(kind);
+            assert!(
+                matches!(&err, WalletError::ProposalRejected { kind: actual, reason }
+                    if *actual == kind && reason == "upstream detail"),
+                "{err:?}"
+            );
+            assert_eq!(err.posture(), posture, "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn insufficient_funds_rejection_reports_insufficient_balance() {
+        let required_zat = Zatoshis::try_from(20_000_u64).unwrap_or(Zatoshis::zero());
+        let available_zat = Zatoshis::try_from(10_000_u64).unwrap_or(Zatoshis::zero());
+        let err = storage_rejection(ProposalRejectionKind::InsufficientFunds {
+            required_zat,
+            available_zat,
         });
-        assert!(matches!(err, WalletError::Storage(_)));
-        assert_eq!(err.posture(), FailurePosture::Retryable);
+        assert!(
+            matches!(err, WalletError::InsufficientBalance { requested_zat, spendable_zat }
+                if requested_zat == required_zat && spendable_zat == available_zat),
+            "{err:?}"
+        );
+        assert_eq!(err.posture(), FailurePosture::NotRetryable);
+    }
+
+    #[test]
+    fn unfinished_proposal_artifact_stays_a_storage_error() {
+        let err = WalletError::from(StorageError::ProposalBuildFailed {
+            reason: "pczt serialize failed".to_owned(),
+            posture: FailurePosture::NotRetryable,
+        });
+        assert!(matches!(
+            err,
+            WalletError::Storage(StorageError::ProposalBuildFailed { .. })
+        ));
+        assert_eq!(err.posture(), FailurePosture::NotRetryable);
     }
 
     #[test]

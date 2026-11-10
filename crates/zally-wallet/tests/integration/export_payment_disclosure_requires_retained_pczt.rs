@@ -31,7 +31,7 @@ async fn export_payment_disclosure_requires_retained_pczt() -> Result<(), TestEr
     let plan = ExportPaymentDisclosurePlan::new(
         transaction_id,
         PaymentRecipient::SaplingAddress {
-            encoded: Address::Sapling(sapling_recipient).encode(&params),
+            encoded: Address::Sapling(Box::new(sapling_recipient)).encode(&params),
             network,
         },
         Zatoshis::try_from(1_u64)?,
@@ -92,7 +92,7 @@ async fn export_payment_disclosure_accepts_a_unified_address_with_a_sapling_rece
     let plan = ExportPaymentDisclosurePlan::new(
         transaction_id,
         PaymentRecipient::UnifiedAddress {
-            encoded: Address::Unified(unified_address).encode(&params),
+            encoded: Address::Unified(Box::new(unified_address)).encode(&params),
             network,
         },
         Zatoshis::try_from(1_u64)?,

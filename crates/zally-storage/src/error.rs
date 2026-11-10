@@ -2,6 +2,8 @@
 
 use zally_core::{BlockHeight, FailurePosture, TxId, Zatoshis};
 
+use crate::ProposalRejectionKind;
+
 /// Error returned by [`WalletStorage`](crate::WalletStorage) operations.
 ///
 /// Canonical error type for every storage backend. Backends with a different native error
@@ -16,6 +18,24 @@ pub enum StorageError {
     /// Posture: [`FailurePosture::NotRetryable`]; call `open_or_create` first.
     #[error("wallet storage was not opened; call open_or_create first")]
     NotOpened,
+
+    /// Another storage handle, in this process or another, already holds the wallet database
+    /// at `db_path` open for writing.
+    ///
+    /// One storage handle writes a wallet database at a time; its clones share it. A second
+    /// writer would keep its own per-key send lock and could swap the file under the first
+    /// writer during a rebuild.
+    ///
+    /// Posture: [`FailurePosture::RequiresOperator`]; stop the other writer, or share one
+    /// handle by cloning it.
+    #[error(
+        "wallet database '{}' is already open for writing by another storage handle or process",
+        db_path.display()
+    )]
+    DatabaseLocked {
+        /// Path of the wallet database.
+        db_path: std::path::PathBuf,
+    },
 
     /// Schema migration failed.
     ///
@@ -156,12 +176,10 @@ pub enum StorageError {
     /// hash does not match the wallet's stored view at `at_height`.
     ///
     /// Posture: [`FailurePosture::Retryable`]. The wallet scans to the live chain tip, so a
-    /// divergence at `at_height` is an ordinary reorg of the head. The caller catches this and
-    /// rewinds precisely below the orphan via `WalletStorage::truncate_to_chain_state`, then
-    /// re-runs sync. The librustzcash rewind cap (100 blocks = `COINBASE_MATURITY`) bounds how
-    /// far the truncate can go; if the divergence is deeper than the cap, the truncate call
-    /// surfaces a separate `NotRetryable` storage failure and the operator must reset the
-    /// wallet.
+    /// divergence at `at_height` is an ordinary reorg of the head. A reorg the chain source
+    /// announced is rewound at its fork point before the next scan; one it did not announce
+    /// reaches the sync driver's repair ladder, which rewinds below the orphan via
+    /// `WalletStorage::revert_blocks_above` and re-runs sync. The rewind works at any depth.
     #[error(
         "chain reorg detected at height {at_height}; wallet must roll back to {} and re-sync",
         at_height.as_u32().saturating_sub(1)
@@ -219,23 +237,32 @@ pub enum StorageError {
         raw: String,
     },
 
-    /// `propose_*` could not build a transaction because the wallet has too little
-    /// spendable balance to cover amount + fee.
+    /// A dispense reservation would exceed the wallet's spendable balance.
     ///
     /// Posture: [`FailurePosture::NotRetryable`] until balance is replenished.
     #[error(
         "insufficient spendable balance: required {required_zat:?}, available {available_zat:?}"
     )]
     InsufficientFunds {
-        /// Total value (amount + fee) the proposal needed.
+        /// Amount the reservation asked for.
         required_zat: Zatoshis,
-        /// Spendable value the wallet could draw on at proposal time.
+        /// Spendable value left after the account's active reservations.
         available_zat: Zatoshis,
     },
 
-    /// The librustzcash proposal layer rejected the spend with a typed error that did not
-    /// project onto one of the more specific variants above (e.g. balance change required
-    /// for unsupported fee rule, missing anchor, address decode failure).
+    /// librustzcash refused to build a proposal or transaction.
+    ///
+    /// Posture follows [`ProposalRejectionKind::posture`].
+    #[error("proposal rejected ({kind:?}): {reason}")]
+    ProposalRejected {
+        /// Why the proposal was rejected.
+        kind: ProposalRejectionKind,
+        /// Upstream error detail.
+        reason: String,
+    },
+
+    /// Zally could not finish a proposal artifact librustzcash built, for example because
+    /// the PCZT failed to serialize.
     ///
     /// Posture is carried explicitly so the wallet boundary does not have to infer it from
     /// the message string.
@@ -305,6 +332,7 @@ impl StorageError {
             | Self::HoldNotFound
             | Self::HoldRequestConflict => FailurePosture::NotRetryable,
             Self::MigrationFailed { .. }
+            | Self::DatabaseLocked { .. }
             | Self::ProverUnavailable
             | Self::ShieldedPoolUnsupported { .. }
             | Self::RowValueOutOfRange { .. } => FailurePosture::RequiresOperator,
@@ -315,6 +343,7 @@ impl StorageError {
             Self::SqliteFailed { posture, .. } | Self::ProposalBuildFailed { posture, .. } => {
                 *posture
             }
+            Self::ProposalRejected { kind, .. } => kind.posture(),
         }
     }
 
@@ -375,6 +404,10 @@ mod tests {
             StorageError::ProposalBuildFailed {
                 reason: "x".into(),
                 posture: FailurePosture::NotRetryable,
+            },
+            StorageError::ProposalRejected {
+                kind: ProposalRejectionKind::InputsLocked,
+                reason: "x".into(),
             },
             StorageError::HoldNotFound,
             StorageError::HoldRequestConflict,

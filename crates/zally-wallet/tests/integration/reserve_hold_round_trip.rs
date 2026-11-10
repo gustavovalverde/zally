@@ -9,10 +9,10 @@
 use zally_core::{
     AccountId, HoldId, IdempotencyKey, IdempotencyKeyError, TxId, Zatoshis, ZatoshisError,
 };
-use zally_storage::{HeldNote, HoldRecord, Sqlite, SqliteOptions, StorageError, WalletStorage};
+use zally_storage::{HeldNote, HoldRecord, StorageError, WalletStorage};
 use zally_wallet::{ReserveForDispensePlan, WalletError};
 
-use super::fixtures::{TestWalletFixture, create_test_wallet};
+use super::fixtures::{TestWalletFixture, create_test_wallet, create_test_wallet_with_storage};
 
 #[tokio::test]
 async fn reserve_hold_zero_amount_is_rejected() -> Result<(), TestError> {
@@ -66,17 +66,17 @@ async fn reserve_hold_returns_insufficient_when_amount_exceeds_spendable() -> Re
 
 #[tokio::test]
 async fn reserve_hold_is_idempotent_on_active_request() -> Result<(), TestError> {
-    let TestWalletFixture {
-        wallet,
-        account_id,
-        temp,
-    } = create_test_wallet().await?;
-    let network = wallet.network();
+    let (
+        TestWalletFixture {
+            wallet,
+            account_id,
+            temp: _temp,
+        },
+        storage,
+    ) = create_test_wallet_with_storage().await?;
 
     // Seed an active reservation row via the storage layer so the wallet can hit
     // the idempotent path even though the test wallet has zero spendable balance.
-    let storage = Sqlite::new(SqliteOptions::for_network(network, temp.db_path()));
-    storage.open_or_create().await?;
     let request_id = IdempotencyKey::try_from("idempotent-request")?;
     let idempotency_key = IdempotencyKey::try_from("idempotent-broadcast")?;
     let hold_id = HoldId::new();
@@ -123,14 +123,14 @@ async fn reserve_hold_is_idempotent_on_active_request() -> Result<(), TestError>
 
 #[tokio::test]
 async fn finalize_hold_marks_row_consumed() -> Result<(), TestError> {
-    let TestWalletFixture {
-        wallet,
-        account_id,
-        temp,
-    } = create_test_wallet().await?;
-    let network = wallet.network();
-    let storage = Sqlite::new(SqliteOptions::for_network(network, temp.db_path()));
-    storage.open_or_create().await?;
+    let (
+        TestWalletFixture {
+            wallet,
+            account_id,
+            temp: _temp,
+        },
+        storage,
+    ) = create_test_wallet_with_storage().await?;
 
     let hold_id = HoldId::new();
     storage
@@ -169,14 +169,14 @@ async fn finalize_hold_marks_row_consumed() -> Result<(), TestError> {
 
 #[tokio::test]
 async fn release_hold_marks_row_released() -> Result<(), TestError> {
-    let TestWalletFixture {
-        wallet,
-        account_id,
-        temp,
-    } = create_test_wallet().await?;
-    let network = wallet.network();
-    let storage = Sqlite::new(SqliteOptions::for_network(network, temp.db_path()));
-    storage.open_or_create().await?;
+    let (
+        TestWalletFixture {
+            wallet,
+            account_id,
+            temp: _temp,
+        },
+        storage,
+    ) = create_test_wallet_with_storage().await?;
 
     let hold_id = HoldId::new();
     storage
@@ -213,14 +213,14 @@ async fn release_hold_marks_row_released() -> Result<(), TestError> {
 
 #[tokio::test]
 async fn spendable_for_next_dispense_subtracts_active_holds() -> Result<(), TestError> {
-    let TestWalletFixture {
-        wallet,
-        account_id,
-        temp,
-    } = create_test_wallet().await?;
-    let network = wallet.network();
-    let storage = Sqlite::new(SqliteOptions::for_network(network, temp.db_path()));
-    storage.open_or_create().await?;
+    let (
+        TestWalletFixture {
+            wallet,
+            account_id,
+            temp: _temp,
+        },
+        storage,
+    ) = create_test_wallet_with_storage().await?;
 
     let baseline = wallet.spendable_for_next_dispense(account_id).await?;
     assert_eq!(

@@ -27,7 +27,8 @@ pub use source::{
 };
 pub use submitter::{RejectionReason, SubmitOutcome, Submitter};
 pub use transaction::{
-    TransactionParseError, parse_transaction_expiry_height, parse_transaction_id,
+    TransactionHeader, TransactionParseError, UnmineableReason, parse_transaction_expiry_height,
+    parse_transaction_header, parse_transaction_id,
 };
 pub use zally_core::{CompactBlockArtifact, TreeStateArtifact};
 #[cfg(feature = "zinder")]

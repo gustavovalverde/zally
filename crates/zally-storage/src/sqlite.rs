@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
 use orchard::tree::MerkleHashOrchard;
-use rand::rngs::OsRng;
+use rand::rngs::SysRng;
 use rusqlite::OptionalExtension as _;
 use sapling::Node as SaplingNode;
 use secrecy::{ExposeSecret as _, SecretVec};
@@ -25,20 +25,23 @@ use shardtree::store::{Checkpoint, ShardStore};
 use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
 use zally_core::{
-    AccountId, BlockHeight, CompactBlockArtifact, CompactShieldedAction, CompactTransaction,
-    FailurePosture, HoldId, IdempotencyKey, Network, NetworkParameters, TransparentGapLimit,
-    TreeStateArtifact, TxId, Zatoshis,
+    AccountId, BlockHash, BlockHeight, CompactBlockArtifact, CompactShieldedAction,
+    CompactTransaction, FailurePosture, HoldId, IdempotencyKey, Network, NetworkParameters,
+    TransparentGapLimit, TreeStateArtifact, TxId, Zatoshis,
 };
 use zally_keys::{KeyDerivationError, SeedMaterial, derive_ufvk};
+use zcash_address::unified::Revision;
 use zcash_client_backend::data_api::chain::{ChainState, CommitmentTreeRoot};
 use zcash_client_backend::data_api::scanning::ScanRange;
 use zcash_client_backend::data_api::wallet::{
     ConfirmationsPolicy, LockRequest, SpendingKeys,
-    input_selection::{GreedyInputSelector, LockFilter, LockedInputPolicy, SpendPolicy},
+    input_selection::{
+        GreedyInputSelector, GreedyInputSelectorError, LockFilter, LockedInputPolicy, SpendPolicy,
+    },
 };
 use zcash_client_backend::data_api::{
-    Account, AccountBirthday, MaxSpendMode, TargetValue, WalletCommitmentTrees, WalletRead,
-    WalletWrite,
+    Account, AccountBirthday, MaxSpendMode, OutputLockStore, TargetValue, WalletCommitmentTrees,
+    WalletRead, WalletWrite,
 };
 use zcash_client_backend::fees::{DustOutputPolicy, StandardFeeRule, standard};
 use zcash_client_backend::proto::compact_formats::{
@@ -65,10 +68,22 @@ use zcash_protocol::{PoolType, ShieldedPool};
 use zcash_transparent::address::Script;
 use zcash_transparent::bundle::{OutPoint as UpstreamOutPoint, TxOut};
 
+use crate::ProposalRejectionKind;
 use crate::error::StorageError;
 use crate::wallet::{ChainTips, WalletStorage};
+use crate::zip218::check_zip218_limits;
 
-type Db = WalletDb<rusqlite::Connection, NetworkParameters, SystemClock, OsRng>;
+type StorageClock = SystemClock;
+type StorageOsRng = rand::rand_core::UnwrapErr<SysRng>;
+type Db = WalletDb<rusqlite::Connection, NetworkParameters, StorageClock, StorageOsRng>;
+
+fn storage_clock() -> StorageClock {
+    SystemClock
+}
+
+fn storage_os_rng() -> StorageOsRng {
+    rand::rand_core::UnwrapErr(SysRng)
+}
 
 const DEFAULT_ACCOUNT_NAME: &str = "primary";
 /// Far exceeds the local proving window; successful transaction storage clears the lock.
@@ -114,6 +129,9 @@ enum WalletDbState {
     Opened {
         db: Box<Db>,
         ledger: Box<rusqlite::Connection>,
+        /// Exclusive advisory lock that makes this storage the database's only writer, held
+        /// until the state leaves `Opened`.
+        writer_lock: std::fs::File,
     },
 }
 
@@ -224,6 +242,11 @@ fn validated_sapling_parameter_bytes(
 ///
 /// Cloning yields another handle to the same actor; the actor lives until all
 /// clones are dropped.
+///
+/// A wallet database admits one writer. Opening takes an exclusive advisory lock on the
+/// sibling file `<db_path>.lock`, held until the actor exits, so another `Sqlite` on the same
+/// file, in this process or another, fails with [`StorageError::DatabaseLocked`]. Share one
+/// handle by cloning it.
 #[derive(Clone)]
 pub struct Sqlite {
     options: SqliteOptions,
@@ -301,11 +324,13 @@ impl Sqlite {
                     {
                         let cleanup = match state {
                             WalletDbState::NotOpened => Err(StorageError::NotOpened),
-                            WalletDbState::Opened { db, ledger } => release_pending_pczt_inputs(
-                                db.as_mut(),
-                                ledger.as_ref(),
-                                lock_owner,
-                            ),
+                            WalletDbState::Opened { db, ledger, .. } => {
+                                release_pending_pczt_inputs(
+                                    db.as_mut(),
+                                    ledger.as_ref(),
+                                    lock_owner,
+                                )
+                            }
                         };
                         if let Err(error) = cleanup {
                             tracing::error!(
@@ -378,6 +403,18 @@ impl Sqlite {
         .await
     }
 
+    async fn with_db_mut_and_ledger<F, T>(&self, work: F) -> Result<T, StorageError>
+    where
+        F: FnOnce(&mut Db, &rusqlite::Connection) -> Result<T, StorageError> + Send + 'static,
+        T: Send + 'static,
+    {
+        self.dispatch(move |state, _options| match state {
+            WalletDbState::NotOpened => Err(StorageError::NotOpened),
+            WalletDbState::Opened { db, ledger, .. } => work(db.as_mut(), ledger.as_ref()),
+        })
+        .await
+    }
+
     async fn with_db_and_ledger<F, T>(&self, work: F) -> Result<T, StorageError>
     where
         F: FnOnce(&Db, &rusqlite::Connection) -> Result<T, StorageError> + Send + 'static,
@@ -385,7 +422,7 @@ impl Sqlite {
     {
         self.dispatch(move |state, _options| match state {
             WalletDbState::NotOpened => Err(StorageError::NotOpened),
-            WalletDbState::Opened { db, ledger } => work(db.as_ref(), ledger.as_ref()),
+            WalletDbState::Opened { db, ledger, .. } => work(db.as_ref(), ledger.as_ref()),
         })
         .await
     }
@@ -426,7 +463,14 @@ fn run_wallet_db_actor(options: &SqliteOptions, mut request_rx: mpsc::Receiver<D
 fn open_wallet_db(
     options: &SqliteOptions,
 ) -> Result<(Box<Db>, Box<rusqlite::Connection>), StorageError> {
-    if let Some(parent) = options.db_path.parent() {
+    open_wallet_db_at(options, &options.db_path)
+}
+
+fn open_wallet_db_at(
+    options: &SqliteOptions,
+    db_path: &Path,
+) -> Result<(Box<Db>, Box<rusqlite::Connection>), StorageError> {
+    if let Some(parent) = db_path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| StorageError::SqliteFailed {
             reason: format!("could not create database directory: {e}"),
             posture: FailurePosture::NotRetryable,
@@ -438,7 +482,7 @@ fn open_wallet_db(
         options.gap_limit.internal,
         options.gap_limit.ephemeral,
     );
-    let mut db = WalletDb::for_path(&options.db_path, params, SystemClock, OsRng)
+    let mut db = WalletDb::for_path(db_path, params, storage_clock(), storage_os_rng())
         .map_err(|e| StorageError::SqliteFailed {
             reason: e.to_string(),
             posture: FailurePosture::NotRetryable,
@@ -450,22 +494,18 @@ fn open_wallet_db(
             reason: e.to_string(),
         })?;
 
-    let ledger = open_extension_ledger(&options.db_path)?;
+    let ledger = open_extension_ledger(db_path)?;
 
     Ok((Box::new(db), Box::new(ledger)))
 }
 
-fn open_extension_ledger(db_path: &Path) -> Result<rusqlite::Connection, StorageError> {
-    let ledger = rusqlite::Connection::open(db_path).map_err(|e| StorageError::SqliteFailed {
-        reason: format!("ledger connection open failed: {e}"),
-        posture: FailurePosture::NotRetryable,
-    })?;
-    ledger
-        .execute_batch(
-            "CREATE TABLE IF NOT EXISTS ext_zally_idempotency (\
+/// Zally's payment-ledger schema, created beside the `zcash_client_sqlite` schema in the
+/// wallet database file.
+const LEDGER_SCHEMA_SQL: &str = "CREATE TABLE IF NOT EXISTS ext_zally_idempotency (\
                  idempotency_key TEXT PRIMARY KEY NOT NULL,\
                  tx_id_bytes BLOB NOT NULL,\
-                 recorded_at_unix INTEGER NOT NULL\
+                 recorded_at_unix INTEGER NOT NULL,\
+                 unmineable_at_height INTEGER\
              ); \
              CREATE TABLE IF NOT EXISTS ext_zally_chain_tips (\
                  id INTEGER PRIMARY KEY CHECK (id = 0),\
@@ -515,37 +555,689 @@ fn open_extension_ledger(db_path: &Path) -> Result<rusqlite::Connection, Storage
                  WHERE finalized_tx_id IS NULL AND released_at_ms IS NULL; \
              CREATE INDEX IF NOT EXISTS idx_holds_account_active \
                  ON ext_zally_holds(account_id) \
-                 WHERE finalized_tx_id IS NULL AND released_at_ms IS NULL;",
-        )
+                 WHERE finalized_tx_id IS NULL AND released_at_ms IS NULL; \
+             CREATE TABLE IF NOT EXISTS ext_zally_chain_event_cursor (\
+                 id INTEGER PRIMARY KEY CHECK (id = 0),\
+                 cursor_bytes BLOB NOT NULL,\
+                 recorded_at_ms INTEGER NOT NULL\
+             ); \
+             CREATE TABLE IF NOT EXISTS ext_zally_reverted_broadcasts (\
+                 tx_id_bytes BLOB PRIMARY KEY NOT NULL,\
+                 raw_tx_bytes BLOB NOT NULL,\
+                 expiry_height INTEGER NOT NULL,\
+                 reverted_from_height INTEGER,\
+                 recorded_at_ms INTEGER NOT NULL,\
+                 resubmitted_at_ms INTEGER\
+             ); \
+             CREATE TABLE IF NOT EXISTS ext_zally_send_steps (\
+                 idempotency_key TEXT NOT NULL,\
+                 step_index INTEGER NOT NULL,\
+                 tx_id_bytes BLOB NOT NULL,\
+                 PRIMARY KEY (idempotency_key, step_index)\
+             ); \
+             CREATE TABLE IF NOT EXISTS ext_zally_scan_blind_sends (\
+                 tx_id_bytes BLOB PRIMARY KEY NOT NULL,\
+                 recorded_at_ms INTEGER NOT NULL\
+             );";
+
+fn open_extension_ledger(db_path: &Path) -> Result<rusqlite::Connection, StorageError> {
+    let ledger = rusqlite::Connection::open(db_path).map_err(|e| StorageError::SqliteFailed {
+        reason: format!("ledger connection open failed: {e}"),
+        posture: FailurePosture::NotRetryable,
+    })?;
+    ledger
+        .execute_batch(LEDGER_SCHEMA_SQL)
         .map_err(|e| StorageError::SqliteFailed {
             reason: format!("ext_zally schema init failed: {e}"),
             posture: FailurePosture::NotRetryable,
         })?;
 
+    add_idempotency_unmineable_column(&ledger)?;
+
     Ok(ledger)
 }
 
-/// Removes the wallet database file plus its `-wal` and `-shm` siblings. The zally
-/// ledger tables live in the same file, so this discards them as well.
-fn remove_wallet_db_files(db_path: &Path) -> Result<(), StorageError> {
-    for suffix in ["", "-wal", "-shm"] {
-        let mut os_path = db_path.as_os_str().to_owned();
-        os_path.push(suffix);
-        let path = PathBuf::from(os_path);
-        match std::fs::remove_file(&path) {
-            Ok(()) => {}
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-            Err(err) => {
-                return Err(StorageError::SqliteFailed {
-                    reason: format!(
-                        "could not delete wallet database file '{}': {err}",
-                        path.display()
-                    ),
-                    posture: FailurePosture::Retryable,
+/// Adds `ext_zally_idempotency.unmineable_at_height` to a ledger created before it existed.
+/// A NULL value keeps every earlier key bound to its transaction.
+fn add_idempotency_unmineable_column(ledger: &rusqlite::Connection) -> Result<(), StorageError> {
+    let has_column: bool = ledger
+        .query_row(
+            "SELECT EXISTS (SELECT 1 FROM pragma_table_info('ext_zally_idempotency') \
+                            WHERE name = 'unmineable_at_height')",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|err| StorageError::MigrationFailed {
+            reason: format!("ext_zally_idempotency column check failed: {err}"),
+        })?;
+    if !has_column {
+        ledger
+            .execute_batch(
+                "ALTER TABLE ext_zally_idempotency ADD COLUMN unmineable_at_height INTEGER",
+            )
+            .map_err(|err| StorageError::MigrationFailed {
+                reason: format!("ext_zally_idempotency column add failed: {err}"),
+            })?;
+    }
+    Ok(())
+}
+
+/// Ledger tables a wallet rebuild carries into the replacement database.
+///
+/// `ext_zally_chain_tips` is absent on purpose: chain tips are derived state that the next
+/// sync records again against the rebuilt scan queue. So is `ext_zally_scan_blind_sends`: the
+/// rebuilt wallet rescans from its birthday and judges each carried send's coverage afresh.
+const LEDGER_TABLES_KEPT_ACROSS_REBUILD: [&str; 8] = [
+    "ext_zally_idempotency",
+    "ext_zally_finalized_pczts",
+    "ext_zally_pending_pczt_inputs",
+    "ext_zally_pending_broadcast_inputs",
+    "ext_zally_holds",
+    "ext_zally_chain_event_cursor",
+    "ext_zally_reverted_broadcasts",
+    "ext_zally_send_steps",
+];
+
+/// Suffix of the sibling file a wallet rebuild writes before it replaces the live database.
+const REBUILD_FILE_SUFFIX: &str = ".rebuild";
+
+/// Suffix of the sibling file whose exclusive advisory lock marks the database's only writer.
+///
+/// A sibling rather than the database file itself, because on some platforms a whole-file
+/// lock would collide with the byte-range locks `SQLite` takes on the database. The lock
+/// file is never deleted; the operating system releases the lock with the process.
+const WRITER_LOCK_FILE_SUFFIX: &str = ".lock";
+
+/// How long opening waits for another writer to release the database before failing.
+///
+/// A storage handle in this process releases the lock when its wallet-db actor exits, shortly
+/// after its last clone is dropped, so a wallet reopened right after the prior one was dropped
+/// waits briefly instead of failing.
+const WRITER_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+const WRITER_LOCK_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
+
+/// Sidecar suffixes `SQLite` may keep next to a database file.
+///
+/// A rollback journal or WAL left next to a replaced database would be replayed into its
+/// replacement, so every sidecar goes with the file it belongs to.
+const DATABASE_SIDECAR_SUFFIXES: [&str; 3] = ["-journal", "-wal", "-shm"];
+
+fn sibling_path(db_path: &Path, suffix: &str) -> PathBuf {
+    let mut os_path = db_path.as_os_str().to_owned();
+    os_path.push(suffix);
+    PathBuf::from(os_path)
+}
+
+/// Takes the exclusive advisory lock that makes the caller the only writer of the database
+/// at `db_path`, across storage handles and processes.
+///
+/// Two writers would each keep their own per-key send lock, and one writer's rebuild would
+/// swap the file under the other's open connections, losing its later ledger writes.
+fn lock_database_writer(db_path: &Path) -> Result<std::fs::File, StorageError> {
+    if let Some(parent) = db_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| StorageError::SqliteFailed {
+            reason: format!("could not create database directory: {e}"),
+            posture: FailurePosture::NotRetryable,
+        })?;
+    }
+    let lock_path = sibling_path(db_path, WRITER_LOCK_FILE_SUFFIX);
+    let lock_failed = |err: &dyn std::fmt::Display| StorageError::SqliteFailed {
+        reason: format!(
+            "could not lock wallet database writer file '{}': {err}",
+            lock_path.display()
+        ),
+        posture: FailurePosture::RequiresOperator,
+    };
+    let lock_file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .map_err(|err| lock_failed(&err))?;
+    let deadline = std::time::Instant::now() + WRITER_LOCK_WAIT;
+    loop {
+        match lock_file.try_lock() {
+            Ok(()) => return Ok(lock_file),
+            Err(std::fs::TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(WRITER_LOCK_RETRY_INTERVAL);
+            }
+            Err(std::fs::TryLockError::WouldBlock) => {
+                return Err(StorageError::DatabaseLocked {
+                    db_path: db_path.to_path_buf(),
                 });
+            }
+            Err(std::fs::TryLockError::Error(err)) => return Err(lock_failed(&err)),
+        }
+    }
+}
+
+fn remove_database_file(path: &Path) -> Result<(), StorageError> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(StorageError::SqliteFailed {
+            reason: format!(
+                "could not delete wallet database file '{}': {err}",
+                path.display()
+            ),
+            posture: FailurePosture::Retryable,
+        }),
+    }
+}
+
+fn remove_database_sidecars(db_path: &Path) -> Result<(), StorageError> {
+    for suffix in DATABASE_SIDECAR_SUFFIXES {
+        remove_database_file(&sibling_path(db_path, suffix))?;
+    }
+    Ok(())
+}
+
+/// Rebuilds the wallet database with a fresh account in a sibling file, carries the payment
+/// ledger into it, and swaps it in place of the live file.
+///
+/// The live file stays untouched until the replacement is complete, so a failure or crash
+/// before the swap leaves the prior wallet and its ledger as they were. The caller closes
+/// every connection to the live file first.
+fn rebuild_database_with_ledger(
+    options: &SqliteOptions,
+    secret: &SecretVec<u8>,
+    prior_chain_state: ChainState,
+) -> Result<AccountId, StorageError> {
+    let rebuild_path = sibling_path(&options.db_path, REBUILD_FILE_SUFFIX);
+    remove_database_file(&rebuild_path)?;
+    remove_database_sidecars(&rebuild_path)?;
+    let prior_ephemeral_high_index = prior_ephemeral_high_index(&options.db_path)?;
+    let account_id = {
+        let mut rebuild_options = options.clone();
+        if let Some(high_index) = prior_ephemeral_high_index {
+            rebuild_options.gap_limit.ephemeral = high_index
+                .saturating_add(1)
+                .saturating_add(options.gap_limit.ephemeral);
+        }
+        let (mut db, ledger) = open_wallet_db_at(&rebuild_options, &rebuild_path)?;
+        let account_id = create_account_on(
+            &mut db,
+            options.network,
+            &options.account_name,
+            secret,
+            prior_chain_state,
+        )?;
+        if let Some(high_index) = prior_ephemeral_high_index {
+            reserve_prior_ephemeral_addresses(&mut db, options.network, account_id, high_index)?;
+        }
+        carry_ledger_rows(&ledger, &options.db_path)?;
+        account_id
+    };
+    remove_database_sidecars(&options.db_path)?;
+    std::fs::rename(&rebuild_path, &options.db_path).map_err(|err| StorageError::SqliteFailed {
+        reason: format!(
+            "could not replace wallet database '{}' with its rebuild: {err}",
+            options.db_path.display()
+        ),
+        posture: FailurePosture::Retryable,
+    })?;
+    remove_database_sidecars(&rebuild_path)?;
+    Ok(account_id)
+}
+
+/// Highest ephemeral (ZIP 320) address index the wallet database at `db_path` handed out or
+/// saw used, or `None` when there is none.
+fn prior_ephemeral_high_index(db_path: &Path) -> Result<Option<u32>, StorageError> {
+    if !db_path.exists() {
+        return Ok(None);
+    }
+    let read_failed = |err: rusqlite::Error| StorageError::SqliteFailed {
+        reason: format!("could not read the prior wallet's ephemeral addresses: {err}"),
+        posture: FailurePosture::NotRetryable,
+    };
+    let prior = rusqlite::Connection::open_with_flags(
+        db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(read_failed)?;
+    prior
+        .query_row(
+            "SELECT MAX(transparent_child_index) FROM addresses \
+             WHERE key_scope = ?1 \
+               AND (exposed_at_height IS NOT NULL \
+                    OR id IN (SELECT address_id FROM transparent_received_outputs))",
+            [EPHEMERAL_KEY_SCOPE_CODE],
+            |row| row.get::<_, Option<u32>>(0),
+        )
+        .map_err(read_failed)
+}
+
+/// `zcash_client_sqlite`'s `addresses.key_scope` code for ephemeral (ZIP 320) addresses.
+const EPHEMERAL_KEY_SCOPE_CODE: i64 = 2;
+
+/// Reserves the rebuilt account's ephemeral addresses up to `high_index`.
+///
+/// A rescan recognizes an output to an ephemeral address only when the account already knows
+/// the address, and a rebuilt account knows only its first gap's worth until the rescan meets
+/// earlier uses. The rebuild therefore opens the new database with a gap that reaches past
+/// `high_index`, so account creation derives every address up to it, and reserves them here,
+/// so no new payment reuses an address the prior wallet already handed out.
+fn reserve_prior_ephemeral_addresses(
+    db: &mut Db,
+    network: Network,
+    account_id: AccountId,
+    high_index: u32,
+) -> Result<(), StorageError> {
+    let account_uuid = resolve_account_uuid(db, network, account_id)?;
+    let count = usize::try_from(high_index.saturating_add(1)).unwrap_or(usize::MAX);
+    zcash_client_backend::data_api::WalletWrite::reserve_next_n_ephemeral_addresses(
+        db,
+        account_uuid,
+        count,
+    )
+    .map_err(|err| StorageError::SqliteFailed {
+        reason: format!("could not reserve the prior wallet's ephemeral addresses: {err}"),
+        posture: FailurePosture::NotRetryable,
+    })?;
+    Ok(())
+}
+
+/// Carries every unsettled wallet-created transaction into the rebuilt reverted-broadcast ledger.
+///
+/// The ledger, not `zcash_client_sqlite`'s `created` flag, decides what goes along: a step a
+/// previous rebuild stored again has no creation record, and leaving it behind would strand
+/// its key after a second rebuild.
+///
+/// A transaction is unsettled when an idempotency key still names it or one of the earlier
+/// steps of the send it pays, it still has pending-broadcast rows, or an active dispense hold
+/// was finalized with it. Every step of a multi-step send goes along, so the rebuilt wallet can
+/// store the funding step's outputs before the rescan meets the block that spends them.
+///
+/// The rebuild discards the transaction records `zcash_client_sqlite` keeps, so without its
+/// raw bytes and expiry the rebuilt wallet could neither judge nor resubmit such a
+/// transaction, and its idempotency key would stay bound forever. One that the rescan finds
+/// mined leaves the ledger through the usual join on `transactions`.
+///
+/// An unmined transaction the ledger does not name is left behind: no submitter received it
+/// from the send path, or its key was released because it can never be mined. The driver
+/// resubmits what this ledger holds, so carrying such a transaction would broadcast a
+/// payment whose key may already have paid a replacement.
+const UNSETTLED_SENDS_CARRY_SQL: &str = "\
+    INSERT OR IGNORE INTO main.ext_zally_reverted_broadcasts \
+        (tx_id_bytes, raw_tx_bytes, expiry_height, reverted_from_height, recorded_at_ms, \
+         resubmitted_at_ms) \
+    SELECT t.txid, t.raw, IFNULL(t.expiry_height, 0), t.mined_height, ?1, NULL \
+    FROM prior.transactions t \
+    WHERE t.raw IS NOT NULL \
+      AND (t.txid IN (SELECT tx_id_bytes FROM prior.ext_zally_idempotency \
+                      WHERE unmineable_at_height IS NULL) \
+           OR t.txid IN (SELECT s.tx_id_bytes FROM prior.ext_zally_send_steps s \
+                         JOIN prior.ext_zally_idempotency i \
+                           ON i.idempotency_key = s.idempotency_key \
+                         WHERE i.unmineable_at_height IS NULL) \
+           OR t.txid IN (SELECT broadcast_tx_id \
+                         FROM prior.ext_zally_pending_broadcast_inputs) \
+           OR t.txid IN (SELECT finalized_tx_id FROM prior.ext_zally_holds \
+                         WHERE finalized_tx_id IS NOT NULL AND released_at_ms IS NULL))";
+
+/// Steps of every unsettled carried send, in submission order, with their bytes.
+///
+/// A send is carried while any of its steps has a reverted-broadcast row, and unsettled while
+/// its key is bound and `zcash_client_sqlite` has not seen its paying step mined. Every step
+/// is listed, mined or not, so a funding step's outputs are stored again until the paying
+/// step is mined, whichever ledger still holds its bytes.
+const CARRIED_SEND_STEPS_SQL: &str = "\
+    SELECT s.idempotency_key, i.tx_id_bytes, s.tx_id_bytes, IFNULL(r.raw_tx_bytes, step.raw) \
+    FROM ext_zally_send_steps s \
+    JOIN ext_zally_idempotency i \
+      ON i.idempotency_key = s.idempotency_key AND i.unmineable_at_height IS NULL \
+    LEFT JOIN ext_zally_reverted_broadcasts r ON r.tx_id_bytes = s.tx_id_bytes \
+    LEFT JOIN transactions step ON step.txid = s.tx_id_bytes \
+    LEFT JOIN transactions paying ON paying.txid = i.tx_id_bytes \
+    WHERE paying.mined_height IS NULL \
+      AND s.idempotency_key IN ( \
+          SELECT carried.idempotency_key FROM ext_zally_send_steps carried \
+          JOIN ext_zally_reverted_broadcasts reverted \
+            ON reverted.tx_id_bytes = carried.tx_id_bytes) \
+    ORDER BY s.idempotency_key ASC, s.step_index ASC";
+
+/// Whether `zcash_client_sqlite` records the transparent output `outpoint` as the wallet's.
+const RECEIVED_TRANSPARENT_OUTPUT_EXISTS_SQL: &str = "\
+    SELECT EXISTS ( \
+        SELECT 1 FROM transparent_received_outputs tro \
+        JOIN transactions t ON t.id_tx = tro.transaction_id \
+        WHERE t.txid = ?1 AND tro.output_index = ?2)";
+
+/// Parses a transaction the wallet stored. Version 5 and later transactions carry their own
+/// consensus branch, so the branch passed for earlier versions does not apply to them.
+fn read_stored_transaction(
+    raw_tx_bytes: &[u8],
+) -> Result<zcash_primitives::transaction::Transaction, StorageError> {
+    zcash_primitives::transaction::Transaction::read(
+        raw_tx_bytes,
+        zcash_protocol::consensus::BranchId::Nu5,
+    )
+    .map_err(|err| StorageError::SqliteFailed {
+        reason: format!("stored transaction does not parse: {err}"),
+        posture: FailurePosture::NotRetryable,
+    })
+}
+
+/// One carried send: its paying transaction and its steps in submission order.
+struct CarriedSend {
+    paying_tx_id: TxId,
+    steps: Vec<CarriedStep>,
+}
+
+struct CarriedStep {
+    tx_id: TxId,
+    raw_tx_bytes: Option<Vec<u8>>,
+}
+
+fn list_carried_send_steps(
+    ledger: &rusqlite::Connection,
+) -> Result<Vec<CarriedSend>, StorageError> {
+    let lookup_failed = |err: rusqlite::Error| StorageError::SqliteFailed {
+        reason: format!("carried send-step lookup failed: {err}"),
+        posture: sqlite_failure_posture(&err),
+    };
+    let mut stmt = ledger
+        .prepare(CARRIED_SEND_STEPS_SQL)
+        .map_err(lookup_failed)?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Vec<u8>>(1)?,
+                row.get::<_, Vec<u8>>(2)?,
+                row.get::<_, Option<Vec<u8>>>(3)?,
+            ))
+        })
+        .map_err(lookup_failed)?;
+    let mut sends: Vec<(String, CarriedSend)> = Vec::new();
+    for row in rows {
+        let (key, paying_bytes, step_bytes, raw_tx_bytes) = row.map_err(lookup_failed)?;
+        let step = CarriedStep {
+            tx_id: decode_txid_bytes(step_bytes, "ext_zally_send_steps.tx_id_bytes")?,
+            raw_tx_bytes,
+        };
+        match sends.last_mut() {
+            Some((last_key, send)) if *last_key == key => send.steps.push(step),
+            _ => sends.push((
+                key,
+                CarriedSend {
+                    paying_tx_id: decode_txid_bytes(
+                        paying_bytes,
+                        "ext_zally_idempotency.tx_id_bytes",
+                    )?,
+                    steps: vec![step],
+                },
+            )),
+        }
+    }
+    Ok(sends.into_iter().map(|(_, send)| send).collect())
+}
+
+/// Marks `paying_tx_ids` as sends the scan may pass without recognizing them mined.
+///
+/// The mark stays until the send is released: once a scan ran without the earlier steps'
+/// outputs, it may already have passed the paying step, and outputs recorded later do not
+/// make that scan see it.
+fn record_scan_blind_sends(
+    ledger: &rusqlite::Connection,
+    paying_tx_ids: &[TxId],
+) -> Result<(), StorageError> {
+    let recorded_at_ms = current_unix_ms_for_ledger();
+    for tx_id in paying_tx_ids {
+        ledger
+            .execute(
+                "INSERT OR IGNORE INTO ext_zally_scan_blind_sends (tx_id_bytes, recorded_at_ms) \
+                 VALUES (?1, ?2)",
+                rusqlite::params![tx_id.as_bytes().as_slice(), recorded_at_ms],
+            )
+            .map_err(|err| StorageError::SqliteFailed {
+                reason: format!("scan-blind send record failed: {err}"),
+                posture: sqlite_failure_posture(&err),
+            })?;
+    }
+    Ok(())
+}
+
+fn list_scan_blind_sends(ledger: &rusqlite::Connection) -> Result<Vec<TxId>, StorageError> {
+    let lookup_failed = |err: rusqlite::Error| StorageError::SqliteFailed {
+        reason: format!("scan-blind send lookup failed: {err}"),
+        posture: sqlite_failure_posture(&err),
+    };
+    let mut stmt = ledger
+        .prepare("SELECT tx_id_bytes FROM ext_zally_scan_blind_sends")
+        .map_err(lookup_failed)?;
+    let rows = stmt
+        .query_map([], |row| row.get::<_, Vec<u8>>(0))
+        .map_err(lookup_failed)?;
+    let mut tx_ids = Vec::new();
+    for row in rows {
+        tx_ids.push(decode_txid_bytes(
+            row.map_err(lookup_failed)?,
+            "ext_zally_scan_blind_sends.tx_id_bytes",
+        )?);
+    }
+    Ok(tx_ids)
+}
+
+/// Storing a carried send's steps, or checking that the wallet records their outputs, failed.
+///
+/// The failure is `Retryable` when the database could not serve the call (busy or locked, out
+/// of space or memory, or an I/O call failed) and nothing is known about the send. It is
+/// `NotRetryable` when the send's own data cannot be stored or checked and a retry would fail
+/// the same way.
+fn send_step_failure_from_sqlite(error: &rusqlite::Error, context: &str) -> StorageError {
+    StorageError::SqliteFailed {
+        reason: format!("{context}: {error}"),
+        posture: sqlite_failure_posture(error),
+    }
+}
+
+/// [`send_step_failure_from_sqlite`] for a failure `zcash_client_sqlite` reports.
+fn send_step_failure_from_client(error: &SqliteClientError, context: &str) -> StorageError {
+    if let SqliteClientError::DbError(sqlite_error) = error {
+        return send_step_failure_from_sqlite(sqlite_error, context);
+    }
+    let posture = if matches!(error, SqliteClientError::Io(_)) {
+        FailurePosture::Retryable
+    } else {
+        FailurePosture::NotRetryable
+    };
+    StorageError::SqliteFailed {
+        reason: format!("{context}: {error}"),
+        posture,
+    }
+}
+
+/// `Retryable` for a failure of the database rather than of the statement: busy, locked, out
+/// of space or memory, or an I/O error; `NotRetryable` otherwise.
+fn sqlite_failure_posture(error: &rusqlite::Error) -> FailurePosture {
+    match error.sqlite_error_code() {
+        Some(
+            rusqlite::ErrorCode::DatabaseBusy
+            | rusqlite::ErrorCode::DatabaseLocked
+            | rusqlite::ErrorCode::SystemIoFailure
+            | rusqlite::ErrorCode::DiskFull
+            | rusqlite::ErrorCode::OutOfMemory,
+        ) => FailurePosture::Retryable,
+        _ => FailurePosture::NotRetryable,
+    }
+}
+
+/// Records which of `carried` the scan may pass blind, from each send's coverage as
+/// `store_and_check` reports it, and returns every send marked so far.
+///
+/// A send without coverage, or whose steps fail to store or check with a `NotRetryable`
+/// failure, is marked. A `Retryable` failure marks nothing for that send and fails the call
+/// after the other sends are settled, so the caller does not scan without that send's outputs
+/// and no verdict judges it in that pass; the next call tries it again.
+fn settle_scan_blind_sends(
+    ledger: &rusqlite::Connection,
+    carried: &[CarriedSend],
+    mut store_and_check: impl FnMut(&CarriedSend) -> Result<bool, StorageError>,
+) -> Result<Vec<TxId>, StorageError> {
+    let mut blind = Vec::new();
+    let mut transient_failure = None;
+    for send in carried {
+        match store_and_check(send) {
+            Ok(true) => {}
+            Ok(false) => blind.push(send.paying_tx_id),
+            Err(error) if error.posture() == FailurePosture::Retryable => {
+                tracing::warn!(
+                    target: "zally::storage",
+                    event = "carried_send_steps_store_interrupted",
+                    paying_tx_id = %send.paying_tx_id,
+                    %error,
+                    "could not store a carried send's steps now; the next scan step retries"
+                );
+                if transient_failure.is_none() {
+                    transient_failure = Some(error);
+                }
+            }
+            Err(error) => {
+                tracing::warn!(
+                    target: "zally::storage",
+                    event = "carried_send_steps_unstorable",
+                    paying_tx_id = %send.paying_tx_id,
+                    %error,
+                    "could not store or check a carried send's steps; it is held as scan-blind"
+                );
+                blind.push(send.paying_tx_id);
             }
         }
     }
+    record_scan_blind_sends(ledger, &blind)?;
+    if let Some(error) = transient_failure {
+        return Err(error);
+    }
+    list_scan_blind_sends(ledger)
+}
+
+/// Stores each step of `send` that still has its bytes, in submission order.
+fn store_send_steps(
+    db: &mut Db,
+    params: &zally_core::NetworkParameters,
+    send: &CarriedSend,
+) -> Result<(), StorageError> {
+    for step in &send.steps {
+        let Some(raw_tx_bytes) = step.raw_tx_bytes.as_deref() else {
+            continue;
+        };
+        let transaction = read_stored_transaction(raw_tx_bytes)?;
+        zcash_client_backend::data_api::wallet::decrypt_and_store_transaction(
+            params,
+            db,
+            &transaction,
+            None,
+        )
+        .map_err(|err| send_step_failure_from_client(&err, "storing a carried step failed"))?;
+    }
+    Ok(())
+}
+
+/// Whether every output a later step of `send` spends from an earlier step is recorded as the
+/// wallet's, so a scan recognizes the later step mined even in the same block.
+fn are_funding_outputs_recorded(
+    ledger: &rusqlite::Connection,
+    send: &CarriedSend,
+) -> Result<bool, StorageError> {
+    let step_ids: Vec<TxId> = send.steps.iter().map(|step| step.tx_id).collect();
+    for step in send.steps.iter().skip(1) {
+        let Some(raw_tx_bytes) = step.raw_tx_bytes.as_deref() else {
+            return Ok(false);
+        };
+        let transaction = read_stored_transaction(raw_tx_bytes)?;
+        for input in transaction
+            .transparent_bundle()
+            .map(|bundle| bundle.vin.as_slice())
+            .unwrap_or_default()
+        {
+            let prevout_tx_id = TxId::from_bytes(*input.prevout().hash());
+            if !step_ids.contains(&prevout_tx_id) {
+                continue;
+            }
+            let is_recorded = ledger
+                .query_row(
+                    RECEIVED_TRANSPARENT_OUTPUT_EXISTS_SQL,
+                    rusqlite::params![prevout_tx_id.as_bytes().as_slice(), input.prevout().n()],
+                    |row| row.get::<_, bool>(0),
+                )
+                .map_err(|err| {
+                    send_step_failure_from_sqlite(&err, "funding output lookup failed")
+                })?;
+            if !is_recorded {
+                return Ok(false);
+            }
+        }
+    }
+    Ok(true)
+}
+
+/// Columns `table` has in both the rebuilt and the prior database, comma-separated.
+///
+/// A prior ledger can predate a column added since; naming the shared columns keeps the copy
+/// independent of column order and lets the new column take its default.
+fn shared_ledger_columns(
+    connection: &rusqlite::Connection,
+    table: &str,
+) -> Result<String, rusqlite::Error> {
+    let column_names = |schema: &str| -> Result<Vec<String>, rusqlite::Error> {
+        let mut statement = connection.prepare("SELECT name FROM pragma_table_info(?1, ?2)")?;
+        let names = statement
+            .query_map([table, schema], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(names)
+    };
+    let prior_columns = column_names("prior")?;
+    Ok(column_names("main")?
+        .into_iter()
+        .filter(|column| prior_columns.contains(column))
+        .collect::<Vec<_>>()
+        .join(", "))
+}
+
+/// Copies every ledger row the rebuild keeps from the database at `prior_path` into the
+/// database `ledger` is connected to, in one transaction.
+fn carry_ledger_rows(ledger: &rusqlite::Connection, prior_path: &Path) -> Result<(), StorageError> {
+    if !prior_path.exists() {
+        return Ok(());
+    }
+    let prior_path_text = prior_path
+        .to_str()
+        .ok_or_else(|| StorageError::SqliteFailed {
+            reason: format!(
+                "wallet database path '{}' is not valid UTF-8",
+                prior_path.display()
+            ),
+            posture: FailurePosture::RequiresOperator,
+        })?;
+    let ledger_failure = |err: rusqlite::Error| StorageError::SqliteFailed {
+        reason: format!("carrying the ledger into the rebuilt wallet failed: {err}"),
+        posture: FailurePosture::NotRetryable,
+    };
+    ledger
+        .execute("ATTACH DATABASE ?1 AS prior", [prior_path_text])
+        .map_err(ledger_failure)?;
+    let copied = (|| {
+        let transaction = ledger.unchecked_transaction()?;
+        for table in LEDGER_TABLES_KEPT_ACROSS_REBUILD {
+            let columns = shared_ledger_columns(&transaction, table)?;
+            if columns.is_empty() {
+                continue;
+            }
+            transaction.execute(
+                &format!(
+                    "INSERT INTO main.{table} ({columns}) SELECT {columns} FROM prior.{table}"
+                ),
+                [],
+            )?;
+        }
+        transaction.execute(UNSETTLED_SENDS_CARRY_SQL, [current_unix_ms_for_ledger()])?;
+        transaction.commit()
+    })();
+    let detached = ledger.execute("DETACH DATABASE prior", []);
+    copied.map_err(ledger_failure)?;
+    detached.map_err(ledger_failure)?;
     Ok(())
 }
 
@@ -560,8 +1252,13 @@ impl WalletStorage for Sqlite {
             if matches!(state, WalletDbState::Opened { .. }) {
                 return Ok(());
             }
+            let writer_lock = lock_database_writer(&options.db_path)?;
             let (db, ledger) = open_wallet_db(options)?;
-            *state = WalletDbState::Opened { db, ledger };
+            *state = WalletDbState::Opened {
+                db,
+                ledger,
+                writer_lock,
+            };
             Ok(())
         })
         .await
@@ -588,27 +1285,31 @@ impl WalletStorage for Sqlite {
         seed: &SeedMaterial,
         prior_chain_state: TreeStateArtifact,
     ) -> Result<AccountId, StorageError> {
-        let network = self.options.network;
-        let prior_chain_state = tree_state_to_upstream(prior_chain_state, network)?;
+        let prior_chain_state = tree_state_to_upstream(prior_chain_state, self.options.network)?;
         let secret = SecretVec::new(seed.expose_secret().to_vec());
 
         self.dispatch(move |state, options| {
-            *state = WalletDbState::NotOpened;
-            remove_wallet_db_files(&options.db_path)?;
-            let (mut db, ledger) = open_wallet_db(options)?;
-            let account_id = create_account_on(
-                &mut db,
-                network,
-                &options.account_name,
-                &secret,
-                prior_chain_state,
-            )?;
-            *state = WalletDbState::Opened { db, ledger };
+            let writer_lock = match std::mem::replace(state, WalletDbState::NotOpened) {
+                WalletDbState::Opened { writer_lock, .. } => writer_lock,
+                WalletDbState::NotOpened => lock_database_writer(&options.db_path)?,
+            };
+            let rebuilt = rebuild_database_with_ledger(options, &secret, prior_chain_state);
+            match open_wallet_db(options) {
+                Ok((db, ledger)) => {
+                    *state = WalletDbState::Opened {
+                        db,
+                        ledger,
+                        writer_lock,
+                    };
+                }
+                Err(reopen_error) => return Err(rebuilt.err().unwrap_or(reopen_error)),
+            }
+            let account_id = rebuilt?;
             tracing::warn!(
                 target: "zally::storage",
                 event = "wallet_db_recreated",
                 account_id = %account_id.as_uuid(),
-                "wallet database deleted and rebuilt with a fresh account"
+                "wallet database rebuilt with a fresh account; payment ledger kept"
             );
             Ok(account_id)
         })
@@ -690,7 +1391,7 @@ impl WalletStorage for Sqlite {
                 .map_err(|e| map_sqlite_error(&e))?;
             let mut receivers = Vec::new();
             for (account_uuid, ufvk) in &accounts {
-                let account_id = account_id_from_ufvk(network, ufvk);
+                let account_id = account_id_from_ufvk(network, ufvk)?;
                 let transparent_addresses = db
                     .get_transparent_receivers(*account_uuid, true, true)
                     .map_err(|e| map_sqlite_error(&e))?;
@@ -880,18 +1581,214 @@ impl WalletStorage for Sqlite {
         .await
     }
 
-    async fn truncate_to_chain_state(
+    async fn revert_blocks_above(
         &self,
         chain_state: TreeStateArtifact,
-    ) -> Result<(), StorageError> {
-        let chain_state = tree_state_to_upstream(chain_state, self.options.network)?;
-        self.with_db_mut(move |db| {
-            WalletWrite::truncate_to_chain_state(db, chain_state).map_err(|err| {
-                StorageError::SqliteFailed {
-                    reason: format!("truncate_to_chain_state failed: {err}"),
-                    posture: FailurePosture::NotRetryable,
+        applied_cursor: Option<Vec<u8>>,
+    ) -> Result<crate::wallet::RevertedBlocks, StorageError> {
+        let network = self.options.network;
+        let chain_state = tree_state_to_upstream(chain_state, network)?;
+        self.with_db_mut_and_ledger(move |db, ledger| {
+            let target = chain_state.block_height();
+            let first_reverted = BlockHeight::from(u32::from(target).saturating_add(1));
+            let highest = BlockHeight::from(u32::MAX);
+            let (account_id, account_uuid) = resolve_account(db, network)?;
+            let receives = query_received_shielded_notes_in_range(
+                ledger,
+                first_reverted,
+                highest,
+                account_uuid,
+                account_id,
+            )?;
+            let transactions = query_wallet_tx_ids_mined_in_range(ledger, first_reverted, highest)?;
+            let recorded_at_ms = current_unix_ms_for_ledger();
+            db.transactionally_with_extension(|wdb, ext| {
+                ext.execute(
+                    "INSERT INTO ext_zally_reverted_broadcasts \
+                         (tx_id_bytes, raw_tx_bytes, expiry_height, reverted_from_height, \
+                          recorded_at_ms, resubmitted_at_ms) \
+                     SELECT txid, raw, IFNULL(expiry_height, 0), mined_height, ?2, NULL \
+                     FROM transactions \
+                     WHERE created IS NOT NULL AND raw IS NOT NULL AND mined_height > ?1 \
+                     ON CONFLICT (tx_id_bytes) DO UPDATE SET \
+                         reverted_from_height = excluded.reverted_from_height, \
+                         recorded_at_ms = excluded.recorded_at_ms, \
+                         resubmitted_at_ms = NULL",
+                    rusqlite::params![u32::from(target), recorded_at_ms],
+                )?;
+                WalletWrite::truncate_to_chain_state(wdb, chain_state)?;
+                if let Some(cursor_bytes) = applied_cursor.as_deref() {
+                    ext.execute(
+                        CHAIN_EVENT_CURSOR_UPSERT_SQL,
+                        rusqlite::params![cursor_bytes, recorded_at_ms],
+                    )?;
                 }
+                Ok::<_, SqliteClientError>(())
             })
+            .map_err(|err| StorageError::SqliteFailed {
+                reason: format!("revert_blocks_above failed: {err}"),
+                posture: FailurePosture::NotRetryable,
+            })?;
+            Ok(crate::wallet::RevertedBlocks {
+                receives,
+                transactions,
+            })
+        })
+        .await
+    }
+
+    async fn find_highest_scanned_height(&self) -> Result<Option<BlockHeight>, StorageError> {
+        self.with_db(move |db| {
+            let scanned = WalletRead::block_max_scanned(db).map_err(|e| map_sqlite_error(&e))?;
+            Ok(scanned.map(|metadata| BlockHeight::from(u32::from(metadata.block_height()))))
+        })
+        .await
+    }
+
+    async fn find_scanned_block_hash(
+        &self,
+        height: BlockHeight,
+    ) -> Result<Option<BlockHash>, StorageError> {
+        let target = zcash_protocol::consensus::BlockHeight::from(height.as_u32());
+        self.with_db(move |db| {
+            let hash = WalletRead::get_block_hash(db, target).map_err(|e| map_sqlite_error(&e))?;
+            Ok(hash.map(|hash| BlockHash::from_bytes(hash.0)))
+        })
+        .await
+    }
+
+    async fn find_chain_event_cursor(&self) -> Result<Option<Vec<u8>>, StorageError> {
+        self.with_ledger(move |conn| {
+            conn.query_row(
+                "SELECT cursor_bytes FROM ext_zally_chain_event_cursor WHERE id = 0",
+                [],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .optional()
+            .map_err(|err| StorageError::SqliteFailed {
+                reason: format!("ext_zally_chain_event_cursor lookup failed: {err}"),
+                posture: FailurePosture::NotRetryable,
+            })
+        })
+        .await
+    }
+
+    async fn record_chain_event_cursor(&self, cursor_bytes: Vec<u8>) -> Result<(), StorageError> {
+        let recorded_at_ms = current_unix_ms_for_ledger();
+        self.with_ledger(move |conn| {
+            conn.execute(
+                CHAIN_EVENT_CURSOR_UPSERT_SQL,
+                rusqlite::params![cursor_bytes, recorded_at_ms],
+            )
+            .map(|_| ())
+            .map_err(|err| StorageError::SqliteFailed {
+                reason: format!("ext_zally_chain_event_cursor upsert failed: {err}"),
+                posture: FailurePosture::NotRetryable,
+            })
+        })
+        .await
+    }
+
+    async fn clear_chain_event_cursor(&self) -> Result<(), StorageError> {
+        self.with_ledger(move |conn| {
+            conn.execute("DELETE FROM ext_zally_chain_event_cursor", [])
+                .map(|_| ())
+                .map_err(|err| StorageError::SqliteFailed {
+                    reason: format!("ext_zally_chain_event_cursor delete failed: {err}"),
+                    posture: FailurePosture::NotRetryable,
+                })
+        })
+        .await
+    }
+
+    async fn list_reverted_broadcasts(
+        &self,
+    ) -> Result<Vec<crate::RevertedBroadcastRow>, StorageError> {
+        self.with_ledger(move |conn| {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT r.tx_id_bytes, r.raw_tx_bytes, r.expiry_height, \
+                            r.reverted_from_height, t.mined_height, r.resubmitted_at_ms \
+                     FROM ext_zally_reverted_broadcasts r \
+                     LEFT JOIN transactions t ON t.txid = r.tx_id_bytes \
+                     ORDER BY r.recorded_at_ms ASC, r.tx_id_bytes ASC",
+                )
+                .map_err(|err| map_sqlite_error(&err))?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, Vec<u8>>(0)?,
+                        row.get::<_, Vec<u8>>(1)?,
+                        row.get::<_, u32>(2)?,
+                        row.get::<_, Option<u32>>(3)?,
+                        row.get::<_, Option<u32>>(4)?,
+                        row.get::<_, Option<i64>>(5)?,
+                    ))
+                })
+                .map_err(|err| map_sqlite_error(&err))?;
+            let mut reverted = Vec::new();
+            for row in rows {
+                let (
+                    tx_id_bytes,
+                    raw_tx_bytes,
+                    expiry_height,
+                    reverted_from_height,
+                    mined_height,
+                    resubmitted_at_ms,
+                ) = row.map_err(|err| StorageError::SqliteFailed {
+                    reason: format!("ext_zally_reverted_broadcasts row decode failed: {err}"),
+                    posture: FailurePosture::NotRetryable,
+                })?;
+                reverted.push(crate::RevertedBroadcastRow {
+                    tx_id: decode_txid_bytes(
+                        tx_id_bytes,
+                        "ext_zally_reverted_broadcasts.tx_id_bytes",
+                    )?,
+                    raw_tx_bytes,
+                    expiry_height: BlockHeight::from(expiry_height),
+                    reverted_from_height: reverted_from_height.map(BlockHeight::from),
+                    mined_height: mined_height.map(BlockHeight::from),
+                    resubmitted_at_ms: resubmitted_at_ms
+                        .map(|at_ms| {
+                            u64::try_from(at_ms).map_err(|_| StorageError::RowValueOutOfRange {
+                                column: "ext_zally_reverted_broadcasts.resubmitted_at_ms",
+                                raw: at_ms.to_string(),
+                            })
+                        })
+                        .transpose()?,
+                });
+            }
+            Ok(reverted)
+        })
+        .await
+    }
+
+    async fn record_reverted_broadcast_resubmitted(
+        &self,
+        tx_id: TxId,
+        resubmitted_at_ms: u64,
+    ) -> Result<(), StorageError> {
+        let resubmitted_at_ms = clamp_unsigned_to_i64(resubmitted_at_ms);
+        self.with_ledger(move |conn| {
+            conn.execute(
+                "UPDATE ext_zally_reverted_broadcasts SET resubmitted_at_ms = ?2 \
+                 WHERE tx_id_bytes = ?1",
+                rusqlite::params![tx_id.as_bytes().as_slice(), resubmitted_at_ms],
+            )
+            .map(|_| ())
+            .map_err(|err| map_sqlite_error(&err))
+        })
+        .await
+    }
+
+    async fn clear_reverted_broadcast(&self, tx_id: TxId) -> Result<(), StorageError> {
+        self.with_ledger(move |conn| {
+            conn.execute(
+                "DELETE FROM ext_zally_reverted_broadcasts WHERE tx_id_bytes = ?1",
+                [tx_id.as_bytes().as_slice()],
+            )
+            .map(|_| ())
+            .map_err(|err| map_sqlite_error(&err))
         })
         .await
     }
@@ -1010,6 +1907,7 @@ impl WalletStorage for Sqlite {
                 source_pool,
                 None,
             )?;
+            check_zip218_limits(&params, &proposal)?;
             let first_step = proposal.steps().first();
             let balance = first_step.balance();
             let payment_count = first_step.transaction_request().payments().len();
@@ -1061,7 +1959,10 @@ impl WalletStorage for Sqlite {
                 Some(lock_request),
             )?;
             let build_result = (|| {
+                check_zip218_limits(&params, &proposal)?;
                 ensure_proposal_anchors(db, &proposal)?;
+                let clock = storage_clock();
+                let mut rng = storage_os_rng();
                 let txids = zcash_client_backend::data_api::wallet::create_proposed_transactions::<
                     Db,
                     NetworkParameters,
@@ -1072,6 +1973,8 @@ impl WalletStorage for Sqlite {
                 >(
                     db,
                     &params,
+                    &clock,
+                    &mut rng,
                     &prover,
                     &prover,
                     &spending_keys,
@@ -1101,6 +2004,7 @@ impl WalletStorage for Sqlite {
         let network = self.options.network;
         let account_id = request.account_id;
         let destination_pool = request.destination_pool;
+        let source_tip_height = request.source_tip_height;
 
         self.with_db_mut(move |db| {
             let account_uuid = resolve_account_uuid(db, network, account_id)?;
@@ -1111,13 +2015,21 @@ impl WalletStorage for Sqlite {
                 .map_err(|e| map_sqlite_error(&e))?
                 .into_keys()
                 .collect();
-            let change_pool = match destination_pool {
-                Some(destination_pool) => destination_pool,
-                None => fallback_change_pool(
-                    &params,
-                    db.chain_height().map_err(|e| map_sqlite_error(&e))?,
-                ),
-            };
+            let chain_height = db.chain_height().map_err(|e| map_sqlite_error(&e))?;
+            let change_pool =
+                destination_pool.unwrap_or_else(|| fallback_change_pool(&params, chain_height));
+            let source_lag_blocks = compute_source_lag_blocks(chain_height, source_tip_height);
+            if source_lag_blocks > 0 {
+                tracing::warn!(
+                    target: "zally::storage",
+                    event = "shielding_maturity_judged_at_source_tip",
+                    wallet_tip_height = chain_height.map(u32::from),
+                    source_tip_height = source_tip_height.map(BlockHeight::as_u32),
+                    source_lag_blocks,
+                    "the chain source's tip is below the wallet's; transparent inputs must be \
+                     mature at the source's tip"
+                );
+            }
 
             let lock_request = proposal_lock_request();
             let input_selector = GreedyInputSelector::<Db>::new();
@@ -1141,13 +2053,16 @@ impl WalletStorage for Sqlite {
                 shielding_threshold,
                 &from_addrs,
                 account_uuid,
-                coinbase_safe_shielding_policy(),
+                coinbase_safe_shielding_policy(source_lag_blocks),
                 zcash_client_backend::data_api::CoinbaseFilter::AllTransparentOutputs,
                 Some(lock_request),
             )
             .map_err(|err| classify_proposal_build_error(&err))?;
             let build_result = (|| {
+                check_zip218_limits(&params, &proposal)?;
                 ensure_proposal_anchors(db, &proposal)?;
+                let clock = storage_clock();
+                let mut rng = storage_os_rng();
                 let txids = zcash_client_backend::data_api::wallet::create_proposed_transactions::<
                     Db,
                     NetworkParameters,
@@ -1158,6 +2073,8 @@ impl WalletStorage for Sqlite {
                 >(
                     db,
                     &params,
+                    &clock,
+                    &mut rng,
                     &prover,
                     &prover,
                     &spending_keys,
@@ -1196,7 +2113,7 @@ impl WalletStorage for Sqlite {
 
         self.dispatch_pczt_creation(move |state, _options| match state {
             WalletDbState::NotOpened => Err(StorageError::NotOpened),
-            WalletDbState::Opened { db, ledger } => {
+            WalletDbState::Opened { db, ledger, .. } => {
                 let db = db.as_mut();
                 let account_uuid = resolve_account_uuid(db, network, account_id)?;
                 let lock_request = proposal_lock_request();
@@ -1212,7 +2129,10 @@ impl WalletStorage for Sqlite {
                     Some(lock_request),
                 )?;
                 let build_result = (|| {
+                    check_zip218_limits(&params, &proposal)?;
                     ensure_proposal_anchors(db, &proposal)?;
+                    let clock = storage_clock();
+                    let mut rng = storage_os_rng();
                     let pczt = zcash_client_backend::data_api::wallet::create_pczt_from_proposal::<
                         Db,
                         NetworkParameters,
@@ -1223,6 +2143,8 @@ impl WalletStorage for Sqlite {
                     >(
                         db,
                         &params,
+                        &clock,
+                        &mut rng,
                         account_uuid,
                         zcash_client_backend::wallet::OvkPolicy::Sender,
                         &proposal,
@@ -1273,13 +2195,22 @@ impl WalletStorage for Sqlite {
 
         self.dispatch(move |state, _options| match state {
             WalletDbState::NotOpened => Err(StorageError::NotOpened),
-            WalletDbState::Opened { db, ledger } => {
+            WalletDbState::Opened { db, ledger, .. } => {
                 let db = db.as_mut();
+                let clock = storage_clock();
+                let mut rng = storage_os_rng();
                 let tx_id =
                     zcash_client_backend::data_api::wallet::extract_and_store_transaction_from_pczt::<
                         Db,
                         zcash_client_sqlite::ReceivedNoteId,
-                    >(db, parsed, Some((&spend_vk, &output_vk)), None)
+                    >(
+                        db,
+                        &clock,
+                        &mut rng,
+                        parsed,
+                        Some((&spend_vk, &output_vk)),
+                        None,
+                    )
                     .map_err(|err| StorageError::SqliteFailed {
                         reason: format!("extract_and_store_transaction_from_pczt failed: {err}"),
                         posture: FailurePosture::NotRetryable,
@@ -1328,7 +2259,7 @@ impl WalletStorage for Sqlite {
             pending_pczt_lock_owner(&parsed)?.ok_or(StorageError::PcztLockOwnerMissing)?;
         self.dispatch(move |state, _options| match state {
             WalletDbState::NotOpened => Err(StorageError::NotOpened),
-            WalletDbState::Opened { db, ledger } => {
+            WalletDbState::Opened { db, ledger, .. } => {
                 release_pending_pczt_inputs(db.as_mut(), ledger.as_ref(), lock_owner)
             }
         })
@@ -1359,7 +2290,8 @@ impl WalletStorage for Sqlite {
         self.with_ledger(move |conn| {
             let outcome = conn
                 .query_row(
-                    "SELECT tx_id_bytes FROM ext_zally_idempotency WHERE idempotency_key = ?1",
+                    "SELECT tx_id_bytes FROM ext_zally_idempotency \
+                     WHERE idempotency_key = ?1 AND unmineable_at_height IS NULL",
                     [&key_str],
                     |row| row.get::<_, Vec<u8>>(0),
                 )
@@ -1391,41 +2323,182 @@ impl WalletStorage for Sqlite {
         key: IdempotencyKey,
         tx_id: TxId,
     ) -> Result<(), StorageError> {
-        let key_str = key.as_str().to_owned();
-        let tx_bytes = tx_id.as_bytes().to_vec();
-        let recorded_at_unix = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0_i64, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX));
         self.with_ledger(move |conn| {
-            let prior = conn
-                .query_row(
-                    "SELECT tx_id_bytes FROM ext_zally_idempotency WHERE idempotency_key = ?1",
-                    [&key_str],
-                    |row| row.get::<_, Vec<u8>>(0),
-                )
-                .optional()
-                .map_err(|err| StorageError::SqliteFailed {
-                    reason: format!("ext_zally_idempotency lookup failed: {err}"),
-                    posture: FailurePosture::NotRetryable,
-                })?;
-            if let Some(prior_bytes) = prior {
-                return if prior_bytes == tx_bytes {
-                    Ok(())
-                } else {
-                    Err(StorageError::IdempotencyKeyConflict)
-                };
+            let transaction = conn
+                .unchecked_transaction()
+                .map_err(|err| ledger_transaction_failed("idempotent-submission record", &err))?;
+            if bind_idempotency_key(&transaction, &key, tx_id)? {
+                record_send_steps(&transaction, &key, [tx_id])?;
             }
-            conn.execute(
-                "INSERT INTO ext_zally_idempotency \
-                     (idempotency_key, tx_id_bytes, recorded_at_unix) \
-                  VALUES (?1, ?2, ?3)",
-                rusqlite::params![&key_str, &tx_bytes, recorded_at_unix],
-            )
-            .map_err(|err| StorageError::SqliteFailed {
-                reason: format!("ext_zally_idempotency insert failed: {err}"),
+            transaction
+                .commit()
+                .map_err(|err| ledger_transaction_failed("idempotent-submission record", &err))
+        })
+        .await
+    }
+
+    async fn record_pending_submission(
+        &self,
+        key: IdempotencyKey,
+        tx_id: TxId,
+        records: Vec<crate::wallet::PendingBroadcastRecord>,
+    ) -> Result<(), StorageError> {
+        self.with_ledger(move |conn| {
+            let transaction = conn
+                .unchecked_transaction()
+                .map_err(|err| ledger_transaction_failed("pending-submission record", &err))?;
+            if bind_idempotency_key(&transaction, &key, tx_id)? {
+                record_send_steps(
+                    &transaction,
+                    &key,
+                    records.iter().map(|record| record.broadcast_tx_id),
+                )?;
+            }
+            for record in &records {
+                insert_pending_broadcast_inputs(&transaction, record)?;
+            }
+            transaction
+                .commit()
+                .map_err(|err| ledger_transaction_failed("pending-submission record", &err))
+        })
+        .await
+    }
+
+    async fn list_send_steps(&self, tx_id: TxId) -> Result<Vec<crate::SendStepRow>, StorageError> {
+        self.with_ledger(move |conn| {
+            let lookup_failed = |err: rusqlite::Error| StorageError::SqliteFailed {
+                reason: format!("send-step lookup failed: {err}"),
                 posture: FailurePosture::NotRetryable,
-            })?;
+            };
+            let mut step_ids = {
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT s.tx_id_bytes FROM ext_zally_send_steps s \
+                         JOIN ext_zally_idempotency i ON i.idempotency_key = s.idempotency_key \
+                         WHERE i.tx_id_bytes = ?1 AND i.unmineable_at_height IS NULL \
+                         ORDER BY s.step_index ASC",
+                    )
+                    .map_err(lookup_failed)?;
+                let rows = stmt
+                    .query_map([tx_id.as_bytes().as_slice()], |row| {
+                        row.get::<_, Vec<u8>>(0)
+                    })
+                    .map_err(lookup_failed)?;
+                let mut step_ids = Vec::new();
+                for row in rows {
+                    step_ids.push(decode_txid_bytes(
+                        row.map_err(lookup_failed)?,
+                        "ext_zally_send_steps.tx_id_bytes",
+                    )?);
+                }
+                step_ids
+            };
+            if step_ids.last() != Some(&tx_id) {
+                step_ids = vec![tx_id];
+            }
+            step_ids
+                .into_iter()
+                .map(|step_id| {
+                    let (raw_bytes, mined_height) = conn
+                        .query_row(
+                            "SELECT IFNULL( \
+                                 (SELECT raw FROM transactions WHERE txid = ?1), \
+                                 (SELECT raw_tx_bytes FROM ext_zally_reverted_broadcasts \
+                                  WHERE tx_id_bytes = ?1)), \
+                             (SELECT mined_height FROM transactions WHERE txid = ?1)",
+                            [step_id.as_bytes().as_slice()],
+                            |row| {
+                                Ok((
+                                    row.get::<_, Option<Vec<u8>>>(0)?,
+                                    row.get::<_, Option<u32>>(1)?,
+                                ))
+                            },
+                        )
+                        .map_err(lookup_failed)?;
+                    Ok(crate::SendStepRow {
+                        tx_id: step_id,
+                        raw_bytes,
+                        mined_height: mined_height.map(BlockHeight::from),
+                    })
+                })
+                .collect()
+        })
+        .await
+    }
+
+    async fn record_confirmed_broadcast(
+        &self,
+        raw_tx_bytes: Vec<u8>,
+        confirmed_at_height: BlockHeight,
+    ) -> Result<(), StorageError> {
+        let params = self.options.network.to_parameters();
+        self.with_db_mut_and_ledger(move |db, ledger| {
+            let transaction = read_stored_transaction(&raw_tx_bytes)?;
+            let tx_id = zally_core::TxId::from_bytes(*transaction.txid().as_ref());
+            zcash_client_backend::data_api::wallet::decrypt_and_store_transaction(
+                &params,
+                db,
+                &transaction,
+                Some(zcash_protocol::consensus::BlockHeight::from_u32(
+                    confirmed_at_height.as_u32(),
+                )),
+            )
+            .map_err(|err| map_sqlite_error(&err))?;
+            for statement in [
+                "DELETE FROM ext_zally_pending_broadcast_inputs WHERE broadcast_tx_id = ?1",
+                "DELETE FROM ext_zally_reverted_broadcasts WHERE tx_id_bytes = ?1",
+            ] {
+                ledger
+                    .execute(statement, [tx_id.as_bytes().as_slice()])
+                    .map_err(|err| StorageError::SqliteFailed {
+                        reason: format!("confirmed-broadcast ledger delete failed: {err}"),
+                        posture: FailurePosture::NotRetryable,
+                    })?;
+            }
             Ok(())
+        })
+        .await
+    }
+
+    async fn store_carried_send_steps(&self) -> Result<Vec<TxId>, StorageError> {
+        let params = self.options.network.to_parameters();
+        self.with_db_mut_and_ledger(move |db, ledger| {
+            let carried = list_carried_send_steps(ledger)?;
+            settle_scan_blind_sends(ledger, &carried, |send| {
+                store_send_steps(db, &params, send)?;
+                are_funding_outputs_recorded(ledger, send)
+            })
+        })
+        .await
+    }
+
+    async fn release_pending_submission(&self, tx_ids: Vec<TxId>) -> Result<(), StorageError> {
+        self.with_ledger(move |conn| {
+            let transaction = conn
+                .unchecked_transaction()
+                .map_err(|err| ledger_transaction_failed("pending-submission release", &err))?;
+            for tx_id in &tx_ids {
+                for statement in [
+                    "DELETE FROM ext_zally_send_steps WHERE idempotency_key IN \
+                     (SELECT idempotency_key FROM ext_zally_idempotency \
+                      WHERE tx_id_bytes = ?1 AND unmineable_at_height IS NULL)",
+                    "DELETE FROM ext_zally_idempotency \
+                     WHERE tx_id_bytes = ?1 AND unmineable_at_height IS NULL",
+                    "DELETE FROM ext_zally_pending_broadcast_inputs WHERE broadcast_tx_id = ?1",
+                    "DELETE FROM ext_zally_reverted_broadcasts WHERE tx_id_bytes = ?1",
+                    "DELETE FROM ext_zally_scan_blind_sends WHERE tx_id_bytes = ?1",
+                ] {
+                    transaction
+                        .execute(statement, [tx_id.as_bytes().as_slice()])
+                        .map_err(|err| StorageError::SqliteFailed {
+                            reason: format!("pending-submission release failed: {err}"),
+                            posture: FailurePosture::NotRetryable,
+                        })?;
+                }
+            }
+            transaction
+                .commit()
+                .map_err(|err| ledger_transaction_failed("pending-submission release", &err))
         })
         .await
     }
@@ -1435,57 +2508,8 @@ impl WalletStorage for Sqlite {
         start: BlockHeight,
         end: BlockHeight,
     ) -> Result<Vec<(TxId, BlockHeight)>, StorageError> {
-        let start_h = i64::from(start.as_u32());
-        let end_h = i64::from(end.as_u32());
-        self.with_ledger(move |conn| {
-            let mut stmt = conn
-                .prepare(
-                    "SELECT txid, mined_height FROM transactions \
-                     WHERE mined_height BETWEEN ?1 AND ?2 \
-                     ORDER BY mined_height ASC, id_tx ASC",
-                )
-                .map_err(|err| StorageError::SqliteFailed {
-                    reason: format!("transactions range query prepare failed: {err}"),
-                    posture: FailurePosture::NotRetryable,
-                })?;
-            let rows = stmt
-                .query_map([start_h, end_h], |row| {
-                    let txid_bytes: Vec<u8> = row.get(0)?;
-                    let mined_height: i64 = row.get(1)?;
-                    Ok((txid_bytes, mined_height))
-                })
-                .map_err(|err| StorageError::SqliteFailed {
-                    reason: format!("transactions range query failed: {err}"),
-                    posture: FailurePosture::NotRetryable,
-                })?;
-            let mut entries = Vec::new();
-            for row in rows {
-                let (txid_bytes, mined_height) = row.map_err(|err| StorageError::SqliteFailed {
-                    reason: format!("transactions row decode failed: {err}"),
-                    posture: FailurePosture::NotRetryable,
-                })?;
-                let array: [u8; 32] =
-                    txid_bytes
-                        .try_into()
-                        .map_err(|raw: Vec<u8>| StorageError::SqliteFailed {
-                            reason: format!(
-                                "transactions.txid had wrong byte length: {}",
-                                raw.len()
-                            ),
-                            posture: FailurePosture::NotRetryable,
-                        })?;
-                let height =
-                    u32::try_from(mined_height).map_err(|_| StorageError::SqliteFailed {
-                        reason: format!(
-                            "transactions.mined_height out of u32 range: {mined_height}"
-                        ),
-                        posture: FailurePosture::NotRetryable,
-                    })?;
-                entries.push((TxId::from_bytes(array), BlockHeight::from(height)));
-            }
-            Ok(entries)
-        })
-        .await
+        self.with_ledger(move |conn| query_wallet_tx_ids_mined_in_range(conn, start, end))
+            .await
     }
 
     async fn find_visible_tip(&self) -> Result<Option<BlockHeight>, StorageError> {
@@ -1629,12 +2653,6 @@ impl WalletStorage for Sqlite {
         &self,
         record: crate::wallet::PendingBroadcastRecord,
     ) -> Result<(), StorageError> {
-        let account_uuid_bytes = record.account_id.as_uuid().as_bytes().to_vec();
-        let broadcast_tx_bytes = record.broadcast_tx_id.as_bytes().to_vec();
-        let broadcast_at_ms_i64 = clamp_unsigned_to_i64(record.broadcast_at_ms);
-        let broadcast_at_height_i64 = record.broadcast_at_height.map(|h| i64::from(h.as_u32()));
-        let inputs = record.inputs;
-
         self.with_ledger(move |conn| {
             let tx = conn
                 .unchecked_transaction()
@@ -1644,31 +2662,7 @@ impl WalletStorage for Sqlite {
                     ),
                     posture: FailurePosture::Retryable,
                 })?;
-            {
-                let mut stmt = tx
-                    .prepare_cached(PENDING_BROADCAST_INPUT_UPSERT_SQL)
-                    .map_err(|err| StorageError::SqliteFailed {
-                        reason: format!("ext_zally_pending_broadcast_inputs prepare failed: {err}"),
-                        posture: FailurePosture::NotRetryable,
-                    })?;
-                for (outpoint, value_zat) in inputs {
-                    let outpoint_tx_bytes = outpoint.tx_id.as_bytes().to_vec();
-                    let value_zat_i64 = clamp_unsigned_to_i64(value_zat.as_u64());
-                    stmt.execute(rusqlite::params![
-                        &broadcast_tx_bytes,
-                        &outpoint_tx_bytes,
-                        i64::from(outpoint.output_index),
-                        value_zat_i64,
-                        &account_uuid_bytes,
-                        broadcast_at_ms_i64,
-                        broadcast_at_height_i64,
-                    ])
-                    .map_err(|err| StorageError::SqliteFailed {
-                        reason: format!("ext_zally_pending_broadcast_inputs insert failed: {err}"),
-                        posture: FailurePosture::NotRetryable,
-                    })?;
-                }
-            }
+            insert_pending_broadcast_inputs(&tx, &record)?;
             tx.commit().map_err(|err| StorageError::SqliteFailed {
                 reason: format!("ext_zally_pending_broadcast_inputs commit failed: {err}"),
                 posture: FailurePosture::Retryable,
@@ -1793,6 +2787,73 @@ impl WalletStorage for Sqlite {
         .await
     }
 
+    async fn list_pending_broadcast_transactions(
+        &self,
+    ) -> Result<Vec<crate::PendingBroadcastTransaction>, StorageError> {
+        self.with_ledger(|conn| {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT txid, MIN(raw), MIN(mined_height) FROM ( \
+                         SELECT t.txid AS txid, t.raw AS raw, t.mined_height AS mined_height \
+                         FROM transactions t \
+                         WHERE t.raw IS NOT NULL \
+                           AND (t.txid IN (SELECT broadcast_tx_id \
+                                           FROM ext_zally_pending_broadcast_inputs) \
+                                OR (t.mined_height IS NULL \
+                                    AND t.txid IN (SELECT tx_id_bytes \
+                                                   FROM ext_zally_idempotency \
+                                                   WHERE unmineable_at_height IS NULL))) \
+                         UNION ALL \
+                         SELECT r.tx_id_bytes, r.raw_tx_bytes, t.mined_height \
+                         FROM ext_zally_reverted_broadcasts r \
+                         LEFT JOIN transactions t ON t.txid = r.tx_id_bytes \
+                     ) GROUP BY txid ORDER BY txid ASC",
+                )
+                .map_err(|err| StorageError::SqliteFailed {
+                    reason: format!("pending-broadcast-transactions prepare failed: {err}"),
+                    posture: FailurePosture::NotRetryable,
+                })?;
+            let rows = stmt
+                .query_map([], |row| {
+                    let txid_bytes: Vec<u8> = row.get(0)?;
+                    let raw_bytes: Vec<u8> = row.get(1)?;
+                    let mined_height: Option<i64> = row.get(2)?;
+                    Ok((txid_bytes, raw_bytes, mined_height))
+                })
+                .map_err(|err| StorageError::SqliteFailed {
+                    reason: format!("pending-broadcast-transactions query failed: {err}"),
+                    posture: FailurePosture::NotRetryable,
+                })?;
+            let mut transactions = Vec::new();
+            for row in rows {
+                let (txid_bytes, raw_bytes, mined_height) =
+                    row.map_err(|err| StorageError::SqliteFailed {
+                        reason: format!("pending-broadcast-transactions row decode failed: {err}"),
+                        posture: FailurePosture::NotRetryable,
+                    })?;
+                let mined_height = mined_height
+                    .map(|height| {
+                        u32::try_from(height).map(BlockHeight::from).map_err(|_| {
+                            StorageError::SqliteFailed {
+                                reason: format!(
+                                    "transactions.mined_height out of u32 range: {height}"
+                                ),
+                                posture: FailurePosture::NotRetryable,
+                            }
+                        })
+                    })
+                    .transpose()?;
+                transactions.push(crate::PendingBroadcastTransaction {
+                    broadcast_tx_id: decode_txid_bytes(txid_bytes, "transactions.txid")?,
+                    raw_bytes,
+                    mined_height,
+                });
+            }
+            Ok(transactions)
+        })
+        .await
+    }
+
     async fn clear_pending_broadcast_inputs_for_mined(
         &self,
         tx_ids: &[TxId],
@@ -1833,24 +2894,51 @@ impl WalletStorage for Sqlite {
         .await
     }
 
-    async fn clear_expired_pending_broadcast_inputs(
+    async fn record_unmineable_transaction(
         &self,
-        before_at_ms: u64,
-    ) -> Result<u64, StorageError> {
-        let before_at_ms_i64 = clamp_unsigned_to_i64(before_at_ms);
+        tx_id: TxId,
+        judged_height: BlockHeight,
+    ) -> Result<Option<Vec<crate::UnmineableHold>>, StorageError> {
+        let tx_bytes = tx_id.as_bytes().to_vec();
+        let judged_height_i64 = i64::from(judged_height.as_u32());
+        let settled_at_ms = current_unix_ms_for_ledger();
         self.with_ledger(move |conn| {
-            let count = conn
+            let tx = conn
+                .unchecked_transaction()
+                .map_err(|err| StorageError::SqliteFailed {
+                    reason: format!("unmineable-transaction record start failed: {err}"),
+                    posture: FailurePosture::Retryable,
+                })?;
+            let mut changed_rows = tx
                 .execute(
-                    "DELETE FROM ext_zally_pending_broadcast_inputs WHERE broadcast_at_ms < ?1",
-                    [before_at_ms_i64],
+                    "UPDATE ext_zally_idempotency SET unmineable_at_height = ?2 \
+                     WHERE tx_id_bytes = ?1 AND unmineable_at_height IS NULL",
+                    rusqlite::params![&tx_bytes, judged_height_i64],
                 )
                 .map_err(|err| StorageError::SqliteFailed {
-                    reason: format!(
-                        "ext_zally_pending_broadcast_inputs cleanup-expired failed: {err}"
-                    ),
+                    reason: format!("ext_zally_idempotency unmineable update failed: {err}"),
                     posture: FailurePosture::NotRetryable,
                 })?;
-            Ok(u64::try_from(count).unwrap_or(0))
+            for statement in [
+                "DELETE FROM ext_zally_pending_broadcast_inputs WHERE broadcast_tx_id = ?1",
+                "DELETE FROM ext_zally_reverted_broadcasts WHERE tx_id_bytes = ?1",
+            ] {
+                changed_rows += tx.execute(statement, [&tx_bytes]).map_err(|err| {
+                    StorageError::SqliteFailed {
+                        reason: format!("unmineable-transaction ledger delete failed: {err}"),
+                        posture: FailurePosture::NotRetryable,
+                    }
+                })?;
+            }
+            let holds = settle_holds_of_unmineable_transaction(&tx, &tx_bytes, settled_at_ms)?;
+            if changed_rows == 0 && holds.is_empty() {
+                return Ok(None);
+            }
+            tx.commit().map_err(|err| StorageError::SqliteFailed {
+                reason: format!("unmineable-transaction record commit failed: {err}"),
+                posture: FailurePosture::Retryable,
+            })?;
+            Ok(Some(holds))
         })
         .await
     }
@@ -1914,7 +3002,7 @@ impl WalletStorage for Sqlite {
                     .transpose()?;
                 let has_transparent_receiver = unified_address.transparent().is_some();
                 rows.push(crate::ExposedAddressRow {
-                    unified_address,
+                    unified_address: *unified_address,
                     diversifier_index,
                     has_transparent_receiver,
                     exposed_at_height,
@@ -2080,23 +3168,15 @@ impl WalletStorage for Sqlite {
         to_height: BlockHeight,
     ) -> Result<Vec<crate::wallet::ReceivedShieldedNoteRow>, StorageError> {
         let network = self.options.network;
-        let from_h = i64::from(from_height.as_u32());
-        let to_h = i64::from(to_height.as_u32());
         self.with_db_and_ledger(move |db, conn| {
             let (account_id, account_uuid) = resolve_account(db, network)?;
-            let mut stmt = conn
-                .prepare(RECEIVED_SHIELDED_NOTES_IN_RANGE_SQL)
-                .map_err(|err| StorageError::SqliteFailed {
-                    reason: format!("received_shielded_notes prepare failed: {err}"),
-                    posture: FailurePosture::NotRetryable,
-                })?;
-            let mapped = stmt
-                .query_map([from_h, to_h], decode_received_shielded_note_row)
-                .map_err(|err| StorageError::SqliteFailed {
-                    reason: format!("received_shielded_notes query failed: {err}"),
-                    posture: FailurePosture::NotRetryable,
-                })?;
-            collect_received_shielded_note_rows(mapped, account_uuid, account_id)
+            query_received_shielded_notes_in_range(
+                conn,
+                from_height,
+                to_height,
+                account_uuid,
+                account_id,
+            )
         })
         .await
     }
@@ -2573,6 +3653,260 @@ fn pending_pczt_lock_owner(pczt: &pczt::Pczt) -> Result<Option<LockOwner>, Stora
 /// Bound to one outpoint per execution. The whole batch runs inside one transaction with a
 /// reused prepared statement so a 620-input shielding sweep takes one parse+plan round
 /// instead of 620.
+fn query_wallet_tx_ids_mined_in_range(
+    conn: &rusqlite::Connection,
+    start: BlockHeight,
+    end: BlockHeight,
+) -> Result<Vec<(TxId, BlockHeight)>, StorageError> {
+    let start_h = i64::from(start.as_u32());
+    let end_h = i64::from(end.as_u32());
+    let mut stmt = conn
+        .prepare(
+            "SELECT txid, mined_height FROM transactions \
+                 WHERE mined_height BETWEEN ?1 AND ?2 \
+                 ORDER BY mined_height ASC, id_tx ASC",
+        )
+        .map_err(|err| StorageError::SqliteFailed {
+            reason: format!("transactions range query prepare failed: {err}"),
+            posture: FailurePosture::NotRetryable,
+        })?;
+    let rows = stmt
+        .query_map([start_h, end_h], |row| {
+            let txid_bytes: Vec<u8> = row.get(0)?;
+            let mined_height: i64 = row.get(1)?;
+            Ok((txid_bytes, mined_height))
+        })
+        .map_err(|err| StorageError::SqliteFailed {
+            reason: format!("transactions range query failed: {err}"),
+            posture: FailurePosture::NotRetryable,
+        })?;
+    let mut entries = Vec::new();
+    for row in rows {
+        let (txid_bytes, mined_height) = row.map_err(|err| StorageError::SqliteFailed {
+            reason: format!("transactions row decode failed: {err}"),
+            posture: FailurePosture::NotRetryable,
+        })?;
+        let array: [u8; 32] =
+            txid_bytes
+                .try_into()
+                .map_err(|raw: Vec<u8>| StorageError::SqliteFailed {
+                    reason: format!("transactions.txid had wrong byte length: {}", raw.len()),
+                    posture: FailurePosture::NotRetryable,
+                })?;
+        let height = u32::try_from(mined_height).map_err(|_| StorageError::SqliteFailed {
+            reason: format!("transactions.mined_height out of u32 range: {mined_height}"),
+            posture: FailurePosture::NotRetryable,
+        })?;
+        entries.push((TxId::from_bytes(array), BlockHeight::from(height)));
+    }
+    Ok(entries)
+}
+
+/// Undoes the finalization of every hold finalized with an unmineable transaction.
+///
+/// The dispense never happened, so each such hold becomes active again and reserves its
+/// amount for the replacement dispense. A hold whose request identifier another active hold
+/// already holds is released instead, since that other hold is the live attempt.
+fn settle_holds_of_unmineable_transaction(
+    transaction: &rusqlite::Transaction<'_>,
+    tx_bytes: &[u8],
+    settled_at_ms: i64,
+) -> Result<Vec<crate::UnmineableHold>, StorageError> {
+    let finalized: Vec<(Vec<u8>, String)> = {
+        let mut statement = transaction
+            .prepare(
+                "SELECT hold_id, request_id FROM ext_zally_holds \
+                 WHERE finalized_tx_id = ?1 AND released_at_ms IS NULL \
+                 ORDER BY reserved_at_ms ASC, hold_id ASC",
+            )
+            .map_err(|err| map_sqlite_error(&err))?;
+        let rows = statement
+            .query_map([tx_bytes], |row| Ok((row.get(0)?, row.get(1)?)))
+            .map_err(|err| map_sqlite_error(&err))?;
+        rows.collect::<Result<_, _>>()
+            .map_err(|err| map_row_decode_error(&err))?
+    };
+    let mut holds = Vec::with_capacity(finalized.len());
+    for (hold_id_bytes, request_id) in finalized {
+        let is_request_taken = transaction
+            .query_row(
+                "SELECT EXISTS (SELECT 1 FROM ext_zally_holds WHERE request_id = ?1 \
+                     AND finalized_tx_id IS NULL AND released_at_ms IS NULL)",
+                [&request_id],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(|err| map_sqlite_error(&err))?;
+        if is_request_taken {
+            transaction.execute(
+                "UPDATE ext_zally_holds SET released_at_ms = ?2 WHERE hold_id = ?1",
+                rusqlite::params![hold_id_bytes, settled_at_ms],
+            )
+        } else {
+            transaction.execute(
+                "UPDATE ext_zally_holds SET finalized_tx_id = NULL WHERE hold_id = ?1",
+                [&hold_id_bytes],
+            )
+        }
+        .map_err(|err| map_sqlite_error(&err))?;
+        holds.push(crate::UnmineableHold {
+            hold_id: decode_hold_id_bytes(hold_id_bytes)?,
+            request_id: IdempotencyKey::try_from(request_id).map_err(|_| {
+                StorageError::RowValueOutOfRange {
+                    column: "ext_zally_holds.request_id",
+                    raw: "invalid idempotency key".to_owned(),
+                }
+            })?,
+            is_reopened: !is_request_taken,
+        });
+    }
+    Ok(holds)
+}
+
+/// Binds `key` to `tx_id` in the idempotency ledger; returns whether it wrote a binding.
+///
+/// A key whose transaction was recorded unmineable is rebound; a key already bound to
+/// `tx_id` is left as it is; a key bound to another transaction that can still be mined fails
+/// with [`StorageError::IdempotencyKeyConflict`].
+fn bind_idempotency_key(
+    conn: &rusqlite::Connection,
+    key: &IdempotencyKey,
+    tx_id: TxId,
+) -> Result<bool, StorageError> {
+    let key_str = key.as_str();
+    let tx_bytes = tx_id.as_bytes().to_vec();
+    let recorded_at_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0_i64, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX));
+    let prior = conn
+        .query_row(
+            "SELECT tx_id_bytes, unmineable_at_height IS NOT NULL \
+             FROM ext_zally_idempotency WHERE idempotency_key = ?1",
+            [key_str],
+            |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, bool>(1)?)),
+        )
+        .optional()
+        .map_err(|err| StorageError::SqliteFailed {
+            reason: format!("ext_zally_idempotency lookup failed: {err}"),
+            posture: FailurePosture::NotRetryable,
+        })?;
+    let statement = match prior {
+        None => {
+            "INSERT INTO ext_zally_idempotency \
+                 (idempotency_key, tx_id_bytes, recorded_at_unix) \
+              VALUES (?1, ?2, ?3)"
+        }
+        Some((_, true)) => {
+            "UPDATE ext_zally_idempotency \
+             SET tx_id_bytes = ?2, recorded_at_unix = ?3, unmineable_at_height = NULL \
+             WHERE idempotency_key = ?1"
+        }
+        Some((prior_bytes, false)) => {
+            return if prior_bytes == tx_bytes {
+                Ok(false)
+            } else {
+                Err(StorageError::IdempotencyKeyConflict)
+            };
+        }
+    };
+    conn.execute(
+        statement,
+        rusqlite::params![key_str, &tx_bytes, recorded_at_unix],
+    )
+    .map_err(|err| StorageError::SqliteFailed {
+        reason: format!("ext_zally_idempotency write failed: {err}"),
+        posture: FailurePosture::NotRetryable,
+    })?;
+    Ok(true)
+}
+
+/// Records `tx_ids`, in submission order, as the steps of the send `key` is bound to,
+/// replacing the steps of any send the key named before.
+fn record_send_steps(
+    conn: &rusqlite::Connection,
+    key: &IdempotencyKey,
+    tx_ids: impl IntoIterator<Item = TxId>,
+) -> Result<(), StorageError> {
+    let steps_failed = |err: rusqlite::Error| StorageError::SqliteFailed {
+        reason: format!("ext_zally_send_steps write failed: {err}"),
+        posture: FailurePosture::NotRetryable,
+    };
+    conn.execute(
+        "DELETE FROM ext_zally_send_steps WHERE idempotency_key = ?1",
+        [key.as_str()],
+    )
+    .map_err(steps_failed)?;
+    for (step_index, tx_id) in tx_ids.into_iter().enumerate() {
+        conn.execute(
+            "INSERT INTO ext_zally_send_steps (idempotency_key, step_index, tx_id_bytes) \
+             VALUES (?1, ?2, ?3)",
+            rusqlite::params![
+                key.as_str(),
+                i64::try_from(step_index).unwrap_or(i64::MAX),
+                tx_id.as_bytes().as_slice()
+            ],
+        )
+        .map_err(steps_failed)?;
+    }
+    Ok(())
+}
+
+/// A ledger transaction that could not start or commit, which a retry may complete.
+fn ledger_transaction_failed(operation: &str, err: &rusqlite::Error) -> StorageError {
+    StorageError::SqliteFailed {
+        reason: format!("{operation} transaction failed: {err}"),
+        posture: FailurePosture::Retryable,
+    }
+}
+
+fn insert_pending_broadcast_inputs(
+    conn: &rusqlite::Connection,
+    record: &crate::wallet::PendingBroadcastRecord,
+) -> Result<(), StorageError> {
+    let account_uuid_bytes = record.account_id.as_uuid().as_bytes().to_vec();
+    let broadcast_tx_bytes = record.broadcast_tx_id.as_bytes().to_vec();
+    let broadcast_at_ms_i64 = clamp_unsigned_to_i64(record.broadcast_at_ms);
+    let broadcast_at_height_i64 = record.broadcast_at_height.map(|h| i64::from(h.as_u32()));
+    let mut stmt = conn
+        .prepare_cached(PENDING_BROADCAST_INPUT_UPSERT_SQL)
+        .map_err(|err| StorageError::SqliteFailed {
+            reason: format!("ext_zally_pending_broadcast_inputs prepare failed: {err}"),
+            posture: FailurePosture::NotRetryable,
+        })?;
+    for (outpoint, value_zat) in &record.inputs {
+        let outpoint_tx_bytes = outpoint.tx_id.as_bytes().to_vec();
+        let value_zat_i64 = clamp_unsigned_to_i64(value_zat.as_u64());
+        stmt.execute(rusqlite::params![
+            &broadcast_tx_bytes,
+            &outpoint_tx_bytes,
+            i64::from(outpoint.output_index),
+            value_zat_i64,
+            &account_uuid_bytes,
+            broadcast_at_ms_i64,
+            broadcast_at_height_i64,
+        ])
+        .map_err(|err| StorageError::SqliteFailed {
+            reason: format!("ext_zally_pending_broadcast_inputs insert failed: {err}"),
+            posture: FailurePosture::NotRetryable,
+        })?;
+    }
+    Ok(())
+}
+
+const CHAIN_EVENT_CURSOR_UPSERT_SQL: &str = "\
+    INSERT INTO ext_zally_chain_event_cursor (id, cursor_bytes, recorded_at_ms) \
+    VALUES (0, ?1, ?2) \
+    ON CONFLICT (id) DO UPDATE SET \
+        cursor_bytes = excluded.cursor_bytes, \
+        recorded_at_ms = excluded.recorded_at_ms";
+
+fn current_unix_ms_for_ledger() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0_i64, |elapsed| {
+            i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX)
+        })
+}
+
 const PENDING_BROADCAST_INPUT_UPSERT_SQL: &str = "\
     INSERT INTO ext_zally_pending_broadcast_inputs \
         (broadcast_tx_id, outpoint_tx_id, outpoint_index, value_zat, \
@@ -2591,6 +3925,10 @@ const PENDING_BROADCAST_INPUT_UPSERT_SQL: &str = "\
 /// shape, decoding the diversifier index, and projecting to [`ExposedAddressRow`] happens
 /// in Rust so the SQL stays portable across `zcash_client_sqlite` migrations.
 ///
+/// Rows without a diversifier index are imported standalone transparent addresses
+/// (`key_scope = -1`), which `zcash_client_sqlite` marks exposed when they receive funds.
+/// They were never derived, so they have no place in derivation order.
+///
 /// [`ExposedAddressRow`]: crate::ExposedAddressRow
 const EXPOSED_ADDRESSES_SQL: &str = "\
     SELECT a.address, a.diversifier_index_be, a.exposed_at_height \
@@ -2598,6 +3936,7 @@ const EXPOSED_ADDRESSES_SQL: &str = "\
     JOIN accounts ac ON ac.id = a.account_id \
     WHERE ac.uuid = ?1 \
       AND a.exposed_at_height IS NOT NULL \
+      AND a.diversifier_index_be IS NOT NULL \
     ORDER BY a.exposed_at_height ASC, a.diversifier_index_be ASC";
 
 /// Aggregate of unmatured wallet-owned coinbase transparent value at one target height.
@@ -2749,6 +4088,30 @@ fn decode_received_shielded_note_row(
         row.get(7)?,
         row.get(8)?,
     ))
+}
+
+fn query_received_shielded_notes_in_range(
+    conn: &rusqlite::Connection,
+    from_height: BlockHeight,
+    to_height: BlockHeight,
+    account_uuid: AccountUuid,
+    account_id: AccountId,
+) -> Result<Vec<crate::wallet::ReceivedShieldedNoteRow>, StorageError> {
+    let from_h = i64::from(from_height.as_u32());
+    let to_h = i64::from(to_height.as_u32());
+    let mut stmt = conn
+        .prepare(RECEIVED_SHIELDED_NOTES_IN_RANGE_SQL)
+        .map_err(|err| StorageError::SqliteFailed {
+            reason: format!("received_shielded_notes prepare failed: {err}"),
+            posture: FailurePosture::NotRetryable,
+        })?;
+    let mapped = stmt
+        .query_map([from_h, to_h], decode_received_shielded_note_row)
+        .map_err(|err| StorageError::SqliteFailed {
+            reason: format!("received_shielded_notes query failed: {err}"),
+            posture: FailurePosture::NotRetryable,
+        })?;
+    collect_received_shielded_note_rows(mapped, account_uuid, account_id)
 }
 
 /// Decodes received-note rows, stamping each with the wallet's deterministic
@@ -3233,9 +4596,23 @@ where
 /// The id is the UUID v5 of the network-encoded UFVK under
 /// [`ZALLY_ACCOUNT_NAMESPACE`]. Account identity is key identity, so the id is stable
 /// across database rebuilds, machines, and resets.
-fn account_id_from_ufvk(network: Network, ufvk: &UnifiedFullViewingKey) -> AccountId {
-    let encoded = ufvk.encode(&network.to_parameters());
-    AccountId::from_uuid(Uuid::new_v5(&ZALLY_ACCOUNT_NAMESPACE, encoded.as_bytes()))
+///
+/// The encoding is pinned to ZIP 316 Revision 0, the revision every Zally account id has
+/// been derived from, so a change in the upstream default revision cannot change identity.
+/// A UFVK with no Revision 0 encoding fails rather than deriving a second identity.
+fn account_id_from_ufvk(
+    network: Network,
+    ufvk: &UnifiedFullViewingKey,
+) -> Result<AccountId, StorageError> {
+    let encoded = ufvk
+        .encode_revision(&network.to_parameters(), Revision::R0)
+        .map_err(|err| StorageError::KeyDerivationFailed {
+            reason: format!("account identity needs a Revision 0 UFVK encoding: {err}"),
+        })?;
+    Ok(AccountId::from_uuid(Uuid::new_v5(
+        &ZALLY_ACCOUNT_NAMESPACE,
+        encoded.as_bytes(),
+    )))
 }
 
 /// Computes the deterministic [`AccountId`] for a stored account via its UFVK.
@@ -3249,7 +4626,7 @@ fn deterministic_account_id<A: Account>(
             reason: "account has no unified full viewing key to derive its identity from"
                 .to_owned(),
         })?;
-    Ok(account_id_from_ufvk(network, ufvk))
+    account_id_from_ufvk(network, ufvk)
 }
 
 /// Resolves the wallet's single account to its deterministic [`AccountId`] and the
@@ -3361,7 +4738,8 @@ fn propose_payment_proposal<DbT>(
     StorageError,
 >
 where
-    DbT: zcash_client_backend::data_api::WalletWrite<
+    DbT: zcash_client_backend::data_api::WalletWrite
+        + zcash_client_backend::data_api::WalletRead<
             AccountId = AccountUuid,
             Error = zcash_client_sqlite::error::SqliteClientError,
         > + zcash_client_backend::data_api::InputSource<
@@ -3422,7 +4800,10 @@ where
 }
 
 fn proposal_lock_request() -> LockRequest {
-    LockRequest::new(LockOwner::random(&mut OsRng), PROPOSAL_INPUT_LOCK_BLOCKS)
+    LockRequest::new(
+        LockOwner::random(&mut storage_os_rng()),
+        PROPOSAL_INPUT_LOCK_BLOCKS,
+    )
 }
 
 fn proposal_input_refs<FeeRuleT, NoteRefT>(
@@ -3508,7 +4889,13 @@ fn release_proposal_inputs_after_failure<T, FeeRuleT, NoteRefT>(
 /// `trusted` is kept at the upstream default (3) because shielded-note
 /// confirmation policy takes a separate code path and is unaffected by
 /// this helper.
-pub(crate) fn coinbase_safe_shielding_policy() -> ConfirmationsPolicy {
+///
+/// The SQL clause counts confirmations from the wallet's chain tip, but the
+/// shielding transaction is mined above the chain source's tip. When the
+/// source's tip sits `source_lag_blocks` below the wallet's, `untrusted`
+/// grows by that many blocks, so an output is selected only when it is
+/// mature at the source's tip too.
+pub(crate) fn coinbase_safe_shielding_policy(source_lag_blocks: u32) -> ConfirmationsPolicy {
     const COINBASE_MATURITY_CONFIRMATIONS: u32 = 100;
     const TRUSTED_DEFAULT_CONFIRMATIONS: u32 = 3;
     #[allow(
@@ -3519,39 +4906,169 @@ pub(crate) fn coinbase_safe_shielding_policy() -> ConfirmationsPolicy {
         .expect("TRUSTED_DEFAULT_CONFIRMATIONS is non-zero");
     #[allow(
         clippy::expect_used,
-        reason = "constants are non-zero by construction; the conversion cannot fail"
+        reason = "the maturity constant is non-zero and saturating addition never lowers it"
     )]
-    let untrusted = NonZeroU32::new(COINBASE_MATURITY_CONFIRMATIONS)
-        .expect("COINBASE_MATURITY_CONFIRMATIONS is non-zero");
+    let untrusted =
+        NonZeroU32::new(COINBASE_MATURITY_CONFIRMATIONS.saturating_add(source_lag_blocks))
+            .expect("COINBASE_MATURITY_CONFIRMATIONS is non-zero");
     #[allow(
         clippy::expect_used,
         reason = "trusted <= untrusted by construction; the policy invariant is upheld"
     )]
     ConfirmationsPolicy::new(trusted, untrusted, false)
-        .expect("trusted=3 <= untrusted=100 satisfies the policy invariant")
+        .expect("trusted=3 <= untrusted>=100 satisfies the policy invariant")
 }
 
-/// Classifies a proposal-build error into a typed [`StorageError`] variant.
-///
-/// Distinguishes insufficient funds from other build failures so the wallet boundary does
-/// not have to string-match the error display. Takes the error by `Debug` rather than
-/// `Display` because the upstream `data_api::error::Error<...>` does not implement
-/// `Display` over its `NoteRef` generic.
-pub(crate) fn classify_proposal_build_error<E: std::fmt::Debug>(err: &E) -> StorageError {
-    let reason = format!("{err:?}");
-    let lc = reason.to_lowercase();
-    if lc.contains("insufficientfunds") || lc.contains("insufficient funds") {
-        return StorageError::InsufficientFunds {
-            required_zat: Zatoshis::zero(),
-            available_zat: Zatoshis::zero(),
-        };
+/// Blocks the wallet's chain tip sits above the chain source's tip; zero when either is
+/// unknown or the source is at or above the wallet.
+fn compute_source_lag_blocks(
+    wallet_tip_height: Option<zcash_protocol::consensus::BlockHeight>,
+    source_tip_height: Option<BlockHeight>,
+) -> u32 {
+    match (wallet_tip_height, source_tip_height) {
+        (Some(wallet_tip), Some(source_tip)) => {
+            u32::from(wallet_tip).saturating_sub(source_tip.as_u32())
+        }
+        _ => 0,
     }
-    let posture = if lc.contains("inputslocked") || lc.contains("inputs locked") {
-        FailurePosture::Retryable
-    } else {
-        FailurePosture::NotRetryable
-    };
-    StorageError::ProposalBuildFailed { reason, posture }
+}
+
+/// Classifies a librustzcash proposal or transaction-construction error.
+///
+/// Matches the upstream error variants rather than their text, so a new upstream variant
+/// falls through to [`ProposalRejectionKind::Other`] instead of being misread. The reason
+/// keeps the upstream `Debug` rendering, because `data_api::error::Error` implements
+/// `Display` only for a `Display` note reference.
+pub(crate) fn classify_proposal_build_error<E: ProposalFailure>(err: &E) -> StorageError {
+    StorageError::ProposalRejected {
+        kind: err.rejection_kind(),
+        reason: format!("{err:?}"),
+    }
+}
+
+/// An upstream error raised while proposing or building a transaction.
+pub(crate) trait ProposalFailure: std::fmt::Debug {
+    /// Why the proposal was rejected.
+    fn rejection_kind(&self) -> ProposalRejectionKind;
+}
+
+/// `Infallible` has no values, so this is never called.
+impl ProposalFailure for std::convert::Infallible {
+    fn rejection_kind(&self) -> ProposalRejectionKind {
+        ProposalRejectionKind::Other
+    }
+}
+
+impl<DataSourceErrT, CommitmentTreeErrT, SelectionErrT, FeeErrT, ChangeErrT, NoteRefT>
+    ProposalFailure
+    for zcash_client_backend::data_api::error::Error<
+        DataSourceErrT,
+        CommitmentTreeErrT,
+        SelectionErrT,
+        FeeErrT,
+        ChangeErrT,
+        NoteRefT,
+    >
+where
+    DataSourceErrT: std::fmt::Debug,
+    CommitmentTreeErrT: std::fmt::Debug,
+    SelectionErrT: ProposalFailure,
+    FeeErrT: std::fmt::Debug,
+    ChangeErrT: std::fmt::Debug,
+    NoteRefT: std::fmt::Debug,
+{
+    fn rejection_kind(&self) -> ProposalRejectionKind {
+        #[allow(
+            clippy::wildcard_enum_match_arm,
+            reason = "the error is non_exhaustive; variants without a typed kind are Other"
+        )]
+        match self {
+            Self::InsufficientFunds {
+                available,
+                required,
+            } => insufficient_funds(*required, *available),
+            Self::NoteSelection(selection) => selection.rejection_kind(),
+            Self::Change(change) => change_rejection_kind(change),
+            Self::Proposal(proposal) => proposal_rejection_kind(proposal),
+            Self::ExpiryHeightConflictsWithCanonicalCrossing { requested } => {
+                ProposalRejectionKind::ExpiryConflictsWithCanonicalCrossing {
+                    requested_expiry_height: BlockHeight::from(u32::from(*requested)),
+                }
+            }
+            Self::RecipientAddressExpiry { .. } => ProposalRejectionKind::RecipientAddressExpired,
+            _ => ProposalRejectionKind::Other,
+        }
+    }
+}
+
+impl ProposalFailure for GreedyInputSelectorError {
+    fn rejection_kind(&self) -> ProposalRejectionKind {
+        #[allow(
+            clippy::wildcard_enum_match_arm,
+            reason = "the error is non_exhaustive; variants without a typed kind are Other"
+        )]
+        match self {
+            // Since zcash_client_backend 0.25 these replace the InsufficientFunds results the
+            // selector used to return with more value available than required.
+            Self::RequirementCovered { .. }
+            | Self::DustInputsNotGiven
+            | Self::ExcludedNoteSelected
+            | Self::UnrequestedPoolSelected => ProposalRejectionKind::SelectionContractViolated,
+            _ => ProposalRejectionKind::Other,
+        }
+    }
+}
+
+/// Input-source failures while building a proposed transaction carry no proposal kind.
+impl ProposalFailure for SqliteClientError {
+    fn rejection_kind(&self) -> ProposalRejectionKind {
+        ProposalRejectionKind::Other
+    }
+}
+
+fn insufficient_funds(
+    required: zcash_protocol::value::Zatoshis,
+    available: zcash_protocol::value::Zatoshis,
+) -> ProposalRejectionKind {
+    ProposalRejectionKind::InsufficientFunds {
+        required_zat: Zatoshis::from(required),
+        available_zat: Zatoshis::from(available),
+    }
+}
+
+fn change_rejection_kind<ChangeErrT, NoteRefT>(
+    change: &zcash_client_backend::fees::ChangeError<ChangeErrT, NoteRefT>,
+) -> ProposalRejectionKind {
+    #[allow(
+        clippy::wildcard_enum_match_arm,
+        reason = "the error is non_exhaustive; variants without a typed kind are Other"
+    )]
+    match change {
+        zcash_client_backend::fees::ChangeError::InsufficientFunds {
+            available,
+            required,
+        } => insufficient_funds(*required, *available),
+        _ => ProposalRejectionKind::Other,
+    }
+}
+
+fn proposal_rejection_kind(
+    proposal: &zcash_client_backend::proposal::ProposalError,
+) -> ProposalRejectionKind {
+    use zcash_client_backend::proposal::ProposalError;
+    #[allow(
+        clippy::wildcard_enum_match_arm,
+        reason = "the error is non_exhaustive; variants without a typed kind are Other"
+    )]
+    match proposal {
+        ProposalError::InputsLocked(_) => ProposalRejectionKind::InputsLocked,
+        ProposalError::TransactionTooLarge { .. } => ProposalRejectionKind::TransactionTooLarge,
+        ProposalError::OrchardReceiverRequiresIronwood(_) => {
+            ProposalRejectionKind::OrchardRecipientNeedsIronwood
+        }
+        ProposalError::OrchardPoolPayment(_) => ProposalRejectionKind::SelectionContractViolated,
+        _ => ProposalRejectionKind::Other,
+    }
 }
 
 /// Builds prepared-transaction records for each proposal step.
@@ -4016,6 +5533,17 @@ fn sum_active_reservations(
     })
 }
 
+fn decode_hold_id_bytes(hold_id_bytes: Vec<u8>) -> Result<HoldId, StorageError> {
+    let hold_id_array: [u8; 16] =
+        hold_id_bytes
+            .try_into()
+            .map_err(|raw: Vec<u8>| StorageError::RowValueOutOfRange {
+                column: "ext_zally_holds.hold_id",
+                raw: format!("uuid byte length {}", raw.len()),
+            })?;
+    Ok(HoldId::from_uuid(uuid::Uuid::from_bytes(hold_id_array)))
+}
+
 fn decode_hold_row(row: &rusqlite::Row<'_>) -> Result<crate::HoldRow, StorageError> {
     let reservation_uuid_bytes: Vec<u8> = row.get(0).map_err(|e| map_row_decode_error(&e))?;
     let request_id_str: String = row.get(1).map_err(|e| map_row_decode_error(&e))?;
@@ -4027,13 +5555,7 @@ fn decode_hold_row(row: &rusqlite::Row<'_>) -> Result<crate::HoldRow, StorageErr
     let finalized_tx_bytes: Option<Vec<u8>> = row.get(7).map_err(|e| map_row_decode_error(&e))?;
     let released_at_ms_raw: Option<i64> = row.get(8).map_err(|e| map_row_decode_error(&e))?;
 
-    let reservation_uuid_array: [u8; 16] =
-        reservation_uuid_bytes.try_into().map_err(|raw: Vec<u8>| {
-            StorageError::RowValueOutOfRange {
-                column: "ext_zally_holds.hold_id",
-                raw: format!("uuid byte length {}", raw.len()),
-            }
-        })?;
+    let hold_id = decode_hold_id_bytes(reservation_uuid_bytes)?;
     let account_uuid_array: [u8; 16] =
         account_uuid_bytes
             .try_into()
@@ -4082,7 +5604,7 @@ fn decode_hold_row(row: &rusqlite::Row<'_>) -> Result<crate::HoldRow, StorageErr
     let locked_notes = decode_locked_notes(&locked_notes_blob)?;
 
     Ok(crate::HoldRow {
-        hold_id: HoldId::from_uuid(uuid::Uuid::from_bytes(reservation_uuid_array)),
+        hold_id,
         request_id,
         idempotency_key,
         account_id: AccountId::from_uuid(uuid::Uuid::from_bytes(account_uuid_array)),
@@ -4105,6 +5627,106 @@ fn map_row_decode_error(err: &rusqlite::Error) -> StorageError {
 mod tests {
     use super::*;
     use zally_keys::Mnemonic;
+
+    fn ledger_in_memory() -> Result<rusqlite::Connection, rusqlite::Error> {
+        let ledger = rusqlite::Connection::open_in_memory()?;
+        ledger.execute_batch(LEDGER_SCHEMA_SQL)?;
+        Ok(ledger)
+    }
+
+    fn carried_send(paying_byte: u8) -> CarriedSend {
+        CarriedSend {
+            paying_tx_id: TxId::from_bytes([paying_byte; 32]),
+            steps: Vec::new(),
+        }
+    }
+
+    fn sqlite_failure(code: std::ffi::c_int) -> rusqlite::Error {
+        rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(code), None)
+    }
+
+    #[test]
+    fn database_failures_are_transient_and_statement_failures_deterministic() {
+        for code in [
+            rusqlite::ffi::SQLITE_BUSY,
+            rusqlite::ffi::SQLITE_LOCKED,
+            rusqlite::ffi::SQLITE_IOERR,
+            rusqlite::ffi::SQLITE_FULL,
+        ] {
+            assert_eq!(
+                send_step_failure_from_sqlite(&sqlite_failure(code), "store").posture(),
+                FailurePosture::Retryable
+            );
+        }
+        for code in [
+            rusqlite::ffi::SQLITE_CONSTRAINT,
+            rusqlite::ffi::SQLITE_CORRUPT,
+        ] {
+            assert_eq!(
+                send_step_failure_from_sqlite(&sqlite_failure(code), "store").posture(),
+                FailurePosture::NotRetryable
+            );
+        }
+        assert_eq!(
+            send_step_failure_from_client(
+                &SqliteClientError::Io(std::io::Error::other("disk gone")),
+                "store"
+            )
+            .posture(),
+            FailurePosture::Retryable
+        );
+    }
+
+    #[test]
+    fn a_transient_store_failure_marks_nothing_and_a_later_success_leaves_the_send_covered()
+    -> Result<(), StorageError> {
+        let ledger = ledger_in_memory()?;
+        let carried = vec![carried_send(0x51)];
+
+        let interrupted = settle_scan_blind_sends(&ledger, &carried, |_| {
+            Err(send_step_failure_from_sqlite(
+                &sqlite_failure(rusqlite::ffi::SQLITE_BUSY),
+                "storing a carried step failed",
+            ))
+        });
+        assert!(
+            matches!(&interrupted, Err(error) if error.posture() == FailurePosture::Retryable),
+            "a transient failure fails the call so no scan runs without the send's outputs: \
+             {interrupted:?}"
+        );
+        assert!(list_scan_blind_sends(&ledger)?.is_empty());
+
+        assert_eq!(
+            settle_scan_blind_sends(&ledger, &carried, |_| Ok(true))?,
+            Vec::<TxId>::new(),
+            "the retry covers the send and leaves it unmarked"
+        );
+        assert!(list_scan_blind_sends(&ledger)?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn a_deterministic_store_failure_marks_the_send_until_it_is_released()
+    -> Result<(), StorageError> {
+        let ledger = ledger_in_memory()?;
+        let carried = vec![carried_send(0x52), carried_send(0x53)];
+        let unparseable = carried_send(0x52).paying_tx_id;
+
+        let blind = settle_scan_blind_sends(&ledger, &carried, |send| {
+            if send.paying_tx_id == unparseable {
+                read_stored_transaction(&[0xff]).map(|_| true)
+            } else {
+                Ok(true)
+            }
+        })?;
+        assert_eq!(blind, vec![unparseable]);
+        assert_eq!(
+            settle_scan_blind_sends(&ledger, &carried, |_| Ok(true))?,
+            vec![unparseable],
+            "a later success does not lift the mark"
+        );
+        Ok(())
+    }
     use zcash_protocol::local_consensus::LocalNetwork;
 
     type TestChainError = zcash_client_backend::data_api::chain::error::Error<
@@ -4125,19 +5747,190 @@ mod tests {
             nu6_1: height(22),
             nu6_2: height(23),
             nu6_3: height(30),
+            nu7: None,
         })
     }
 
+    type TestBuildError = zcash_client_backend::data_api::error::Error<
+        SqliteClientError,
+        SqliteClientError,
+        GreedyInputSelectorError,
+        std::convert::Infallible,
+        std::convert::Infallible,
+        zcash_client_sqlite::ReceivedNoteId,
+    >;
+
+    fn upstream_zatoshis(zat: u64) -> zcash_protocol::value::Zatoshis {
+        zcash_protocol::value::Zatoshis::const_from_u64(zat)
+    }
+
+    fn rejection_kind(error: &TestBuildError) -> Option<ProposalRejectionKind> {
+        let StorageError::ProposalRejected { kind, .. } = classify_proposal_build_error(error)
+        else {
+            return None;
+        };
+        Some(kind)
+    }
+
+    fn zat(value: u64) -> Zatoshis {
+        Zatoshis::from(upstream_zatoshis(value))
+    }
+
     #[test]
-    fn proposal_input_lock_conflict_is_retryable() {
-        let error = classify_proposal_build_error(&"InputsLocked");
+    fn insufficient_funds_carries_the_required_and_available_values() {
+        let expected = Some(ProposalRejectionKind::InsufficientFunds {
+            required_zat: zat(20_000),
+            available_zat: zat(10_000),
+        });
+        let from_selector = TestBuildError::from(
+            zcash_client_backend::data_api::wallet::input_selection::InputSelectorError::<
+                SqliteClientError,
+                GreedyInputSelectorError,
+                std::convert::Infallible,
+                zcash_client_sqlite::ReceivedNoteId,
+            >::InsufficientFunds {
+                available: upstream_zatoshis(10_000),
+                required: upstream_zatoshis(20_000),
+            },
+        );
+        let from_change =
+            TestBuildError::Change(zcash_client_backend::fees::ChangeError::InsufficientFunds {
+                available: upstream_zatoshis(10_000),
+                required: upstream_zatoshis(20_000),
+            });
+        assert_eq!(rejection_kind(&from_selector), expected);
+        assert_eq!(rejection_kind(&from_change), expected);
+    }
+
+    #[test]
+    fn upstream_contract_violations_require_an_operator() {
+        let selector_violations = [
+            GreedyInputSelectorError::RequirementCovered {
+                required: upstream_zatoshis(20_000),
+                available: upstream_zatoshis(30_000),
+            },
+            GreedyInputSelectorError::DustInputsNotGiven,
+            GreedyInputSelectorError::ExcludedNoteSelected,
+            GreedyInputSelectorError::UnrequestedPoolSelected,
+        ]
+        .map(TestBuildError::NoteSelection);
+        let orchard_pool_payment = TestBuildError::Proposal(
+            zcash_client_backend::proposal::ProposalError::OrchardPoolPayment(0),
+        );
+        for violation in selector_violations
+            .into_iter()
+            .chain([orchard_pool_payment])
+        {
+            let error = classify_proposal_build_error(&violation);
+            assert!(
+                matches!(
+                    error,
+                    StorageError::ProposalRejected {
+                        kind: ProposalRejectionKind::SelectionContractViolated,
+                        ..
+                    }
+                ),
+                "{error:?}"
+            );
+            assert_eq!(error.posture(), FailurePosture::RequiresOperator);
+        }
+    }
+
+    #[test]
+    fn proposal_errors_classify_by_variant() {
+        use zcash_client_backend::proposal::ProposalError;
+        let locked = classify_proposal_build_error(&TestBuildError::Proposal(
+            ProposalError::InputsLocked(zcash_client_backend::wallet::OutputRef::new(
+                zcash_protocol::TxId::from_bytes([0x11; 32]),
+                zcash_protocol::PoolType::ORCHARD,
+                0,
+            )),
+        ));
         assert!(matches!(
-            error,
-            StorageError::ProposalBuildFailed {
-                posture: FailurePosture::Retryable,
+            locked,
+            StorageError::ProposalRejected {
+                kind: ProposalRejectionKind::InputsLocked,
                 ..
             }
         ));
+        assert_eq!(locked.posture(), FailurePosture::Retryable);
+
+        let too_large = TestBuildError::Proposal(ProposalError::TransactionTooLarge {
+            estimated_size: 2_000_001,
+            limit: 2_000_000,
+            sapling_input_count: 0,
+            orchard_input_count: 0,
+            ironwood_input_count: 5_000,
+        });
+        assert_eq!(
+            rejection_kind(&too_large),
+            Some(ProposalRejectionKind::TransactionTooLarge)
+        );
+
+        let needs_ironwood =
+            TestBuildError::Proposal(ProposalError::OrchardReceiverRequiresIronwood(
+                zcash_primitives::transaction::TxVersion::V5,
+            ));
+        assert_eq!(
+            rejection_kind(&needs_ironwood),
+            Some(ProposalRejectionKind::OrchardRecipientNeedsIronwood)
+        );
+    }
+
+    #[test]
+    fn caller_expiry_on_a_canonical_crossing_is_typed() {
+        let error = TestBuildError::ExpiryHeightConflictsWithCanonicalCrossing {
+            requested: zcash_protocol::consensus::BlockHeight::from_u32(4_500_000),
+        };
+        assert_eq!(
+            rejection_kind(&error),
+            Some(
+                ProposalRejectionKind::ExpiryConflictsWithCanonicalCrossing {
+                    requested_expiry_height: BlockHeight::from(4_500_000),
+                }
+            )
+        );
+    }
+
+    #[test]
+    fn recipient_address_expiry_is_typed_and_not_retryable() {
+        use zcash_client_backend::data_api::error::AddressExpiryError;
+        use zcash_protocol::consensus::BlockHeight as UpstreamBlockHeight;
+        for expiry in [
+            AddressExpiryError::TimeExpired { expiry_time: 1 },
+            AddressExpiryError::HeightExpired {
+                address_expiry: UpstreamBlockHeight::from_u32(100),
+                chain_height: UpstreamBlockHeight::from_u32(101),
+            },
+            AddressExpiryError::ExpiryHeightConflict {
+                address_expiry: UpstreamBlockHeight::from_u32(150),
+                transaction_expiry: UpstreamBlockHeight::from_u32(160),
+            },
+        ] {
+            let error = classify_proposal_build_error(&TestBuildError::RecipientAddressExpiry {
+                payment_index: 0,
+                error: expiry,
+            });
+            assert!(
+                matches!(
+                    error,
+                    StorageError::ProposalRejected {
+                        kind: ProposalRejectionKind::RecipientAddressExpired,
+                        ..
+                    }
+                ),
+                "{error:?}"
+            );
+            assert_eq!(error.posture(), FailurePosture::NotRetryable);
+        }
+    }
+
+    #[test]
+    fn unclassified_rejections_are_other() {
+        assert_eq!(
+            rejection_kind(&TestBuildError::ScanRequired),
+            Some(ProposalRejectionKind::Other)
+        );
     }
 
     #[test]
@@ -4280,18 +6073,20 @@ mod tests {
     }
 
     #[test]
-    fn account_id_is_deterministic_for_key_material() -> Result<(), KeyDerivationError> {
+    fn account_id_is_deterministic_for_key_material() -> Result<(), StorageError> {
         let mnemonic = Mnemonic::generate();
         let seed = SeedMaterial::from_mnemonic(&mnemonic, "");
         let regtest = Network::regtest();
 
-        let ufvk = derive_ufvk(regtest, &seed, zip32::AccountId::ZERO)?;
-        let first = account_id_from_ufvk(regtest, &ufvk);
-        let second = account_id_from_ufvk(regtest, &ufvk);
+        let ufvk = derive_ufvk(regtest, &seed, zip32::AccountId::ZERO)
+            .map_err(|err| map_derivation_error(&err))?;
+        let first = account_id_from_ufvk(regtest, &ufvk)?;
+        let second = account_id_from_ufvk(regtest, &ufvk)?;
         assert_eq!(first, second, "same key material must yield the same id");
 
-        let mainnet_ufvk = derive_ufvk(Network::Mainnet, &seed, zip32::AccountId::ZERO)?;
-        let mainnet = account_id_from_ufvk(Network::Mainnet, &mainnet_ufvk);
+        let mainnet_ufvk = derive_ufvk(Network::Mainnet, &seed, zip32::AccountId::ZERO)
+            .map_err(|err| map_derivation_error(&err))?;
+        let mainnet = account_id_from_ufvk(Network::Mainnet, &mainnet_ufvk)?;
         assert_ne!(
             first, mainnet,
             "a different network encoding must yield a different identity"
@@ -4411,7 +6206,7 @@ mod tests {
 
     #[test]
     fn coinbase_safe_shielding_policy_requires_100_confirmations_with_no_zero_conf() {
-        let policy = coinbase_safe_shielding_policy();
+        let policy = coinbase_safe_shielding_policy(0);
         assert!(
             !policy.allow_zero_conf_shielding(),
             "shielding policy must disable zero-conf so the min_confirmations SQL filter actually fires; otherwise the immature-coinbase tx_index check is the only line of defense and it silently no-ops when chain-source-ingested UTXOs leave tx_index NULL"
@@ -4420,6 +6215,37 @@ mod tests {
             u32::from(policy.untrusted()),
             100,
             "untrusted confirmations must equal Zcash's COINBASE_MATURITY (100) so the SQL clause target_height - mined_height >= :min_confirmations rejects any immature coinbase even when the per-row tx_index filter is unreliable"
+        );
+    }
+
+    #[test]
+    fn coinbase_safe_shielding_policy_counts_maturity_from_the_lower_source_tip() {
+        assert_eq!(
+            u32::from(coinbase_safe_shielding_policy(255).untrusted()),
+            355
+        );
+        assert_eq!(
+            u32::from(coinbase_safe_shielding_policy(u32::MAX).untrusted()),
+            u32::MAX
+        );
+        assert_eq!(u32::from(coinbase_safe_shielding_policy(255).trusted()), 3);
+    }
+
+    #[test]
+    fn source_lag_counts_only_a_source_below_the_wallet_tip() {
+        let wallet_tip = Some(zcash_protocol::consensus::BlockHeight::from_u32(4_602_663));
+        assert_eq!(
+            compute_source_lag_blocks(wallet_tip, Some(BlockHeight::from(4_602_408))),
+            255
+        );
+        assert_eq!(
+            compute_source_lag_blocks(wallet_tip, Some(BlockHeight::from(4_602_700))),
+            0
+        );
+        assert_eq!(compute_source_lag_blocks(wallet_tip, None), 0);
+        assert_eq!(
+            compute_source_lag_blocks(None, Some(BlockHeight::from(10))),
+            0
         );
     }
 
