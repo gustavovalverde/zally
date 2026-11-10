@@ -4518,8 +4518,8 @@ dependencies = [
 
 [[package]]
 name = "zinder-client"
-version = "0.5.0-rc.8"
-source = "git+https://github.com/gustavovalverde/zinder?rev=71f49e5ebb260287647c6894d5a718c28d82d4c1#71f49e5ebb260287647c6894d5a718c28d82d4c1"
+version = "0.7.0"
+source = "git+https://github.com/ZcashFoundation/zinder?rev=6117ac2b3c31fb301586fdfd301399dccf296a2c#6117ac2b3c31fb301586fdfd301399dccf296a2c"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -4536,8 +4536,8 @@ dependencies = [
 
 [[package]]
 name = "zinder-core"
-version = "0.5.0-rc.8"
-source = "git+https://github.com/gustavovalverde/zinder?rev=71f49e5ebb260287647c6894d5a718c28d82d4c1#71f49e5ebb260287647c6894d5a718c28d82d4c1"
+version = "0.7.0"
+source = "git+https://github.com/ZcashFoundation/zinder?rev=6117ac2b3c31fb301586fdfd301399dccf296a2c#6117ac2b3c31fb301586fdfd301399dccf296a2c"
 dependencies = [
  "blake2b_simd",
  "hex",
@@ -4550,8 +4550,8 @@ dependencies = [
 
 [[package]]
 name = "zinder-proto"
-version = "0.5.0-rc.8"
-source = "git+https://github.com/gustavovalverde/zinder?rev=71f49e5ebb260287647c6894d5a718c28d82d4c1#71f49e5ebb260287647c6894d5a718c28d82d4c1"
+version = "0.7.0"
+source = "git+https://github.com/ZcashFoundation/zinder?rev=6117ac2b3c31fb301586fdfd301399dccf296a2c#6117ac2b3c31fb301586fdfd301399dccf296a2c"
 dependencies = [
  "prost",
  "thiserror 2.0.19",

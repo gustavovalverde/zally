@@ -46,5 +46,5 @@ allow-git = [
     # zally-chain. Pulled from a pinned git revision so external consumers can
     # build Zally without a local checkout. Pin a specific commit rather than
     # tracking a branch.
-    "https://github.com/gustavovalverde/zinder",
+    "https://github.com/ZcashFoundation/zinder",
 ]
