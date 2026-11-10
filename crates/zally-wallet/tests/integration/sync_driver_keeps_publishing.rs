@@ -61,11 +61,14 @@ async fn a_caught_up_driver_republishes_while_the_chain_is_silent() -> Result<()
     Ok(())
 }
 
+/// Every subscription hangs, so the fault recurs on each reopen and the test never depends on
+/// catching one short-lived snapshot.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_hung_chain_event_subscription_faults_instead_of_silencing_the_driver()
 -> Result<(), FixtureError> {
     let base = chain_wallet(TIP_HEIGHT).await?;
-    base.chain_handle.hang_chain_event_subscriptions_next(1);
+    base.chain_handle
+        .hang_chain_event_subscriptions_next(u32::MAX);
     let handle = start_driver(
         &base.wallet,
         &base.chain,
@@ -81,19 +84,24 @@ async fn a_hung_chain_event_subscription_faults_instead_of_silencing_the_driver(
                 repair: SyncRepair::Retry,
                 ..
             }
-        ) && snapshot.last_fault.is_some()
+        ) && snapshot.last_fault.as_ref().is_some_and(|fault| {
+            fault
+                .reason
+                .contains("chain-event subscription did not answer within 1 seconds")
+        })
     })
     .await?;
-    let reason = faulted
-        .last_fault
-        .map(|fault| fault.reason)
-        .unwrap_or_default();
     assert!(
-        reason.contains("chain-event subscription did not answer within 1 seconds"),
-        "the hung subscription must surface as a fault naming it, got {reason:?}"
+        faulted
+            .last_fault
+            .is_some_and(|fault| fault.repair == SyncRepair::Retry),
+        "a hung subscription is an environment fault the driver retries"
     );
 
-    wait_for_driver(&handle, &mut seen, is_caught_up).await?;
+    wait_for_driver(&handle, &mut seen, |snapshot| {
+        snapshot.scanned_height == Some(BlockHeight::from(TIP_HEIGHT))
+    })
+    .await?;
     tokio::time::timeout(REPUBLISH_TIMEOUT, async {
         while base.chain_handle.chain_event_subscription_starts().len() < 2 {
             tokio::time::sleep(Duration::from_millis(20)).await;
