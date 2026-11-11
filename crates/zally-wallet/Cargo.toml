@@ -1,6 +1,6 @@
 [package]
 name = "zally-wallet"
-version = "0.1.0"
+version = "0.1.1"
 description = "Zally operator-facing wallet API"
 edition.workspace = true
 license.workspace = true

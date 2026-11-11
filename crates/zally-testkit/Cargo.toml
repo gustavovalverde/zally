@@ -1,6 +1,6 @@
 [package]
 name = "zally-testkit"
-version = "0.1.0"
+version = "0.1.1"
 description = "Deterministic wallet fixtures for Zally tests"
 edition.workspace = true
 license.workspace = true
