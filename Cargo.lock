@@ -4518,8 +4518,9 @@ dependencies = [
 
 [[package]]
 name = "zinder-client"
-version = "0.7.0"
-source = "git+https://github.com/ZcashFoundation/zinder?rev=6117ac2b3c31fb301586fdfd301399dccf296a2c#6117ac2b3c31fb301586fdfd301399dccf296a2c"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5020f8bdca9191a84e4ffadd9464f2ef2e1d1f60dbbc17081d9f592c1d1b6a74"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -4536,8 +4537,9 @@ dependencies = [
 
 [[package]]
 name = "zinder-core"
-version = "0.7.0"
-source = "git+https://github.com/ZcashFoundation/zinder?rev=6117ac2b3c31fb301586fdfd301399dccf296a2c#6117ac2b3c31fb301586fdfd301399dccf296a2c"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2a0b184eb14f43f9c0f3fc44d0e573664c2d2430b96628ba0ff8afd9e0731167"
 dependencies = [
  "blake2b_simd",
  "hex",
@@ -4550,8 +4552,9 @@ dependencies = [
 
 [[package]]
 name = "zinder-proto"
-version = "0.7.0"
-source = "git+https://github.com/ZcashFoundation/zinder?rev=6117ac2b3c31fb301586fdfd301399dccf296a2c#6117ac2b3c31fb301586fdfd301399dccf296a2c"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "15f016bf8b034664d354a88fb7a78a5434257b7ebc5d9fe4cb9b0cb4397276a5"
 dependencies = [
  "prost",
  "thiserror 2.0.19",
