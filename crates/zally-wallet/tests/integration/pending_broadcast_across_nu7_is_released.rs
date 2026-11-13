@@ -461,6 +461,62 @@ async fn a_verdict_the_source_cannot_check_waits_and_is_reported_once() -> Resul
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_absence_the_source_cannot_prove_never_frees_the_key() -> Result<(), TestError> {
+    let PendingShieldingWallet {
+        wallet,
+        storage,
+        chain,
+        chain_handle,
+        pending_tx_id,
+        temp: _temp,
+        ..
+    } = wallet_with_pending_shielding().await?;
+    chain_handle.set_transaction_status_mode(MockTransactionStatusMode::HistoryFrom {
+        first_available_height: BlockHeight::from(ANCHOR_WINDOW_START_HEIGHT),
+    });
+    let mut events = wallet.observe();
+    let settled = NU7_ACTIVATION_HEIGHT - 1;
+    sync_to(&wallet, &chain, &chain_handle, settled + 6, settled).await?;
+    wallet.sync(&chain).await?;
+
+    let mut withheld = Vec::new();
+    while let Ok(Some(event)) =
+        tokio::time::timeout(Duration::from_millis(200), events.next()).await
+    {
+        if let WalletEvent::PendingBroadcastVerdictWithheld { tx_id, reason } = event {
+            withheld.push((tx_id, reason));
+        } else if let WalletEvent::PendingBroadcastUnmineable { .. } = event {
+            return Err(TestError::Fixture(
+                "an absence the source cannot prove judged a broadcast unmineable",
+            ));
+        }
+    }
+    let [(withheld_tx_id, reason)] = withheld.as_slice() else {
+        return Err(TestError::Fixture("expected exactly one withheld verdict"));
+    };
+    assert_eq!(*withheld_tx_id, pending_tx_id);
+    assert!(
+        reason.contains("history starts at height 100"),
+        "the withheld verdict names the source's history floor: {reason}"
+    );
+    assert_eq!(
+        storage.find_idempotent_submission(&shield_key()?).await?,
+        Some(pending_tx_id),
+        "an unprovable absence frees nothing"
+    );
+
+    chain_handle.set_transaction_status_mode(MockTransactionStatusMode::Canonical);
+    wallet.sync(&chain).await?;
+    let reports = unmineable_reports(&mut events).await;
+    assert_eq!(
+        reports.iter().map(|(tx_id, _)| *tx_id).collect::<Vec<_>>(),
+        vec![pending_tx_id],
+        "the verdict runs once a source with complete history reports the broadcast absent"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_hung_status_lookup_neither_hangs_the_sync_nor_frees_the_key() -> Result<(), TestError> {
     let PendingShieldingWallet {
         wallet,

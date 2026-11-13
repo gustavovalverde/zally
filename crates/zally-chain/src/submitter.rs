@@ -26,6 +26,13 @@ pub enum RejectionReason {
     BadConsensusBranch,
     /// Mempool is at capacity and refused the transaction.
     MempoolFull,
+    /// Transaction version is not valid under the network upgrade that applies to the next
+    /// block, such as a v4 transaction after NU7. Rebuild the transaction; re-signing cannot fix
+    /// it.
+    UnsupportedTransactionVersion,
+    /// Transaction alone exceeds a ZIP 218 per-block shielded action limit, so no block can
+    /// include it. Split the payment across transactions.
+    ExceedsBlockActionLimit,
 }
 
 #[cfg(feature = "zinder")]
@@ -40,6 +47,12 @@ impl From<zinder_core::BroadcastRejectionReason> for RejectionReason {
             zinder_core::BroadcastRejectionReason::BadExpiryHeight => Self::BadExpiryHeight,
             zinder_core::BroadcastRejectionReason::BadConsensusBranch => Self::BadConsensusBranch,
             zinder_core::BroadcastRejectionReason::MempoolFull => Self::MempoolFull,
+            zinder_core::BroadcastRejectionReason::UnsupportedTransactionVersion => {
+                Self::UnsupportedTransactionVersion
+            }
+            zinder_core::BroadcastRejectionReason::ExceedsBlockActionLimit => {
+                Self::ExceedsBlockActionLimit
+            }
             _ => Self::Unknown,
         }
     }

@@ -8,7 +8,8 @@ use std::collections::HashSet;
 use std::time::Duration;
 
 use zally_chain::{
-    ChainEpoch, ChainSource, TransactionStatus, UnmineableReason, parse_transaction_header,
+    ChainEpoch, ChainSource, ChainSourceError, TransactionStatus, UnmineableReason,
+    parse_transaction_header,
 };
 use zally_core::{BlockHeight, TxId};
 use zally_storage::UnmineableHold;
@@ -261,8 +262,9 @@ impl Wallet {
     /// Asks the pinned source whether `tx_id` is in the canonical chain at its epoch.
     ///
     /// `NotFound` counts as absent only while `epoch` is still the source's current epoch, so a
-    /// lookup that raced an epoch change cannot pass for absence. A transaction the source
-    /// reports mined is recorded mined.
+    /// lookup that raced an epoch change cannot pass for absence. An absence the source cannot
+    /// prove, like every other error, establishes nothing. A transaction the source reports
+    /// mined is recorded mined.
     async fn find_chain_presence(
         &self,
         pinned: PinnedChain<'_>,
@@ -308,6 +310,12 @@ impl Wallet {
             }
             Ok(Ok(status)) => {
                 ChainPresence::Unknown(format!("the chain source reports {status:?}"))
+            }
+            Ok(Err(error @ ChainSourceError::TransactionAbsenceUnprovable { .. })) => {
+                ChainPresence::Unknown(format!(
+                    "{error}; only a source that retains complete history can back an \
+                     unmineable verdict"
+                ))
             }
             Ok(Err(error)) => {
                 ChainPresence::Unknown(format!("the chain source lookup failed: {error}"))

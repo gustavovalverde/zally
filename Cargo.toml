@@ -77,8 +77,8 @@ incrementalmerkletree = "=0.9.0"
 
 # Optional chain-plane backend. The `zinder` cargo feature on zally-chain pulls these
 # crates from their crates.io releases.
-zinder-client = { version = "0.8.0", default-features = false }
-zinder-core = { version = "0.8.0", default-features = false }
+zinder-client = { version = "0.10.0", default-features = false }
+zinder-core = { version = "0.10.0", default-features = false }
 
 # Async runtime and concurrency.
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "fs", "io-util"] }

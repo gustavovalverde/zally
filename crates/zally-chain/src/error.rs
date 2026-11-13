@@ -10,7 +10,7 @@
 //! contract that anchors this vocabulary, including the upstream zinder
 //! `ADR-0013` it inherits.
 
-use zally_core::{BlockHeight, FailurePosture, Network};
+use zally_core::{BlockHeight, FailurePosture, Network, TxId};
 
 #[cfg(feature = "zinder")]
 use zinder_client::{IndexerError, RetryPolicy as IndexerRetryPolicy};
@@ -130,6 +130,25 @@ pub enum ChainSourceError {
     /// announced.
     #[error("chain event cursor is not recognized by the source")]
     ChainEventCursorInvalid,
+
+    /// The source did not find a transaction but cannot prove it absent from the canonical
+    /// chain the epoch makes visible.
+    ///
+    /// Posture: [`FailurePosture::RequiresOperator`]. Waiting does not clear it: a source whose
+    /// history starts at `first_available_height` never stored the blocks below it, and a
+    /// source that reports no floor answered without proof of absence. Point the wallet at a
+    /// source that retains complete history before judging the transaction absent.
+    #[error(
+        "chain source cannot prove transaction {tx_id} absent{}",
+        history_floor_clause(*first_available_height)
+    )]
+    TransactionAbsenceUnprovable {
+        /// Transaction the caller looked up.
+        tx_id: TxId,
+        /// First height the source retains, when its history starts after genesis. `None`
+        /// when the source answered without the proof of absence it should carry.
+        first_available_height: Option<BlockHeight>,
+    },
 
     /// The source returned a protocol variant this Zally build does not understand.
     ///
@@ -266,11 +285,19 @@ impl ChainSourceError {
             | Self::MalformedSubtreeRootPage { .. }
             | Self::MalformedTransparentUtxoSet { .. }
             | Self::TreeStateAnchorHeightMismatch { .. }
-            | Self::ShieldedPoolUnsupported { .. } => FailurePosture::RequiresOperator,
+            | Self::ShieldedPoolUnsupported { .. }
+            | Self::TransactionAbsenceUnprovable { .. } => FailurePosture::RequiresOperator,
             #[cfg(feature = "zinder")]
             Self::Indexer(err) => posture_for_indexer(err.retry_policy()),
         }
     }
+}
+
+fn history_floor_clause(first_available_height: Option<BlockHeight>) -> String {
+    first_available_height.map_or_else(
+        || ": the source gave no proof of absence".to_owned(),
+        |height| format!(": its history starts at height {height}"),
+    )
 }
 
 /// Error returned by [`crate::Submitter`] operations.
@@ -486,6 +513,20 @@ mod tests {
             (
                 ChainSourceError::ShieldedPoolUnsupported {
                     pool: crate::source::ShieldedPool::Ironwood,
+                },
+                FailurePosture::RequiresOperator,
+            ),
+            (
+                ChainSourceError::TransactionAbsenceUnprovable {
+                    tx_id: TxId::from_bytes([7; 32]),
+                    first_available_height: Some(BlockHeight::from(3_000_000)),
+                },
+                FailurePosture::RequiresOperator,
+            ),
+            (
+                ChainSourceError::TransactionAbsenceUnprovable {
+                    tx_id: TxId::from_bytes([7; 32]),
+                    first_available_height: None,
                 },
                 FailurePosture::RequiresOperator,
             ),

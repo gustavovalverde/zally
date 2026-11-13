@@ -253,7 +253,7 @@ The minimum itself is `WalletOptions::minimum_source_reorg_window_blocks`. SYNC-
 
 Pinning the verdict's lookup to an epoch made this breaking change to `ChainSource`:
 
-- `transaction_status` takes the `ChainEpoch` to answer at. `NotFound` must mean the transaction is absent from every canonical block that epoch makes visible; a source that cannot promise that, for example because its history at that epoch is incomplete, returns an error instead.
+- `transaction_status` takes the `ChainEpoch` to answer at. `NotFound` must mean the transaction is absent from every canonical block that epoch makes visible; a source that cannot promise that returns an error instead. A source that missed the transaction but cannot prove the absence, for example because its history starts after genesis, returns `ChainSourceError::TransactionAbsenceUnprovable`, and the wallet leaves the broadcast unjudged.
 
 Binding the idempotency key before submission made these breaking changes:
 
