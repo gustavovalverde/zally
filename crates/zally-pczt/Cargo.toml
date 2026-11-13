@@ -1,6 +1,6 @@
 [package]
 name = "zally-pczt"
-version = "0.1.1"
+version = "0.2.0"
 description = "Zally PCZT roles: Creator, Signer, Combiner, Extractor"
 edition.workspace = true
 license.workspace = true
@@ -23,9 +23,9 @@ sapling.workspace = true
 secp256k1.workspace = true
 serde = { workspace = true }
 thiserror.workspace = true
-zally-core = { path = "../zally-core", version = "0.1" }
-zally-keys = { path = "../zally-keys", version = "0.1" }
-zcash-payment-disclosure = { path = "../zcash-payment-disclosure", version = "0.1" }
+zally-core = { path = "../zally-core", version = "0.2" }
+zally-keys = { path = "../zally-keys", version = "0.2" }
+zcash-payment-disclosure = { path = "../zcash-payment-disclosure", version = "0.2" }
 zcash_keys = { workspace = true, features = ["orchard", "sapling", "transparent-inputs"] }
 zcash_note_encryption = "0.5.1"
 zcash_protocol.workspace = true

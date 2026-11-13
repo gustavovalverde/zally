@@ -1,6 +1,6 @@
 [package]
 name = "zally-core"
-version = "0.1.1"
+version = "0.2.0"
 description = "Zally domain types: Network, Zatoshis, BlockHeight, AccountId, and error vocabulary"
 edition.workspace = true
 license.workspace = true

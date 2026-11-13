@@ -1,6 +1,6 @@
 [package]
 name = "zally-keys"
-version = "0.1.1"
+version = "0.2.0"
 description = "Zally seed lifecycle: SeedSealing trait, AgeFileSealing, Mnemonic, UFVK derivation"
 edition.workspace = true
 license.workspace = true
@@ -24,7 +24,7 @@ secrecy.workspace = true
 serde = { workspace = true, optional = true }
 thiserror.workspace = true
 tokio = { workspace = true, features = ["fs", "io-util", "sync"] }
-zally-core = { path = "../zally-core", version = "0.1" }
+zally-core = { path = "../zally-core", version = "0.2" }
 zcash_keys = { workspace = true, features = ["orchard", "sapling", "transparent-inputs"] }
 zeroize.workspace = true
 zip32.workspace = true
