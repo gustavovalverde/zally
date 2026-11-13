@@ -1,6 +1,6 @@
 [package]
 name = "zally-chain"
-version = "0.1.1"
+version = "0.2.0"
 description = "Zally chain-read and broadcast plane: ChainSource and Submitter traits, with a zinder-backed implementation available behind a feature flag"
 edition.workspace = true
 license.workspace = true
@@ -23,7 +23,7 @@ serde = { workspace = true, optional = true }
 thiserror.workspace = true
 serde_json = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true }
-zally-core = { path = "../zally-core", version = "0.1" }
+zally-core = { path = "../zally-core", version = "0.2" }
 zcash_primitives.workspace = true
 zcash_protocol.workspace = true
 zinder-client = { workspace = true, default-features = false, features = ["remote"], optional = true }
@@ -32,7 +32,7 @@ zinder-core = { workspace = true, default-features = false, optional = true }
 [dev-dependencies]
 thiserror.workspace = true
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
-zally-testkit = { path = "../zally-testkit", version = "0.1" }
+zally-testkit = { path = "../zally-testkit", version = "0.2" }
 
 [lints]
 workspace = true

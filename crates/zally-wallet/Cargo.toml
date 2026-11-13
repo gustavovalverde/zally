@@ -1,6 +1,6 @@
 [package]
 name = "zally-wallet"
-version = "0.1.1"
+version = "0.2.0"
 description = "Zally operator-facing wallet API"
 edition.workspace = true
 license.workspace = true
@@ -34,12 +34,12 @@ thiserror.workspace = true
 tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
 tokio-stream.workspace = true
 tracing.workspace = true
-zally-chain = { path = "../zally-chain", version = "0.1" }
-zally-core = { path = "../zally-core", version = "0.1" }
-zally-keys = { path = "../zally-keys", version = "0.1" }
-zally-pczt = { path = "../zally-pczt", version = "0.1" }
-zally-storage = { path = "../zally-storage", version = "0.1" }
-zcash-payment-disclosure = { path = "../zcash-payment-disclosure", version = "0.1" }
+zally-chain = { path = "../zally-chain", version = "0.2" }
+zally-core = { path = "../zally-core", version = "0.2" }
+zally-keys = { path = "../zally-keys", version = "0.2" }
+zally-pczt = { path = "../zally-pczt", version = "0.2" }
+zally-storage = { path = "../zally-storage", version = "0.2" }
+zcash-payment-disclosure = { path = "../zcash-payment-disclosure", version = "0.2" }
 zcash_address.workspace = true
 zcash_client_backend = { workspace = true, features = ["orchard", "transparent-inputs"] }
 zcash_keys.workspace = true
@@ -61,7 +61,7 @@ thiserror.workspace = true
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "time"] }
 tracing-subscriber.workspace = true
 uuid.workspace = true
-zally-testkit = { path = "../zally-testkit", version = "0.1" }
+zally-testkit = { path = "../zally-testkit", version = "0.2" }
 wagyu-zcash-parameters = "0.2"
 zcash_primitives = { workspace = true, features = ["circuits", "test-dependencies"] }
 zcash_proofs.workspace = true
