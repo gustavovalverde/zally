@@ -153,7 +153,8 @@ mod tests {
     use zally_core::TxId;
     use zinder_core::{
         BroadcastAccepted, BroadcastDuplicate, BroadcastInvalidEncoding, BroadcastQueued,
-        TransactionBroadcastOutcome, TransactionId as ZinderTransactionId,
+        BroadcastRejected, BroadcastRejectionReason, TransactionBroadcastOutcome,
+        TransactionId as ZinderTransactionId,
     };
 
     #[test]
@@ -231,6 +232,38 @@ mod tests {
                 detail: "truncated".to_owned(),
             }
         );
+        Ok(())
+    }
+
+    #[test]
+    fn unmineable_rejections_keep_their_typed_reason() -> Result<(), crate::SubmitterError> {
+        let cases = [
+            (
+                BroadcastRejectionReason::UnsupportedTransactionVersion,
+                RejectionReason::UnsupportedTransactionVersion,
+            ),
+            (
+                BroadcastRejectionReason::ExceedsBlockActionLimit,
+                RejectionReason::ExceedsBlockActionLimit,
+            ),
+        ];
+        for (kind, expected) in cases {
+            let outcome = translate_broadcast_outcome(
+                TransactionBroadcastOutcome::Rejected(BroadcastRejected {
+                    kind,
+                    error_code: Some(-25),
+                    message: "rejected".to_owned(),
+                }),
+                Ok(TxId::from_bytes([3; 32])),
+            )?;
+            assert_eq!(
+                outcome,
+                SubmitOutcome::Rejected {
+                    reason: expected,
+                    detail: "rejected".to_owned(),
+                }
+            );
+        }
         Ok(())
     }
 }

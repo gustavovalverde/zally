@@ -2038,7 +2038,7 @@ dependencies = [
  "subtle",
  "zcash_note_encryption",
  "zcash_primitives",
- "zcash_protocol 0.11.0",
+ "zcash_protocol",
  "zcash_script",
  "zcash_transparent",
  "zeroize",
@@ -3929,7 +3929,7 @@ dependencies = [
  "zally-core",
  "zally-testkit",
  "zcash_primitives",
- "zcash_protocol 0.11.0",
+ "zcash_protocol",
  "zinder-client",
  "zinder-core",
 ]
@@ -3945,7 +3945,7 @@ dependencies = [
  "sha2 0.10.9",
  "thiserror 2.0.19",
  "uuid",
- "zcash_protocol 0.11.0",
+ "zcash_protocol",
 ]
 
 [[package]]
@@ -3985,7 +3985,7 @@ dependencies = [
  "zcash_keys",
  "zcash_note_encryption",
  "zcash_proofs",
- "zcash_protocol 0.11.0",
+ "zcash_protocol",
  "zcash_transparent",
  "zip32",
 ]
@@ -4017,13 +4017,13 @@ dependencies = [
  "wagyu-zcash-parameters",
  "zally-core",
  "zally-keys",
- "zcash_address 0.14.0",
+ "zcash_address",
  "zcash_client_backend",
  "zcash_client_sqlite",
  "zcash_keys",
  "zcash_primitives",
  "zcash_proofs",
- "zcash_protocol 0.11.0",
+ "zcash_protocol",
  "zcash_script",
  "zcash_transparent",
  "zip32",
@@ -4044,7 +4044,7 @@ dependencies = [
  "zally-chain",
  "zally-core",
  "zally-keys",
- "zcash_protocol 0.11.0",
+ "zcash_protocol",
 ]
 
 [[package]]
@@ -4077,12 +4077,12 @@ dependencies = [
  "zally-storage",
  "zally-testkit",
  "zcash-payment-disclosure",
- "zcash_address 0.14.0",
+ "zcash_address",
  "zcash_client_backend",
  "zcash_keys",
  "zcash_primitives",
  "zcash_proofs",
- "zcash_protocol 0.11.0",
+ "zcash_protocol",
  "zcash_transparent",
  "zip32",
  "zip321",
@@ -4109,22 +4109,8 @@ dependencies = [
  "zcash_note_encryption",
  "zcash_primitives",
  "zcash_proofs",
- "zcash_protocol 0.11.0",
+ "zcash_protocol",
  "zcash_transparent",
-]
-
-[[package]]
-name = "zcash_address"
-version = "0.13.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5a854b28c07dba372f4410ea8ad62b4bf7d5c2bf8be32fc4b31bc0db6521a975"
-dependencies = [
- "bech32 0.11.1",
- "bs58",
- "corez",
- "f4jumble",
- "zcash_encoding 0.4.0",
- "zcash_protocol 0.10.1",
 ]
 
 [[package]]
@@ -4137,8 +4123,8 @@ dependencies = [
  "bs58",
  "corez",
  "f4jumble",
- "zcash_encoding 0.5.0",
- "zcash_protocol 0.11.0",
+ "zcash_encoding",
+ "zcash_protocol",
 ]
 
 [[package]]
@@ -4179,12 +4165,12 @@ dependencies = [
  "tonic-prost-build",
  "tracing",
  "which",
- "zcash_address 0.14.0",
- "zcash_encoding 0.5.0",
+ "zcash_address",
+ "zcash_encoding",
  "zcash_keys",
  "zcash_note_encryption",
  "zcash_primitives",
- "zcash_protocol 0.11.0",
+ "zcash_protocol",
  "zcash_script",
  "zcash_transparent",
  "zip32",
@@ -4228,27 +4214,16 @@ dependencies = [
  "time",
  "tracing",
  "uuid",
- "zcash_address 0.14.0",
+ "zcash_address",
  "zcash_client_backend",
- "zcash_encoding 0.5.0",
+ "zcash_encoding",
  "zcash_keys",
  "zcash_pool_migration",
  "zcash_primitives",
- "zcash_protocol 0.11.0",
+ "zcash_protocol",
  "zcash_script",
  "zcash_transparent",
  "zip32",
-]
-
-[[package]]
-name = "zcash_encoding"
-version = "0.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1440921903cdb86133fb9e2fe800be488015db2939a30bedb413078a1acb0306"
-dependencies = [
- "corez",
- "hex",
- "nonempty",
 ]
 
 [[package]]
@@ -4285,9 +4260,9 @@ dependencies = [
  "secrecy",
  "subtle",
  "tracing",
- "zcash_address 0.14.0",
- "zcash_encoding 0.5.0",
- "zcash_protocol 0.11.0",
+ "zcash_address",
+ "zcash_encoding",
+ "zcash_protocol",
  "zcash_transparent",
  "zip32",
 ]
@@ -4323,7 +4298,7 @@ dependencies = [
  "zcash_client_backend",
  "zcash_keys",
  "zcash_primitives",
- "zcash_protocol 0.11.0",
+ "zcash_protocol",
  "zip32",
 ]
 
@@ -4350,9 +4325,9 @@ dependencies = [
  "sapling-crypto",
  "secp256k1",
  "sha2 0.10.9",
- "zcash_encoding 0.5.0",
+ "zcash_encoding",
  "zcash_note_encryption",
- "zcash_protocol 0.11.0",
+ "zcash_protocol",
  "zcash_script",
  "zcash_transparent",
 ]
@@ -4382,19 +4357,6 @@ dependencies = [
 
 [[package]]
 name = "zcash_protocol"
-version = "0.10.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4034db33a1ce58416430e065b01474b958e4649caa3e06e20654683a95149710"
-dependencies = [
- "corez",
- "document-features",
- "hex",
- "memuse",
- "zcash_encoding 0.4.0",
-]
-
-[[package]]
-name = "zcash_protocol"
 version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "266da226b6be42545b9fc299f1def9f5e525764845b8afa874f167155de943ba"
@@ -4406,7 +4368,7 @@ dependencies = [
  "incrementalmerkletree-testing",
  "memuse",
  "proptest",
- "zcash_encoding 0.5.0",
+ "zcash_encoding",
 ]
 
 [[package]]
@@ -4453,8 +4415,8 @@ dependencies = [
  "secp256k1",
  "sha2 0.10.9",
  "subtle",
- "zcash_encoding 0.5.0",
- "zcash_protocol 0.11.0",
+ "zcash_encoding",
+ "zcash_protocol",
  "zcash_script",
  "zcash_spec",
  "zip32",
@@ -4518,9 +4480,9 @@ dependencies = [
 
 [[package]]
 name = "zinder-client"
-version = "0.8.0"
+version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5020f8bdca9191a84e4ffadd9464f2ef2e1d1f60dbbc17081d9f592c1d1b6a74"
+checksum = "84d5a8441d5db270a03c9441ccbfb48d9df9d42b939e3c31806bb2a5409daf0c"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -4537,24 +4499,24 @@ dependencies = [
 
 [[package]]
 name = "zinder-core"
-version = "0.8.0"
+version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2a0b184eb14f43f9c0f3fc44d0e573664c2d2430b96628ba0ff8afd9e0731167"
+checksum = "18110f57047f8945f966257744d54cdde751f533ba2466e148d418f1ec1167a4"
 dependencies = [
  "blake2b_simd",
  "hex",
  "prost",
  "sha2 0.10.9",
  "thiserror 2.0.19",
- "zcash_address 0.13.0",
- "zcash_protocol 0.10.1",
+ "zcash_address",
+ "zcash_protocol",
 ]
 
 [[package]]
 name = "zinder-proto"
-version = "0.8.0"
+version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "15f016bf8b034664d354a88fb7a78a5434257b7ebc5d9fe4cb9b0cb4397276a5"
+checksum = "ead9a4a7292a4830c4a328d4f316b572dd253b9279f0c395b2a0b693eccb4dc8"
 dependencies = [
  "prost",
  "thiserror 2.0.19",
@@ -4587,8 +4549,8 @@ dependencies = [
  "base64 0.22.1",
  "nom",
  "percent-encoding",
- "zcash_address 0.14.0",
- "zcash_protocol 0.11.0",
+ "zcash_address",
+ "zcash_protocol",
 ]
 
 [[package]]

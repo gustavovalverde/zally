@@ -394,7 +394,9 @@ pub trait ChainSource: Send + Sync + 'static {
     /// absent from every block of the canonical chain the epoch makes visible. A source that
     /// cannot promise that, because the epoch expired, the history the transaction could sit in
     /// is unavailable, or the lookup failed for any other reason, must return an error instead:
-    /// an error leaves the payment unjudged, while a wrong `NotFound` lets its key pay twice.
+    /// an error leaves the payment unjudged, while a wrong `NotFound` lets its key pay twice. A
+    /// source that missed the transaction but cannot prove the absence returns
+    /// [`ChainSourceError::TransactionAbsenceUnprovable`].
     async fn transaction_status(
         &self,
         chain_epoch: ChainEpoch,

@@ -209,6 +209,13 @@ pub enum MockTransactionStatusMode {
     /// Fails every lookup with [`ChainSourceError::CapabilitiesUnavailable`], as a source
     /// without transaction lookups does.
     CapabilityMissing,
+    /// Looks the transaction up like [`Self::Canonical`], but answers a miss with
+    /// [`ChainSourceError::TransactionAbsenceUnprovable`], as a source whose history starts
+    /// at `first_available_height` does.
+    HistoryFrom {
+        /// First height the source claims to retain.
+        first_available_height: BlockHeight,
+    },
     /// Never answers, as a hung source.
     Hanging,
 }
@@ -785,16 +792,19 @@ impl ChainSource for MockChainSource {
     ) -> Result<TransactionStatus, ChainSourceError> {
         self.validate_epoch(chain_epoch)?;
         let mode = self.state.lock().transaction_status_mode;
-        match mode {
-            MockTransactionStatusMode::Canonical => {}
+        let absence_floor = match mode {
+            MockTransactionStatusMode::Canonical => None,
+            MockTransactionStatusMode::HistoryFrom {
+                first_available_height,
+            } => Some(first_available_height),
             MockTransactionStatusMode::AlwaysNotFound => return Ok(TransactionStatus::NotFound),
             MockTransactionStatusMode::CapabilityMissing => {
                 return Err(ChainSourceError::CapabilitiesUnavailable {
                     capabilities: vec!["transaction".to_owned()],
                 });
             }
-            MockTransactionStatusMode::Hanging => std::future::pending::<()>().await,
-        }
+            MockTransactionStatusMode::Hanging => return std::future::pending().await,
+        };
         let guard = self.state.lock();
         let visible_tip_height = guard.visible_tip_height.as_u32();
         let confirmed_at_height = guard
@@ -810,14 +820,19 @@ impl ChainSource for MockChainSource {
                 })
             });
         drop(guard);
-        Ok(
-            confirmed_at_height.map_or(TransactionStatus::NotFound, |height| {
-                TransactionStatus::Confirmed {
-                    tx_id,
-                    confirmed_at_height: BlockHeight::from(height),
-                }
+        match (confirmed_at_height, absence_floor) {
+            (Some(height), _) => Ok(TransactionStatus::Confirmed {
+                tx_id,
+                confirmed_at_height: BlockHeight::from(height),
             }),
-        )
+            (None, None) => Ok(TransactionStatus::NotFound),
+            (None, Some(first_available_height)) => {
+                Err(ChainSourceError::TransactionAbsenceUnprovable {
+                    tx_id,
+                    first_available_height: Some(first_available_height),
+                })
+            }
+        }
     }
 
     async fn transparent_utxos(

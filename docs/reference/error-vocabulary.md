@@ -55,10 +55,11 @@ Only `retryable` moves the breaker's failure counter, and only a call that compl
 | `BlockHeightAboveVisibleTip` | `not_retryable` | Requested height is above the epoch's visible tip; acquire a new `ChainEpoch`. |
 | `NetworkMismatch` | `requires_operator` | The source serves a different network than the caller asked for. |
 | `CapabilitiesUnavailable` | `requires_operator` | The endpoint does not advertise every capability required for event-driven native sync. |
-| `ContractRevisionUnsupported` | `requires_operator` | The endpoint contract revision is older than revision 2. |
+| `ContractRevisionUnsupported` | `requires_operator` | The endpoint contract revision is older than the linked `zinder-client` requires (revision 8 for `zinder-client` 0.10.0). |
 | `ChainEpochPinUnavailable` | `restartable` | The pinned epoch expired; restart the wallet sync against a fresh epoch. |
 | `ChainEventCursorExpired` | `restartable` | Reconcile the wallet against a fresh epoch, then subscribe from the earliest retained event. |
 | `ChainEventCursorInvalid` | `not_retryable` | The source did not issue the resume cursor; discard it and subscribe from the earliest retained event. |
+| `TransactionAbsenceUnprovable` | `requires_operator` | The source missed a transaction but cannot prove it absent, because its history starts after genesis (`first_available_height`) or its server predates typed absence answers. The transaction stays unjudged; point the wallet at a source that retains complete history. |
 | `MalformedCompactBlock` | `requires_operator` | The source returned bytes that did not decode; investigate the upstream version. |
 | `CompactBlockStreamOrder` | `requires_operator` | A compact-block range was incomplete, duplicated, or out of order. |
 | `TreeStateAnchorHeightMismatch` | `requires_operator` | A tree-state artifact did not match the exact requested anchor height. |

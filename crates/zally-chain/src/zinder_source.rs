@@ -197,6 +197,34 @@ impl ZinderChainSource {
         }
     }
 
+    /// Maps a failed transaction lookup. zinder-client answers `TxStatus::NotFound` only for a
+    /// proven absence and reports an absence it cannot prove as one of these errors, which must
+    /// never reach the wallet as `NotFound`.
+    #[allow(
+        clippy::wildcard_enum_match_arm,
+        reason = "IndexerError is non-exhaustive; every other error keeps the shared mapping"
+    )]
+    fn map_transaction_lookup_error(
+        tx_id: TxId,
+        error: zinder_client::IndexerError,
+    ) -> ChainSourceError {
+        match error {
+            zinder_client::IndexerError::CanonicalHistoryUnavailable {
+                first_available_height,
+            } => ChainSourceError::TransactionAbsenceUnprovable {
+                tx_id,
+                first_available_height: Some(BlockHeight::from(first_available_height.value())),
+            },
+            zinder_client::IndexerError::TransactionAbsenceUnverified { .. } => {
+                ChainSourceError::TransactionAbsenceUnprovable {
+                    tx_id,
+                    first_available_height: None,
+                }
+            }
+            other => Self::map_indexer_error(other),
+        }
+    }
+
     fn pinned_result<T>(
         operation_result: Result<T, zinder_client::IndexerError>,
     ) -> Result<T, ChainSourceError> {
@@ -312,11 +340,11 @@ impl ChainSource for ZinderChainSource {
         self.ensure_capabilities(&[Capability::Transaction]).await?;
         let epoch = self.pinned_epoch(chain_epoch)?;
         let zinder_id = ZinderTransactionId::from_bytes(*tx_id.as_bytes());
-        // The pinned zinder-client answers every gRPC NOT_FOUND for an epoch-pinned lookup with
-        // `TxStatus::NotFound`, including server-side unavailable history; the wallet therefore
-        // treats `NotFound` as a second guard behind its own scan, not as proof on its own.
-        let status =
-            Self::pinned_result(self.inner.transaction_by_id(zinder_id, Some(epoch)).await)?;
+        let status = self
+            .inner
+            .transaction_by_id(zinder_id, Some(epoch))
+            .await
+            .map_err(|error| Self::map_transaction_lookup_error(tx_id, error))?;
         #[allow(
             clippy::wildcard_enum_match_arm,
             reason = "non_exhaustive zinder tx statuses fail closed on unknown variants"
@@ -1026,6 +1054,42 @@ mod tests {
             ChainSourceError::ChainEventCursorExpired {
                 recovery: ChainEventCursorRecovery::EarliestRetained,
             }
+        ));
+    }
+
+    #[test]
+    fn unprovable_transaction_absence_never_maps_to_not_found() {
+        let tx_id = TxId::from_bytes([9; 32]);
+        assert!(matches!(
+            ZinderChainSource::map_transaction_lookup_error(
+                tx_id,
+                zinder_client::IndexerError::CanonicalHistoryUnavailable {
+                    first_available_height: ZinderBlockHeight::new(3_000_000),
+                }
+            ),
+            ChainSourceError::TransactionAbsenceUnprovable {
+                tx_id: mapped_tx_id,
+                first_available_height: Some(height),
+            } if mapped_tx_id == tx_id && height == BlockHeight::from(3_000_000)
+        ));
+        assert!(matches!(
+            ZinderChainSource::map_transaction_lookup_error(
+                tx_id,
+                zinder_client::IndexerError::TransactionAbsenceUnverified {
+                    message: "transaction not found".to_owned(),
+                }
+            ),
+            ChainSourceError::TransactionAbsenceUnprovable {
+                tx_id: mapped_tx_id,
+                first_available_height: None,
+            } if mapped_tx_id == tx_id
+        ));
+        assert!(matches!(
+            ZinderChainSource::map_transaction_lookup_error(
+                tx_id,
+                zinder_client::IndexerError::ChainEpochPinUnavailable
+            ),
+            ChainSourceError::ChainEpochPinUnavailable
         ));
     }
 }
