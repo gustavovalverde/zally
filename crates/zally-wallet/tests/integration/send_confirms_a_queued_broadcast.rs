@@ -144,12 +144,12 @@ async fn a_zero_budget_fails_on_the_first_queued_answer() -> Result<(), FixtureE
 /// mine the transaction.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_breaker_opened_after_a_queued_answer_keeps_the_send_bound() -> Result<(), FixtureError> {
-    const BREAKER_COOLDOWN: Duration = Duration::from_secs(2);
+    const BREAKER_COOLDOWN_MS: u64 = 2_000;
     let options = WalletOptions::default()
         .with_queued_broadcast_confirmation_ms(CONFIRMATION_BUDGET_MS)
         .with_circuit_breaker_config(CircuitBreakerConfig {
             failure_threshold: 1,
-            cooldown: BREAKER_COOLDOWN,
+            cooldown: Duration::from_millis(BREAKER_COOLDOWN_MS),
         });
     let base = wallet_with_options(options).await?;
     base.wallet.set_retry_policy(RetryPolicy::none());
@@ -177,7 +177,7 @@ async fn a_breaker_opened_after_a_queued_answer_keeps_the_send_bound() -> Result
             "a breaker that opens after a queued answer must leave the send unconfirmed",
         ));
     };
-    tokio::time::sleep(BREAKER_COOLDOWN).await;
+    tokio::time::sleep(Duration::from_millis(BREAKER_COOLDOWN_MS)).await;
     let accepting = transaction_id_submitter(base.network);
     let outcome = shield_into_sapling(&base, key, &accepting).await?;
     assert_eq!(

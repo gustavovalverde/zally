@@ -32,7 +32,7 @@ struct SubmissionContext<'a> {
 }
 
 /// Pause before a send submits again a transaction the node answered as queued.
-const QUEUED_BROADCAST_RESUBMIT_INTERVAL: Duration = Duration::from_secs(1);
+const QUEUED_BROADCAST_RESUBMIT_MS: u64 = 1_000;
 
 /// One transaction to submit until the node reports it holds it.
 pub(crate) struct BroadcastAttempt<'a> {
@@ -812,7 +812,7 @@ impl Wallet {
     /// accepted or duplicate answer means the node holds the transaction in its mempool or its
     /// chain. A queued answer means it is still verifying the transaction and may yet drop it
     /// without another answer, so the same bytes go again after
-    /// [`QUEUED_BROADCAST_RESUBMIT_INTERVAL`] until
+    /// [`QUEUED_BROADCAST_RESUBMIT_MS`] until
     /// [`crate::WalletOptions::queued_broadcast_confirmation_ms`], counted from the first
     /// queued answer, runs out. Counting from that answer gives a node whose first answer was
     /// slow the whole budget to finish verifying. The budget also bounds every submission
@@ -822,7 +822,7 @@ impl Wallet {
         &self,
         attempt: BroadcastAttempt<'_>,
     ) -> Result<(), WalletError> {
-        let budget = Duration::from_millis(self.inner.options.queued_broadcast_confirmation_ms);
+        let confirmation_budget_ms = self.inner.options.queued_broadcast_confirmation_ms;
         let mut confirmation_deadline: Option<Instant> = None;
         let mut queued_answers = 0_u32;
         loop {
@@ -857,8 +857,10 @@ impl Wallet {
                 return Ok(());
             }
             queued_answers = queued_answers.saturating_add(1);
-            let deadline = *confirmation_deadline.get_or_insert_with(|| Instant::now() + budget);
-            let resubmit_at = Instant::now() + QUEUED_BROADCAST_RESUBMIT_INTERVAL;
+            let deadline = *confirmation_deadline.get_or_insert_with(|| {
+                Instant::now() + Duration::from_millis(confirmation_budget_ms)
+            });
+            let resubmit_at = Instant::now() + Duration::from_millis(QUEUED_BROADCAST_RESUBMIT_MS);
             if resubmit_at >= deadline {
                 return Err(unconfirmed_after_queued(
                     &attempt,
