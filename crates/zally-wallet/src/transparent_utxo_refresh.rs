@@ -1,10 +1,12 @@
 //! Transparent UTXO refresh, decoupled from block-scan cadence.
 //!
-//! `Wallet::refresh_transparent_utxos` pins one source [`zally_chain::ChainEpoch`] and the
-//! wallet's scanned frontier, then walks every wallet-owned transparent receiver, recording
-//! each receiver's UTXOs as soon as they are fetched. Every commit carries the pinned
+//! `Wallet::refresh_transparent_utxos` walks every wallet-owned transparent receiver,
+//! recording each receiver's UTXOs as soon as they are fetched. Each attempt pins one source
+//! [`zally_chain::ChainEpoch`] and the wallet's scanned frontier; every commit carries that
 //! frontier as a floor, so a reorg rewind on the block-scan loop that lands between one
-//! receiver's fetch and its commit is rejected rather than written.
+//! receiver's fetch and its commit is rejected rather than written. A retryable or restartable
+//! failure re-pins both and resumes at the receiver that failed, under the wallet's
+//! transparent-UTXO refresh retry policy.
 //! [`run_transparent_utxo_refresh_driver`] repeats that walk on its own cadence, independent
 //! of the [`crate::SyncDriver`] block-scan loop: a receiver set whose refresh cost grows with
 //! on-chain activity never occupies the scan attempt's timeout or retry ladder, and a slow or
@@ -15,6 +17,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
+use parking_lot::Mutex;
 use tokio::sync::oneshot;
 use tokio::time::{sleep, timeout};
 use zally_chain::ChainSource;
@@ -23,10 +26,19 @@ use zally_storage::{TransparentReceiverRow, TransparentUtxoRow};
 
 use crate::error::WalletError;
 use crate::event::WalletEvent;
-use crate::retry::with_breaker_and_retry;
+use crate::retry::{RetryPolicy, with_breaker_and_retry};
 use crate::wallet::{Wallet, current_unix_ms};
 
-/// Summary of one [`Wallet::refresh_transparent_utxos`] attempt.
+/// Default [`Wallet::transparent_utxo_refresh_retry_policy`]: 8 attempts, backing off from
+/// 250 milliseconds doubling to an 8-second cap (about 24 seconds of backoff in all).
+pub(crate) const DEFAULT_TRANSPARENT_UTXO_REFRESH_RETRY_POLICY: RetryPolicy = RetryPolicy {
+    max_attempts: 8,
+    initial_backoff_ms: 250,
+    max_backoff_ms: 8_000,
+    backoff_multiplier_x10: 20,
+};
+
+/// Summary of one completed [`Wallet::refresh_transparent_utxos`] walk.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[non_exhaustive]
@@ -39,113 +51,210 @@ pub struct TransparentUtxoRefreshOutcome {
     pub completed_at_ms: u64,
 }
 
+/// Progress of one walk, carried across its retry attempts.
+#[derive(Default)]
+struct TransparentUtxoWalk {
+    attempts: u32,
+    receivers: Option<Arc<[TransparentReceiverRow]>>,
+    receivers_refreshed: usize,
+    recorded_outpoints: HashSet<(TxId, u32)>,
+    utxo_count: u64,
+    started_at_ms: u64,
+}
+
+impl TransparentUtxoWalk {
+    fn incomplete(&self, source: WalletError) -> WalletError {
+        WalletError::TransparentUtxoRefreshIncomplete {
+            receivers_refreshed: u64::try_from(self.receivers_refreshed).unwrap_or(u64::MAX),
+            receivers: self.receivers.as_ref().map_or(0, |receivers| {
+                u64::try_from(receivers.len()).unwrap_or(u64::MAX)
+            }),
+            attempts: self.attempts,
+            source: Box::new(source),
+        }
+    }
+}
+
 impl Wallet {
     /// Refreshes every wallet-owned transparent receiver's UTXO set against `chain`.
     ///
-    /// Pins one chain epoch for the whole walk: every receiver's read observes that epoch,
-    /// and a rotation mid-walk surfaces as `ChainSourceError::ChainEpochPinUnavailable`
-    /// ([`zally_chain::FailurePosture::Restartable`]), aborting the walk rather than mixing
-    /// two epochs' results. Each receiver's UTXOs are recorded as soon as they are fetched,
-    /// so an aborted walk keeps every receiver it already visited; a retry (or the next
-    /// scheduled walk) revisits every receiver under a fresh pin, which is safe because
-    /// `WalletStorage::record_transparent_utxos` is idempotent.
+    /// Each attempt pins one chain epoch and the wallet's scanned frontier, and every receiver
+    /// read and commit in that attempt uses them. A failure whose posture allows a retry (a
+    /// source that is not ready, a rotated epoch pin, a receded scan frontier) backs off under
+    /// [`Self::transparent_utxo_refresh_retry_policy`], re-pins both, and resumes at the
+    /// receiver that failed. Receivers already refreshed keep their recorded UTXOs, so a
+    /// source that rotates its epoch faster than one whole walk still completes it. Mixing
+    /// epochs across receivers is safe: each receiver's UTXOs are validated against the epoch
+    /// that served them, and `WalletStorage::record_transparent_utxos` only adds idempotent
+    /// rows, never removes them.
     ///
-    /// Also pins the wallet's scanned frontier at the same moment: every receiver's commit
-    /// carries that floor, so a reorg rewind landing on the block-scan loop between one
-    /// receiver's fetch and its commit surfaces as `StorageError::ScanFrontierReceded`
+    /// The scanned-frontier floor means a reorg rewind landing on the block-scan loop between
+    /// one receiver's fetch and its commit surfaces as `StorageError::ScanFrontierReceded`
     /// (`Restartable`) instead of writing UTXOs against blocks the wallet no longer attests.
     ///
-    /// `requires_operator` on network mismatch. `retryable` on transient chain-source
-    /// failures. `restartable` on a rotated epoch pin or a receded scan frontier.
+    /// # Errors
+    ///
+    /// Returns [`WalletError::CircuitBroken`] when the circuit breaker is open, and otherwise
+    /// [`WalletError::TransparentUtxoRefreshIncomplete`] for a walk that stopped early. Its
+    /// posture is the posture of the failure that ended the walk: `requires_operator` on
+    /// network mismatch or a malformed UTXO set, `retryable` or `restartable` once the retry
+    /// policy ran out of attempts.
     pub async fn refresh_transparent_utxos(
         &self,
         chain: &dyn ChainSource,
     ) -> Result<TransparentUtxoRefreshOutcome, WalletError> {
+        let walk = Mutex::new(TransparentUtxoWalk::default());
         with_breaker_and_retry(
             &self.inner.circuit_breaker,
-            self.retry_policy(),
+            self.transparent_utxo_refresh_retry_policy(),
             "sync.transparent_utxo_refresh",
-            || self.refresh_transparent_utxos_inner(chain),
-            std::convert::identity,
+            || self.resume_transparent_utxo_walk(chain, &walk),
+            |error| walk.lock().incomplete(error),
         )
         .await
     }
 
-    async fn refresh_transparent_utxos_inner(
+    async fn resume_transparent_utxo_walk(
         &self,
         chain: &dyn ChainSource,
+        walk: &Mutex<TransparentUtxoWalk>,
     ) -> Result<TransparentUtxoRefreshOutcome, WalletError> {
-        let chain_epoch = self.pin_chain_epoch(chain).await?;
-        let min_scanned_height = self.inner.storage.fully_scanned_height().await?;
-        let receivers = self.inner.storage.list_transparent_receivers().await?;
-        let receiver_count = u64::try_from(receivers.len()).unwrap_or(u64::MAX);
-        let started_at_ms = current_unix_ms();
+        let (attempt, receivers) = self.begin_transparent_utxo_attempt(walk).await?;
+        let pinned = TransparentUtxoAttempt {
+            attempt,
+            receiver_count: u64::try_from(receivers.len()).unwrap_or(u64::MAX),
+            chain_epoch: self.pin_chain_epoch(chain).await?,
+            min_scanned_height: self.inner.storage.fully_scanned_height().await?,
+        };
+        let resume_index = walk.lock().receivers_refreshed;
         tracing::info!(
             target: "zally::sync",
             event = "wallet_transparent_utxo_refresh_started",
-            receivers = receiver_count,
+            receivers = pinned.receiver_count,
+            receiver_index = u64::try_from(resume_index).unwrap_or(u64::MAX),
+            attempt,
             "starting transparent UTXO refresh walk"
         );
-
-        let mut seen_outpoints = HashSet::new();
-        let mut utxo_count: u64 = 0;
-        for (index, receiver) in receivers.into_iter().enumerate() {
-            let receiver_index = u64::try_from(index).unwrap_or(u64::MAX);
-            let utxos = match chain
-                .transparent_utxos(chain_epoch, &receiver.script_pub_key_bytes)
-                .await
-            {
-                Ok(utxos) => utxos,
-                Err(source_error) => {
-                    tracing::warn!(
-                        target: "zally::sync",
-                        event = "wallet_transparent_utxo_refresh_faulted",
-                        receiver_index,
-                        receivers = receiver_count,
-                        posture = source_error.posture().label(),
-                        reason = %source_error,
-                        "transparent UTXO refresh walk aborted"
-                    );
-                    return Err(WalletError::ChainSource(source_error));
-                }
-            };
-            let rows = validate_transparent_utxo_batch(
-                chain_epoch,
-                &receiver,
-                utxos,
-                &mut seen_outpoints,
-            )?;
-            let recorded = self
-                .inner
-                .storage
-                .record_transparent_utxos(min_scanned_height, rows)
+        for (index, receiver) in receivers.iter().enumerate().skip(resume_index) {
+            self.refresh_transparent_receiver(chain, &pinned, (index, receiver), walk)
                 .await?;
-            utxo_count = utxo_count.saturating_add(recorded);
-            tracing::debug!(
-                target: "zally::sync",
-                event = "wallet_transparent_utxo_receiver_completed",
-                receiver_index,
-                receivers = receiver_count,
-                utxo_count = recorded,
-                "refreshed one transparent receiver"
-            );
         }
 
+        let (utxo_count, started_at_ms) = {
+            let progress = walk.lock();
+            (progress.utxo_count, progress.started_at_ms)
+        };
         let outcome = TransparentUtxoRefreshOutcome {
-            receivers_visited: receiver_count,
+            receivers_visited: pinned.receiver_count,
             utxo_count,
             completed_at_ms: current_unix_ms(),
         };
         tracing::info!(
             target: "zally::sync",
             event = "wallet_transparent_utxo_refresh_completed",
-            receivers = receiver_count,
+            receivers = pinned.receiver_count,
             utxo_count,
+            attempts = attempt,
             elapsed_ms = outcome.completed_at_ms.saturating_sub(started_at_ms),
             "transparent UTXO refresh walk completed"
         );
         Ok(outcome)
     }
+
+    /// Counts one attempt and returns the walk's receivers, listing them on the first attempt
+    /// that gets that far so every retry resumes over the same list.
+    async fn begin_transparent_utxo_attempt(
+        &self,
+        walk: &Mutex<TransparentUtxoWalk>,
+    ) -> Result<(u32, Arc<[TransparentReceiverRow]>), WalletError> {
+        let (attempt, listed_receivers) = {
+            let mut progress = walk.lock();
+            progress.attempts = progress.attempts.saturating_add(1);
+            (progress.attempts, progress.receivers.clone())
+        };
+        if let Some(receivers) = listed_receivers {
+            return Ok((attempt, receivers));
+        }
+        let receivers: Arc<[TransparentReceiverRow]> = self
+            .inner
+            .storage
+            .list_transparent_receivers()
+            .await?
+            .into();
+        {
+            let mut progress = walk.lock();
+            progress.receivers = Some(Arc::clone(&receivers));
+            progress.started_at_ms = current_unix_ms();
+        }
+        Ok((attempt, receivers))
+    }
+
+    async fn refresh_transparent_receiver(
+        &self,
+        chain: &dyn ChainSource,
+        pinned: &TransparentUtxoAttempt,
+        (index, receiver): (usize, &TransparentReceiverRow),
+        walk: &Mutex<TransparentUtxoWalk>,
+    ) -> Result<(), WalletError> {
+        let receiver_index = u64::try_from(index).unwrap_or(u64::MAX);
+        let utxos = match chain
+            .transparent_utxos(pinned.chain_epoch, &receiver.script_pub_key_bytes)
+            .await
+        {
+            Ok(utxos) => utxos,
+            Err(source_error) => {
+                tracing::warn!(
+                    target: "zally::sync",
+                    event = "wallet_transparent_utxo_refresh_faulted",
+                    receiver_index,
+                    receivers = pinned.receiver_count,
+                    attempt = pinned.attempt,
+                    posture = source_error.posture().label(),
+                    reason = %source_error,
+                    "transparent UTXO refresh walk interrupted"
+                );
+                return Err(WalletError::ChainSource(source_error));
+            }
+        };
+        let rows = validate_transparent_utxo_batch(
+            pinned.chain_epoch,
+            receiver,
+            utxos,
+            &walk.lock().recorded_outpoints,
+        )?;
+        let outpoints: Vec<(TxId, u32)> = rows
+            .iter()
+            .map(|row| (row.tx_id, row.output_index))
+            .collect();
+        let recorded = self
+            .inner
+            .storage
+            .record_transparent_utxos(pinned.min_scanned_height, rows)
+            .await?;
+        {
+            let mut progress = walk.lock();
+            progress.recorded_outpoints.extend(outpoints);
+            progress.utxo_count = progress.utxo_count.saturating_add(recorded);
+            progress.receivers_refreshed = index.saturating_add(1);
+        }
+        tracing::debug!(
+            target: "zally::sync",
+            event = "wallet_transparent_utxo_receiver_completed",
+            receiver_index,
+            receivers = pinned.receiver_count,
+            utxo_count = recorded,
+            "refreshed one transparent receiver"
+        );
+        Ok(())
+    }
+}
+
+/// Source boundaries one walk attempt pinned, shared by every receiver it refreshes.
+struct TransparentUtxoAttempt {
+    attempt: u32,
+    receiver_count: u64,
+    chain_epoch: zally_chain::ChainEpoch,
+    min_scanned_height: Option<zally_core::BlockHeight>,
 }
 
 /// Long-lived loop that refreshes transparent UTXOs on its own cadence.
@@ -156,9 +265,11 @@ impl Wallet {
 /// blocks. Waits one interval before its first attempt, so a freshly started driver's block
 /// scan gets the chain source to itself rather than racing this loop's first request.
 ///
-/// Bounds every attempt to `timeout_seconds`, so a chain read that never returns faults the
-/// attempt instead of wedging the loop forever. Every faulted attempt (including a timed-out
-/// one) publishes [`WalletEvent::TransparentUtxoRefreshFaulted`] carrying the running
+/// Each tick runs one [`Wallet::refresh_transparent_utxos`] call, which retries within the
+/// tick under the wallet's transparent-UTXO refresh retry policy. Bounds every call to
+/// `timeout_seconds`, retries included, so a chain read that never returns faults the tick
+/// instead of wedging the loop forever. Every faulted tick (including a timed-out one)
+/// publishes [`WalletEvent::TransparentUtxoRefreshFaulted`] carrying the running
 /// consecutive-failure count, so a host observes a stall through the wallet's event stream
 /// rather than only in logs.
 pub(crate) async fn run_transparent_utxo_refresh_driver(
@@ -220,19 +331,21 @@ pub(crate) async fn run_transparent_utxo_refresh_driver(
 }
 
 /// Validates one receiver's chain-reported UTXOs against the pinned epoch's visible tip, the
-/// receiver's own script, and every outpoint seen so far in this walk, returning the rows
+/// receiver's own script, and every outpoint recorded so far in this walk, returning the rows
 /// ready to record.
 ///
-/// `seen_outpoints` accumulates across the whole walk (not just this receiver) so a chain
-/// source that reports the same outpoint under two receivers is caught even though each
-/// receiver commits independently.
+/// `recorded_outpoints` spans the whole walk (not just this receiver) so a chain source that
+/// reports the same outpoint under two receivers is caught even though each receiver commits
+/// independently. It holds only committed receivers' outpoints, so a receiver re-read after a
+/// failed commit is not mistaken for its own duplicate.
 fn validate_transparent_utxo_batch(
     chain_epoch: zally_chain::ChainEpoch,
     receiver: &TransparentReceiverRow,
     utxos: Vec<zally_chain::TransparentUtxo>,
-    seen_outpoints: &mut HashSet<(TxId, u32)>,
+    recorded_outpoints: &HashSet<(TxId, u32)>,
 ) -> Result<Vec<TransparentUtxoRow>, WalletError> {
     let mut rows = Vec::with_capacity(utxos.len());
+    let mut batch_outpoints = HashSet::with_capacity(utxos.len());
     for utxo in utxos {
         if utxo.confirmed_at_height > chain_epoch.visible_tip().height {
             return Err(WalletError::ChainSource(
@@ -247,7 +360,8 @@ fn validate_transparent_utxo_batch(
                 },
             ));
         }
-        if !seen_outpoints.insert((utxo.tx_id, utxo.output_index)) {
+        let outpoint = (utxo.tx_id, utxo.output_index);
+        if recorded_outpoints.contains(&outpoint) || !batch_outpoints.insert(outpoint) {
             return Err(WalletError::ChainSource(
                 zally_chain::ChainSourceError::MalformedTransparentUtxoSet {
                     reason: format!(
@@ -328,13 +442,13 @@ mod tests {
 
     #[test]
     fn malformed_receiver_yields_no_storage_batch() {
-        let mut seen = HashSet::new();
+        let recorded = HashSet::new();
         let receiver = transparent_receiver(1, &[1]);
         let result = validate_transparent_utxo_batch(
             transparent_test_epoch(),
             &receiver,
             vec![transparent_utxo(1, &[1], 11)],
-            &mut seen,
+            &recorded,
         );
         assert!(matches!(
             result,
@@ -346,23 +460,24 @@ mod tests {
 
     #[test]
     fn cross_receiver_duplicate_yields_no_storage_batch() {
-        let mut seen = HashSet::new();
+        let mut recorded = HashSet::new();
         let duplicate = transparent_utxo(1, &[1], 9);
         let first_receiver = transparent_receiver(1, &[1]);
         let first = validate_transparent_utxo_batch(
             transparent_test_epoch(),
             &first_receiver,
             vec![duplicate.clone()],
-            &mut seen,
-        );
-        assert!(first.is_ok(), "the first receiver's read is well-formed");
+            &recorded,
+        )
+        .expect("the first receiver's read is well-formed");
+        recorded.extend(first.iter().map(|row| (row.tx_id, row.output_index)));
 
         let second_receiver = transparent_receiver(2, &[1]);
         let second = validate_transparent_utxo_batch(
             transparent_test_epoch(),
             &second_receiver,
             vec![duplicate],
-            &mut seen,
+            &recorded,
         );
         assert!(matches!(
             second,
@@ -373,14 +488,48 @@ mod tests {
     }
 
     #[test]
+    fn in_batch_duplicate_yields_no_storage_batch() {
+        let recorded = HashSet::new();
+        let receiver = transparent_receiver(1, &[1]);
+        let result = validate_transparent_utxo_batch(
+            transparent_test_epoch(),
+            &receiver,
+            vec![transparent_utxo(1, &[1], 9), transparent_utxo(1, &[1], 9)],
+            &recorded,
+        );
+        assert!(matches!(
+            result,
+            Err(WalletError::ChainSource(
+                ChainSourceError::MalformedTransparentUtxoSet { .. }
+            ))
+        ));
+    }
+
+    #[test]
+    fn uncommitted_batch_validates_again_on_a_retry() {
+        let recorded = HashSet::new();
+        let receiver = transparent_receiver(1, &[1]);
+        for _ in 0..2_u32 {
+            let rows = validate_transparent_utxo_batch(
+                transparent_test_epoch(),
+                &receiver,
+                vec![transparent_utxo(1, &[1], 9)],
+                &recorded,
+            )
+            .expect("a batch whose commit failed must validate again when re-read");
+            assert_eq!(rows.len(), 1);
+        }
+    }
+
+    #[test]
     fn script_mismatch_yields_no_storage_batch() {
-        let mut seen = HashSet::new();
+        let recorded = HashSet::new();
         let receiver = transparent_receiver(1, &[1]);
         let result = validate_transparent_utxo_batch(
             transparent_test_epoch(),
             &receiver,
             vec![transparent_utxo(1, &[2], 9)],
-            &mut seen,
+            &recorded,
         );
         assert!(matches!(
             result,
@@ -392,13 +541,13 @@ mod tests {
 
     #[test]
     fn well_formed_batch_yields_one_row_per_utxo() {
-        let mut seen = HashSet::new();
+        let recorded = HashSet::new();
         let receiver = transparent_receiver(1, &[1]);
         let rows = validate_transparent_utxo_batch(
             transparent_test_epoch(),
             &receiver,
             vec![transparent_utxo(1, &[1], 9), transparent_utxo(2, &[1], 10)],
-            &mut seen,
+            &recorded,
         )
         .expect("well-formed batch validates");
         assert_eq!(rows.len(), 2);
@@ -426,7 +575,7 @@ mod tests {
         let sync_outcome = wallet.sync(&bootstrap_chain).await.expect("initial sync");
         assert_eq!(sync_outcome.scanned_to_height, tip);
 
-        wallet.set_retry_policy(RetryPolicy::none());
+        wallet.set_transparent_utxo_refresh_retry_policy(RetryPolicy::none());
         let rewind_to = BlockHeight::from(10);
         let chain = RewindOnFirstTransparentFetch {
             inner: bootstrap_chain,
@@ -438,10 +587,16 @@ mod tests {
         let result = wallet.refresh_transparent_utxos(&chain).await;
         assert!(
             matches!(
-                result,
-                Err(WalletError::Storage(
-                    StorageError::ScanFrontierReceded { .. }
-                ))
+                &result,
+                Err(WalletError::TransparentUtxoRefreshIncomplete {
+                    receivers_refreshed: 0,
+                    attempts: 1,
+                    source,
+                    ..
+                }) if matches!(
+                    source.as_ref(),
+                    WalletError::Storage(StorageError::ScanFrontierReceded { .. })
+                )
             ),
             "a reorg rewind landing mid-walk must reject the commit, got {result:?}"
         );

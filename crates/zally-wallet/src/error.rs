@@ -255,6 +255,31 @@ pub enum WalletError {
         source: Box<Self>,
     },
 
+    /// A [`crate::Wallet::refresh_transparent_utxos`] walk stopped before it refreshed every
+    /// transparent receiver.
+    ///
+    /// The receivers it refreshed keep their recorded UTXOs; the next walk visits every
+    /// receiver again. `attempts` counts the attempts the walk spent, including retries that
+    /// re-pinned the chain epoch and resumed at the receiver that failed.
+    ///
+    /// Posture: inherited from `source`, the failure that ended the walk.
+    #[error(
+        "transparent UTXO refresh stopped after {receivers_refreshed} of {receivers} receivers \
+         and {attempts} attempts: {source}"
+    )]
+    TransparentUtxoRefreshIncomplete {
+        /// Receivers whose UTXOs the walk recorded before it stopped.
+        receivers_refreshed: u64,
+        /// Receivers the walk set out to refresh. Zero when the walk failed before it listed
+        /// them.
+        receivers: u64,
+        /// Attempts the walk spent, including the one that failed.
+        attempts: u32,
+        /// Failure that ended the walk.
+        #[source]
+        source: Box<Self>,
+    },
+
     /// The chain source stopped following the chain, so the wallet refuses new spends: a
     /// transaction built against a frozen branch could pay from funds the chain no longer
     /// holds.
@@ -355,7 +380,8 @@ impl WalletError {
             | Self::ChainSourceHalted { .. }
             | Self::SourceReorgWindowUnverified { .. }
             | Self::PendingBroadcastUnsettled { .. } => FailurePosture::Retryable,
-            Self::UnverifiedScanChunk { source, .. } => source.posture(),
+            Self::UnverifiedScanChunk { source, .. }
+            | Self::TransparentUtxoRefreshIncomplete { source, .. } => source.posture(),
             Self::ProposalRejected { kind, .. } => kind.posture(),
             Self::NetworkMismatch { .. }
             | Self::NoSealedSeed
@@ -505,6 +531,12 @@ mod tests {
                     unchanged_since_ms: 0,
                 },
             },
+            WalletError::TransparentUtxoRefreshIncomplete {
+                receivers_refreshed: 1,
+                receivers: 2,
+                attempts: 3,
+                source: Box::new(WalletError::AccountNotFound),
+            },
             WalletError::SyncDriverFailed { reason: "x".into() },
         ];
         for e in variants {
@@ -642,6 +674,20 @@ mod tests {
     fn unverified_scan_chunk_inherits_its_source_posture() {
         let err = WalletError::UnverifiedScanChunk {
             scanned_to: BlockHeight::from(9),
+            source: Box::new(WalletError::ChainSource(
+                ChainSourceError::ChainEpochPinUnavailable,
+            )),
+        };
+        assert_eq!(err.posture(), FailurePosture::Restartable);
+        assert!(err.is_retryable());
+    }
+
+    #[test]
+    fn incomplete_transparent_utxo_refresh_inherits_its_source_posture() {
+        let err = WalletError::TransparentUtxoRefreshIncomplete {
+            receivers_refreshed: 4,
+            receivers: 31,
+            attempts: 8,
             source: Box::new(WalletError::ChainSource(
                 ChainSourceError::ChainEpochPinUnavailable,
             )),

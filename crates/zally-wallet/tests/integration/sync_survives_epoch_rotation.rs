@@ -8,9 +8,9 @@
 //! keep the blocks it committed before the pin expired.
 //!
 //! [`Wallet::refresh_transparent_utxos`] pins its own epoch, independent of the block-scan
-//! path; the tests here also cover its half of the same contract: a rotation surfaces as
-//! itself rather than a silently mixed result, and every receiver visited by one attempt
-//! observes the same pinned epoch.
+//! path; the tests here also cover its half of the same contract: a walk whose retries run
+//! out on rotations names the rotation as its cause and leaves the breaker alone, and every
+//! receiver read within one attempt observes that attempt's pinned epoch.
 
 use std::sync::Arc;
 
@@ -31,7 +31,7 @@ use super::fixtures::{
 const BLOCKS_PER_SYNC_CHUNK: u32 = 1_000;
 
 #[tokio::test]
-async fn refresh_transparent_utxos_surfaces_a_rotated_pin_as_itself() -> Result<(), TestWalletError>
+async fn refresh_transparent_utxos_names_a_rotated_pin_as_its_cause() -> Result<(), TestWalletError>
 {
     let TestWalletFixture {
         temp: _temp,
@@ -39,7 +39,7 @@ async fn refresh_transparent_utxos_surfaces_a_rotated_pin_as_itself() -> Result<
         account_id: _account_id,
     } = create_test_wallet().await?;
     let network = wallet.network();
-    wallet.set_retry_policy(RetryPolicy::none());
+    wallet.set_transparent_utxo_refresh_retry_policy(RetryPolicy::none());
 
     let chain = MockChainSource::new(network);
     let chain_handle = chain.handle();
@@ -50,12 +50,14 @@ async fn refresh_transparent_utxos_surfaces_a_rotated_pin_as_itself() -> Result<
         let outcome = wallet.refresh_transparent_utxos(&chain).await;
         assert!(
             matches!(
-                outcome,
-                Err(WalletError::ChainSource(
-                    ChainSourceError::ChainEpochPinUnavailable
-                ))
+                &outcome,
+                Err(WalletError::TransparentUtxoRefreshIncomplete { source, .. })
+                    if matches!(
+                        source.as_ref(),
+                        WalletError::ChainSource(ChainSourceError::ChainEpochPinUnavailable)
+                    )
             ),
-            "the rotated pin must surface as itself, got {outcome:?}"
+            "the rotated pin must be named as the cause, got {outcome:?}"
         );
         assert!(
             matches!(
@@ -75,8 +77,8 @@ async fn refresh_transparent_utxos_surfaces_a_rotated_pin_as_itself() -> Result<
 /// Every receiver read inside one `refresh_transparent_utxos` attempt must observe the same
 /// pinned epoch.
 ///
-/// Holds even when the wallet has more than one transparent receiver: nothing in the walk
-/// re-pins mid-attempt, so a result mixing two epochs cannot arise.
+/// Holds even when the wallet has more than one transparent receiver: the walk re-pins only
+/// when an attempt fails, so a source that never rotates serves the whole walk from one pin.
 #[tokio::test]
 async fn refresh_transparent_utxos_pins_one_epoch_across_every_receiver() -> Result<(), TestError> {
     let TestWalletFixture {

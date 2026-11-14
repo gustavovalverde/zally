@@ -44,6 +44,7 @@ Only `retryable` moves the breaker's failure counter, and only a call that compl
 | `SourceReorgWindowTooShallow` | `requires_operator` | The last read of the chain source's reorg window, by a sync or the sync driver, was below `WalletOptions::minimum_source_reorg_window_blocks`, so new spends are refused and no pending broadcast is judged unmineable; raise the source's window (Zinder `reorg_window_blocks`) or lower the minimum. |
 | `SourceReorgWindowUnverified` | `retryable` | The sync driver requires a minimum chain source reorg window and has not yet read the source's window, so new spends are refused; retry once it has, normally right after the driver starts. |
 | `PendingBroadcastUnsettled` | `retryable` | A retried send's idempotency key names a transaction the next block can no longer include, and the pending-broadcast verdict has not settled it. Do not pay again under another key; retry the same key after `PendingBroadcastUnmineable` (the key then builds a replacement) or `TransactionConfirmed`. |
+| `TransparentUtxoRefreshIncomplete` | Inherits its `source` | A `Wallet::refresh_transparent_utxos` walk stopped before it refreshed every transparent receiver, either on a failure that allows no retry or once its retry policy ran out of attempts. It counts the receivers refreshed and the attempts spent; the refreshed receivers keep their recorded UTXOs. |
 | `SyncDriverFailed` | Carries `FailurePosture` | The sync driver failed outside a wallet operation. Cancellation surfaces `Retryable`; panic surfaces `RequiresOperator`. |
 
 ## ChainSourceError
