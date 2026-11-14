@@ -57,8 +57,8 @@ pub struct WalletOptions {
     /// A node queues a submission it has not finished verifying, for example one whose input
     /// it is still looking for, and answers the same bytes submitted again as queued until it
     /// decides. A queued answer shows nothing about that decision, so the send submits the
-    /// same bytes again about once a second. Once this budget runs out with the transaction
-    /// still queued, the send fails with [`crate::WalletError::BroadcastUnconfirmed`] and its
+    /// same bytes again about once a second. Once this budget, counted from the first queued
+    /// answer, runs out with the transaction still queued, the send fails with [`crate::WalletError::BroadcastUnconfirmed`] and its
     /// idempotency key stays bound. Zero fails on the first queued answer.
     ///
     /// Default: 5 seconds.

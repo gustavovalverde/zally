@@ -124,6 +124,7 @@ impl ShieldingWallet {
             .record_transparent_unspent_set(
                 None,
                 TransparentUnspentSet::new(
+                    Network::Testnet,
                     self.script_pub_key_bytes.clone(),
                     BlockHeight::from(SCAN_END),
                     utxos,
@@ -256,6 +257,64 @@ async fn an_output_spent_by_an_unexpired_shielding_keeps_its_spend() -> Result<(
     Ok(())
 }
 
+/// A transaction that also pays another receiver stays mined on one receiver's omission: the
+/// other receiver's output may still be unspent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_output_whose_transaction_pays_another_receiver_is_kept() -> Result<(), TestError> {
+    let wallet = ShieldingWallet::scanned().await?;
+    let other_script = wallet
+        .storage
+        .list_transparent_receivers()
+        .await?
+        .into_iter()
+        .map(|receiver| receiver.script_pub_key_bytes)
+        .find(|script| *script != wallet.script_pub_key_bytes)
+        .ok_or_else(|| TestError::fixture("the wallet has a second transparent receiver"))?;
+    let omitted = wallet.utxo(0x61);
+    let sibling = TransparentUtxoRow::new(
+        omitted.tx_id,
+        1,
+        omitted.value_zat,
+        omitted.mined_height,
+        other_script,
+    );
+    wallet
+        .storage
+        .record_transparent_utxos(None, vec![omitted, sibling])
+        .await?;
+
+    let recorded = wallet.record_unspent_set(Vec::new()).await?;
+
+    assert!(
+        recorded.retired_outpoints.is_empty(),
+        "one receiver's omission does not un-mine a transaction another receiver holds"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_set_from_another_network_is_refused() -> Result<(), TestError> {
+    let wallet = ShieldingWallet::scanned().await?;
+    let refused = wallet
+        .storage
+        .record_transparent_unspent_set(
+            None,
+            TransparentUnspentSet::new(
+                Network::Mainnet,
+                wallet.script_pub_key_bytes.clone(),
+                BlockHeight::from(SCAN_END),
+                Vec::new(),
+            ),
+        )
+        .await;
+    assert!(
+        matches!(refused, Err(StorageError::ScanArtifactInvalid { .. })),
+        "a set from another network must be refused before it records or retires anything, \
+         got {refused:?}"
+    );
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_output_above_the_observed_height_is_kept() -> Result<(), TestError> {
     let wallet = ShieldingWallet::scanned().await?;
@@ -268,6 +327,7 @@ async fn an_output_above_the_observed_height_is_kept() -> Result<(), TestError> 
         .record_transparent_unspent_set(
             None,
             TransparentUnspentSet::new(
+                Network::Testnet,
                 wallet.script_pub_key_bytes.clone(),
                 BlockHeight::from(TRANSPARENT_MINED_HEIGHT - 1),
                 Vec::new(),

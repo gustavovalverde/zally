@@ -381,6 +381,8 @@ impl TransparentUtxoRow {
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub struct TransparentUnspentSet {
+    /// Network of the chain source that served the set.
+    pub network: Network,
     /// Receiver `scriptPubKey` bytes the set was read for.
     pub script_pub_key_bytes: Vec<u8>,
     /// Visible tip of the chain epoch that served the set. The set says nothing about an
@@ -394,11 +396,13 @@ impl TransparentUnspentSet {
     /// Constructs a transparent unspent set.
     #[must_use]
     pub fn new(
+        network: Network,
         script_pub_key_bytes: Vec<u8>,
         observed_at_height: BlockHeight,
         utxos: Vec<TransparentUtxoRow>,
     ) -> Self {
         Self {
+            network,
             script_pub_key_bytes,
             observed_at_height,
             utxos,
@@ -656,6 +660,9 @@ pub trait WalletStorage: Send + Sync + 'static {
     ///   the wallet's own send consumed keeps its spend record instead.
     /// - the wallet holds no shielded note from the producing transaction and records no
     ///   spend by it, so no block scan attests the transaction's place in the chain.
+    /// - every wallet output of the producing transaction is at the receiver's script.
+    ///   Un-mining a transaction that also pays another receiver would retire that
+    ///   receiver's output on this receiver's evidence, so such a transaction is left alone.
     ///
     /// A source omits such an output once a reorg replaced the block that mined it, including
     /// a block below the wallet's scanned height: rescanning that height cannot un-mine a
@@ -664,8 +671,8 @@ pub trait WalletStorage: Send + Sync + 'static {
     /// its row stays. A later set that reports the output again records it again at the
     /// reported height.
     ///
-    /// `not_retryable` on malformed output scripts or schema errors; `restartable` on a
-    /// receded scan frontier; `retryable` on transient I/O.
+    /// `not_retryable` on a set from another network, malformed output scripts, or schema
+    /// errors; `restartable` on a receded scan frontier; `retryable` on transient I/O.
     async fn record_transparent_unspent_set(
         &self,
         min_scanned_height: Option<BlockHeight>,

@@ -1425,9 +1425,19 @@ impl WalletStorage for Sqlite {
         min_scanned_height: Option<BlockHeight>,
         unspent_set: crate::wallet::TransparentUnspentSet,
     ) -> Result<crate::wallet::TransparentUnspentSetRecorded, StorageError> {
+        if unspent_set.network != self.options.network {
+            return Err(StorageError::ScanArtifactInvalid {
+                field: "unspent_set.network",
+                reason: format!(
+                    "source network {:?} differs from storage network {:?}",
+                    unspent_set.network, self.options.network
+                ),
+            });
+        }
         self.with_db_mut_and_ledger(move |db, ledger| {
             ensure_scan_frontier_at_least(db, min_scanned_height)?;
             let crate::wallet::TransparentUnspentSet {
+                network: _,
                 script_pub_key_bytes,
                 observed_at_height,
                 utxos,
@@ -5335,8 +5345,8 @@ fn put_transparent_utxo_rows(
 /// Retirement candidates: outputs recorded at script `?1`, mined at or below `?2`.
 ///
 /// No transaction mined or unexpired at the next block (`?3`) spends a candidate, and its
-/// producing transaction carries nothing else of the wallet's: no shielded note it received
-/// and no spend of its funds.
+/// producing transaction carries nothing else of the wallet's: no shielded note it received,
+/// no spend of its funds, and no transparent output at another script.
 const UNREPORTED_TRANSPARENT_UTXO_CANDIDATES_SQL: &str = "\
     SELECT t.id_tx, t.txid, tro.output_index \
     FROM transparent_received_outputs tro \
@@ -5358,7 +5368,10 @@ const UNREPORTED_TRANSPARENT_UTXO_CANDIDATES_SQL: &str = "\
       AND NOT EXISTS (SELECT 1 FROM orchard_received_note_spends WHERE transaction_id = t.id_tx) \
       AND NOT EXISTS (SELECT 1 FROM ironwood_received_note_spends WHERE transaction_id = t.id_tx) \
       AND NOT EXISTS ( \
-          SELECT 1 FROM transparent_received_output_spends WHERE transaction_id = t.id_tx)";
+          SELECT 1 FROM transparent_received_output_spends WHERE transaction_id = t.id_tx) \
+      AND NOT EXISTS ( \
+          SELECT 1 FROM transparent_received_outputs sibling \
+          WHERE sibling.transaction_id = t.id_tx AND sibling.script != ?1)";
 
 /// Un-mines one transaction.
 ///

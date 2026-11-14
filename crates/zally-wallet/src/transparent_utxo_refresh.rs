@@ -251,6 +251,7 @@ impl Wallet {
             .record_transparent_unspent_set(
                 pinned.min_scanned_height,
                 TransparentUnspentSet::new(
+                    pinned.chain_epoch.network(),
                     receiver.script_pub_key_bytes.clone(),
                     pinned.chain_epoch.visible_tip().height,
                     rows,
