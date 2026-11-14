@@ -1,6 +1,6 @@
 [package]
 name = "zally-keys"
-version = "0.2.1"
+version = "0.2.2"
 description = "Zally seed lifecycle: SeedSealing trait, AgeFileSealing, Mnemonic, UFVK derivation"
 edition.workspace = true
 license.workspace = true
