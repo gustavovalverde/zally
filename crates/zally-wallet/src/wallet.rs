@@ -43,6 +43,7 @@ pub(crate) struct WalletInner {
     pub(crate) base_capabilities: WalletCapabilities,
     pub(crate) event_tx: broadcast::Sender<WalletEvent>,
     pub(crate) retry_policy: Mutex<RetryPolicy>,
+    pub(crate) transparent_utxo_refresh_retry_policy: Mutex<RetryPolicy>,
     pub(crate) circuit_breaker: CircuitBreaker,
     pub(crate) options: WalletOptions,
     pub(crate) idempotency_key_locks: IdempotencyKeyLocks,
@@ -134,6 +135,23 @@ impl Wallet {
     /// in flight finish under the prior policy.
     pub fn set_retry_policy(&self, policy: RetryPolicy) {
         *self.inner.retry_policy.lock() = policy;
+    }
+
+    /// Returns the [`RetryPolicy`] that bounds one [`Self::refresh_transparent_utxos`] walk.
+    ///
+    /// Defaults to 8 attempts with backoff from 250 milliseconds doubling to an 8-second
+    /// cap, about 24 seconds of backoff in all, so a walk outlasts a brief chain-source
+    /// readiness gap. Separate from [`Self::retry_policy`]: the walk resumes where it failed
+    /// instead of repeating work, so it can afford a longer ladder than a scan attempt.
+    #[must_use]
+    pub fn transparent_utxo_refresh_retry_policy(&self) -> RetryPolicy {
+        *self.inner.transparent_utxo_refresh_retry_policy.lock()
+    }
+
+    /// Replaces the [`RetryPolicy`] that bounds [`Self::refresh_transparent_utxos`]. A walk
+    /// already in flight finishes under the prior policy.
+    pub fn set_transparent_utxo_refresh_retry_policy(&self, policy: RetryPolicy) {
+        *self.inner.transparent_utxo_refresh_retry_policy.lock() = policy;
     }
 
     /// Rebuilds the wallet's derived chain state from the sealed seed at the account
@@ -803,6 +821,9 @@ where
         base_capabilities: capabilities,
         event_tx,
         retry_policy: Mutex::new(RetryPolicy::default()),
+        transparent_utxo_refresh_retry_policy: Mutex::new(
+            crate::transparent_utxo_refresh::DEFAULT_TRANSPARENT_UTXO_REFRESH_RETRY_POLICY,
+        ),
         circuit_breaker: CircuitBreaker::new(options.circuit_breaker),
         options,
         idempotency_key_locks: IdempotencyKeyLocks::default(),

@@ -55,5 +55,6 @@ mod sync_survives_epoch_rotation;
 mod tex_payment_mined_after_a_rebuild;
 mod to_uri_round_trips_through_propose;
 mod transparent_utxo_refresh_decoupled_from_sync;
+mod transparent_utxo_refresh_resumes_after_retries;
 #[cfg(feature = "unsafe_plaintext_seed")]
 mod unsafe_plaintext_seed_warns;

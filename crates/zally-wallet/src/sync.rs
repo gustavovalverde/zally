@@ -231,8 +231,8 @@ pub struct SyncDriverOptions {
     /// walk paces itself by its own duration, and this floor only prevents busy-looping when
     /// the walk returns quickly (an empty receiver list, or a source with no new UTXOs).
     pub transparent_utxo_refresh_interval_ms: u64,
-    /// Maximum seconds one [`Wallet::refresh_transparent_utxos`] attempt may run before the
-    /// refresh loop treats it as faulted and moves on to the next tick.
+    /// Maximum seconds one [`Wallet::refresh_transparent_utxos`] call may run, retries
+    /// included, before the refresh loop treats it as faulted and moves on to the next tick.
     ///
     /// Bounds a hung chain read the same way [`Self::sync_timeout_seconds`] bounds a hung
     /// scan attempt: without this, a source that never returns wedges the refresh loop

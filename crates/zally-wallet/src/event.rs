@@ -131,8 +131,8 @@ pub enum WalletEvent {
         /// identity is key identity, not database identity.
         account_id: AccountId,
     },
-    /// A [`crate::Wallet::refresh_transparent_utxos`] attempt run by the driver's own refresh
-    /// loop faulted, including a timed-out attempt. Emitted on every faulted attempt so a
+    /// A [`crate::Wallet::refresh_transparent_utxos`] call run by the driver's own refresh
+    /// loop faulted once its retries ran out, or timed out. Emitted on every faulted call so a
     /// host observes a stall as it happens rather than only in logs; `consecutive_failures`
     /// tells the host whether this is an isolated blip or a sustained outage.
     TransparentUtxoRefreshFaulted {

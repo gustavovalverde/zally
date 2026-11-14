@@ -62,6 +62,7 @@ struct MockState {
     epoch_id: u64,
     current_epoch_failures: Vec<ChainSourceError>,
     transparent_utxo_failures: Vec<ChainSourceError>,
+    transparent_reads_until_epoch_expiry: Option<u32>,
     subtree_failures: Vec<ChainSourceError>,
     compact_failures: Vec<ChainSourceError>,
     tree_state_failure_heights: Vec<u32>,
@@ -239,6 +240,7 @@ impl MockChainSource {
                 epoch_id: 0,
                 current_epoch_failures: Vec::new(),
                 transparent_utxo_failures: Vec::new(),
+                transparent_reads_until_epoch_expiry: None,
                 subtree_failures: Vec::new(),
                 compact_failures: Vec::new(),
                 tree_state_failure_heights: Vec::new(),
@@ -514,6 +516,13 @@ impl MockChainSourceHandle {
         for _ in 0..count {
             guard.transparent_utxo_failures.push(produce_error());
         }
+    }
+
+    /// Rotates the epoch once `reads` more `transparent_utxos` calls have succeeded (at least
+    /// one), so the next call pinned to the old epoch fails with
+    /// [`ChainSourceError::ChainEpochPinUnavailable`].
+    pub fn expire_epoch_after_transparent_reads(&self, reads: u32) {
+        self.state.lock().transparent_reads_until_epoch_expiry = Some(reads);
     }
 
     /// Expires the current epoch during the next subtree-root read.
@@ -852,6 +861,16 @@ impl ChainSource for MockChainSource {
             drop(guard);
             return Err(injected);
         }
+        if let Some(remaining_reads) = guard.transparent_reads_until_epoch_expiry {
+            if remaining_reads <= 1 {
+                guard.transparent_reads_until_epoch_expiry = None;
+                guard.epoch_id = guard.epoch_id.saturating_add(1);
+            } else {
+                guard.transparent_reads_until_epoch_expiry =
+                    Some(remaining_reads.saturating_sub(1));
+            }
+        }
+        drop(guard);
         Ok(Vec::new())
     }
 
