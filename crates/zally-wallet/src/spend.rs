@@ -7,7 +7,7 @@
 
 use std::time::Duration;
 
-use tokio::time::{Instant, sleep};
+use tokio::time::{Instant, sleep_until, timeout_at};
 use zally_chain::{ShieldedPool, Submitter};
 use zally_core::{
     AccountId, BlockHeight, IdempotencyKey, Memo, MemoBytes, Network, PaymentRecipient, TxId,
@@ -814,52 +814,58 @@ impl Wallet {
     /// without another answer, so the same bytes go again after
     /// [`QUEUED_BROADCAST_RESUBMIT_INTERVAL`] until
     /// [`crate::WalletOptions::queued_broadcast_confirmation_ms`], counted from the first
-    /// queued answer, runs out, and the call then fails with
-    /// [`WalletError::BroadcastUnconfirmed`]. Counting from that answer gives a node whose
-    /// first answer was slow the whole budget to finish verifying.
+    /// queued answer, runs out. Counting from that answer gives a node whose first answer was
+    /// slow the whole budget to finish verifying. The budget also bounds every submission
+    /// after that answer, and once it runs out, or a later submission fails, the call fails
+    /// with [`WalletError::BroadcastUnconfirmed`].
     pub(crate) async fn submit_until_held(
         &self,
         attempt: BroadcastAttempt<'_>,
     ) -> Result<(), WalletError> {
         let budget = Duration::from_millis(self.inner.options.queued_broadcast_confirmation_ms);
-        let mut first_queued_at: Option<Instant> = None;
+        let mut confirmation_deadline: Option<Instant> = None;
         let mut queued_answers = 0_u32;
         loop {
-            let submitted = crate::retry::with_breaker_and_retry(
+            let submission = crate::retry::with_breaker_and_retry(
                 &self.inner.circuit_breaker,
                 self.broadcast_retry_policy(),
                 attempt.operation,
                 || attempt.submitter.submit(attempt.raw_bytes),
                 WalletError::from,
-            )
-            .await;
-            let outcome = match submitted {
-                Ok(outcome) => outcome,
-                Err(error) if queued_answers > 0 => {
-                    return Err(unconfirmed_after_queued(&attempt, queued_answers, &error));
-                }
-                Err(error) => return Err(error),
+            );
+            let outcome = match confirmation_deadline {
+                None => submission.await?,
+                Some(deadline) => match timeout_at(deadline, submission).await {
+                    Ok(Ok(outcome)) => outcome,
+                    Ok(Err(error)) => {
+                        return Err(unconfirmed_after_queued(
+                            &attempt,
+                            queued_answers,
+                            &error.to_string(),
+                        ));
+                    }
+                    Err(_elapsed) => {
+                        return Err(unconfirmed_after_queued(
+                            &attempt,
+                            queued_answers,
+                            "the confirmation budget ran out during a submission",
+                        ));
+                    }
+                },
             };
             if resolve_submit_outcome(outcome, attempt.tx_id)? == SubmitAcknowledgement::Held {
                 return Ok(());
             }
             queued_answers = queued_answers.saturating_add(1);
-            let remaining =
-                budget.saturating_sub(first_queued_at.get_or_insert_with(Instant::now).elapsed());
-            if remaining.is_zero() {
-                tracing::warn!(
-                    target: "zally::wallet",
-                    event = "broadcast_unconfirmed",
-                    operation = attempt.operation,
-                    tx_id = %attempt.tx_id,
+            let deadline = *confirmation_deadline.get_or_insert_with(|| Instant::now() + budget);
+            let resubmit_at = Instant::now() + QUEUED_BROADCAST_RESUBMIT_INTERVAL;
+            if resubmit_at >= deadline {
+                return Err(unconfirmed_after_queued(
+                    &attempt,
                     queued_answers,
-                    "the node kept the transaction queued for verification and never reported \
-                     it held"
-                );
-                return Err(WalletError::BroadcastUnconfirmed {
-                    tx_id: attempt.tx_id,
-                    tx_expiry_height: attempt.tx_expiry_height,
-                });
+                    "the node still had the transaction queued when the confirmation budget \
+                     ran out",
+                ));
             }
             tracing::info!(
                 target: "zally::wallet",
@@ -869,7 +875,7 @@ impl Wallet {
                 queued_answers,
                 "the node queued the transaction for verification; submitting it again"
             );
-            sleep(remaining.min(QUEUED_BROADCAST_RESUBMIT_INTERVAL)).await;
+            sleep_until(resubmit_at).await;
         }
     }
 
@@ -883,16 +889,15 @@ impl Wallet {
     }
 }
 
-/// The error for a submission the node already queued once and that a later submission
-/// could not confirm, because the circuit breaker opened or the submitter failed.
+/// The error for a send the node answered as queued and never reported held.
 ///
-/// The node holds the transaction, so the failure must not read as never submitted
-/// ([`is_unsubmitted`]): that would release the send's binding while the transaction can
-/// still be mined.
+/// The node holds the transaction, so no later failure may read as never submitted
+/// ([`is_unsubmitted`]), not even an open circuit breaker: that would release the send's
+/// binding while the transaction can still be mined.
 fn unconfirmed_after_queued(
     attempt: &BroadcastAttempt<'_>,
     queued_answers: u32,
-    error: &WalletError,
+    reason: &str,
 ) -> WalletError {
     tracing::warn!(
         target: "zally::wallet",
@@ -900,8 +905,8 @@ fn unconfirmed_after_queued(
         operation = attempt.operation,
         tx_id = %attempt.tx_id,
         queued_answers,
-        %error,
-        "submitting a queued transaction again failed; the node never reported it held"
+        reason,
+        "the node kept the transaction queued for verification and never reported it held"
     );
     WalletError::BroadcastUnconfirmed {
         tx_id: attempt.tx_id,
