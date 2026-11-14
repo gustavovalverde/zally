@@ -25,6 +25,6 @@ pub use wallet::{
     ChainTips, CommitmentTreeRoots, HoldRecord, PendingBroadcastRecord,
     PendingBroadcastTransaction, PreparedTransaction, ProposalPaymentRequest, ProposalSummary,
     ReceivedShieldedNoteRow, RevertedBlocks, ScanRequest, ScanResult, ShieldTransparentRequest,
-    StorageKind, TransparentReceiverRow, TransparentUtxoRow, UnmineableHold,
-    UnspentShieldedNoteRow, WalletStorage,
+    StorageKind, TransparentReceiverRow, TransparentUnspentSet, TransparentUnspentSetRecorded,
+    TransparentUtxoRow, UnmineableHold, UnspentShieldedNoteRow, WalletStorage,
 };

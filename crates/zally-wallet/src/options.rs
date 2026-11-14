@@ -51,6 +51,18 @@ pub struct WalletOptions {
     ///
     /// Default: 30 seconds.
     pub source_lookup_timeout_ms: u64,
+    /// Longest a send keeps submitting a transaction the node answers as queued, waiting for
+    /// the node to report it accepted or already known.
+    ///
+    /// A node queues a submission it has not finished verifying, for example one whose input
+    /// it is still looking for, and answers the same bytes submitted again as queued until it
+    /// decides. A queued answer shows nothing about that decision, so the send submits the
+    /// same bytes again about once a second. Once this budget, counted from the first queued
+    /// answer, runs out with the transaction still queued, the send fails with [`crate::WalletError::BroadcastUnconfirmed`] and its
+    /// idempotency key stays bound. Zero fails on the first queued answer.
+    ///
+    /// Default: 5 seconds.
+    pub queued_broadcast_confirmation_ms: u64,
 }
 
 impl WalletOptions {
@@ -64,6 +76,19 @@ impl WalletOptions {
 
     /// Default wait for one chain source read that backs an unmineable verdict: 30 seconds.
     pub const DEFAULT_SOURCE_LOOKUP_TIMEOUT_MS: u64 = 30_000;
+
+    /// Default budget for confirming a queued submission: 5 seconds.
+    pub const DEFAULT_QUEUED_BROADCAST_CONFIRMATION_MS: u64 = 5_000;
+
+    /// Returns a copy of `self` with `queued_broadcast_confirmation_ms` replaced.
+    #[must_use]
+    pub const fn with_queued_broadcast_confirmation_ms(
+        mut self,
+        queued_broadcast_confirmation_ms: u64,
+    ) -> Self {
+        self.queued_broadcast_confirmation_ms = queued_broadcast_confirmation_ms;
+        self
+    }
 
     /// Returns a copy of `self` with `source_lookup_timeout_ms` replaced.
     #[must_use]
@@ -109,6 +134,7 @@ impl Default for WalletOptions {
             ),
             circuit_breaker: CircuitBreakerConfig::default(),
             source_lookup_timeout_ms: Self::DEFAULT_SOURCE_LOOKUP_TIMEOUT_MS,
+            queued_broadcast_confirmation_ms: Self::DEFAULT_QUEUED_BROADCAST_CONFIRMATION_MS,
         }
     }
 }

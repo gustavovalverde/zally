@@ -18,7 +18,9 @@
 //!   [`MockChainSourceHandle::set_reorg_window_blocks`],
 //! - report a transaction mined at the lowest canonical block, at or below the visible tip,
 //!   that [`MockChainSourceHandle::mine_transactions`] put it in, and every other transaction
-//!   not found.
+//!   not found,
+//! - serve a transparent receiver's unspent set via
+//!   [`MockChainSourceHandle::serve_transparent_utxos`]; every other receiver has none.
 //!
 //! Blocks on the original branch carry all-zero hashes, so tests that serve their own
 //! all-zero tree states keep chaining. Every block a reorg replaces carries a hash derived
@@ -63,6 +65,7 @@ struct MockState {
     current_epoch_failures: Vec<ChainSourceError>,
     transparent_utxo_failures: Vec<ChainSourceError>,
     transparent_reads_until_epoch_expiry: Option<u32>,
+    transparent_utxos_by_script: HashMap<Vec<u8>, Vec<TransparentUtxo>>,
     subtree_failures: Vec<ChainSourceError>,
     compact_failures: Vec<ChainSourceError>,
     tree_state_failure_heights: Vec<u32>,
@@ -241,6 +244,7 @@ impl MockChainSource {
                 current_epoch_failures: Vec::new(),
                 transparent_utxo_failures: Vec::new(),
                 transparent_reads_until_epoch_expiry: None,
+                transparent_utxos_by_script: HashMap::new(),
                 subtree_failures: Vec::new(),
                 compact_failures: Vec::new(),
                 tree_state_failure_heights: Vec::new(),
@@ -516,6 +520,20 @@ impl MockChainSourceHandle {
         for _ in 0..count {
             guard.transparent_utxo_failures.push(produce_error());
         }
+    }
+
+    /// Replaces the unspent set served for the receiver whose `scriptPubKey` is
+    /// `script_pub_key_bytes`. A read returns the outputs confirmed at or below the pinned
+    /// epoch's visible tip; an empty `utxos` serves the receiver none.
+    pub fn serve_transparent_utxos(
+        &self,
+        script_pub_key_bytes: Vec<u8>,
+        utxos: Vec<TransparentUtxo>,
+    ) {
+        self.state
+            .lock()
+            .transparent_utxos_by_script
+            .insert(script_pub_key_bytes, utxos);
     }
 
     /// Rotates the epoch once `reads` more `transparent_utxos` calls have succeeded (at least
@@ -847,7 +865,7 @@ impl ChainSource for MockChainSource {
     async fn transparent_utxos(
         &self,
         chain_epoch: ChainEpoch,
-        _script_pub_key_bytes: &[u8],
+        script_pub_key_bytes: &[u8],
     ) -> Result<Vec<TransparentUtxo>, ChainSourceError> {
         self.state
             .lock()
@@ -870,8 +888,18 @@ impl ChainSource for MockChainSource {
                     Some(remaining_reads.saturating_sub(1));
             }
         }
-        drop(guard);
-        Ok(Vec::new())
+        let visible_tip_height = chain_epoch.visible_tip().height;
+        Ok(guard
+            .transparent_utxos_by_script
+            .get(script_pub_key_bytes)
+            .map(|utxos| {
+                utxos
+                    .iter()
+                    .filter(|utxo| utxo.confirmed_at_height <= visible_tip_height)
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default())
     }
 
     async fn chain_event_envelopes(

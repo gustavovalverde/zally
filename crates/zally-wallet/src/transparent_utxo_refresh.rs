@@ -1,12 +1,13 @@
 //! Transparent UTXO refresh, decoupled from block-scan cadence.
 //!
 //! `Wallet::refresh_transparent_utxos` walks every wallet-owned transparent receiver,
-//! recording each receiver's UTXOs as soon as they are fetched. Each attempt pins one source
-//! [`zally_chain::ChainEpoch`] and the wallet's scanned frontier; every commit carries that
-//! frontier as a floor, so a reorg rewind on the block-scan loop that lands between one
-//! receiver's fetch and its commit is rejected rather than written. A retryable or restartable
-//! failure re-pins both and resumes at the receiver that failed, under the wallet's
-//! transparent-UTXO refresh retry policy.
+//! reconciling each receiver's recorded UTXOs with the complete unspent set the chain source
+//! reports as soon as it is fetched: new outputs are recorded and outputs the set no longer
+//! contains are retired. Each attempt pins one source [`zally_chain::ChainEpoch`] and the
+//! wallet's scanned frontier; every commit carries that frontier as a floor, so a reorg rewind
+//! on the block-scan loop that lands between one receiver's fetch and its commit is rejected
+//! rather than written. A retryable or restartable failure re-pins both and resumes at the
+//! receiver that failed, under the wallet's transparent-UTXO refresh retry policy.
 //! [`run_transparent_utxo_refresh_driver`] repeats that walk on its own cadence, independent
 //! of the [`crate::SyncDriver`] block-scan loop: a receiver set whose refresh cost grows with
 //! on-chain activity never occupies the scan attempt's timeout or retry ladder, and a slow or
@@ -22,7 +23,7 @@ use tokio::sync::oneshot;
 use tokio::time::{sleep, timeout};
 use zally_chain::ChainSource;
 use zally_core::TxId;
-use zally_storage::{TransparentReceiverRow, TransparentUtxoRow};
+use zally_storage::{TransparentReceiverRow, TransparentUnspentSet, TransparentUtxoRow};
 
 use crate::error::WalletError;
 use crate::event::WalletEvent;
@@ -47,6 +48,9 @@ pub struct TransparentUtxoRefreshOutcome {
     pub receivers_visited: u64,
     /// Number of transparent UTXOs recorded during this walk.
     pub utxo_count: u64,
+    /// Number of recorded transparent UTXOs this walk retired because the chain source no
+    /// longer reports them.
+    pub utxos_retired: u64,
     /// Unix milliseconds when this walk completed.
     pub completed_at_ms: u64,
 }
@@ -59,6 +63,7 @@ struct TransparentUtxoWalk {
     receivers_refreshed: usize,
     recorded_outpoints: HashSet<(TxId, u32)>,
     utxo_count: u64,
+    utxos_retired: u64,
     started_at_ms: u64,
 }
 
@@ -82,11 +87,19 @@ impl Wallet {
     /// read and commit in that attempt uses them. A failure whose posture allows a retry (a
     /// source that is not ready, a rotated epoch pin, a receded scan frontier) backs off under
     /// [`Self::transparent_utxo_refresh_retry_policy`], re-pins both, and resumes at the
-    /// receiver that failed. Receivers already refreshed keep their recorded UTXOs, so a
+    /// receiver that failed. Receivers already refreshed keep their reconciled UTXOs, so a
     /// source that rotates its epoch faster than one whole walk still completes it. Mixing
-    /// epochs across receivers is safe: each receiver's UTXOs are validated against the epoch
-    /// that served them, and `WalletStorage::record_transparent_utxos` only adds idempotent
-    /// rows, never removes them.
+    /// epochs across receivers is safe: each receiver's set is validated against, and
+    /// reconciled with, the epoch that served it, so no receiver's result depends on
+    /// another's epoch.
+    ///
+    /// Each receiver's set is complete, so `WalletStorage::record_transparent_unspent_set`
+    /// also retires a recorded output the set omits: one mined at or below the epoch's
+    /// visible tip, that no mined or unexpired transaction spends, from a transaction that
+    /// carries nothing else of the wallet's. A reorg that replaced the output's block leaves
+    /// exactly that, even below the wallet's scanned height, and shielding it would only get
+    /// the transaction rejected for a missing input. A retired output leaves every balance and
+    /// proposal; a later walk that sees it again records it again.
     ///
     /// The scanned-frontier floor means a reorg rewind landing on the block-scan loop between
     /// one receiver's fetch and its commit surfaces as `StorageError::ScanFrontierReceded`
@@ -140,13 +153,18 @@ impl Wallet {
                 .await?;
         }
 
-        let (utxo_count, started_at_ms) = {
+        let (utxo_count, utxos_retired, started_at_ms) = {
             let progress = walk.lock();
-            (progress.utxo_count, progress.started_at_ms)
+            (
+                progress.utxo_count,
+                progress.utxos_retired,
+                progress.started_at_ms,
+            )
         };
         let outcome = TransparentUtxoRefreshOutcome {
             receivers_visited: pinned.receiver_count,
             utxo_count,
+            utxos_retired,
             completed_at_ms: current_unix_ms(),
         };
         tracing::info!(
@@ -154,6 +172,7 @@ impl Wallet {
             event = "wallet_transparent_utxo_refresh_completed",
             receivers = pinned.receiver_count,
             utxo_count,
+            utxos_retired,
             attempts = attempt,
             elapsed_ms = outcome.completed_at_ms.saturating_sub(started_at_ms),
             "transparent UTXO refresh walk completed"
@@ -229,12 +248,34 @@ impl Wallet {
         let recorded = self
             .inner
             .storage
-            .record_transparent_utxos(pinned.min_scanned_height, rows)
+            .record_transparent_unspent_set(
+                pinned.min_scanned_height,
+                TransparentUnspentSet::new(
+                    pinned.chain_epoch.network(),
+                    receiver.script_pub_key_bytes.clone(),
+                    pinned.chain_epoch.visible_tip().height,
+                    rows,
+                ),
+            )
             .await?;
+        for outpoint in &recorded.retired_outpoints {
+            tracing::warn!(
+                target: "zally::sync",
+                event = "wallet_transparent_utxo_retired",
+                tx_id = %outpoint.tx_id,
+                output_index = outpoint.output_index,
+                receiver_index,
+                observed_at_height = pinned.chain_epoch.visible_tip().height.as_u32(),
+                "the chain source no longer reports a recorded transparent UTXO; it no longer \
+                 counts toward balances or proposals"
+            );
+        }
+        let retired_count = u64::try_from(recorded.retired_outpoints.len()).unwrap_or(u64::MAX);
         {
             let mut progress = walk.lock();
             progress.recorded_outpoints.extend(outpoints);
-            progress.utxo_count = progress.utxo_count.saturating_add(recorded);
+            progress.utxo_count = progress.utxo_count.saturating_add(recorded.recorded_count);
+            progress.utxos_retired = progress.utxos_retired.saturating_add(retired_count);
             progress.receivers_refreshed = index.saturating_add(1);
         }
         tracing::debug!(
@@ -242,7 +283,8 @@ impl Wallet {
             event = "wallet_transparent_utxo_receiver_completed",
             receiver_index,
             receivers = pinned.receiver_count,
-            utxo_count = recorded,
+            utxo_count = recorded.recorded_count,
+            utxos_retired = retired_count,
             "refreshed one transparent receiver"
         );
         Ok(())

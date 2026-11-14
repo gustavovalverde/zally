@@ -119,9 +119,10 @@ impl Wallet {
     /// Returns the wallet's [`RetryPolicy`] with the backoff zeroed, for transaction
     /// broadcast only.
     ///
-    /// Resubmission is idempotent: Zebra dedupes by txid and `AlreadyQueued` maps to a
-    /// success outcome, so a failed broadcast attempt retries immediately against the
-    /// submitter's own per-call timeout instead of sleeping between attempts.
+    /// Resubmission is idempotent: Zebra dedupes by txid and answers a transaction it is
+    /// still verifying as queued, so a failed broadcast attempt retries immediately against
+    /// the submitter's own per-call timeout instead of sleeping between attempts. A queued
+    /// answer is confirmed separately, under `WalletOptions::queued_broadcast_confirmation_ms`.
     pub(crate) fn broadcast_retry_policy(&self) -> RetryPolicy {
         RetryPolicy {
             initial_backoff_ms: 0,

@@ -79,16 +79,16 @@ pub enum SubmitOutcome {
         /// Resulting transaction identifier.
         tx_id: TxId,
     },
-    /// The upstream node accepted the broadcast into its download or
-    /// verification queue but has not yet produced a final verdict.
+    /// The upstream node holds the broadcast in its download or verification
+    /// queue but has not yet produced a final verdict.
     ///
     /// Re-submitting the same byte-identical transaction while the prior
-    /// submission is in flight produces this state on Zebra. Callers should
-    /// treat it as a success-equivalent for idempotency purposes: the
-    /// pending-broadcast tracking row stays in place, the dispense path
-    /// returns the tx id (so auto-shield and dispense pipelines record the
-    /// same identifier that will eventually mine), and no retry is
-    /// scheduled.
+    /// submission is in flight produces this state on Zebra, including a retry
+    /// after a submission that timed out while Zebra waited for a missing input.
+    /// It is not evidence of acceptance: a transaction that fails verification
+    /// leaves the queue without another answer. The wallet submits the same
+    /// bytes again until the node answers [`Self::Accepted`] or
+    /// [`Self::Duplicate`], and otherwise reports the send unconfirmed.
     ///
     /// `tx_id` echoes the caller-computed identifier rather than one
     /// returned by the upstream node, because Zebra does not echo a tx id

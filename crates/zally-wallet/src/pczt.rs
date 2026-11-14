@@ -182,8 +182,13 @@ impl Wallet {
     /// before its transaction is stored or submitted, and the inputs held for it are released.
     /// The verdict is safe only while this wallet is the PCZT's sole broadcaster.
     ///
+    /// A node that keeps the transaction queued for verification past
+    /// [`crate::WalletOptions::queued_broadcast_confirmation_ms`] fails the call with
+    /// [`WalletError::BroadcastUnconfirmed`].
+    ///
     /// `not_retryable` on malformed or unmineable PCZTs, missing prover params, or submitter
-    /// rejection; `retryable` on transient submitter or storage I/O.
+    /// rejection; `retryable` on transient submitter or storage I/O and on
+    /// [`WalletError::BroadcastUnconfirmed`].
     pub async fn extract_and_submit_pczt(
         &self,
         pczt: &PcztBytes,
@@ -204,16 +209,25 @@ impl Wallet {
             .extract_and_store_pczt(pczt.as_bytes().to_vec())
             .await
             .map_err(WalletError::from)?;
-        let policy = self.broadcast_retry_policy();
-        let outcome = crate::retry::with_breaker_and_retry(
-            &self.inner.circuit_breaker,
-            policy,
-            "extract_and_submit_pczt.submit",
-            || submitter.submit(&prepared.raw_bytes),
-            WalletError::from,
-        )
+        self.submit_until_held(crate::spend::BroadcastAttempt {
+            operation: "extract_and_submit_pczt.submit",
+            submitter,
+            raw_bytes: &prepared.raw_bytes,
+            tx_id: prepared.tx_id,
+            tx_expiry_height: prepared.tx_expiry_height,
+        })
         .await?;
-        translate_submit_outcome(outcome, prepared.tx_id, prepared.tx_expiry_height)
+        Ok(SendOutcome {
+            signed: crate::SignedPczt {
+                tx_id: prepared.tx_id,
+                fee_zat: zally_core::Zatoshis::zero(),
+                tx_expiry_height: prepared.tx_expiry_height,
+            },
+            broadcast: crate::BroadcastOutcome {
+                tx_id: prepared.tx_id,
+                broadcast_at_height: BlockHeight::from(0),
+            },
+        })
     }
 }
 
@@ -250,73 +264,5 @@ fn validate_pczt_network(
             storage: wallet_network,
             requested: pczt_network,
         })
-    }
-}
-
-fn translate_submit_outcome(
-    outcome: zally_chain::SubmitOutcome,
-    expected_tx_id: zally_core::TxId,
-    tx_expiry_height: BlockHeight,
-) -> Result<SendOutcome, WalletError> {
-    #[allow(
-        clippy::wildcard_enum_match_arm,
-        reason = "non_exhaustive submit outcomes fall through to SubmissionRejected with a placeholder typed reason"
-    )]
-    match outcome {
-        zally_chain::SubmitOutcome::Accepted { tx_id }
-        | zally_chain::SubmitOutcome::Duplicate { tx_id }
-        | zally_chain::SubmitOutcome::Queued { tx_id } => {
-            if tx_id != expected_tx_id {
-                return Err(WalletError::SubmittedTransactionIdMismatch {
-                    expected: expected_tx_id,
-                    returned: tx_id,
-                });
-            }
-            Ok(SendOutcome {
-                signed: crate::SignedPczt {
-                    tx_id,
-                    fee_zat: zally_core::Zatoshis::zero(),
-                    tx_expiry_height,
-                },
-                broadcast: crate::BroadcastOutcome {
-                    tx_id,
-                    broadcast_at_height: BlockHeight::from(0),
-                },
-            })
-        }
-        zally_chain::SubmitOutcome::Rejected { reason, detail } => {
-            Err(WalletError::SubmissionRejected { reason, detail })
-        }
-        _ => Err(WalletError::SubmissionRejected {
-            reason: zally_chain::RejectionReason::Unknown,
-            detail: "submitter returned an unrecognised outcome variant".into(),
-        }),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::translate_submit_outcome;
-    use crate::WalletError;
-    use zally_core::{BlockHeight, TxId};
-
-    #[test]
-    fn pczt_submission_rejects_success_for_a_different_transaction() {
-        let expected = TxId::from_bytes([1; 32]);
-        let returned = TxId::from_bytes([2; 32]);
-
-        let outcome = translate_submit_outcome(
-            zally_chain::SubmitOutcome::Queued { tx_id: returned },
-            expected,
-            BlockHeight::from(100),
-        );
-
-        assert!(matches!(
-            outcome,
-            Err(WalletError::SubmittedTransactionIdMismatch {
-                expected: actual_expected,
-                returned: actual_returned,
-            }) if actual_expected == expected && actual_returned == returned
-        ));
     }
 }
