@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use parking_lot::Mutex;
-use zally_chain::{ChainSource, ShieldedPool, Submitter};
+use zally_chain::{ChainSource, ShieldedPool, Submitter, TransparentUtxo};
 use zally_core::{
     AccountId, BlockHeight, CompactChainMetadata, CompactSaplingOutput, CompactTransaction,
     CompactTransparentInput, HoldId, IdempotencyKey, Network, PaymentRecipient,
@@ -222,15 +222,19 @@ pub(crate) async fn record_transparent_utxo(
     base: &ChainWallet,
     funding_tx_id: [u8; 32],
 ) -> Result<(), FixtureError> {
-    record_transparent_utxo_at(base, funding_tx_id, 1).await
+    record_transparent_utxo_at(base, funding_tx_id, 1).await?;
+    Ok(())
 }
 
 /// Records a transparent UTXO the wallet owns, created by `funding_tx_id` at `mined_height`.
+///
+/// The output goes to a fresh transparent receiver whose unspent set the mock chain then
+/// serves as that one output. Returns the receiver's `scriptPubKey` bytes.
 pub(crate) async fn record_transparent_utxo_at(
     base: &ChainWallet,
     funding_tx_id: [u8; 32],
     mined_height: u32,
-) -> Result<(), FixtureError> {
+) -> Result<Vec<u8>, FixtureError> {
     let address = base
         .storage
         .derive_next_address_with_transparent(base.account_id)
@@ -238,19 +242,33 @@ pub(crate) async fn record_transparent_utxo_at(
     let transparent = address.transparent().copied().ok_or(FixtureError::Fixture(
         "derived address has no transparent receiver",
     ))?;
+    let script_pub_key_bytes = Script::from(transparent.script()).0.0;
+    let tx_id = TxId::from_bytes(funding_tx_id);
+    let value_zat = zatoshis(TRANSPARENT_UTXO_ZAT)?;
+    let mined_height = BlockHeight::from(mined_height);
+    base.chain_handle.serve_transparent_utxos(
+        script_pub_key_bytes.clone(),
+        vec![TransparentUtxo {
+            tx_id,
+            output_index: 0,
+            value_zat,
+            confirmed_at_height: mined_height,
+            script_pub_key_bytes: script_pub_key_bytes.clone(),
+        }],
+    );
     base.storage
         .record_transparent_utxos(
             None,
             vec![TransparentUtxoRow::new(
-                TxId::from_bytes(funding_tx_id),
+                tx_id,
                 0,
-                zatoshis(TRANSPARENT_UTXO_ZAT)?,
-                BlockHeight::from(mined_height),
-                Script::from(transparent.script()).0.0,
+                value_zat,
+                mined_height,
+                script_pub_key_bytes.clone(),
             )],
         )
         .await?;
-    Ok(())
+    Ok(script_pub_key_bytes)
 }
 
 /// Records a hold in the wallet's ledger, as a dispense reservation would.
@@ -507,7 +525,7 @@ fn sapling_trees_after(transaction: &Transaction) -> Result<MockCommitmentTrees,
 }
 
 /// Transaction id of a serialized NU7 transaction, or all zeros when it does not parse.
-fn parsed_transaction_id(raw_tx: &[u8]) -> TxId {
+pub(crate) fn parsed_transaction_id(raw_tx: &[u8]) -> TxId {
     Transaction::read(raw_tx, BranchId::Nu7).map_or(TxId::from_bytes([0; 32]), |transaction| {
         TxId::from_bytes(*transaction.txid().as_ref())
     })

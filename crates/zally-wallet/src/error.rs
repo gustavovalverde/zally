@@ -336,6 +336,30 @@ pub enum WalletError {
         tx_expiry_height: BlockHeight,
     },
 
+    /// The node kept the submitted transaction queued for verification and never reported it
+    /// accepted or already known, so nothing shows that it reached the mempool.
+    ///
+    /// A node answers a repeated submission of a transaction it is still verifying as queued,
+    /// and drops the transaction without another answer if verification fails, for example
+    /// when an input is in no block it holds. The send therefore may be lost. Its idempotency
+    /// key stays bound to `tx_id`: do not pay again under another key. Retrying the same key
+    /// submits the same bytes again and returns the send once the node reports it held. Once
+    /// the transaction can no longer be mined, the wallet reports
+    /// [`crate::WalletEvent::PendingBroadcastUnmineable`] and the key builds a replacement.
+    ///
+    /// Posture: [`FailurePosture::Retryable`]: retry the same key.
+    #[error(
+        "transaction {tx_id} stayed queued for verification at the node and was never \
+         reported accepted (expiry height {})",
+        tx_expiry_height.as_u32()
+    )]
+    BroadcastUnconfirmed {
+        /// Transaction the node kept queued.
+        tx_id: TxId,
+        /// The transaction's expiry height.
+        tx_expiry_height: BlockHeight,
+    },
+
     /// The sync driver requires a minimum chain source reorg window and has not yet read the
     /// source's window, so the wallet refuses new spends until it has.
     ///
@@ -379,7 +403,8 @@ impl WalletError {
             Self::CircuitBroken { .. }
             | Self::ChainSourceHalted { .. }
             | Self::SourceReorgWindowUnverified { .. }
-            | Self::PendingBroadcastUnsettled { .. } => FailurePosture::Retryable,
+            | Self::PendingBroadcastUnsettled { .. }
+            | Self::BroadcastUnconfirmed { .. } => FailurePosture::Retryable,
             Self::UnverifiedScanChunk { source, .. }
             | Self::TransparentUtxoRefreshIncomplete { source, .. } => source.posture(),
             Self::ProposalRejected { kind, .. } => kind.posture(),

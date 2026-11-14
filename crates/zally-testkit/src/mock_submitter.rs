@@ -25,6 +25,7 @@ struct MockState {
     submitted: Vec<Vec<u8>>,
     submit_failures: Vec<SubmitterError>,
     failures_consumed: u32,
+    queued_answers_remaining: u32,
     derive_tx_id: fn(&[u8]) -> TxId,
 }
 
@@ -48,11 +49,8 @@ impl MockSubmitter {
         Self::with_outcome(network, MockOutcome::Duplicating)
     }
 
-    /// Constructs a submitter that always returns `SubmitOutcome::Queued`.
-    ///
-    /// Used by tests that exercise the success-equivalent in-flight handling: the
-    /// caller observes the fallback tx id and the pending-broadcast row stays in
-    /// place, just like for `Duplicate`.
+    /// Constructs a submitter that always returns `SubmitOutcome::Queued`, as a node that
+    /// keeps a transaction queued for verification and never reports it held.
     #[must_use]
     pub fn queuing(network: Network) -> Self {
         Self::with_outcome(network, MockOutcome::Queuing)
@@ -79,6 +77,7 @@ impl MockSubmitter {
                 submitted: Vec::new(),
                 submit_failures: Vec::new(),
                 failures_consumed: 0,
+                queued_answers_remaining: 0,
                 derive_tx_id: derive_txid,
             })),
         }
@@ -132,6 +131,13 @@ impl MockSubmitterHandle {
         }
     }
 
+    /// Answers the next `count` submissions with `SubmitOutcome::Queued`, as a node still
+    /// verifying the transaction, before the configured outcome resumes. Queued failures from
+    /// [`Self::fail_submit_next`] are consumed first.
+    pub fn queue_next_submissions(&self, count: u32) {
+        self.state.lock().queued_answers_remaining = count;
+    }
+
     /// Number of failures consumed since the submitter was constructed.
     #[must_use]
     pub fn failures_consumed(&self) -> u32 {
@@ -154,7 +160,13 @@ impl Submitter for MockSubmitter {
                 return Err(injected);
             }
             guard.submitted.push(raw_tx.to_vec());
-            (guard.outcome.clone(), guard.derive_tx_id)
+            let outcome = if guard.queued_answers_remaining > 0 {
+                guard.queued_answers_remaining = guard.queued_answers_remaining.saturating_sub(1);
+                MockOutcome::Queuing
+            } else {
+                guard.outcome.clone()
+            };
+            (outcome, guard.derive_tx_id)
         };
         let (outcome, derive_tx_id) = outcome;
         let tx_id = derive_tx_id(raw_tx);

@@ -10,6 +10,7 @@
 //! [`Sqlite`] is a cheap [`Clone`] handle holding only the
 //! channel sender; the actor lives until every clone is dropped.
 
+use std::collections::HashSet;
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 
@@ -27,7 +28,7 @@ use uuid::Uuid;
 use zally_core::{
     AccountId, BlockHash, BlockHeight, CompactBlockArtifact, CompactShieldedAction,
     CompactTransaction, FailurePosture, HoldId, IdempotencyKey, Network, NetworkParameters,
-    TransparentGapLimit, TreeStateArtifact, TxId, Zatoshis,
+    OutPoint, TransparentGapLimit, TreeStateArtifact, TxId, Zatoshis,
 };
 use zally_keys::{KeyDerivationError, SeedMaterial, derive_ufvk};
 use zcash_address::unified::Revision;
@@ -1413,27 +1414,42 @@ impl WalletStorage for Sqlite {
         utxos: Vec<crate::wallet::TransparentUtxoRow>,
     ) -> Result<u64, StorageError> {
         self.with_db_mut(move |db| {
-            if let Some(min_scanned_height) = min_scanned_height {
-                let scanned_height = db
-                    .get_wallet_summary(ConfirmationsPolicy::default())
-                    .map_err(|e| map_sqlite_error(&e))?
-                    .map(|summary| BlockHeight::from(u32::from(summary.fully_scanned_height())));
-                if scanned_height.is_none_or(|height| height < min_scanned_height) {
-                    return Err(StorageError::ScanFrontierReceded {
-                        min_scanned_height,
-                        observed: scanned_height,
-                    });
-                }
-            }
-            db.transactionally(|wdb| {
-                let mut recorded_count = 0_u64;
-                for utxo in utxos {
-                    let output = transparent_utxo_row_to_output(utxo)?;
-                    wdb.put_received_transparent_utxo(&output)
-                        .map_err(|e| map_sqlite_error(&e))?;
-                    recorded_count = recorded_count.saturating_add(1);
-                }
-                Ok(recorded_count)
+            ensure_scan_frontier_at_least(db, min_scanned_height)?;
+            put_transparent_utxo_rows(db, utxos)
+        })
+        .await
+    }
+
+    async fn record_transparent_unspent_set(
+        &self,
+        min_scanned_height: Option<BlockHeight>,
+        unspent_set: crate::wallet::TransparentUnspentSet,
+    ) -> Result<crate::wallet::TransparentUnspentSetRecorded, StorageError> {
+        self.with_db_mut_and_ledger(move |db, ledger| {
+            ensure_scan_frontier_at_least(db, min_scanned_height)?;
+            let crate::wallet::TransparentUnspentSet {
+                script_pub_key_bytes,
+                observed_at_height,
+                utxos,
+            } = unspent_set;
+            let reported_tx_ids: HashSet<TxId> = utxos.iter().map(|utxo| utxo.tx_id).collect();
+            let recorded_count = put_transparent_utxo_rows(db, utxos)?;
+            let Some(chain_tip) = db.chain_height().map_err(|e| map_sqlite_error(&e))? else {
+                return Ok(crate::wallet::TransparentUnspentSetRecorded {
+                    recorded_count,
+                    retired_outpoints: Vec::new(),
+                });
+            };
+            let retired_outpoints = retire_unreported_transparent_utxos(
+                ledger,
+                &script_pub_key_bytes,
+                observed_at_height,
+                BlockHeight::from(u32::from(chain_tip).saturating_add(1)),
+                &reported_tx_ids,
+            )?;
+            Ok(crate::wallet::TransparentUnspentSetRecorded {
+                recorded_count,
+                retired_outpoints,
             })
         })
         .await
@@ -1451,50 +1467,21 @@ impl WalletStorage for Sqlite {
         &self,
         request: crate::wallet::ScanRequest,
     ) -> Result<crate::wallet::ScanResult, StorageError> {
-        if request
-            .from_state
-            .height
-            .as_u32()
-            .checked_add(1)
-            .is_none_or(|expected_from| expected_from != request.from_height.as_u32())
-        {
-            return Err(StorageError::ScanArtifactInvalid {
-                field: "scan_request.from_state.height",
-                reason: format!(
-                    "tree-state height {} must immediately precede scan height {}",
-                    request.from_state.height, request.from_height
-                ),
-            });
-        }
-        let params = self.options.network.to_parameters();
-        let from_height_proto: zcash_protocol::consensus::BlockHeight = request.from_height.into();
-        let block_count = u64::try_from(request.blocks.len()).unwrap_or(u64::MAX);
-        let limit = request.blocks.len().max(1);
-        let blocks = request
-            .blocks
-            .into_iter()
-            .map(compact_block_to_upstream)
-            .collect::<Result<Vec<_>, _>>()?;
-        let source = InMemoryBlockSource { blocks };
-        let from_state = tree_state_to_upstream(request.from_state, self.options.network)?;
+        let scan = PreparedScan::new(request, self.options.network)?;
+        self.with_db_mut(move |db| scan.run(db)).await
+    }
 
-        self.with_db_mut(move |db| {
-            zcash_client_backend::data_api::chain::scan_cached_blocks(
-                &params,
-                &source,
-                db,
-                from_height_proto,
-                &from_state,
-                limit,
-            )
-            .map_err(|err| map_scan_error(&err))
-            .map(|summary| {
-                let scanned_to_u32 = u32::from(summary.scanned_range().end.saturating_sub(1));
-                crate::wallet::ScanResult {
-                    scanned_to_height: BlockHeight::from(scanned_to_u32),
-                    block_count,
-                }
-            })
+    async fn scan_blocks_to_tip(
+        &self,
+        chain_tips: ChainTips,
+        request: crate::wallet::ScanRequest,
+    ) -> Result<crate::wallet::ScanResult, StorageError> {
+        validate_chain_tips(chain_tips)?;
+        let scan = PreparedScan::new(request, self.options.network)?;
+        self.with_db_mut_and_ledger(move |db, ledger| {
+            update_upstream_chain_tip(db, chain_tips.visible)?;
+            upsert_chain_tips(ledger, chain_tips)?;
+            scan.run(db)
         })
         .await
     }
@@ -1794,16 +1781,8 @@ impl WalletStorage for Sqlite {
     }
 
     async fn update_chain_tip(&self, tip_height: BlockHeight) -> Result<(), StorageError> {
-        let target = zcash_protocol::consensus::BlockHeight::from(tip_height.as_u32());
-        self.with_db_mut(move |db| {
-            zcash_client_backend::data_api::WalletWrite::update_chain_tip(db, target).map_err(
-                |err| StorageError::SqliteFailed {
-                    reason: format!("update_chain_tip failed: {err}"),
-                    posture: FailurePosture::NotRetryable,
-                },
-            )
-        })
-        .await
+        self.with_db_mut(move |db| update_upstream_chain_tip(db, tip_height))
+            .await
     }
 
     async fn fully_scanned_height(&self) -> Result<Option<BlockHeight>, StorageError> {
@@ -2623,30 +2602,13 @@ impl WalletStorage for Sqlite {
         visible_tip: BlockHeight,
         settled_tip: BlockHeight,
     ) -> Result<(), StorageError> {
-        if settled_tip > visible_tip {
-            return Err(StorageError::InvalidChainTips {
-                visible_tip,
-                settled_tip,
-            });
-        }
-        let visible_tip_i64 = i64::from(visible_tip.as_u32());
-        let settled_tip_i64 = i64::from(settled_tip.as_u32());
-        self.with_ledger(move |conn| {
-            conn.execute(
-                "INSERT INTO ext_zally_chain_tips \
-                     (id, visible_tip_height, settled_tip_height) VALUES (0, ?1, ?2) \
-                 ON CONFLICT(id) DO UPDATE SET \
-                     visible_tip_height = excluded.visible_tip_height, \
-                     settled_tip_height = excluded.settled_tip_height",
-                [visible_tip_i64, settled_tip_i64],
-            )
-            .map_err(|err| StorageError::SqliteFailed {
-                reason: format!("ext_zally_chain_tips upsert failed: {err}"),
-                posture: FailurePosture::NotRetryable,
-            })?;
-            Ok(())
-        })
-        .await
+        let chain_tips = ChainTips {
+            visible: visible_tip,
+            settled: settled_tip,
+        };
+        validate_chain_tips(chain_tips)?;
+        self.with_ledger(move |conn| upsert_chain_tips(conn, chain_tips))
+            .await
     }
 
     async fn record_pending_broadcast_inputs(
@@ -5330,6 +5292,260 @@ fn decode_diversifier_index_be(
             })?;
     di_be.reverse();
     Ok(zip32::DiversifierIndex::from(di_be))
+}
+
+/// Fails with [`StorageError::ScanFrontierReceded`] unless the wallet's fully scanned height is
+/// still at or above `min_scanned_height`. `None` checks nothing.
+fn ensure_scan_frontier_at_least(
+    db: &Db,
+    min_scanned_height: Option<BlockHeight>,
+) -> Result<(), StorageError> {
+    let Some(min_scanned_height) = min_scanned_height else {
+        return Ok(());
+    };
+    let scanned_height = db
+        .get_wallet_summary(ConfirmationsPolicy::default())
+        .map_err(|e| map_sqlite_error(&e))?
+        .map(|summary| BlockHeight::from(u32::from(summary.fully_scanned_height())));
+    if scanned_height.is_none_or(|height| height < min_scanned_height) {
+        return Err(StorageError::ScanFrontierReceded {
+            min_scanned_height,
+            observed: scanned_height,
+        });
+    }
+    Ok(())
+}
+
+fn put_transparent_utxo_rows(
+    db: &mut Db,
+    utxos: Vec<crate::wallet::TransparentUtxoRow>,
+) -> Result<u64, StorageError> {
+    db.transactionally(|wdb| {
+        let mut recorded_count = 0_u64;
+        for utxo in utxos {
+            let output = transparent_utxo_row_to_output(utxo)?;
+            wdb.put_received_transparent_utxo(&output)
+                .map_err(|e| map_sqlite_error(&e))?;
+            recorded_count = recorded_count.saturating_add(1);
+        }
+        Ok(recorded_count)
+    })
+}
+
+/// Retirement candidates: outputs recorded at script `?1`, mined at or below `?2`.
+///
+/// No transaction mined or unexpired at the next block (`?3`) spends a candidate, and its
+/// producing transaction carries nothing else of the wallet's: no shielded note it received
+/// and no spend of its funds.
+const UNREPORTED_TRANSPARENT_UTXO_CANDIDATES_SQL: &str = "\
+    SELECT t.id_tx, t.txid, tro.output_index \
+    FROM transparent_received_outputs tro \
+    JOIN transactions t ON t.id_tx = tro.transaction_id \
+    WHERE tro.script = ?1 \
+      AND t.mined_height <= ?2 \
+      AND NOT EXISTS ( \
+          SELECT 1 FROM transparent_received_output_spends spend \
+          JOIN transactions spending ON spending.id_tx = spend.transaction_id \
+          WHERE spend.transparent_received_output_id = tro.id \
+            AND (spending.mined_height IS NOT NULL \
+                 OR spending.expiry_height IS NULL \
+                 OR spending.expiry_height = 0 \
+                 OR spending.expiry_height >= ?3)) \
+      AND NOT EXISTS (SELECT 1 FROM sapling_received_notes WHERE transaction_id = t.id_tx) \
+      AND NOT EXISTS (SELECT 1 FROM orchard_received_notes WHERE transaction_id = t.id_tx) \
+      AND NOT EXISTS (SELECT 1 FROM ironwood_received_notes WHERE transaction_id = t.id_tx) \
+      AND NOT EXISTS (SELECT 1 FROM sapling_received_note_spends WHERE transaction_id = t.id_tx) \
+      AND NOT EXISTS (SELECT 1 FROM orchard_received_note_spends WHERE transaction_id = t.id_tx) \
+      AND NOT EXISTS (SELECT 1 FROM ironwood_received_note_spends WHERE transaction_id = t.id_tx) \
+      AND NOT EXISTS ( \
+          SELECT 1 FROM transparent_received_output_spends WHERE transaction_id = t.id_tx)";
+
+/// Un-mines one transaction.
+///
+/// This is the statement `zcash_client_sqlite`'s `truncate_to_height` runs for every
+/// transaction above the truncation height. That crate has no call that un-mines a single
+/// transaction at or below the wallet's scanned height.
+const UNMINE_TRANSPARENT_RECEIVE_SQL: &str = "\
+    UPDATE transactions \
+    SET block = NULL, mined_height = NULL, tx_index = NULL, confirmed_unmined_at_height = NULL \
+    WHERE id_tx = ?1";
+
+const CLEAR_OBSERVED_UNSPENT_HEIGHT_SQL: &str = "\
+    UPDATE transparent_received_outputs SET max_observed_unspent_height = NULL \
+    WHERE transaction_id = ?1";
+
+/// Un-mines the producing transaction of every candidate output at `script_pub_key_bytes` that
+/// the receiver's unspent set omits, in one transaction, and returns the retired outpoints.
+///
+/// A candidate whose producing transaction the set still names is kept: the set proves that
+/// transaction is in the chain.
+fn retire_unreported_transparent_utxos(
+    ledger: &rusqlite::Connection,
+    script_pub_key_bytes: &[u8],
+    observed_at_height: BlockHeight,
+    next_block_height: BlockHeight,
+    reported_tx_ids: &HashSet<TxId>,
+) -> Result<Vec<OutPoint>, StorageError> {
+    let retirement_failed = |err: rusqlite::Error| StorageError::SqliteFailed {
+        reason: format!("retiring unreported transparent UTXOs failed: {err}"),
+        posture: FailurePosture::NotRetryable,
+    };
+    let transaction = ledger.unchecked_transaction().map_err(retirement_failed)?;
+    let candidates = {
+        let mut statement = transaction
+            .prepare(UNREPORTED_TRANSPARENT_UTXO_CANDIDATES_SQL)
+            .map_err(retirement_failed)?;
+        let rows = statement
+            .query_map(
+                rusqlite::params![
+                    script_pub_key_bytes,
+                    observed_at_height.as_u32(),
+                    next_block_height.as_u32()
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, Vec<u8>>(1)?,
+                        row.get::<_, u32>(2)?,
+                    ))
+                },
+            )
+            .map_err(retirement_failed)?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(retirement_failed)?
+    };
+    let mut unmined_transactions = HashSet::new();
+    let mut retired_outpoints = Vec::new();
+    for (transaction_row_id, tx_id_bytes, output_index) in candidates {
+        let tx_id_bytes: [u8; 32] =
+            tx_id_bytes
+                .try_into()
+                .map_err(|_| StorageError::SqliteFailed {
+                    reason: "transactions.txid is not 32 bytes".to_owned(),
+                    posture: FailurePosture::NotRetryable,
+                })?;
+        let tx_id = TxId::from_bytes(tx_id_bytes);
+        if reported_tx_ids.contains(&tx_id) {
+            continue;
+        }
+        if unmined_transactions.insert(transaction_row_id) {
+            transaction
+                .execute(UNMINE_TRANSPARENT_RECEIVE_SQL, [transaction_row_id])
+                .map_err(retirement_failed)?;
+            transaction
+                .execute(CLEAR_OBSERVED_UNSPENT_HEIGHT_SQL, [transaction_row_id])
+                .map_err(retirement_failed)?;
+        }
+        retired_outpoints.push(OutPoint::new(tx_id, output_index));
+    }
+    transaction.commit().map_err(retirement_failed)?;
+    Ok(retired_outpoints)
+}
+
+/// A scan request converted to upstream types, ready to run on the wallet-db actor.
+struct PreparedScan {
+    params: NetworkParameters,
+    from_height: zcash_protocol::consensus::BlockHeight,
+    from_state: ChainState,
+    source: InMemoryBlockSource,
+    block_count: u64,
+    limit: usize,
+}
+
+impl PreparedScan {
+    fn new(request: crate::wallet::ScanRequest, network: Network) -> Result<Self, StorageError> {
+        if request
+            .from_state
+            .height
+            .as_u32()
+            .checked_add(1)
+            .is_none_or(|expected_from| expected_from != request.from_height.as_u32())
+        {
+            return Err(StorageError::ScanArtifactInvalid {
+                field: "scan_request.from_state.height",
+                reason: format!(
+                    "tree-state height {} must immediately precede scan height {}",
+                    request.from_state.height, request.from_height
+                ),
+            });
+        }
+        let block_count = u64::try_from(request.blocks.len()).unwrap_or(u64::MAX);
+        let limit = request.blocks.len().max(1);
+        let blocks = request
+            .blocks
+            .into_iter()
+            .map(compact_block_to_upstream)
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self {
+            params: network.to_parameters(),
+            from_height: request.from_height.into(),
+            from_state: tree_state_to_upstream(request.from_state, network)?,
+            source: InMemoryBlockSource { blocks },
+            block_count,
+            limit,
+        })
+    }
+
+    fn run(self, db: &mut Db) -> Result<crate::wallet::ScanResult, StorageError> {
+        zcash_client_backend::data_api::chain::scan_cached_blocks(
+            &self.params,
+            &self.source,
+            db,
+            self.from_height,
+            &self.from_state,
+            self.limit,
+        )
+        .map_err(|err| map_scan_error(&err))
+        .map(|summary| {
+            let scanned_to_u32 = u32::from(summary.scanned_range().end.saturating_sub(1));
+            crate::wallet::ScanResult {
+                scanned_to_height: BlockHeight::from(scanned_to_u32),
+                block_count: self.block_count,
+            }
+        })
+    }
+}
+
+fn update_upstream_chain_tip(db: &mut Db, tip_height: BlockHeight) -> Result<(), StorageError> {
+    let target = zcash_protocol::consensus::BlockHeight::from(tip_height.as_u32());
+    zcash_client_backend::data_api::WalletWrite::update_chain_tip(db, target).map_err(|err| {
+        StorageError::SqliteFailed {
+            reason: format!("update_chain_tip failed: {err}"),
+            posture: FailurePosture::NotRetryable,
+        }
+    })
+}
+
+const fn validate_chain_tips(chain_tips: ChainTips) -> Result<(), StorageError> {
+    if chain_tips.settled.as_u32() > chain_tips.visible.as_u32() {
+        return Err(StorageError::InvalidChainTips {
+            visible_tip: chain_tips.visible,
+            settled_tip: chain_tips.settled,
+        });
+    }
+    Ok(())
+}
+
+fn upsert_chain_tips(
+    conn: &rusqlite::Connection,
+    chain_tips: ChainTips,
+) -> Result<(), StorageError> {
+    conn.execute(
+        "INSERT INTO ext_zally_chain_tips \
+             (id, visible_tip_height, settled_tip_height) VALUES (0, ?1, ?2) \
+         ON CONFLICT(id) DO UPDATE SET \
+             visible_tip_height = excluded.visible_tip_height, \
+             settled_tip_height = excluded.settled_tip_height",
+        [
+            i64::from(chain_tips.visible.as_u32()),
+            i64::from(chain_tips.settled.as_u32()),
+        ],
+    )
+    .map_err(|err| StorageError::SqliteFailed {
+        reason: format!("ext_zally_chain_tips upsert failed: {err}"),
+        posture: FailurePosture::NotRetryable,
+    })?;
+    Ok(())
 }
 
 fn transparent_utxo_row_to_output(

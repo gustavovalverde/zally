@@ -376,6 +376,47 @@ impl TransparentUtxoRow {
     }
 }
 
+/// The complete unspent set a chain source reported for one transparent receiver at one
+/// chain epoch.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub struct TransparentUnspentSet {
+    /// Receiver `scriptPubKey` bytes the set was read for.
+    pub script_pub_key_bytes: Vec<u8>,
+    /// Visible tip of the chain epoch that served the set. The set says nothing about an
+    /// output mined above this height.
+    pub observed_at_height: BlockHeight,
+    /// Every unspent output the chain source reported for the receiver.
+    pub utxos: Vec<TransparentUtxoRow>,
+}
+
+impl TransparentUnspentSet {
+    /// Constructs a transparent unspent set.
+    #[must_use]
+    pub fn new(
+        script_pub_key_bytes: Vec<u8>,
+        observed_at_height: BlockHeight,
+        utxos: Vec<TransparentUtxoRow>,
+    ) -> Self {
+        Self {
+            script_pub_key_bytes,
+            observed_at_height,
+            utxos,
+        }
+    }
+}
+
+/// Summary of one [`WalletStorage::record_transparent_unspent_set`] call.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[non_exhaustive]
+pub struct TransparentUnspentSetRecorded {
+    /// Number of reported outputs recorded.
+    pub recorded_count: u64,
+    /// Recorded outputs of the receiver that the set no longer contains, now out of every
+    /// balance and proposal.
+    pub retired_outpoints: Vec<OutPoint>,
+}
+
 /// Summary of a successful [`WalletStorage::propose_payment`] call.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
@@ -600,6 +641,37 @@ pub trait WalletStorage: Send + Sync + 'static {
         utxos: Vec<TransparentUtxoRow>,
     ) -> Result<u64, StorageError>;
 
+    /// Records one transparent receiver's complete unspent set, then retires the receiver's
+    /// recorded outputs that the set no longer contains.
+    ///
+    /// Records every output in `unspent_set` as [`Self::record_transparent_utxos`] does, under
+    /// the same `min_scanned_height` guard, which covers the retirement too. It then retires
+    /// each output recorded at the receiver's script that the set omits, when all of these
+    /// hold:
+    ///
+    /// - its producing transaction is mined at or below `unspent_set.observed_at_height`, so
+    ///   the set's epoch could see it. An output known only from the mempool, or mined above
+    ///   that height, is left alone.
+    /// - no transaction that is mined, or whose expiry has not passed, spends it. An output
+    ///   the wallet's own send consumed keeps its spend record instead.
+    /// - the wallet holds no shielded note from the producing transaction and records no
+    ///   spend by it, so no block scan attests the transaction's place in the chain.
+    ///
+    /// A source omits such an output once a reorg replaced the block that mined it, including
+    /// a block below the wallet's scanned height: rescanning that height cannot un-mine a
+    /// transaction with no shielded part. Retiring un-mines the producing transaction, as a
+    /// rewind below its height does, so the output leaves every balance and proposal while
+    /// its row stays. A later set that reports the output again records it again at the
+    /// reported height.
+    ///
+    /// `not_retryable` on malformed output scripts or schema errors; `restartable` on a
+    /// receded scan frontier; `retryable` on transient I/O.
+    async fn record_transparent_unspent_set(
+        &self,
+        min_scanned_height: Option<BlockHeight>,
+        unspent_set: TransparentUnspentSet,
+    ) -> Result<TransparentUnspentSetRecorded, StorageError>;
+
     /// Returns the network this storage instance was opened for.
     fn network(&self) -> Network;
 
@@ -619,6 +691,24 @@ pub trait WalletStorage: Send + Sync + 'static {
     ///
     /// `not_retryable` on malformed blocks or chain-state mismatch; `retryable` on transient I/O.
     async fn scan_blocks(&self, request: ScanRequest) -> Result<ScanResult, StorageError>;
+
+    /// Moves the chain tip to `chain_tips` and scans `request.blocks` in one step, so no read
+    /// sees the new tip before the blocks that reach it are scanned.
+    ///
+    /// Runs [`Self::update_chain_tip`] with `chain_tips.visible`, [`Self::record_chain_tips`],
+    /// and [`Self::scan_blocks`] with nothing in between. While a recorded tip is ahead of the
+    /// scanned blocks, `zcash_client_sqlite` treats every note in the commitment-tree shard the
+    /// unscanned blocks fall in as lacking a witness, so balances and proposals would leave
+    /// those notes out until the scan caught up. The caller passes blocks that run from the
+    /// wallet's scanned frontier to `chain_tips.visible`.
+    ///
+    /// `not_retryable` on invalid chain tips, malformed blocks, or chain-state mismatch;
+    /// `retryable` on transient I/O.
+    async fn scan_blocks_to_tip(
+        &self,
+        chain_tips: ChainTips,
+        request: ScanRequest,
+    ) -> Result<ScanResult, StorageError>;
 
     /// Returns the scan ranges the wallet wants scanned, highest priority first.
     ///

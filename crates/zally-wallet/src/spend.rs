@@ -5,6 +5,9 @@
 //! `Wallet::send_payment` adds signing and submission through the caller-supplied
 //! `Submitter`.
 
+use std::time::Duration;
+
+use tokio::time::{Instant, sleep};
 use zally_chain::{ShieldedPool, Submitter};
 use zally_core::{
     AccountId, BlockHeight, IdempotencyKey, Memo, MemoBytes, Network, PaymentRecipient, TxId,
@@ -26,6 +29,27 @@ struct SubmissionContext<'a> {
     account_id: AccountId,
     visible_tip: Option<BlockHeight>,
     idempotency: &'a IdempotencyKey,
+}
+
+/// Pause before a send submits again a transaction the node answered as queued.
+const QUEUED_BROADCAST_RESUBMIT_INTERVAL: Duration = Duration::from_secs(1);
+
+/// One transaction to submit until the node reports it holds it.
+pub(crate) struct BroadcastAttempt<'a> {
+    pub(crate) operation: &'static str,
+    pub(crate) submitter: &'a dyn Submitter,
+    pub(crate) raw_bytes: &'a [u8],
+    pub(crate) tx_id: TxId,
+    pub(crate) tx_expiry_height: BlockHeight,
+}
+
+/// What a node's answer to one submission shows about the transaction.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SubmitAcknowledgement {
+    /// The node accepted the transaction or already holds it in its mempool or chain.
+    Held,
+    /// The node queued the transaction for verification without a verdict yet.
+    Queued,
 }
 
 /// Parsed ZIP-321 payment request.
@@ -359,8 +383,14 @@ impl Wallet {
     /// the same key builds one replacement. Sends that share a key through one wallet handle
     /// run one at a time, so concurrent retries return the same transaction.
     ///
+    /// A node that only queues the transaction for verification is asked again until it
+    /// reports the transaction held; one that keeps it queued past
+    /// [`crate::WalletOptions::queued_broadcast_confirmation_ms`] fails the call with
+    /// [`WalletError::BroadcastUnconfirmed`] and the key stays bound.
+    ///
     /// `not_retryable` on validation failure, insufficient balance, or missing prover
-    /// params; `retryable` on transient submitter failures.
+    /// params; `retryable` on transient submitter failures and on
+    /// [`WalletError::BroadcastUnconfirmed`].
     #[allow(
         clippy::too_many_lines,
         reason = "send_payment is the single composed flow; splitting it further would scatter the (sign, idempotency, broadcast) transaction across helpers"
@@ -526,7 +556,8 @@ impl Wallet {
     /// shorter branch, mines the shielding transaction above its own tip, so an output mature
     /// only against the wallet's tip waits for a later call. When what remains is below
     /// `plan.shielding_threshold_zat`, the call fails with [`WalletError::InsufficientBalance`]
-    /// and submits nothing.
+    /// and submits nothing. An output the chain source stopped reporting, for example one a
+    /// reorg removed, is never selected once [`Wallet::refresh_transparent_utxos`] retired it.
     ///
     /// `plan.idempotency` makes the send idempotent, as for [`Wallet::send_payment`]: the key
     /// is bound to the shielding transaction before it is submitted, and a key that already
@@ -537,8 +568,12 @@ impl Wallet {
     /// the same key builds one replacement. Sends that share a key through one wallet handle
     /// run one at a time, so concurrent retries return the same transaction.
     ///
+    /// As for [`Wallet::send_payment`], a node that keeps the shielding queued for
+    /// verification fails the call with [`WalletError::BroadcastUnconfirmed`].
+    ///
     /// `not_retryable` on insufficient transparent funds or missing prover params;
-    /// `retryable` on transient submitter failures.
+    /// `retryable` on transient submitter failures and on
+    /// [`WalletError::BroadcastUnconfirmed`].
     pub async fn shield_transparent_funds(
         &self,
         plan: ShieldTransparentPlan<'_>,
@@ -659,16 +694,15 @@ impl Wallet {
             .await?;
 
         for (step_index, transaction) in prepared.iter().enumerate() {
-            let policy = self.broadcast_retry_policy();
-            let submitted = crate::retry::with_breaker_and_retry(
-                &self.inner.circuit_breaker,
-                policy,
-                submission.operation,
-                || submission.submitter.submit(&transaction.raw_bytes),
-                WalletError::from,
-            )
-            .await
-            .and_then(|outcome| resolve_send_outcome(outcome, transaction.tx_id));
+            let submitted = self
+                .submit_until_held(BroadcastAttempt {
+                    operation: submission.operation,
+                    submitter: submission.submitter,
+                    raw_bytes: &transaction.raw_bytes,
+                    tx_id: transaction.tx_id,
+                    tx_expiry_height: transaction.tx_expiry_height,
+                })
+                .await;
             let Err(error) = submitted else {
                 continue;
             };
@@ -747,15 +781,15 @@ impl Wallet {
                         tx_expiry_height,
                     });
                 }
-                let outcome = crate::retry::with_breaker_and_retry(
-                    &self.inner.circuit_breaker,
-                    self.broadcast_retry_policy(),
+                self.submit_until_held(BroadcastAttempt {
                     operation,
-                    || submitter.submit(raw_bytes),
-                    WalletError::from,
-                )
+                    submitter,
+                    raw_bytes,
+                    tx_id: step.tx_id,
+                    tx_expiry_height: zally_chain::parse_transaction_expiry_height(raw_bytes)
+                        .unwrap_or_else(|_| BlockHeight::from(0)),
+                })
                 .await?;
-                resolve_send_outcome(outcome, step.tx_id)?;
             }
         }
         let broadcast_at_height = visible_tip.unwrap_or_else(|| BlockHeight::from(0));
@@ -770,6 +804,63 @@ impl Wallet {
                 broadcast_at_height,
             },
         }))
+    }
+
+    /// Submits `attempt.raw_bytes` until the node reports that it holds the transaction.
+    ///
+    /// Each submission runs under the broadcast retry policy and the circuit breaker. An
+    /// accepted or duplicate answer means the node holds the transaction in its mempool or its
+    /// chain. A queued answer means it is still verifying the transaction and may yet drop it
+    /// without another answer, so the same bytes go again after
+    /// [`QUEUED_BROADCAST_RESUBMIT_INTERVAL`] until
+    /// [`crate::WalletOptions::queued_broadcast_confirmation_ms`] runs out, and the call then
+    /// fails with [`WalletError::BroadcastUnconfirmed`].
+    pub(crate) async fn submit_until_held(
+        &self,
+        attempt: BroadcastAttempt<'_>,
+    ) -> Result<(), WalletError> {
+        let budget = Duration::from_millis(self.inner.options.queued_broadcast_confirmation_ms);
+        let started_at = Instant::now();
+        let mut queued_answers = 0_u32;
+        loop {
+            let outcome = crate::retry::with_breaker_and_retry(
+                &self.inner.circuit_breaker,
+                self.broadcast_retry_policy(),
+                attempt.operation,
+                || attempt.submitter.submit(attempt.raw_bytes),
+                WalletError::from,
+            )
+            .await?;
+            if resolve_submit_outcome(outcome, attempt.tx_id)? == SubmitAcknowledgement::Held {
+                return Ok(());
+            }
+            queued_answers = queued_answers.saturating_add(1);
+            let remaining = budget.saturating_sub(started_at.elapsed());
+            if remaining.is_zero() {
+                tracing::warn!(
+                    target: "zally::wallet",
+                    event = "broadcast_unconfirmed",
+                    operation = attempt.operation,
+                    tx_id = %attempt.tx_id,
+                    queued_answers,
+                    "the node kept the transaction queued for verification and never reported \
+                     it held"
+                );
+                return Err(WalletError::BroadcastUnconfirmed {
+                    tx_id: attempt.tx_id,
+                    tx_expiry_height: attempt.tx_expiry_height,
+                });
+            }
+            tracing::info!(
+                target: "zally::wallet",
+                event = "broadcast_queued",
+                operation = attempt.operation,
+                tx_id = %attempt.tx_id,
+                queued_answers,
+                "the node queued the transaction for verification; submitting it again"
+            );
+            sleep(remaining.min(QUEUED_BROADCAST_RESUBMIT_INTERVAL)).await;
+        }
     }
 
     async fn visible_tip_or_zero(&self) -> Result<BlockHeight, WalletError> {
@@ -830,30 +921,31 @@ pub(crate) fn protocol_shielded_pool(
     clippy::wildcard_enum_match_arm,
     reason = "non_exhaustive submit outcomes fall through to SubmissionRejected with a placeholder typed reason"
 )]
-fn resolve_send_outcome(
+fn resolve_submit_outcome(
     outcome: zally_chain::SubmitOutcome,
     expected_tx_id: TxId,
-) -> Result<TxId, WalletError> {
-    match outcome {
+) -> Result<SubmitAcknowledgement, WalletError> {
+    let (tx_id, acknowledgement) = match outcome {
         zally_chain::SubmitOutcome::Accepted { tx_id }
-        | zally_chain::SubmitOutcome::Duplicate { tx_id }
-        | zally_chain::SubmitOutcome::Queued { tx_id } => {
-            if tx_id != expected_tx_id {
-                return Err(WalletError::SubmittedTransactionIdMismatch {
-                    expected: expected_tx_id,
-                    returned: tx_id,
-                });
-            }
-            Ok(tx_id)
-        }
+        | zally_chain::SubmitOutcome::Duplicate { tx_id } => (tx_id, SubmitAcknowledgement::Held),
+        zally_chain::SubmitOutcome::Queued { tx_id } => (tx_id, SubmitAcknowledgement::Queued),
         zally_chain::SubmitOutcome::Rejected { reason, detail } => {
-            Err(WalletError::SubmissionRejected { reason, detail })
+            return Err(WalletError::SubmissionRejected { reason, detail });
         }
-        _ => Err(WalletError::SubmissionRejected {
-            reason: zally_chain::RejectionReason::Unknown,
-            detail: "submitter returned an unrecognised outcome variant".into(),
-        }),
+        _ => {
+            return Err(WalletError::SubmissionRejected {
+                reason: zally_chain::RejectionReason::Unknown,
+                detail: "submitter returned an unrecognised outcome variant".into(),
+            });
+        }
+    };
+    if tx_id != expected_tx_id {
+        return Err(WalletError::SubmittedTransactionIdMismatch {
+            expected: expected_tx_id,
+            returned: tx_id,
+        });
     }
+    Ok(acknowledgement)
 }
 
 fn memo_to_wire_bytes(memo: &Memo) -> Vec<u8> {
@@ -1458,37 +1550,60 @@ mod tests {
         clippy::wildcard_enum_match_arm,
         reason = "tests assert on exact outcome shapes; expect/panic make failing assertions readable, and wildcard arms catch future SubmitOutcome variants intentionally"
     )]
-    mod resolve_send_outcome {
+    mod resolve_submit_outcome {
         use super::*;
 
         #[test]
-        fn returns_accepted_tx_id() {
+        fn accepted_is_held() {
             let accepted_tx_id = TxId::from_bytes([7_u8; 32]);
             let outcome = zally_chain::SubmitOutcome::Accepted {
                 tx_id: accepted_tx_id,
             };
-            let tx_id = resolve_send_outcome(outcome, accepted_tx_id).expect("Accepted is Ok");
-            assert_eq!(tx_id, accepted_tx_id);
+            let acknowledgement =
+                resolve_submit_outcome(outcome, accepted_tx_id).expect("Accepted is Ok");
+            assert_eq!(acknowledgement, SubmitAcknowledgement::Held);
         }
 
         #[test]
-        fn returns_canonical_tx_id_on_duplicate() {
+        fn duplicate_is_held() {
             let expected_tx_id = TxId::from_bytes([1_u8; 32]);
             let outcome = zally_chain::SubmitOutcome::Duplicate {
                 tx_id: expected_tx_id,
             };
-            let tx_id = resolve_send_outcome(outcome, expected_tx_id).expect("Duplicate is Ok");
-            assert_eq!(tx_id, expected_tx_id);
+            let acknowledgement =
+                resolve_submit_outcome(outcome, expected_tx_id).expect("Duplicate is Ok");
+            assert_eq!(acknowledgement, SubmitAcknowledgement::Held);
         }
 
         #[test]
-        fn returns_canonical_tx_id_on_queued() {
+        fn queued_is_not_held() {
             let expected_tx_id = TxId::from_bytes([1_u8; 32]);
             let outcome = zally_chain::SubmitOutcome::Queued {
                 tx_id: expected_tx_id,
             };
-            let tx_id = resolve_send_outcome(outcome, expected_tx_id).expect("Queued is Ok");
-            assert_eq!(tx_id, expected_tx_id);
+            let acknowledgement =
+                resolve_submit_outcome(outcome, expected_tx_id).expect("Queued is Ok");
+            assert_eq!(acknowledgement, SubmitAcknowledgement::Queued);
+        }
+
+        #[test]
+        fn rejects_queued_outcome_for_a_different_transaction() {
+            let expected_tx_id = TxId::from_bytes([1_u8; 32]);
+            let returned_tx_id = TxId::from_bytes([2_u8; 32]);
+            let outcome = zally_chain::SubmitOutcome::Queued {
+                tx_id: returned_tx_id,
+            };
+
+            let error = resolve_submit_outcome(outcome, expected_tx_id)
+                .expect_err("mismatched queued txid must fail closed");
+
+            assert!(matches!(
+                error,
+                WalletError::SubmittedTransactionIdMismatch {
+                    expected,
+                    returned,
+                } if expected == expected_tx_id && returned == returned_tx_id
+            ));
         }
 
         #[test]
@@ -1499,7 +1614,7 @@ mod tests {
                 tx_id: returned_tx_id,
             };
 
-            let error = resolve_send_outcome(outcome, expected_tx_id)
+            let error = resolve_submit_outcome(outcome, expected_tx_id)
                 .expect_err("mismatched success txid must fail closed");
 
             assert!(matches!(
@@ -1518,7 +1633,7 @@ mod tests {
                 reason: zally_chain::RejectionReason::MempoolFull,
                 detail: "queue at capacity".to_owned(),
             };
-            let err = resolve_send_outcome(outcome, fallback_tx_id).expect_err("Rejected is Err");
+            let err = resolve_submit_outcome(outcome, fallback_tx_id).expect_err("Rejected is Err");
             match err {
                 WalletError::SubmissionRejected { reason, detail } => {
                     assert_eq!(reason, zally_chain::RejectionReason::MempoolFull);

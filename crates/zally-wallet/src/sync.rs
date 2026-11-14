@@ -39,7 +39,7 @@ use zally_chain::{
     ShieldedPool, Submitter, SubtreeIndex,
 };
 use zally_core::{BlockHeight, CompactBlockArtifact, Network, TreeStateArtifact};
-use zally_storage::{ScanRequest, StorageError};
+use zally_storage::{ChainTips, ScanRequest, StorageError};
 use zcash_client_backend::data_api::scanning::ScanPriority;
 
 use crate::error::WalletError;
@@ -54,6 +54,10 @@ use crate::wallet::{Wallet, current_unix_ms};
 /// Maximum compact blocks scanned in one `Wallet::sync` call. A suggested range larger than
 /// this is scanned across successive calls; the driver loops until the scan queue drains.
 const MAX_BLOCKS_PER_SYNC: u32 = 1_000;
+
+/// Most blocks a caught-up wallet scans in the same storage step that records the new tip.
+/// A frontier further behind is catch-up work, planned through the scan queue.
+const TIP_EXTENSION_MAX_BLOCKS: u32 = 10;
 
 /// Subtree-root page size for the per-cycle backfill. Zinder clamps to its own page cap.
 const SUBTREE_ROOT_PAGE: u32 = 128;
@@ -72,6 +76,24 @@ struct ScanContext {
     scanned_from: BlockHeight,
     target_height: BlockHeight,
     block_count: u64,
+}
+
+/// How one scan step's blocks relate to the recorded chain tip.
+#[derive(Clone, Copy)]
+enum ScanTarget {
+    /// A range the scan queue suggested against a tip already recorded.
+    QueuedRange(zally_chain::ChainEpoch),
+    /// The blocks between a caught-up wallet's scanned frontier and the epoch's visible tip,
+    /// recorded as the new tip in the same storage step as their scan.
+    TipExtension(zally_chain::ChainEpoch),
+}
+
+impl ScanTarget {
+    const fn chain_epoch(self) -> zally_chain::ChainEpoch {
+        match self {
+            Self::QueuedRange(chain_epoch) | Self::TipExtension(chain_epoch) => chain_epoch,
+        }
+    }
 }
 
 /// Summary of a `Wallet::sync` run.
@@ -2326,6 +2348,9 @@ impl Wallet {
 
     async fn sync_inner(&self, chain: &dyn ChainSource) -> Result<SyncOutcome, WalletError> {
         let chain_epoch = self.pin_chain_epoch(chain).await?;
+        if let Some(outcome) = self.scan_tip_extension(chain, chain_epoch).await? {
+            return Ok(outcome);
+        }
         let visible_tip = chain_epoch.visible_tip().height;
         self.inner.storage.update_chain_tip(visible_tip).await?;
         self.inner
@@ -2333,6 +2358,68 @@ impl Wallet {
             .record_chain_tips(visible_tip, chain_epoch.settled_tip().height)
             .await?;
         self.scan_one_range(chain, chain_epoch).await
+    }
+
+    /// Scans the blocks the chain added above a caught-up wallet in the same storage step that
+    /// records the new tip, returning `None` when the wallet is not caught up that way.
+    ///
+    /// Recording a tip before scanning up to it leaves the tip's commitment-tree shard with
+    /// unscanned blocks, and `zcash_client_sqlite` then gives no note in that shard a witness:
+    /// a balance read or proposal in that window leaves out every such note. A wallet whose
+    /// queue holds no work at or below the visible tip, and whose scanned frontier trails the
+    /// tip by at most [`TIP_EXTENSION_MAX_BLOCKS`], fetches those blocks first and records the
+    /// tip with their scan, so no read sees the gap. Any other wallet records the tip first and
+    /// scans the range the queue suggests.
+    async fn scan_tip_extension(
+        &self,
+        chain: &dyn ChainSource,
+        chain_epoch: zally_chain::ChainEpoch,
+    ) -> Result<Option<SyncOutcome>, WalletError> {
+        let visible_tip = chain_epoch.visible_tip().height;
+        let Some(scanned_height) = self.inner.storage.fully_scanned_height().await? else {
+            return Ok(None);
+        };
+        let extension_blocks = visible_tip.as_u32().saturating_sub(scanned_height.as_u32());
+        if extension_blocks == 0
+            || extension_blocks > TIP_EXTENSION_MAX_BLOCKS
+            || self.next_scan_range(visible_tip).await?.is_some()
+        {
+            return Ok(None);
+        }
+        let scan_blind_sends = self.inner.storage.store_carried_send_steps().await?;
+        *self.inner.scan_blind_sends.lock() = Some(scan_blind_sends.into_iter().collect());
+        let scan_start = BlockHeight::from(scanned_height.as_u32().saturating_add(1));
+        self.publish_event(WalletEvent::ScanProgress {
+            scanned_height: scan_start,
+            target_height: visible_tip,
+        });
+        tracing::info!(
+            target: "zally::sync",
+            event = "wallet_sync_cycle",
+            scanned_from = scan_start.as_u32(),
+            scan_end = visible_tip.as_u32(),
+            settled_tip = chain_epoch.settled_tip().height.as_u32(),
+            visible_tip = visible_tip.as_u32(),
+            priority = "tip_extension",
+            "sync cycle: scanning the blocks above the scanned frontier with the new tip"
+        );
+        let from_state = fetch_prior_chain_state(chain, chain_epoch, scan_start).await?;
+        let blocks = fetch_compact_blocks(chain, chain_epoch, scan_start, visible_tip).await?;
+        let block_count = u64::try_from(blocks.len()).unwrap_or(u64::MAX);
+        let outcome = self
+            .scan_and_emit(
+                ScanContext {
+                    blocks,
+                    scanned_from: scan_start,
+                    target_height: visible_tip,
+                    block_count,
+                },
+                from_state,
+                chain,
+                ScanTarget::TipExtension(chain_epoch),
+            )
+            .await?;
+        Ok(Some(outcome))
     }
 
     async fn scan_queued_range_inner(
@@ -2412,7 +2499,7 @@ impl Wallet {
             },
             from_state,
             chain,
-            chain_epoch,
+            ScanTarget::QueuedRange(chain_epoch),
         )
         .await
     }
@@ -2567,7 +2654,7 @@ impl Wallet {
         context: ScanContext,
         from_state: TreeStateArtifact,
         chain: &dyn ChainSource,
-        chain_epoch: zally_chain::ChainEpoch,
+        target: ScanTarget,
     ) -> Result<SyncOutcome, WalletError> {
         let ScanContext {
             blocks,
@@ -2576,10 +2663,9 @@ impl Wallet {
             block_count,
         } = context;
         let timestamps_by_height = block_timestamp_index(&blocks);
+        let chain_epoch = target.chain_epoch();
         let outcome = self
-            .inner
-            .storage
-            .scan_blocks(ScanRequest::new(blocks, scanned_from, from_state))
+            .scan_into_storage(ScanRequest::new(blocks, scanned_from, from_state), target)
             .await?;
 
         // The only detector for a corrupt tree runs ahead of every read that can outlive the
@@ -2646,6 +2732,27 @@ impl Wallet {
             block_count,
             completed_at_ms: current_unix_ms(),
         })
+    }
+
+    async fn scan_into_storage(
+        &self,
+        request: ScanRequest,
+        target: ScanTarget,
+    ) -> Result<zally_storage::ScanResult, WalletError> {
+        let scanned = match target {
+            ScanTarget::QueuedRange(_) => self.inner.storage.scan_blocks(request).await?,
+            ScanTarget::TipExtension(chain_epoch) => {
+                let chain_tips = ChainTips {
+                    visible: chain_epoch.visible_tip().height,
+                    settled: chain_epoch.settled_tip().height,
+                };
+                self.inner
+                    .storage
+                    .scan_blocks_to_tip(chain_tips, request)
+                    .await?
+            }
+        };
+        Ok(scanned)
     }
 
     /// Checks the wallet's note-commitment tree roots against the chain's tree state at
