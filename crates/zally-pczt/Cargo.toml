@@ -1,6 +1,6 @@
 [package]
 name = "zally-pczt"
-version = "0.2.1"
+version = "0.2.2"
 description = "Zally PCZT roles: Creator, Signer, Combiner, Extractor"
 edition.workspace = true
 license.workspace = true
