@@ -411,9 +411,11 @@ impl TransparentUnspentSet {
 }
 
 /// Summary of one [`WalletStorage::record_transparent_unspent_set`] call.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub struct TransparentUnspentSetRecorded {
+    /// Network of the storage that recorded the set.
+    pub network: Network,
     /// Number of reported outputs recorded.
     pub recorded_count: u64,
     /// Recorded outputs of the receiver that the set no longer contains, now out of every
@@ -656,8 +658,10 @@ pub trait WalletStorage: Send + Sync + 'static {
     /// - its producing transaction is mined at or below `unspent_set.observed_at_height`, so
     ///   the set's epoch could see it. An output known only from the mempool, or mined above
     ///   that height, is left alone.
-    /// - no transaction that is mined, or whose expiry has not passed, spends it. An output
-    ///   the wallet's own send consumed keeps its spend record instead.
+    /// - no transaction that is mined, or whose expiry has not passed, spends it or any other
+    ///   output of its producing transaction. An output the wallet's own send consumed keeps
+    ///   its spend record instead, and a mined spend of a sibling output proves the producing
+    ///   transaction is in the chain.
     /// - the wallet holds no shielded note from the producing transaction and records no
     ///   spend by it, so no block scan attests the transaction's place in the chain.
     /// - every wallet output of the producing transaction is at the receiver's script.

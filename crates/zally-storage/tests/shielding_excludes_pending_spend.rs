@@ -292,6 +292,37 @@ async fn an_output_whose_transaction_pays_another_receiver_is_kept() -> Result<(
     Ok(())
 }
 
+/// A spend that can still be mined of one output keeps the producing transaction mined for
+/// its other outputs at the same receiver.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_output_whose_sibling_has_a_pending_spend_is_kept() -> Result<(), TestError> {
+    let wallet = ShieldingWallet::scanned().await?;
+    let spent = wallet.utxo(0x71);
+    let spent_outpoint = OutPoint::new(spent.tx_id, 0);
+    let sibling = TransparentUtxoRow::new(
+        spent.tx_id,
+        1,
+        spent.value_zat,
+        spent.mined_height,
+        wallet.script_pub_key_bytes.clone(),
+    );
+    wallet.record_unspent_set(vec![spent]).await?;
+    assert_eq!(wallet.shield().await?, vec![spent_outpoint]);
+    wallet
+        .storage
+        .record_transparent_utxos(None, vec![sibling])
+        .await?;
+
+    let recorded = wallet.record_unspent_set(Vec::new()).await?;
+
+    assert!(
+        recorded.retired_outpoints.is_empty(),
+        "a sibling's pending spend keeps the producing transaction mined"
+    );
+    assert_eq!(recorded.network, Network::Testnet);
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_set_from_another_network_is_refused() -> Result<(), TestError> {
     let wallet = ShieldingWallet::scanned().await?;

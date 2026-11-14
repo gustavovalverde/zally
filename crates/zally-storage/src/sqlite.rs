@@ -1434,6 +1434,7 @@ impl WalletStorage for Sqlite {
                 ),
             });
         }
+        let network = self.options.network;
         self.with_db_mut_and_ledger(move |db, ledger| {
             ensure_scan_frontier_at_least(db, min_scanned_height)?;
             let crate::wallet::TransparentUnspentSet {
@@ -1446,6 +1447,7 @@ impl WalletStorage for Sqlite {
             let recorded_count = put_transparent_utxo_rows(db, utxos)?;
             let Some(chain_tip) = db.chain_height().map_err(|e| map_sqlite_error(&e))? else {
                 return Ok(crate::wallet::TransparentUnspentSetRecorded {
+                    network,
                     recorded_count,
                     retired_outpoints: Vec::new(),
                 });
@@ -1458,6 +1460,7 @@ impl WalletStorage for Sqlite {
                 &reported_tx_ids,
             )?;
             Ok(crate::wallet::TransparentUnspentSetRecorded {
+                network,
                 recorded_count,
                 retired_outpoints,
             })
@@ -5344,9 +5347,10 @@ fn put_transparent_utxo_rows(
 
 /// Retirement candidates: outputs recorded at script `?1`, mined at or below `?2`.
 ///
-/// No transaction mined or unexpired at the next block (`?3`) spends a candidate, and its
-/// producing transaction carries nothing else of the wallet's: no shielded note it received,
-/// no spend of its funds, and no transparent output at another script.
+/// No transaction mined or unexpired at the next block (`?3`) spends a candidate or any other
+/// output of its producing transaction, and that transaction carries nothing else of the
+/// wallet's: no shielded note it received, no spend of its funds, and no transparent output
+/// at another script.
 const UNREPORTED_TRANSPARENT_UTXO_CANDIDATES_SQL: &str = "\
     SELECT t.id_tx, t.txid, tro.output_index \
     FROM transparent_received_outputs tro \
@@ -5354,9 +5358,11 @@ const UNREPORTED_TRANSPARENT_UTXO_CANDIDATES_SQL: &str = "\
     WHERE tro.script = ?1 \
       AND t.mined_height <= ?2 \
       AND NOT EXISTS ( \
-          SELECT 1 FROM transparent_received_output_spends spend \
+          SELECT 1 FROM transparent_received_outputs sibling \
+          JOIN transparent_received_output_spends spend \
+            ON spend.transparent_received_output_id = sibling.id \
           JOIN transactions spending ON spending.id_tx = spend.transaction_id \
-          WHERE spend.transparent_received_output_id = tro.id \
+          WHERE sibling.transaction_id = t.id_tx \
             AND (spending.mined_height IS NOT NULL \
                  OR spending.expiry_height IS NULL \
                  OR spending.expiry_height = 0 \
