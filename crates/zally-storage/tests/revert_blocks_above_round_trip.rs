@@ -393,7 +393,10 @@ async fn a_reverted_send_reports_its_new_mined_height_once_scanned() -> Result<(
         .storage
         .clear_reverted_broadcast(shielding_tx_id)
         .await?;
-    assert!(wallet.storage.list_reverted_broadcasts().await?.is_empty());
+    assert_eq!(
+        wallet.storage.list_reverted_broadcasts().await?,
+        [] as [zally_storage::RevertedBroadcastRow; 0]
+    );
     Ok(())
 }
 

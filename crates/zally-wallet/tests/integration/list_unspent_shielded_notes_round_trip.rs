@@ -50,7 +50,7 @@ async fn list_unspent_shielded_notes_uses_visible_tip_after_sync() -> Result<(),
 
     // No notes still (mock returned empty), but the surface compiles and returns Ok.
     let notes = wallet.list_unspent_shielded_notes(account_id).await?;
-    assert!(notes.is_empty());
+    assert_eq!(notes, [] as [zally_wallet::UnspentShieldedNote; 0]);
     Ok(())
 }
 

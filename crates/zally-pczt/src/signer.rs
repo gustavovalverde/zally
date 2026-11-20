@@ -57,6 +57,7 @@ impl Signer {
     /// any spend in the PCZT.
     #[allow(
         clippy::unused_async,
+        clippy::unused_async_trait_impl,
         reason = "async surface matches the rest of zally-pczt; ZIP-32 derivation runs on \
                   the caller's thread and moves into spawn_blocking when the prover wire-up \
                   needs it"

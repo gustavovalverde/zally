@@ -221,7 +221,7 @@ async fn an_output_the_receiver_reports_again_is_shielded() -> Result<(), TestEr
     assert!(is_insufficient_funds(&wallet.shield().await));
 
     let restored = wallet.record_unspent_set(vec![utxo]).await?;
-    assert!(restored.retired_outpoints.is_empty());
+    assert_eq!(restored.retired_outpoints, [] as [zally_core::OutPoint; 0]);
     assert_eq!(wallet.shield().await?, vec![outpoint]);
     Ok(())
 }
@@ -365,7 +365,7 @@ async fn an_output_above_the_observed_height_is_kept() -> Result<(), TestError> 
             ),
         )
         .await?;
-    assert!(recorded.retired_outpoints.is_empty());
+    assert_eq!(recorded.retired_outpoints, [] as [zally_core::OutPoint; 0]);
     assert_eq!(wallet.shield().await?, vec![outpoint]);
     Ok(())
 }

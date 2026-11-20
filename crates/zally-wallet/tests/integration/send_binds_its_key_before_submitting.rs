@@ -67,7 +67,7 @@ async fn a_retry_broadcasts_a_bound_transaction_no_node_received() -> Result<(),
         matches!(&first, Err(error) if error.is_retryable()),
         "the unreachable node surfaces as a retryable error: {first:?}"
     );
-    assert!(submitter.received().is_empty());
+    assert_eq!(submitter.received(), [] as [zally_core::TxId; 0]);
     let retried = shield(&base, &submitter).await?;
     assert_eq!(
         submitter.received(),
@@ -141,7 +141,7 @@ async fn a_send_the_open_circuit_breaker_stopped_frees_its_key() -> Result<(), F
         matches!(&stopped, Err(WalletError::CircuitBroken { .. })),
         "the open breaker stops the send: {stopped:?}"
     );
-    assert!(submitter.received().is_empty());
+    assert_eq!(submitter.received(), [] as [zally_core::TxId; 0]);
     assert_eq!(
         base.storage
             .find_idempotent_submission(&send_key()?)
@@ -149,10 +149,9 @@ async fn a_send_the_open_circuit_breaker_stopped_frees_its_key() -> Result<(), F
         None,
         "a transaction no submitter received frees its key"
     );
-    assert!(
-        pending_inputs_of(&base.wallet, base.account_id)
-            .await?
-            .is_empty()
+    assert_eq!(
+        pending_inputs_of(&base.wallet, base.account_id).await?,
+        [] as [zally_core::TxId; 0]
     );
     Ok(())
 }

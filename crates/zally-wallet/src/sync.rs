@@ -3090,7 +3090,10 @@ mod tests {
         );
         assert_eq!(kept_at_boundary.len(), 3);
 
-        assert!(subtree_roots_completed_at_or_below(roots, None).is_empty());
+        assert_eq!(
+            subtree_roots_completed_at_or_below(roots, None),
+            [] as [zally_chain::SubtreeRoot; 0]
+        );
     }
 
     #[test]

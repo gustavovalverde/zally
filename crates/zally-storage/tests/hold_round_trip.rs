@@ -459,7 +459,10 @@ async fn an_unmineable_dispense_reopens_its_hold() -> Result<(), TestError> {
     let request_id = make_request_id(7)?;
     let dead_tx_id = TxId::from_bytes([0xD0; 32]);
     let hold_id = create_finalized_hold(&storage, account, &request_id, dead_tx_id).await?;
-    assert!(storage.list_active_holds(account).await?.is_empty());
+    assert_eq!(
+        storage.list_active_holds(account).await?,
+        [] as [zally_storage::HoldRow; 0]
+    );
 
     let settled = storage
         .record_unmineable_transaction(dead_tx_id, zally_core::BlockHeight::from(50))
@@ -486,7 +489,10 @@ async fn an_unmineable_dispense_reopens_its_hold() -> Result<(), TestError> {
 
     let replacement = TxId::from_bytes([0xD1; 32]);
     storage.finalize_hold(hold_id, replacement).await?;
-    assert!(storage.list_active_holds(account).await?.is_empty());
+    assert_eq!(
+        storage.list_active_holds(account).await?,
+        [] as [zally_storage::HoldRow; 0]
+    );
     Ok(())
 }
 

@@ -1150,8 +1150,7 @@ fn are_funding_outputs_recorded(
         let transaction = read_stored_transaction(raw_tx_bytes)?;
         for input in transaction
             .transparent_bundle()
-            .map(|bundle| bundle.vin.as_slice())
-            .unwrap_or_default()
+            .map_or_default(|bundle| bundle.vin.as_slice())
         {
             let prevout_tx_id = TxId::from_bytes(*input.prevout().hash());
             if !step_ids.contains(&prevout_tx_id) {
@@ -5074,23 +5073,20 @@ fn prepared_transactions_with_inputs<'a, FeeRuleT, NoteRefT>(
                 posture: FailurePosture::NotRetryable,
             })?;
         let tx_expiry_height = BlockHeight::from(u32::from(stored.expiry_height()));
-        let transparent_inputs = steps
-            .get(step_index)
-            .map(|step| {
-                step.transparent_inputs()
-                    .iter()
-                    .map(|utxo| {
-                        let prevout = utxo.outpoint();
-                        let outpoint = zally_core::OutPoint::new(
-                            zally_core::TxId::from_bytes(*prevout.hash()),
-                            prevout.n(),
-                        );
-                        let value_zat = Zatoshis::from(utxo.txout().value());
-                        (outpoint, value_zat)
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
+        let transparent_inputs = steps.get(step_index).map_or_default(|step| {
+            step.transparent_inputs()
+                .iter()
+                .map(|utxo| {
+                    let prevout = utxo.outpoint();
+                    let outpoint = zally_core::OutPoint::new(
+                        zally_core::TxId::from_bytes(*prevout.hash()),
+                        prevout.n(),
+                    );
+                    let value_zat = Zatoshis::from(utxo.txout().value());
+                    (outpoint, value_zat)
+                })
+                .collect::<Vec<_>>()
+        });
         prepared.push(crate::wallet::PreparedTransaction::new(
             zally_core::TxId::from_bytes(*tx_id.as_ref()),
             raw_bytes,
@@ -5929,14 +5925,14 @@ mod tests {
             "a transient failure fails the call so no scan runs without the send's outputs: \
              {interrupted:?}"
         );
-        assert!(list_scan_blind_sends(&ledger)?.is_empty());
+        assert_eq!(list_scan_blind_sends(&ledger)?, [] as [zally_core::TxId; 0]);
 
         assert_eq!(
             settle_scan_blind_sends(&ledger, &carried, |_| Ok(true))?,
             Vec::<TxId>::new(),
             "the retry covers the send and leaves it unmarked"
         );
-        assert!(list_scan_blind_sends(&ledger)?.is_empty());
+        assert_eq!(list_scan_blind_sends(&ledger)?, [] as [zally_core::TxId; 0]);
         Ok(())
     }
 
@@ -6388,7 +6384,10 @@ mod tests {
         record_pending_pczt_inputs(&conn, lock_owner, &inputs)?;
         assert_eq!(find_pending_pczt_inputs(&conn, lock_owner)?, inputs);
         delete_pending_pczt_inputs(&conn, lock_owner)?;
-        assert!(find_pending_pczt_inputs(&conn, lock_owner)?.is_empty());
+        assert_eq!(
+            find_pending_pczt_inputs(&conn, lock_owner)?,
+            [] as [zcash_client_backend::wallet::OutputRef; 0]
+        );
         Ok(())
     }
 

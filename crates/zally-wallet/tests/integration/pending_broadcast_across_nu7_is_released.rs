@@ -260,7 +260,10 @@ async fn broadcast_signed_before_nu7_is_reported_once_across_a_long_settled_lag(
         lagging_settled,
     )
     .await?;
-    assert!(unmineable_reports(&mut events).await.is_empty());
+    assert_eq!(
+        unmineable_reports(&mut events).await,
+        [] as [(zally_core::TxId, std::string::String); 0]
+    );
     let snapshot = wallet.get_pending_transparent_inputs(account_id).await?;
     assert_eq!(snapshot.inputs.len(), 1, "an old, unjudged input is kept");
     assert!(snapshot.inputs[0].is_stale, "and flagged as stale");
