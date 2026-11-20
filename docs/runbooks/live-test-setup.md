@@ -43,9 +43,9 @@ paths and seals the seed with age.
 
 The isolated nextest process asserts account creation, transparent funding,
 Ironwood self-send discovery, fresh-database restore from the same seed, retained
-balances and notes after wallet reopen, resumed sync onto a new block, public wallet pending-input observation before shielding is mined, mined status
-and wallet receive discovery,
-PCZT abandonment, and a proven, signed PCZT payment. The final PCZT also supplies
+balances and notes after wallet reopen, resumed sync onto a new block, public
+wallet pending-input observation before shielding is mined, mined status and
+wallet receive discovery, PCZT abandonment, and a proven, signed PCZT payment. The final PCZT also supplies
 an Ironwood disclosure that the harness verifies against the mined transaction.
 The campaign send, pending, mined, and scanned steps refer to the same transparent
 shielding transaction: its returned ID matches a pending input ledger entry and
@@ -62,10 +62,30 @@ lifecycle runner: `prepare` runs the suite once, and subsequent step commands
 read its assertions. Reader order does not change the suite's execution order.
 Set `restart_scope` to `process-restart` in that runner's case manifest.
 
-The suite closes the first wallet, launches an independent OS process that
-opens the sealed database, asserts its persisted state, syncs a new block, and
-exits. The parent requires successful exit and reopens the database again.
-Abrupt process termination and crash recovery require separate evidence. Sapling and Orchard funded sends,
+The suite closes the first wallet and launches a subprocess that opens the
+sealed database, asserts its persisted state, and exits. After its successful
+exit, the parent mines a new block and starts a second subprocess that opens
+the same database and syncs that block. The parent then reopens the database
+and verifies progress onto another newly mined block. Reports retain distinct
+process IDs and the actual persisted heights.
+
+The schema v2 adapter hashes independently observed transaction IDs from the
+send outcome, pending wallet row, canonical mined response, and scanned wallet
+note. It also records independent database, public account, and recovered
+activity fingerprints for restore. Validation uses always-on checks, including
+when Python runs with optimization.
+
+For the orchestrated adapter, install `strace` and use explicit loopback IPv4
+URIs with ports for the native endpoint and control node. It traces connection
+syscalls across the wallet test process tree, excluding build tools. It requires
+a connection to the configured
+native endpoint, and rejects other network peers except the control node.
+Reports distinguish the configured URI from this observed process trace and
+retain its SHA-256. Set `ZALLY_TEST_LIFECYCLE_ARCHIVE` to a new private directory
+to retain sanitized observations and the connection trace after runner cleanup.
+
+Abrupt process termination and crash recovery require separate evidence.
+Sapling and Orchard funded sends,
 reorg recovery, Testnet spending, and public-network funds are outside this
 Regtest command's coverage.
 
