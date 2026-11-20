@@ -13,6 +13,82 @@ The default validation gate (`cargo nextest run --profile=ci`) only runs in-proc
 - Credentials wired through environment variables (sensitive leaves never come from `ZALLY_*` env vars on the wallet side; the live-test runner is the only consumer).
 - An additional `--run-ignored=all` flag so `#[ignore]` tests execute.
 
+## Native wallet lifecycle conformance
+
+Zally uses Zinder's native `WalletQuery` gRPC implementation through
+`zinder-client`, not the lightwalletd compatibility service. The integration pins
+`zinder-client`, `zinder-core`, and the resolved `zinder-proto` to 0.21.0.
+Rust 1.100.0 is required by that client. The wallet SDK remains on
+`zcash_client_backend` 0.25.0 and `zcash_client_sqlite` 0.23.0; the stack update
+advances `zcash_primitives` to 0.31.1 and `zcash_transparent` to 0.11.1.
+Existing wallet databases use the same SDK schema.
+
+Run the funded conformance test only against a disposable Regtest node. It spends
+one mature coinbase derived from the harness's public test seed `[0x42; 32]`
+(account 0, external child 0), then mines blocks. Its activation schedule comes
+from the node's `getblockchaininfo`; Ironwood must be active. The node must expose
+`generate`, `getaddressutxos`, `gettxout`, and `getrawtransaction`. The native query
+endpoint must expose the corresponding chain, mempool, and broadcast capabilities.
+
+```sh
+ZINDER_ENDPOINT=http://127.0.0.1:32402 \
+ZALLY_TEST_NODE_JSON_RPC_ADDR=http://127.0.0.1:32432 \
+scripts/verify-zinder-wallet.sh
+```
+
+For basic authentication, supply `ZALLY_TEST_NODE_RPC_USER` and
+`ZALLY_TEST_NODE_RPC_PASSWORD` through the environment. The harness never prints
+these credentials or its generated mnemonic. It creates fresh temporary wallet
+paths and seals the seed with age.
+
+The isolated nextest process asserts account creation, transparent funding,
+Ironwood self-send discovery, fresh-database restore from the same seed, retained
+balances and notes after wallet reopen, resumed sync onto a new block, public
+wallet pending-input observation before shielding is mined, mined status and
+wallet receive discovery, PCZT abandonment, and a proven, signed PCZT payment. The final PCZT also supplies
+an Ironwood disclosure that the harness verifies against the mined transaction.
+The campaign send, pending, mined, and scanned steps refer to the same transparent
+shielding transaction: its returned ID matches a pending input ledger entry and
+the mined Ironwood receive. The additional shielded send has node RPC mempool
+evidence only. Zally has no public shielded-pending read method. Its epoch-pinned
+transaction status lookup deliberately excludes the live mempool, preserving
+canonical absence semantics.
+
+The actual suite order is create, transparent funding, shielding and discovery,
+restore, PCZT abandonment, send and pending observation, mining and receive
+scanning, PCZT payment and disclosure verification, wallet reopen, and resumed
+sync. `scripts/zinder-wallet-lifecycle.py` adapts this suite to the shared Zinder
+lifecycle runner: `prepare` runs the suite once, and subsequent step commands
+read its assertions. Reader order does not change the suite's execution order.
+Set `restart_scope` to `process-restart` in that runner's case manifest.
+
+The suite closes the first wallet and launches a subprocess that opens the
+sealed database, asserts its persisted state, and exits. After its successful
+exit, the parent mines a new block and starts a second subprocess that opens
+the same database and syncs that block. The parent then reopens the database
+and verifies progress onto another newly mined block. Reports retain distinct
+process IDs and the actual persisted heights.
+
+The schema v2 adapter hashes independently observed transaction IDs from the
+send outcome, pending wallet row, canonical mined response, and scanned wallet
+note. It also records independent database, public account, and recovered
+activity fingerprints for restore. Validation uses always-on checks, including
+when Python runs with optimization.
+
+For the orchestrated adapter, install `strace` and use explicit loopback IPv4
+URIs with ports for the native endpoint and control node. It traces connection
+syscalls across the wallet test process tree, excluding build tools. It requires
+a connection to the configured
+native endpoint, and rejects other network peers except the control node.
+Reports distinguish the configured URI from this observed process trace and
+retain its SHA-256. Set `ZALLY_TEST_LIFECYCLE_ARCHIVE` to a new private directory
+to retain sanitized observations and the connection trace after runner cleanup.
+
+Abrupt process termination and crash recovery require separate evidence.
+Sapling and Orchard funded sends,
+reorg recovery, Testnet spending, and public-network funds are outside this
+Regtest command's coverage.
+
 ## Profiles
 
 The repo defines two nextest profiles:

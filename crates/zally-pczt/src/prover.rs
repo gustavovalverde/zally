@@ -50,6 +50,7 @@ impl Prover {
     /// the PCZT is malformed or upstream proof creation rejects its contents.
     #[allow(
         clippy::unused_async,
+        clippy::unused_async_trait_impl,
         reason = "async surface matches the other zally-pczt role APIs and leaves room for scheduled proof creation"
     )]
     pub async fn prove_with_seed(

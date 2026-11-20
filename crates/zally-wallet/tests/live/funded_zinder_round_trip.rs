@@ -15,7 +15,7 @@ use zally_chain::{
 use zally_core::{
     AccountId, BlockHeight, IdempotencyKey, Network, PaymentRecipient, TxId, Zatoshis,
 };
-use zally_keys::{AgeFileSealing, AgeFileSealingOptions};
+use zally_keys::{AgeFileSealing, AgeFileSealingOptions, Mnemonic, SeedMaterial, SeedSealing};
 use zally_storage::{Sqlite, SqliteOptions};
 use zally_testkit::{
     LiveTestError, TempWalletPath, init, require_live, require_network, require_zinder_endpoint,
@@ -66,13 +66,36 @@ async fn funded_wallet_syncs_sends_and_submits_pczt_with_zinder() -> Result<(), 
 
     let mut round_trip = FundedZinderRoundTrip::open().await?;
     let funding_tx_id = round_trip.submit_transparent_funding().await?;
-    let shield_tx_id = round_trip.shield_transparent_funds().await?;
+    let (shield_tx_id, transaction_observations) = round_trip.shield_transparent_funds().await?;
     assert_ne!(funding_tx_id, shield_tx_id);
 
+    let restore_observation = round_trip.restore_discovers_funds().await?;
     round_trip.abandon_pczt_releases_inputs().await?;
     let send_tx_id = round_trip.submit_shielded_payment().await?;
     let pczt_tx_id = round_trip.submit_pczt_payment().await?;
     assert_ne!(send_tx_id, pczt_tx_id);
+    let (round_trip, restart_observation) = round_trip.restart_and_resume().await?;
+    if let Ok(path) = env::var("ZALLY_TEST_LIFECYCLE_REPORT") {
+        std::fs::write(path, serde_json::to_vec_pretty(&json!({
+            "status": "completed", "endpoint": require_zinder_endpoint()?,
+            "fallback_used": false, "assertions_enabled": true,
+            "endpoint_evidence_scope": "configured",
+            "pending_scope": "Wallet::get_pending_transparent_inputs for the same shielding transaction sent and mined",
+            "lifecycle_transaction": shield_tx_id.to_string(),
+            "transaction_observations": transaction_observations,
+            "restore_observation": restore_observation,
+            "restart_observation": restart_observation,
+            "additional_shielded_send_pending_scope": "control node RPC only; no public wallet shielded-pending read method",
+            "native_status_scope": "epoch-pinned canonical status excludes live mempool",
+            "assertions": {"bootstrap": true, "restore": true,
+                "transparent-discovery": true, "shielded-discovery": true,
+                "send": true, "pending": true, "mined": true, "scanned": true,
+                "restart": true, "resume": true, "restart_wallet_reopened": true, "restart_process_exited": true},
+            "transactions": {"funding": funding_tx_id.to_string(), "shield": shield_tx_id.to_string(),
+                "send": send_tx_id.to_string(), "pczt": pczt_tx_id.to_string()},
+            "restart_scope": "process-restart"
+        })).map_err(std::io::Error::other)?)?;
+    }
     round_trip.close().await?;
     Ok(())
 }
@@ -128,9 +151,80 @@ async fn shielding_does_not_reselect_a_pending_spend() -> Result<(), TestError> 
     Ok(())
 }
 
+#[tokio::test]
+#[ignore = "live test; invoked by funded lifecycle parent with isolated wallet paths"]
+async fn wallet_process_reopens_and_resumes() -> Result<(), TestError> {
+    require_live()?;
+    let (directory, phase) = match (
+        env::var("ZALLY_TEST_REOPEN_DIR"),
+        env::var("ZALLY_TEST_REOPEN_PHASE"),
+    ) {
+        (Err(env::VarError::NotPresent), Err(env::VarError::NotPresent)) => return Ok(()),
+        (Ok(directory), Ok(phase)) => (directory, phase),
+        _ => {
+            return Err(TestError::Unexpected {
+                reason: "both wallet subprocess variables must be configured together".to_owned(),
+            });
+        }
+    };
+    let miner = JsonRpcClient::from_node_env()?;
+    let (network, _) = miner.regtest_networks_from_node()?;
+    let directory = std::path::Path::new(&directory);
+    let expected: Value = serde_json::from_slice(&std::fs::read(directory.join("reopen.json"))?)
+        .map_err(std::io::Error::other)?;
+    let sealing = AgeFileSealing::new(AgeFileSealingOptions::at_path(directory.join("wallet.age")));
+    let storage = Sqlite::new(SqliteOptions::for_network(
+        network,
+        directory.join("wallet.db"),
+    ));
+    let (wallet, account_id) = Wallet::builder(network, sealing, storage)
+        .with_options(WalletOptions::default().with_minimum_source_reorg_window_blocks(None))
+        .open()
+        .await?;
+    let balance = wallet.get_account_balance(account_id).await?;
+    assert_eq!(json!(account_id.as_uuid().to_string()), expected["account"]);
+    assert_eq!(json!(balance.total_zat().as_u64()), expected["total_zat"]);
+    assert_eq!(
+        json!(balance.as_of_height.map(BlockHeight::as_u32)),
+        expected["height"]
+    );
+    assert_eq!(
+        json!(wallet.list_shielded_receives(account_id).await?.len()),
+        expected["note_count"]
+    );
+    let chain = ZinderChainSource::connect_remote(ZinderRemoteOptions {
+        endpoint: require_zinder_endpoint()?,
+        network,
+    })?;
+    let driver = SyncDriver::new(
+        wallet.clone(),
+        Arc::new(chain),
+        SyncDriverOptions::default().with_poll_interval_ms(250),
+    )?;
+    let handle = driver.sync_continuously();
+    let mut snapshots = handle.observe_status();
+    wait_until_at_tip_at_or_above(&mut snapshots, miner.visible_tip_height()?).await?;
+    let after = wallet.get_account_balance(account_id).await?;
+    if phase == "advance" {
+        assert!(after.as_of_height > balance.as_of_height);
+    } else {
+        assert_eq!(phase, "baseline");
+        assert_eq!(after.as_of_height, balance.as_of_height);
+    }
+    handle.close().await?;
+    std::fs::write(directory.join(format!("{phase}.json")), serde_json::to_vec(&json!({
+        "pid": std::process::id(), "before_height": balance.as_of_height.map(BlockHeight::as_u32),
+        "after_height": after.as_of_height.map(BlockHeight::as_u32), "state_matches": true
+    })).map_err(std::io::Error::other)?)?;
+    Ok(())
+}
+
 struct FundedZinderRoundTrip {
     /// Keeps the wallet's files on disk for the round trip's lifetime.
-    _wallet_path: TempWalletPath,
+    wallet_path: TempWalletPath,
+    mnemonic: Mnemonic,
+    birthday: BlockHeight,
+    chain: ZinderChainSource,
     miner: JsonRpcClient,
     wallet: Wallet,
     account_id: AccountId,
@@ -152,7 +246,12 @@ impl FundedZinderRoundTrip {
         let chain = ZinderChainSource::connect_remote(ZinderRemoteOptions { endpoint, network })?;
         let submitter = chain.submitter();
         let tip = chain.current_epoch().await?.settled_tip().height;
-        let (wallet_path, wallet, account_id) = create_wallet_at_tip(&chain, network, tip).await?;
+        let (wallet_path, wallet, account_id, mnemonic, birthday) =
+            create_wallet_at_tip(&chain, network, tip).await?;
+        tracing::info!(
+            step = "bootstrap",
+            assertion = "fresh wallet and account created"
+        );
 
         let chain_source: Arc<dyn ChainSource> = Arc::new(chain.clone());
         let driver = SyncDriver::new(
@@ -166,7 +265,10 @@ impl FundedZinderRoundTrip {
         let sync_snapshots = sync_handle.observe_status();
 
         Ok(Self {
-            _wallet_path: wallet_path,
+            wallet_path,
+            mnemonic,
+            birthday,
+            chain,
             miner,
             wallet,
             account_id,
@@ -203,10 +305,11 @@ impl FundedZinderRoundTrip {
             funded_height,
         )
         .await?;
+        tracing::info!(step = "transparent-discovery", assertion = "wallet transparent balance is positive", tx_id = %funding_tx_id);
         Ok(funding_tx_id)
     }
 
-    async fn shield_transparent_funds(&mut self) -> Result<TxId, TestError> {
+    async fn shield_transparent_funds(&mut self) -> Result<(TxId, Value), TestError> {
         let shielding_threshold_zat = shielding_threshold_zat_from_env()?;
         let shield_idempotency = IdempotencyKey::try_from("t3-funded-shield")?;
         let shield_outcome = self
@@ -221,16 +324,65 @@ impl FundedZinderRoundTrip {
                 .with_destination_pool(ShieldedPool::Ironwood),
             )
             .await?;
+        let pending = self
+            .wallet
+            .get_pending_transparent_inputs(self.account_id)
+            .await?;
+        let pending_input = pending
+            .inputs
+            .iter()
+            .find(|input| input.broadcast_tx_id == shield_outcome.tx_id())
+            .ok_or_else(|| TestError::Unexpected {
+                reason: "shielding transaction missing from wallet pending inputs".to_owned(),
+            })?;
+        tracing::info!(step = "pending", assertion = "public wallet ledger reports unmined shielding inputs", tx_id = %shield_outcome.tx_id());
         self.miner
             .generate_blocks(SHIELDED_SPEND_CONFIRMATION_BLOCKS)?;
         let shielded_height = self.miner.visible_tip_height()?;
         wait_until_at_tip_at_or_above(&mut self.sync_snapshots, shielded_height).await?;
         let receives = self.wallet.list_shielded_receives(self.account_id).await?;
+        let received_note = receives
+            .iter()
+            .find(|note| {
+                note.tx_id == shield_outcome.tx_id()
+                    && note.pool == ShieldedPool::Ironwood
+                    && note.value > Zatoshis::zero()
+            })
+            .ok_or_else(|| TestError::Unexpected {
+                reason: "shielding transaction missing from mined wallet notes".to_owned(),
+            })?;
+        let status = self
+            .chain
+            .transaction_status(self.chain.current_epoch().await?, shield_outcome.tx_id())
+            .await?;
+        let zally_chain::TransactionStatus::Confirmed {
+            tx_id: mined_tx_id,
+            confirmed_at_height,
+        } = status
+        else {
+            return Err(TestError::Unexpected {
+                reason: "shielding transaction not canonically mined".to_owned(),
+            });
+        };
+        assert_eq!(mined_tx_id, received_note.tx_id);
+        assert_eq!(confirmed_at_height, received_note.mined_height);
         assert!(
-            !receives.is_empty(),
-            "funded live test expected Zally to observe its shielded self-send"
+            self.wallet
+                .get_account_balance(self.account_id)
+                .await?
+                .ironwood_zat
+                > Zatoshis::zero()
         );
-        Ok(shield_outcome.tx_id())
+        tracing::info!(step = "shielded-discovery", assertion = "mined Ironwood self-send discovered with positive spendable balance", tx_id = %shield_outcome.tx_id());
+        Ok((
+            shield_outcome.tx_id(),
+            json!({
+                "send": {"tx_id": shield_outcome.tx_id().to_string(), "actor": "Wallet::shield_transparent_funds"},
+                "pending": {"tx_id": pending_input.broadcast_tx_id.to_string(), "actor": "Wallet::get_pending_transparent_inputs"},
+                "mined": {"tx_id": mined_tx_id.to_string(), "actor": "ChainSource::transaction_status", "height": confirmed_at_height.as_u32()},
+                "scanned": {"tx_id": received_note.tx_id.to_string(), "actor": "Wallet::list_shielded_receives", "height": received_note.mined_height.as_u32()}
+            }),
+        ))
     }
 
     async fn submit_shielded_payment(&mut self) -> Result<TxId, TestError> {
@@ -248,10 +400,29 @@ impl FundedZinderRoundTrip {
                 &self.submitter,
             ))
             .await?;
+        let mempool = self.miner.call("getrawmempool", &json!([]))?;
+        assert!(mempool.as_array().is_some_and(|transactions| {
+            transactions.contains(&json!(send_outcome.tx_id().to_string()))
+        }));
+        tracing::info!(step = "pending", assertion = "sent transaction observed in control node mempool", tx_id = %send_outcome.tx_id());
         self.miner
             .generate_blocks(SHIELDED_SPEND_CONFIRMATION_BLOCKS)?;
         let send_height = self.miner.visible_tip_height()?;
         wait_until_at_tip_at_or_above(&mut self.sync_snapshots, send_height).await?;
+        assert!(matches!(
+            self.chain
+                .transaction_status(self.chain.current_epoch().await?, send_outcome.tx_id())
+                .await?,
+            zally_chain::TransactionStatus::Confirmed { .. }
+        ));
+        assert!(
+            self.wallet
+                .list_shielded_receives(self.account_id)
+                .await?
+                .iter()
+                .any(|note| note.tx_id == send_outcome.tx_id())
+        );
+        tracing::info!(step = "mined", assertion = "sent transaction mined and wallet receive scanned", tx_id = %send_outcome.tx_id());
         Ok(send_outcome.tx_id())
     }
 
@@ -357,7 +528,7 @@ impl FundedZinderRoundTrip {
             evidence.transaction_id(),
             disclosure.portable().transaction_id()
         );
-        assert!(!evidence.ironwood_spends().is_empty());
+        assert_ne!(evidence.ironwood_spends(), []);
         assert_eq!(evidence.ironwood_outputs().len(), 1);
         assert_eq!(
             evidence.ironwood_outputs()[0].recipient(),
@@ -419,17 +590,190 @@ impl FundedZinderRoundTrip {
             .await
     }
 
+    #[allow(
+        clippy::needless_pass_by_ref_mut,
+        reason = "Sync auto-trait coercion requires exclusive borrow on this !Sync struct"
+    )]
+    async fn restore_discovers_funds(&mut self) -> Result<Value, TestError> {
+        let restored_path = TempWalletPath::create()?;
+        assert_ne!(restored_path.db_path(), self.wallet_path.db_path());
+        assert!(!restored_path.db_path().exists());
+        let sealing =
+            AgeFileSealing::new(AgeFileSealingOptions::at_path(restored_path.seed_path()));
+        sealing
+            .seal_seed(&SeedMaterial::from_mnemonic(&self.mnemonic, ""))
+            .await
+            .map_err(WalletError::from)?;
+        let storage = Sqlite::new(SqliteOptions::for_network(
+            self.network,
+            restored_path.db_path(),
+        ));
+        let (restored, account_id) = Wallet::builder(self.network, sealing, storage)
+            .with_options(WalletOptions::default().with_minimum_source_reorg_window_blocks(None))
+            .open_or_create_account(&self.chain, self.birthday)
+            .await?;
+        let driver = SyncDriver::new(
+            restored.clone(),
+            Arc::new(self.chain.clone()),
+            SyncDriverOptions::default().with_poll_interval_ms(250),
+        )?;
+        let handle = driver.sync_continuously();
+        let mut snapshots = handle.observe_status();
+        wait_until_at_tip_at_or_above(&mut snapshots, self.miner.visible_tip_height()?).await?;
+        let original = self.wallet.get_account_balance(self.account_id).await?;
+        assert_eq!(restored.get_account_balance(account_id).await?, original);
+        let original_notes = self.wallet.list_shielded_receives(self.account_id).await?;
+        let restored_notes = restored.list_shielded_receives(account_id).await?;
+        assert_ne!(
+            restored_notes,
+            [] as [zally_wallet::ShieldedReceiveRecord; 0]
+        );
+        for note in &original_notes {
+            assert!(
+                restored_notes
+                    .iter()
+                    .any(|restored_note| restored_note.tx_id == note.tx_id
+                        && restored_note.pool == note.pool
+                        && restored_note.value == note.value)
+            );
+        }
+        assert_eq!(account_id, self.account_id);
+        assert_eq!(original_notes.len(), restored_notes.len());
+        let restored_balance = restored.get_account_balance(account_id).await?;
+        assert!(restored_balance.total_zat() > Zatoshis::zero());
+        handle.close().await?;
+        tracing::info!(
+            step = "restore",
+            assertion = "same seed restored balance and mined shielded notes in fresh database"
+        );
+        let source_activity = original_notes
+            .first()
+            .ok_or_else(|| TestError::Unexpected {
+                reason: "missing source activity".to_owned(),
+            })?;
+        let restored_activity = restored_notes
+            .iter()
+            .find(|note| note.tx_id == source_activity.tx_id)
+            .ok_or_else(|| TestError::Unexpected {
+                reason: "missing restored activity".to_owned(),
+            })?;
+        Ok(json!({"fresh_database": true,
+            "source_database": std::fs::canonicalize(self.wallet_path.db_path())?,
+            "restored_database": std::fs::canonicalize(restored_path.db_path())?,
+            "source_wallet": self.account_id.as_uuid().to_string(),
+            "restored_wallet": account_id.as_uuid().to_string(),
+            "source_activity": source_activity.tx_id.to_string(),
+            "restored_activity": restored_activity.tx_id.to_string(), "account_matches": account_id == self.account_id,
+            "balance_matches": restored_balance == original, "note_count": restored_notes.len(),
+            "total_zat": restored_balance.total_zat().as_u64(),
+            "height": restored_balance.as_of_height.map(BlockHeight::as_u32)}))
+    }
+
+    async fn restart_and_resume(self) -> Result<(Self, Value), TestError> {
+        let before = self.wallet.get_account_balance(self.account_id).await?;
+        let notes = self.wallet.list_shielded_receives(self.account_id).await?;
+        self.sync_handle.close().await?;
+        drop(self.wallet);
+        std::fs::write(
+            self.wallet_path.dir().join("reopen.json"),
+            serde_json::to_vec(&json!({
+                "account": self.account_id.as_uuid().to_string(), "total_zat": before.total_zat().as_u64(),
+                "height": before.as_of_height.map(BlockHeight::as_u32), "note_count": notes.len()
+            }))
+            .map_err(std::io::Error::other)?,
+        )?;
+        let baseline = reopen_wallet_in_process(self.wallet_path.dir(), "baseline")?;
+        self.miner.generate_blocks(1)?;
+        let child = reopen_wallet_in_process(self.wallet_path.dir(), "advance")?;
+        assert_ne!(baseline["pid"], child["pid"]);
+        let sealing =
+            AgeFileSealing::new(AgeFileSealingOptions::at_path(self.wallet_path.seed_path()));
+        let storage = Sqlite::new(SqliteOptions::for_network(
+            self.network,
+            self.wallet_path.db_path(),
+        ));
+        let (wallet, account_id) = Wallet::builder(self.network, sealing, storage)
+            .with_options(WalletOptions::default().with_minimum_source_reorg_window_blocks(None))
+            .open()
+            .await?;
+        assert_eq!(account_id, self.account_id);
+        let reopened = wallet.get_account_balance(account_id).await?;
+        assert!(reopened.as_of_height > before.as_of_height);
+        assert_eq!(
+            json!(reopened.as_of_height.map(BlockHeight::as_u32)),
+            child["after_height"]
+        );
+        assert_eq!(wallet.list_shielded_receives(account_id).await?, notes);
+        tracing::info!(
+            step = "restart",
+            assertion = "reopened sealed wallet retains account balance and notes"
+        );
+        self.miner.generate_blocks(1)?;
+        let driver = SyncDriver::new(
+            wallet.clone(),
+            Arc::new(self.chain.clone()),
+            SyncDriverOptions::default().with_poll_interval_ms(250),
+        )?;
+        let sync_handle = driver.sync_continuously();
+        let mut sync_snapshots = sync_handle.observe_status();
+        wait_until_at_tip_at_or_above(&mut sync_snapshots, self.miner.visible_tip_height()?)
+            .await?;
+        let resumed = wallet.get_account_balance(account_id).await?;
+        assert!(resumed.as_of_height > reopened.as_of_height);
+        tracing::info!(
+            step = "resume",
+            assertion = "reopened wallet advances to a newly mined block"
+        );
+        let observation = json!({"process_exited": true, "baseline": baseline, "child": child,
+            "before_height": before.as_of_height.map(BlockHeight::as_u32),
+            "reopened_height": reopened.as_of_height.map(BlockHeight::as_u32),
+            "resumed_height": resumed.as_of_height.map(BlockHeight::as_u32),
+            "new_block_mined_after_restart": resumed.as_of_height > reopened.as_of_height});
+        Ok((
+            Self {
+                wallet,
+                account_id,
+                sync_handle,
+                sync_snapshots,
+                ..self
+            },
+            observation,
+        ))
+    }
+
     async fn close(self) -> Result<(), TestError> {
         self.sync_handle.close().await?;
         Ok(())
     }
 }
 
+fn reopen_wallet_in_process(directory: &std::path::Path, phase: &str) -> Result<Value, TestError> {
+    let status = Command::new(env::current_exe()?)
+        .args([
+            "--ignored",
+            "--exact",
+            "live::funded_zinder_round_trip::wallet_process_reopens_and_resumes",
+            "--nocapture",
+        ])
+        .env("ZALLY_TEST_REOPEN_DIR", directory)
+        .env("ZALLY_TEST_REOPEN_PHASE", phase)
+        .status()?;
+    assert!(
+        status.success(),
+        "isolated wallet process must pass its assertions and exit successfully"
+    );
+    let observed: Value =
+        serde_json::from_slice(&std::fs::read(directory.join(format!("{phase}.json")))?)
+            .map_err(std::io::Error::other)?;
+    assert_ne!(observed["pid"], json!(std::process::id()));
+    Ok(observed)
+}
+
 async fn create_wallet_at_tip(
     chain: &ZinderChainSource,
     network: Network,
     tip_height: BlockHeight,
-) -> Result<(TempWalletPath, Wallet, AccountId), TestError> {
+) -> Result<(TempWalletPath, Wallet, AccountId, Mnemonic, BlockHeight), TestError> {
     let temp = TempWalletPath::create()?;
     let sealing = AgeFileSealing::new(AgeFileSealingOptions::at_path(temp.seed_path()));
     let storage = Sqlite::new(SqliteOptions::for_network(network, temp.db_path()));
@@ -437,11 +781,11 @@ async fn create_wallet_at_tip(
     // The live Zinder pair keeps its default 100-block reorg window; the integration suite
     // covers the window check.
     let options = WalletOptions::default().with_minimum_source_reorg_window_blocks(None);
-    let (wallet, account_id, _mnemonic) = Wallet::builder(network, sealing, storage)
+    let (wallet, account_id, mnemonic) = Wallet::builder(network, sealing, storage)
         .with_options(options)
         .create(chain, birthday)
         .await?;
-    Ok((temp, wallet, account_id))
+    Ok((temp, wallet, account_id, mnemonic, birthday))
 }
 
 async fn derive_unified_recipient(
@@ -961,7 +1305,7 @@ fn display_txid_to_wire_bytes(txid: &str) -> Result<[u8; 32], TestError> {
         });
     }
     let mut decoded = [0_u8; 32];
-    for (index, chunk) in raw.chunks_exact(2).enumerate() {
+    for (index, chunk) in raw.as_chunks::<2>().0.iter().enumerate() {
         decoded[index] = (hex_nibble(chunk[0])? << 4) | hex_nibble(chunk[1])?;
     }
     decoded.reverse();

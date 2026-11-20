@@ -147,8 +147,7 @@ impl MockState {
             block_time_seconds: height,
             transactions: self
                 .canonical_mined_block(height)
-                .map(|block| block.transactions.clone())
-                .unwrap_or_default(),
+                .map_or_default(|block| block.transactions.clone()),
             chain_metadata,
         }
     }
@@ -892,14 +891,13 @@ impl ChainSource for MockChainSource {
         Ok(guard
             .transparent_utxos_by_script
             .get(script_pub_key_bytes)
-            .map(|utxos| {
+            .map_or_default(|utxos| {
                 utxos
                     .iter()
                     .filter(|utxo| utxo.confirmed_at_height <= visible_tip_height)
                     .cloned()
                     .collect()
-            })
-            .unwrap_or_default())
+            }))
     }
 
     async fn chain_event_envelopes(

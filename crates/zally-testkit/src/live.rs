@@ -112,9 +112,7 @@ pub fn require_zinder_endpoint() -> Result<String, LiveTestError> {
 }
 
 fn env_flag_is_set(var: &str) -> bool {
-    env::var(var)
-        .ok()
-        .is_some_and(|raw| matches!(raw.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+    env::var(var).is_ok_and(|raw| matches!(raw.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
 }
 
 /// Error returned by the live-test gates.

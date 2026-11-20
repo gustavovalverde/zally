@@ -200,7 +200,10 @@ async fn assert_settled_unmineable_once(
         unmineable_reports, 1,
         "a dead withdrawal is reported exactly once"
     );
-    assert!(storage.list_reverted_broadcasts().await?.is_empty());
+    assert_eq!(
+        storage.list_reverted_broadcasts().await?,
+        [] as [zally_storage::RevertedBroadcastRow; 0]
+    );
     assert_eq!(
         storage
             .find_idempotent_submission(&funded.shielding_key)

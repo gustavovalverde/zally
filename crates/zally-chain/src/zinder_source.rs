@@ -956,8 +956,8 @@ mod tests {
         )
         .expect("pre-activation tree state decodes");
         assert_eq!(tree_state.sapling_final_state_bytes, vec![0xab, 0xcd]);
-        assert!(tree_state.orchard_final_state_bytes.is_empty());
-        assert!(tree_state.ironwood_final_state_bytes.is_empty());
+        assert_eq!(tree_state.orchard_final_state_bytes, [] as [u8; 0]);
+        assert_eq!(tree_state.ironwood_final_state_bytes, [] as [u8; 0]);
     }
 
     #[test]

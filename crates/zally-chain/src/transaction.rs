@@ -531,7 +531,7 @@ mod tests {
         let error = parse_transaction_expiry_height(&[0_u8; 4])
             .expect_err("malformed transaction bytes must fail");
         let TransactionParseError::Read { reason } = error;
-        assert!(!reason.is_empty());
+        assert_ne!(reason, "");
     }
 
     #[test]
