@@ -155,11 +155,20 @@ async fn shielding_does_not_reselect_a_pending_spend() -> Result<(), TestError> 
 #[ignore = "live test; invoked by funded lifecycle parent with isolated wallet paths"]
 async fn wallet_process_reopens_and_resumes() -> Result<(), TestError> {
     require_live()?;
+    let (directory, phase) = match (
+        env::var("ZALLY_TEST_REOPEN_DIR"),
+        env::var("ZALLY_TEST_REOPEN_PHASE"),
+    ) {
+        (Err(env::VarError::NotPresent), Err(env::VarError::NotPresent)) => return Ok(()),
+        (Ok(directory), Ok(phase)) => (directory, phase),
+        _ => {
+            return Err(TestError::Unexpected {
+                reason: "both wallet subprocess variables must be configured together".to_owned(),
+            });
+        }
+    };
     let miner = JsonRpcClient::from_node_env()?;
     let (network, _) = miner.regtest_networks_from_node()?;
-    let directory = env::var("ZALLY_TEST_REOPEN_DIR").map_err(|_| TestError::Unexpected {
-        reason: "missing isolated wallet directory".to_owned(),
-    })?;
     let directory = std::path::Path::new(&directory);
     let expected: Value = serde_json::from_slice(&std::fs::read(directory.join("reopen.json"))?)
         .map_err(std::io::Error::other)?;
@@ -187,7 +196,6 @@ async fn wallet_process_reopens_and_resumes() -> Result<(), TestError> {
         endpoint: require_zinder_endpoint()?,
         network,
     })?;
-    let phase = env::var("ZALLY_TEST_REOPEN_PHASE").map_err(std::io::Error::other)?;
     let driver = SyncDriver::new(
         wallet.clone(),
         Arc::new(chain),
