@@ -20,7 +20,8 @@ blake2b_simd.workspace = true
 hex.workspace = true
 rand.workspace = true
 rusqlite.workspace = true
-secrecy.workspace = true
+# The wallet backend accepts secrecy 0.8 SecretVec in its account APIs.
+secrecy = "0.8"
 serde = { workspace = true, optional = true }
 thiserror.workspace = true
 tokio = { workspace = true, features = ["sync", "rt"] }

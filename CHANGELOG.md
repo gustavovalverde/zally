@@ -2,15 +2,26 @@
 
 ## 0.2.3
 
-Zally now uses the Zinder 0.21 native WalletQuery SDK. Use Rust 1.100 or later
+Zally now uses the Zinder 0.23.0 native WalletQuery SDK. Use Rust 1.100 or later
 and a Zinder endpoint that supports native contract revision 8 or later.
 The wallet database schema is unchanged. Move every Zally Git dependency to
 `tag = "v0.2.3"` together.
 
 If your application pins librustzcash crates directly, align
 `zcash_primitives` with 0.31.1 and `zcash_transparent` with 0.11.1 before
-updating the tag. If it exchanges SDK types with Zally, align its direct
-`zinder-client` and `zinder-core` dependencies with 0.21.0.
+updating the tag.
+
+Hosts using `ZinderChainSource::connect_remote` can keep their existing
+endpoint and network configuration. If your host passes an existing
+`EndpointBackedIndex` to `ZinderChainSource::from_chain_index` or
+`ZinderSubmitter::from_chain_index`, build the handle with
+`zinder-client = "=0.23.0"`. Rust treats a handle from an earlier SDK as a
+different type. Align `zinder-core` to 0.23.0 wherever you exchange its types
+with Zally.
+
+The dependency refresh also updates rustix to 1.1.6, which fixes an
+uninitialized-memory issue in extended attribute reads.
+[RustSec advisory](https://rustsec.org/advisories/RUSTSEC-2026-0486.html)
 
 The [Regtest lifecycle procedure](docs/runbooks/live-test-setup.md#native-wallet-lifecycle-conformance)
 covers wallet creation, restore, persisted state across process restarts, and

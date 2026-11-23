@@ -17,11 +17,13 @@ The default validation gate (`cargo nextest run --profile=ci`) only runs in-proc
 
 Zally uses Zinder's native `WalletQuery` gRPC implementation through
 `zinder-client`, not the lightwalletd compatibility service. The integration pins
-`zinder-client`, `zinder-core`, and the resolved `zinder-proto` to 0.21.0.
-Rust 1.100.0 is required by that client. The wallet SDK remains on
-`zcash_client_backend` 0.25.0 and `zcash_client_sqlite` 0.23.0; the stack update
-advances `zcash_primitives` to 0.31.1 and `zcash_transparent` to 0.11.1.
-Existing wallet databases use the same SDK schema.
+`zinder-client`, `zinder-core`, and the resolved `zinder-proto` to 0.23.0.
+Use Rust 1.100 or later and a server at native contract revision 8 or later.
+Hosts that connect with `ZinderChainSource::connect_remote` supply the endpoint
+and network. The Foundation native endpoints are `https://testnet.zinder.zfnd.org`
+on Testnet and `https://zinder.zfnd.org` on Mainnet. Hosts that pass their own
+client to `from_chain_index` on the chain source or submitter must build that
+handle with `zinder-client = "=0.23.0"`. The wallet database schema is unchanged.
 
 Run the funded conformance test only against a disposable Regtest node. It spends
 one mature coinbase derived from the harness's public test seed `[0x42; 32]`
@@ -145,7 +147,7 @@ ZALLY_TEST_LIVE=1 cargo nextest run --locked -p zally-chain --features zinder \
 
 The hosted compatibility workflow reports these two reads in its separate
 Testnet job. To fund an embedded wallet and follow one payment to settlement,
-use the [Zspend Testnet walkthrough in Zpay](https://github.com/gustavovalverde/zpay/blob/83b8a765c654d2025b2b08026cef55864afc467c/docs/runbooks/zspend-testnet-payment.md).
+use the [Zspend Testnet walkthrough in Zpay](https://github.com/gustavovalverde/zpay/blob/5cc13dd7eb9d9b6b36455272ac367fdda87de196/docs/runbooks/zspend-testnet-payment.md).
 
 ## Mainnet (gated behind explicit acknowledgement)
 
@@ -155,11 +157,12 @@ Mainnet runs require an extra acknowledgement environment variable on top of `ZA
 ZALLY_TEST_LIVE=1 \
   ZALLY_TEST_ALLOW_MAINNET=1 \
   ZALLY_NETWORK=mainnet \
-  ZINDER_ENDPOINT=https://mainnet-zinder.example/ \
-  cargo nextest run --profile=ci-live --features zinder --run-ignored=all
+  ZINDER_ENDPOINT=https://zinder.zfnd.org \
+  cargo nextest run --locked -p zally-chain --features zinder \
+    --test live_zinder_source --profile=ci-live --run-ignored=only
 ```
 
-**Never** run live tests against an operator-owned mainnet wallet without explicit confirmation in the same operations session. The test runner does not validate which wallet it is talking to; if the sealed file points at a real account, real funds are at stake.
+This command reads the chain tip, compact blocks, and the reorg window through the native client.
 
 ## Bringing up a Regtest Zinder chain source
 
