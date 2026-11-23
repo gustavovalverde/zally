@@ -1,0 +1,41 @@
+# Changelog
+
+## 0.2.3
+
+Zally now uses the Zinder 0.21 native WalletQuery SDK. Use Rust 1.100 or later
+and a Zinder endpoint that supports native contract revision 8 or later.
+The wallet database schema is unchanged. Move every Zally Git dependency to
+`tag = "v0.2.3"` together.
+
+If your application pins librustzcash crates directly, align
+`zcash_primitives` with 0.31.1 and `zcash_transparent` with 0.11.1 before
+updating the tag. If it exchanges SDK types with Zally, align its direct
+`zinder-client` and `zinder-core` dependencies with 0.21.0.
+
+The [Regtest lifecycle procedure](docs/runbooks/live-test-setup.md#native-wallet-lifecycle-conformance)
+covers wallet creation, restore, persisted state across process restarts, and
+the same shielding transaction through submission, mining, and scanning.
+The [public Testnet probe](docs/runbooks/live-test-setup.md#public-testnet)
+checks connectivity, wallet synchronization, and settled tree state.
+
+### Bundled SQLite advisory
+
+The wallet still bundles `libsqlite3-sys` 0.35.0 through the
+`zcash_client_sqlite` 0.23.0 dependency cohort. SQLite can disclose local
+process memory when opening a database and its WAL that an untrusted party
+could write. Keep wallet databases and WAL files in directories writable only
+by the wallet operator and avoid opening untrusted copies. The bundled copy
+remains affected. [RUSTSEC-2026-0459](https://rustsec.org/advisories/RUSTSEC-2026-0459)
+
+For the v0.2.3 release work, run `python3 scripts/check-dependencies.py`.
+It reports the original policy result, then rechecks all dependency policies
+with only this advisory excepted for the locked `libsqlite3-sys` 0.35.0.
+The exception is inactive once the full checkout contains the v0.2.3 tag or
+any workspace crate changes version. A compatible published release of the
+wallet SQLite cohort is needed to remove the exception code.
+[Upstream coordination](https://github.com/zcash/librustzcash/issues/3276)
+
+## Earlier releases
+
+See [GitHub Releases](https://github.com/gustavovalverde/zally/releases) for
+changes and upgrade notes for v0.2.2 and earlier.
