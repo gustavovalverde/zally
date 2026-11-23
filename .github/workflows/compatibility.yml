@@ -90,3 +90,23 @@ jobs:
         run: |
           python3 zinder/scripts/wallet-clients/zally-payment.py \
             --source "$GITHUB_WORKSPACE" --build "$RUNNER_TEMP/zally-consumer" build
+
+  testnet-reads:
+    name: Public Testnet reads
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2.90.8
+        with:
+          tool: cargo-nextest@0.9.152
+      - name: Read the reorg window and a settled compact-block range
+        env:
+          ZALLY_TEST_LIVE: "1"
+          ZALLY_NETWORK: testnet
+          ZINDER_ENDPOINT: https://testnet.zinder.zfnd.org:443
+        run: |
+          cargo nextest run --locked -p zally-chain --features zinder \
+            --test live_zinder_source --profile=ci-live --run-ignored=only --no-tests=fail

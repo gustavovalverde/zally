@@ -22,5 +22,6 @@ Operational procedures for running Zally against the workspace and external syst
 
 - [Bootstrap an operator wallet](runbooks/bootstrap-operator-wallet.md): sealing choice, `Wallet::create` flow, mnemonic capture, operator checklist.
 - [Live-test setup](runbooks/live-test-setup.md): regtest, testnet, and mainnet wiring for `ZALLY_TEST_LIVE=1` tests, plus bringing up the zinder-backed chain source.
+- [Make a Testnet payment with Zspend](runbooks/zally-testnet-payment.md): sync an embedded wallet, fund it, and follow the payment to settlement.
 - [Sweep with PCZT](runbooks/sweep-with-pczt.md): operator-facing flow that walks the Creator, Prover, Signer, Combiner, Extractor role chain.
 - [Upgrade a wallet database](runbooks/upgrade-wallet-database.md): backup before a release that migrates `wallet.db`, and restoring it instead of rolling back.

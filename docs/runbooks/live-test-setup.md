@@ -140,8 +140,12 @@ compact-block range from the same endpoint, run:
 
 ```sh
 ZALLY_TEST_LIVE=1 cargo nextest run --locked -p zally-chain --features zinder \
-  --test live_zinder_source --profile=ci-live --run-ignored=all
+  --test live_zinder_source --profile=ci-live --run-ignored=only --no-tests=fail
 ```
+
+The hosted compatibility workflow reports these two reads in its separate
+Testnet job. To fund an embedded wallet and follow one payment to settlement,
+use the [Zspend Testnet walkthrough](zally-testnet-payment.md).
 
 ## Mainnet (gated behind explicit acknowledgement)
 
