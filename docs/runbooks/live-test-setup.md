@@ -17,11 +17,11 @@ The default validation gate (`cargo nextest run --profile=ci`) only runs in-proc
 
 Zally uses Zinder's native `WalletQuery` gRPC implementation through
 `zinder-client`, not the lightwalletd compatibility service. The integration pins
-`zinder-client`, `zinder-core`, and the resolved `zinder-proto` to 0.21.0.
-Rust 1.100.0 is required by that client. The wallet SDK remains on
-`zcash_client_backend` 0.25.0 and `zcash_client_sqlite` 0.23.0; the stack update
-advances `zcash_primitives` to 0.31.1 and `zcash_transparent` to 0.11.1.
-Existing wallet databases use the same SDK schema.
+`zinder-client`, `zinder-core`, and the resolved `zinder-proto` to 0.23.0.
+Use Rust 1.100 or later and a server at native contract revision 8 or later.
+Hosts that connect with `ZinderChainSource::connect_remote` supply the endpoint
+and network. Hosts that pass an existing client to `from_chain_index` must use
+`zinder-client` 0.23.0. The wallet SDK and database schema are unchanged.
 
 Run the funded conformance test only against a disposable Regtest node. It spends
 one mature coinbase derived from the harness's public test seed `[0x42; 32]`
@@ -123,8 +123,9 @@ The repo defines two nextest profiles:
 ```sh
 ZALLY_TEST_LIVE=1 \
   ZALLY_NETWORK=testnet \
-  ZINDER_ENDPOINT=http://127.0.0.1:9203 \
-  cargo nextest run --profile=ci-live --features zinder --run-ignored=all
+  ZINDER_ENDPOINT=https://testnet.zinder.zfnd.org \
+  cargo nextest run --locked -p zally-chain --features zinder \
+    --test live_zinder_source --profile=ci-live --run-ignored=only
 ```
 
 ## Mainnet (gated behind explicit acknowledgement)
@@ -135,11 +136,12 @@ Mainnet runs require an extra acknowledgement environment variable on top of `ZA
 ZALLY_TEST_LIVE=1 \
   ZALLY_TEST_ALLOW_MAINNET=1 \
   ZALLY_NETWORK=mainnet \
-  ZINDER_ENDPOINT=https://mainnet-zinder.example/ \
-  cargo nextest run --profile=ci-live --features zinder --run-ignored=all
+  ZINDER_ENDPOINT=https://zinder.zfnd.org \
+  cargo nextest run --locked -p zally-chain --features zinder \
+    --test live_zinder_source --profile=ci-live --run-ignored=only
 ```
 
-**Never** run live tests against an operator-owned mainnet wallet without explicit confirmation in the same operations session. The test runner does not validate which wallet it is talking to; if the sealed file points at a real account, real funds are at stake.
+Both commands read the chain tip, compact blocks, and the reorg window through the native client.
 
 ## Bringing up a zinder-backed chain source
 

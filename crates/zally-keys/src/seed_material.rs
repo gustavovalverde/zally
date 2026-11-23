@@ -1,6 +1,6 @@
 //! Zeroizing wrapper around raw seed bytes.
 
-use secrecy::{ExposeSecret, Secret};
+use secrecy::{ExposeSecret, SecretBox};
 use zeroize::Zeroize;
 
 use crate::mnemonic::Mnemonic;
@@ -8,8 +8,8 @@ use crate::mnemonic::Mnemonic;
 /// Zeroizing wrapper around raw seed bytes (32-252 bytes per ZIP-32).
 ///
 /// Constructed from a [`Mnemonic`] via [`SeedMaterial::from_mnemonic`]. The underlying buffer
-/// is zeroized on drop via [`secrecy::Secret`].
-pub struct SeedMaterial(Secret<Vec<u8>>);
+/// is zeroized on drop via [`SecretBox`].
+pub struct SeedMaterial(SecretBox<Vec<u8>>);
 
 impl SeedMaterial {
     /// Derives seed bytes from a 24-word [`Mnemonic`] with the given passphrase.
@@ -21,7 +21,7 @@ impl SeedMaterial {
         let mut bytes = mnemonic.to_seed_bytes(passphrase);
         let owned = bytes.to_vec();
         bytes.zeroize();
-        Self(Secret::new(owned))
+        Self(SecretBox::new(Box::new(owned)))
     }
 
     /// Wraps raw seed bytes after validating the ZIP-32 length range (32-252 bytes).
@@ -30,17 +30,18 @@ impl SeedMaterial {
     /// the seam for [`crate::SeedSealing`] implementations that unseal raw bytes and for
     /// testkit fixtures.
     pub fn from_raw_bytes(bytes: Vec<u8>) -> Result<Self, SeedMaterialError> {
-        let byte_count = bytes.len();
+        let seed = Self(SecretBox::new(Box::new(bytes)));
+        let byte_count = seed.byte_count();
         if !(32..=252).contains(&byte_count) {
             return Err(SeedMaterialError::InvalidLength { byte_count });
         }
-        Ok(Self(Secret::new(bytes)))
+        Ok(seed)
     }
 
     /// Returns the raw seed bytes for use with librustzcash derivation calls.
     #[must_use]
     pub fn expose_secret(&self) -> &[u8] {
-        self.0.expose_secret().as_slice()
+        self.0.expose_secret()
     }
 
     /// Returns the seed byte count.

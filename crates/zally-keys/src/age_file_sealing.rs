@@ -3,10 +3,10 @@
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
+use age::secrecy::ExposeSecret;
 use age::x25519::{Identity, Recipient};
 use age::{Decryptor, Encryptor};
 use async_trait::async_trait;
-use secrecy::ExposeSecret;
 
 use crate::sealing::{SealingError, SeedSealing};
 use crate::seed_material::SeedMaterial;
