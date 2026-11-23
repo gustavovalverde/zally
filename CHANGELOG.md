@@ -17,8 +17,6 @@ covers wallet creation, restore, persisted state across process restarts, and
 the same shielding transaction through submission, mining, and scanning.
 The [public Testnet probe](docs/runbooks/live-test-setup.md#public-testnet)
 checks connectivity, wallet synchronization, and settled tree state.
-The [Zspend Testnet walkthrough](docs/runbooks/zally-testnet-payment.md)
-follows a funded payment from a host that pins Zally v0.2.0.
 
 ### Bundled SQLite advisory
 

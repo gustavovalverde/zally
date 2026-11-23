@@ -145,7 +145,7 @@ ZALLY_TEST_LIVE=1 cargo nextest run --locked -p zally-chain --features zinder \
 
 The hosted compatibility workflow reports these two reads in its separate
 Testnet job. To fund an embedded wallet and follow one payment to settlement,
-use the [Zspend Testnet walkthrough](zally-testnet-payment.md).
+use the [Zspend Testnet walkthrough in Zpay](https://github.com/gustavovalverde/zpay/blob/83b8a765c654d2025b2b08026cef55864afc467c/docs/runbooks/zspend-testnet-payment.md).
 
 ## Mainnet (gated behind explicit acknowledgement)
 
