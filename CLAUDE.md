@@ -28,28 +28,12 @@ cargo machete
 
 The PR validation gate matches this command.
 
+For v0.2.3 release work, see the [scoped dependency policy check](CHANGELOG.md#bundled-sqlite-advisory).
+
 ## Live node tests
 
-T3 live tests against z3 regtest:
-
-```sh
-ZALLY_TEST_LIVE=1 \
-  ZALLY_NETWORK=regtest \
-  ZALLY_NODE__JSON_RPC_ADDR=http://127.0.0.1:18232 \
-  ZALLY_NODE__COOKIE_VALUE=__cookie__:<value> \
-  cargo nextest run --profile=ci-live --run-ignored=all
-```
-
-Public testnet:
-
-```sh
-ZALLY_TEST_LIVE=1 \
-  ZALLY_NETWORK=testnet \
-  ZALLY_NODE__JSON_RPC_ADDR=https://testnet-zebra.example/ \
-  cargo nextest run --profile=ci-live --run-ignored=all
-```
-
-Mainnet requires `ZALLY_TEST_ALLOW_MAINNET=1` in addition. Never run against an operator-owned mainnet wallet without explicit confirmation in the same turn.
+Use the [live-test runbook](docs/runbooks/live-test-setup.md) to select the
+network, configure the endpoint, and run the matching tests.
 
 ## Coding constraints
 
