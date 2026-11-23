@@ -4124,7 +4124,7 @@ checksum = "2fb433233f2df9344722454bc7e96465c9d03bff9d77c248f9e7523fe79585b5"
 
 [[package]]
 name = "zally-chain"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "async-trait",
  "futures-util",
@@ -4143,7 +4143,7 @@ dependencies = [
 
 [[package]]
 name = "zally-core"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "base64 0.23.1",
  "hex",
@@ -4157,7 +4157,7 @@ dependencies = [
 
 [[package]]
 name = "zally-keys"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "age",
  "async-trait",
@@ -4175,7 +4175,7 @@ dependencies = [
 
 [[package]]
 name = "zally-pczt"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "orchard",
  "pczt",
@@ -4199,7 +4199,7 @@ dependencies = [
 
 [[package]]
 name = "zally-storage"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "async-trait",
  "blake2b_simd",
@@ -4238,7 +4238,7 @@ dependencies = [
 
 [[package]]
 name = "zally-testkit"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "async-trait",
  "futures-util",
@@ -4256,7 +4256,7 @@ dependencies = [
 
 [[package]]
 name = "zally-wallet"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "async-trait",
  "futures-util",
@@ -4297,7 +4297,7 @@ dependencies = [
 
 [[package]]
 name = "zcash-payment-disclosure"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "blake2b_simd",
  "bls12_381",

@@ -33,6 +33,19 @@ Live-node tests (T3) run on demand:
 ZALLY_TEST_LIVE=1 ZALLY_NETWORK=regtest cargo nextest run --profile=ci-live --run-ignored=all
 ```
 
+The [v0.2.3 release notes](CHANGELOG.md#023) describe the scoped SQLite
+exception and the policy command for that release.
+
+## Integrate Zally
+
+Use the same [Git release tag](https://github.com/gustavovalverde/zally/releases)
+for each Zally crate in your application's `Cargo.toml`. Enable `zinder` on
+`zally-wallet` for the native Zinder wallet transport. The [live Testnet
+probe](docs/runbooks/live-test-setup.md#public-testnet) syncs an unfunded wallet
+and reads a settled tree state. Its [source](crates/zally-wallet/examples/live-zinder-probe/main.rs)
+shows how to open the chain source, use age sealing and SQLite, and create and
+sync a wallet.
+
 ## Documentation
 
 Start here:
@@ -47,4 +60,26 @@ MIT. See [LICENSE](LICENSE).
 
 ## Contributing
 
-Read [AGENTS.md](AGENTS.md) for repository conventions.
+Install Rust with rustup, then clone the repository. Cargo selects the version
+in `rust-toolchain.toml`. Install cargo-nextest, cargo-deny, and cargo-machete
+to run the [validation gate](#validation-gate). Include `--all-features` in
+the nextest command to exercise the optional Zinder backend. The release policy
+script and external consumer build use Python 3.11 or later.
+
+For a dependency update, change the manifest and lockfile together. The
+[compatibility workflow](.github/workflows/compatibility.yml) checks the
+dependency policy, compares public Rust types against the base revision, and
+compiles Zinder's wallet consumer against your checkout. The
+[dependency policy ADR](docs/adrs/0006-librustzcash-ironwood-version-floor.md)
+explains which Zcash crates move together.
+
+See [AGENTS.md](AGENTS.md) for pull request conventions and the
+[changelog](CHANGELOG.md) for changes and upgrade instructions by tag.
+
+### Release
+
+Update all workspace crate versions, the lockfile, and the changelog together.
+Once the release PR is reviewed and the required checks pass on the merged
+commit, create a signed annotated tag at that commit. Publish the tag with
+its changelog entry in GitHub Releases and verify that an external Cargo
+project can build against the published tag.

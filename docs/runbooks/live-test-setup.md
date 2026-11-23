@@ -21,8 +21,9 @@ Zally uses Zinder's native `WalletQuery` gRPC implementation through
 Use Rust 1.100 or later and a server at native contract revision 8 or later.
 Hosts that connect with `ZinderChainSource::connect_remote` supply the endpoint
 and network. The Foundation native endpoints are `https://testnet.zinder.zfnd.org`
-on Testnet and `https://zinder.zfnd.org` on Mainnet. Hosts that pass an existing client to `from_chain_index` must use
-`zinder-client` 0.23.0. The wallet SDK and database schema are unchanged.
+on Testnet and `https://zinder.zfnd.org` on Mainnet. Hosts that pass their own
+client to `from_chain_index` on the chain source or submitter must build that
+handle with `zinder-client = "=0.23.0"`. The wallet database schema is unchanged.
 
 Run the funded conformance test only against a disposable Regtest node. It spends
 one mature coinbase derived from the harness's public test seed `[0x42; 32]`
@@ -102,7 +103,7 @@ The repo defines two nextest profiles:
 ## Regtest (recommended for local iteration)
 
 1. Bring up or reuse a Zebra regtest node. The local Z3 stack exposes JSON-RPC on `127.0.0.1:29232`.
-2. Bring up or reuse a `zinder-ingest` + `zinder-query` pair for that node. See [Bringing up a zinder-backed chain source](#bringing-up-a-zinder-backed-chain-source).
+2. Bring up or reuse a `zinder-ingest` + `zinder-query` pair for that node. See [Bringing up a Regtest Zinder chain source](#bringing-up-a-regtest-zinder-chain-source).
 3. Verify readiness:
 
    ```sh
@@ -119,14 +120,34 @@ The repo defines two nextest profiles:
      cargo nextest run --profile=ci-live --features zinder --run-ignored=all
    ```
 
-## Public testnet
+## Public Testnet
+
+Run the probe against the Foundation Testnet endpoint:
 
 ```sh
-ZALLY_TEST_LIVE=1 \
-  ZALLY_NETWORK=testnet \
-  ZINDER_ENDPOINT=http://127.0.0.1:9203 \
-  cargo nextest run --profile=ci-live --features zinder --run-ignored=all
+export ZINDER_ENDPOINT=https://testnet.zinder.zfnd.org:443
+export ZALLY_NETWORK=testnet
+cargo run --locked -p zally-wallet --features zinder --example live-zinder-probe
 ```
+
+To use your own node and indexer, follow the [Zinder Testnet deployment
+guide](https://github.com/ZcashFoundation/zinder/blob/v0.23.0/docs/runbooks/deploying.md#quickstart-with-docker-compose).
+Wait for the native query reader to become ready and set `ZINDER_ENDPOINT`
+to its native address, `http://127.0.0.1:19102` in the Compose quickstart.
+
+The example creates a temporary, unfunded wallet. Look for
+`live_zinder_sync_outcome` with a scanned height and `live_zinder_tree_state`
+with the height of a settled block. To test the reorg window and read a short
+compact-block range from the same endpoint, run:
+
+```sh
+ZALLY_TEST_LIVE=1 cargo nextest run --locked -p zally-chain --features zinder \
+  --test live_zinder_source --profile=ci-live --run-ignored=only --no-tests=fail
+```
+
+The hosted compatibility workflow reports these two reads in its separate
+Testnet job. To fund an embedded wallet and follow one payment to settlement,
+use the [Zspend Testnet walkthrough in Zpay](https://github.com/gustavovalverde/zpay/blob/83b8a765c654d2025b2b08026cef55864afc467c/docs/runbooks/zspend-testnet-payment.md).
 
 ## Mainnet (gated behind explicit acknowledgement)
 
@@ -143,7 +164,7 @@ ZALLY_TEST_LIVE=1 \
 
 This command reads the chain tip, compact blocks, and the reorg window through the native client.
 
-## Bringing up a zinder-backed chain source
+## Bringing up a Regtest Zinder chain source
 
 Tests that exercise `ZinderChainSource` need a running `zinder-ingest` + `zinder-query` pair against the node above. The `live_zinder_source.rs` test target, the funded wallet proof, and the `live-zinder-probe` example all read `ZINDER_ENDPOINT` for the query process address.
 
@@ -152,8 +173,6 @@ Pre-requisites:
 - A Zebra node reachable on the host, with `enable_cookie_auth` (or basic-auth) on its JSON-RPC port.
 - A zinder workspace built locally so `zinder-ingest` and `zinder-query` can run.
 - The Zally workspace built with `--features zinder`.
-
-### Regtest
 
 The `z3-regtest-zebra-1` container exposes regtest JSON-RPC on `127.0.0.1:29232` with `zebra:zebra` basic auth.
 
@@ -227,56 +246,6 @@ ZINDER_ENDPOINT=http://127.0.0.1:9102 ZALLY_NETWORK=regtest \
 
 Expected output: `live_zinder_tip_observed tip_height=<N>` then `live_zinder_sync_outcome scanned_to_height=<N>`.
 
-### Testnet
-
-The `z3-testnet-zebra-1` container is testnet on `127.0.0.1:18232` with cookie auth. Refresh the cookie before each session:
-
-```sh
-COOKIE_FULL=$(docker run --rm -v z3-testnet-cookie:/auth:ro alpine cat /auth/.cookie)
-COOKIE_PW="${COOKIE_FULL##*:}"
-sed -i.bak "s|^password = .*|password = \"$COOKIE_PW\"|" \
-  .tmp/testnet/config/zinder-ingest.toml
-```
-
-Start writer, projector, and reader on dedicated 92xx ports so they do not collide with the
-regtest 91xx processes:
-
-```sh
-rm -rf .tmp/testnet/store && mkdir -p .tmp/testnet/store
-cargo run --release -p zinder-ingest --bin zinder-ingest -- \
-  --config .tmp/testnet/config/zinder-ingest.toml \
-  --ops-listen-addr 127.0.0.1:9205 \
-  tip-follow
-
-rm -rf .tmp/testnet/wallet .tmp/testnet/projector-canonical-secondary
-cargo run --release -p zinder-projector --bin zinder-projector -- \
-  --config .tmp/testnet/config/zinder-projector.toml \
-  --canonical-path .tmp/testnet/store \
-  --canonical-secondary-path .tmp/testnet/projector-canonical-secondary \
-  --wallet-path .tmp/testnet/wallet \
-  --projector-control-listen-addr 127.0.0.1:9202 \
-  --ops-listen-addr 127.0.0.1:9204
-
-rm -rf .tmp/testnet/query-canonical-secondary .tmp/testnet/query-wallet-secondary
-cargo run --release -p zinder-query --bin zinder-query -- \
-  --config .tmp/testnet/config/zinder-query.toml \
-  --canonical-primary-path .tmp/testnet/store \
-  --canonical-secondary-root .tmp/testnet/query-canonical-secondary \
-  --wallet-primary-path .tmp/testnet/wallet \
-  --wallet-secondary-root .tmp/testnet/query-wallet-secondary \
-  --ingest-control-addr http://127.0.0.1:9201 \
-  --listen-addr 127.0.0.1:9203 \
-  --ops-listen-addr 127.0.0.1:9206 \
-  --node-json-rpc-addr http://127.0.0.1:18232
-```
-
-Verify Zally connects:
-
-```sh
-ZINDER_ENDPOINT=http://127.0.0.1:9203 ZALLY_NETWORK=testnet \
-  cargo run -p zally-wallet --example live-zinder-probe --features zinder
-```
-
 ## Funded Zinder wallet proof
 
 The funded T3 wallet test proves the full library path:
@@ -340,7 +309,6 @@ Optional amount overrides:
 | Network | Zebra RPC | ingest control | projector control | ingest ops | query gRPC | query ops |
 |---------|-----------|----------------|-------------------|------------|------------|-----------|
 | regtest | 29232     | 9100           | 9101              | 9105       | 9102       | 9106      |
-| testnet | 18232     | 9201           | 9202              | 9205       | 9203       | 9206      |
 
 ### Operator notes
 
