@@ -20,7 +20,8 @@ Zally uses Zinder's native `WalletQuery` gRPC implementation through
 `zinder-client`, `zinder-core`, and the resolved `zinder-proto` to 0.23.0.
 Use Rust 1.100 or later and a server at native contract revision 8 or later.
 Hosts that connect with `ZinderChainSource::connect_remote` supply the endpoint
-and network. Hosts that pass an existing client to `from_chain_index` must use
+and network. The Foundation native endpoints are `https://testnet.zinder.zfnd.org`
+on Testnet and `https://zinder.zfnd.org` on Mainnet. Hosts that pass an existing client to `from_chain_index` must use
 `zinder-client` 0.23.0. The wallet SDK and database schema are unchanged.
 
 Run the funded conformance test only against a disposable Regtest node. It spends
@@ -123,9 +124,8 @@ The repo defines two nextest profiles:
 ```sh
 ZALLY_TEST_LIVE=1 \
   ZALLY_NETWORK=testnet \
-  ZINDER_ENDPOINT=https://testnet.zinder.zfnd.org \
-  cargo nextest run --locked -p zally-chain --features zinder \
-    --test live_zinder_source --profile=ci-live --run-ignored=only
+  ZINDER_ENDPOINT=http://127.0.0.1:9203 \
+  cargo nextest run --profile=ci-live --features zinder --run-ignored=all
 ```
 
 ## Mainnet (gated behind explicit acknowledgement)
@@ -141,7 +141,7 @@ ZALLY_TEST_LIVE=1 \
     --test live_zinder_source --profile=ci-live --run-ignored=only
 ```
 
-Both commands read the chain tip, compact blocks, and the reorg window through the native client.
+This command reads the chain tip, compact blocks, and the reorg window through the native client.
 
 ## Bringing up a zinder-backed chain source
 
