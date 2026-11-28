@@ -1912,7 +1912,7 @@ async fn enter_park(ctx: &DriverContext<'_>, state: &mut DriverState) {
 async fn run_one_sync(
     ctx: &DriverContext<'_>,
     chain_tip: ChainTipRecord,
-    needs_initial_observation: bool,
+    is_initial_observation_needed: bool,
 ) -> SyncRunAttempt {
     let attempt = async {
         let wallet = ctx.wallet;
@@ -1922,7 +1922,7 @@ async fn run_one_sync(
             ChainTipRecord::Current => wallet.scan_queued_range(chain).await,
         }
         .map_err(|error| (committed_chunk_for(&error), error))?;
-        let checked_frontier = if needs_initial_observation
+        let checked_frontier = if is_initial_observation_needed
             && chain_tip == ChainTipRecord::Stale
             && outcome.block_count == 0
         {
@@ -2843,11 +2843,11 @@ impl Wallet {
         }) {
             return Err(WalletError::TreeRootsDiverged { height });
         }
-        let verified = pools
+        let is_verified = pools
             .into_iter()
             .zip(pool_is_empty)
             .all(|((wallet, chain), is_empty)| chain.is_some() && (wallet.is_some() || is_empty));
-        Ok(verified.then(|| SyncObservation {
+        Ok(is_verified.then(|| SyncObservation {
             scanned_to_height: height,
             observed_at_ms: current_unix_ms(),
         }))
