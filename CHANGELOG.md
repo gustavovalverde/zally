@@ -2,10 +2,10 @@
 
 ## Unreleased
 
-Zally uses the Zinder 0.28.0 native WalletQuery SDK. Hosts that construct an
+Zally uses the Zinder 0.29.0 native WalletQuery SDK. Hosts that construct an
 `EndpointBackedIndex` for `ZinderChainSource::from_chain_index` or
-`ZinderSubmitter::from_chain_index` must use `zinder-client = "=0.28.0"`.
-Align `zinder-core` to 0.28.0 wherever you exchange its types with Zally.
+`ZinderSubmitter::from_chain_index` must use `zinder-client = "=0.29.0"`.
+Align `zinder-core` to 0.29.0 wherever you exchange its types with Zally.
 To connect by URL, use the same endpoint and network with
 `ZinderChainSource::connect_remote`. The minimum server contract revision is 8.
 
