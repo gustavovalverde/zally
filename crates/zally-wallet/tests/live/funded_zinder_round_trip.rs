@@ -804,7 +804,9 @@ async fn wait_until_at_tip_at_or_above(
     snapshots: &mut SyncSnapshotStream,
     min_tip_height: BlockHeight,
 ) -> Result<(), TestError> {
-    tokio::time::timeout(Duration::from_secs(30), async {
+    // Rapid mining can fill Zinder's secondary slots. The reader retains observed
+    // epochs for one minute and can spend another 30 seconds draining active reads.
+    tokio::time::timeout(Duration::from_mins(2), async {
         while let Some(snapshot) = snapshots.next().await {
             if matches!(
                 snapshot.sync_status,
