@@ -17,13 +17,13 @@ The default validation gate (`cargo nextest run --profile=ci`) only runs in-proc
 
 Zally uses Zinder's native `WalletQuery` gRPC implementation through
 `zinder-client`, not the lightwalletd compatibility service. The integration pins
-`zinder-client`, `zinder-core`, and the resolved `zinder-proto` to 0.23.0.
+`zinder-client`, `zinder-core`, and the resolved `zinder-proto` to 0.28.0.
 Use Rust 1.100 or later and a server at native contract revision 8 or later.
 Hosts that connect with `ZinderChainSource::connect_remote` supply the endpoint
 and network. The Foundation native endpoints are `https://testnet.zinder.zfnd.org`
 on Testnet and `https://zinder.zfnd.org` on Mainnet. Hosts that pass their own
 client to `from_chain_index` on the chain source or submitter must build that
-handle with `zinder-client = "=0.23.0"`. The wallet database schema is unchanged.
+handle with `zinder-client = "=0.28.0"`. The wallet database schema is unchanged.
 
 Run the funded conformance test only against a disposable Regtest node. It spends
 one mature coinbase derived from the harness's public test seed `[0x42; 32]`
@@ -131,7 +131,7 @@ cargo run --locked -p zally-wallet --features zinder --example live-zinder-probe
 ```
 
 To use your own node and indexer, follow the [Zinder Testnet deployment
-guide](https://github.com/ZcashFoundation/zinder/blob/v0.23.0/docs/runbooks/deploying.md#quickstart-with-docker-compose).
+guide](https://github.com/ZcashFoundation/zinder/blob/v0.28.0/docs/runbooks/deploying.md#quickstart-with-docker-compose).
 Wait for the native query reader to become ready and set `ZINDER_ENDPOINT`
 to its native address, `http://127.0.0.1:19102` in the Compose quickstart.
 
