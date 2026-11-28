@@ -28,7 +28,7 @@ cargo machete
 
 The PR validation gate matches this command.
 
-For v0.2.3 release work, see the [scoped dependency policy check](CHANGELOG.md#bundled-sqlite-advisory).
+For v0.3.0 release work, see the [scoped dependency policy check](CHANGELOG.md#sqlite-security).
 
 ## Live node tests
 
