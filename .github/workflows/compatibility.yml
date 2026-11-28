@@ -84,7 +84,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: ZcashFoundation/zinder
-          ref: 536c66e1675725f38724e843ce36eeb8eb039559 # v0.28.0
+          ref: 33ed92a19113050a26c5d133113a6cd2710dd142 # v0.29.0
           path: zinder
           sparse-checkout: scripts/wallet-clients
           persist-credentials: false
