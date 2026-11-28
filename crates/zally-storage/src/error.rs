@@ -185,7 +185,7 @@ pub enum StorageError {
         at_height.as_u32().saturating_sub(1)
     )]
     ChainReorgDetected {
-        /// Height at which the proposed-block parent hash diverged from the wallet's view.
+        /// Height where the source's block history diverges from the wallet's view.
         at_height: BlockHeight,
     },
 

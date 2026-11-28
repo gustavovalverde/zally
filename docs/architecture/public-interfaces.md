@@ -111,7 +111,7 @@ A name must survive a change of its implementation.
 | `WalletStatus` | `zally-wallet` | Operator readiness snapshot derived from persisted wallet progress. |
 | `SyncDriver` | `zally-wallet` | Caller-owned continuous sync loop over a `Wallet` and `ChainSource`. |
 | `SyncSnapshot` | `zally-wallet` | Observable state emitted by a running `SyncDriver`. |
-| `SyncObservation` | `zally-wallet` | Chain state the wallet has committed and checked against the chain, and when. Carried on `SyncSnapshot::last_observation`; the age input to a consumer's spend-freshness gate. |
+| `SyncObservation` | `zally-wallet` | The wallet's most recent verification of its committed chain state. Freshness comes from a checked scan or an initial recheck of the persisted tip, reported in `SyncSnapshot::last_observation`. |
 | `WalletStorage` | `zally-storage` | Trait abstraction over librustzcash's `WalletRead` + `WalletWrite`. |
 | `PendingBroadcastTransaction` | `zally-storage` | A wallet-owned broadcast whose fate the chain has not settled: transaction ID, stored bytes, and mined height. Returned by `WalletStorage::list_pending_broadcast_transactions`. |
 | `ProposalRejectionKind` | `zally-storage`, re-exported by `zally-wallet` | Why a proposal or its transaction could not be built, with its posture. Carried by `WalletError::ProposalRejected` and `StorageError::ProposalRejected`; see the [error vocabulary](../reference/error-vocabulary.md#proposalrejectionkind). |

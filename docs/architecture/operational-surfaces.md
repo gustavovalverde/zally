@@ -43,7 +43,7 @@ The driver:
 - calls `Wallet::sync` repeatedly until the observed tip is reached or `max_sync_iterations_per_wake_count` is exhausted;
 - publishes `SyncSnapshot` values through `SyncHandle::observe_status` on every lifecycle transition, and republishes the current one on every polling wakeup in every phase, so consecutive snapshots are never further apart than the longer of `poll_interval_ms` and `sync_timeout_seconds` plus the fault backoff cap while the driver task runs;
 - bounds every chain-source and submitter call it awaits by `sync_timeout_seconds`, so a source that never answers faults instead of silencing the driver;
-- stamps `SyncSnapshot::last_observation` whenever an iteration commits chain state and compares its commitment-tree roots against the chain, whether or not the iteration then faulted in the rest of its post-commit tail;
+- stamps `SyncSnapshot::last_observation` when a scan checks its committed roots or an initial verification matches the persisted tip to a fresh epoch. See [ADR-0002 decision 6](../adrs/0002-source-failure-posture.md#decision);
 - stops through `SyncHandle::close`.
 
 The driver does not:

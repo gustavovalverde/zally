@@ -116,7 +116,7 @@ Returned by `TransactionHeader::check_mineable` and carried by `WalletError::Tra
 | `FinalizedPcztConflict` | `not_retryable` | A transaction ID is already bound to different finalized PCZT bytes. |
 | `PcztLockOwnerMissing` | `not_retryable` | A PCZT supplied for abandonment was not created by this Zally storage and lacks its owner-scoped recovery token. |
 | `PcztLockOwnerMalformed` | `not_retryable` | A PCZT carries a Zally lock-owner field that is not exactly 32 bytes. |
-| `ChainReorgDetected` | `retryable` | Scanner input diverged from persisted chain state and needs rollback. |
+| `ChainReorgDetected` | `retryable` | The source block history diverged from persisted wallet state and needs rollback. |
 | `TransparentOutputNotRecognized` | `not_retryable` | A chain source returned a transparent output script Zally cannot map. |
 | `TransparentOutputValueOutOfRange` | `not_retryable` | A chain source returned a transparent output value outside the zatoshis range. |
 | `ProposalRejected` | Follows `ProposalRejectionKind` | librustzcash refused to build a proposal or transaction; `kind` says why. |

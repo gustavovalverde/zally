@@ -9,6 +9,11 @@ Align `zinder-core` to 0.28.0 wherever you exchange its types with Zally.
 To connect by URL, use the same endpoint and network with
 `ZinderChainSource::connect_remote`. The minimum server contract revision is 8.
 
+After restarting on a quiet chain, the sync driver can confirm an already
+caught-up wallet by checking its stored tip against the chain. Faucet and
+other hosts that gate payouts on a fresh sync observation can resume at the
+verified tip without waiting for a new block.
+
 ## 0.2.3
 
 Zally now uses the Zinder 0.23.0 native WalletQuery SDK. Use Rust 1.100 or later
