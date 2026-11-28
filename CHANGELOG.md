@@ -1,18 +1,28 @@
 # Changelog
 
-## Unreleased
+## 0.3.0
 
 Zally uses the Zinder 0.29.0 native WalletQuery SDK. Hosts that construct an
 `EndpointBackedIndex` for `ZinderChainSource::from_chain_index` or
 `ZinderSubmitter::from_chain_index` must use `zinder-client = "=0.29.0"`.
 Align `zinder-core` to 0.29.0 wherever you exchange its types with Zally.
 To connect by URL, use the same endpoint and network with
-`ZinderChainSource::connect_remote`. The minimum server contract revision is 8.
+`ZinderChainSource::connect_remote`. Use Rust 1.100 or later and a Zinder
+endpoint that supports native contract revision 8 or later. Move all Zally
+Git dependencies to `tag = "v0.3.0"` together.
 
 After restarting on a quiet chain, the sync driver can confirm an already
 caught-up wallet by checking its stored tip against the chain. Faucet and
 other hosts that gate payouts on a fresh sync observation can resume at the
 verified tip without waiting for a new block.
+
+### SQLite security
+
+The bundled SQLite remains affected by RUSTSEC-2026-0459. A wallet process can
+disclose memory when it opens a database and write-ahead log that an
+untrusted party could write. Keep both files in a directory writable only
+by the wallet operator and avoid opening untrusted copies.
+[RustSec advisory](https://rustsec.org/advisories/RUSTSEC-2026-0459.html)
 
 ## 0.2.3
 
