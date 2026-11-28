@@ -2,6 +2,8 @@
 all-features = true
 
 [advisories]
+# Keep checking transitive dependencies under cargo-deny 0.22.
+unmaintained = "all"
 yanked = "deny"
 ignore = [
     # proc-macro-error unmaintained advisory; pulled transitively through age's i18n stack.

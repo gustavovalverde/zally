@@ -13,10 +13,13 @@
 
 use std::sync::Arc;
 
+use incrementalmerkletree::{Hashable as _, frontier::CommitmentTree};
 use zally_chain::ChainSource;
 use zally_core::BlockHeight;
 use zally_testkit::MockChainSource;
-use zally_wallet::{RetryPolicy, SyncDriver, SyncDriverOptions, SyncRecoveryPolicy, WalletError};
+use zally_wallet::{
+    RetryPolicy, SyncDriver, SyncDriverOptions, SyncDriverPhase, SyncRecoveryPolicy, WalletError,
+};
 
 use super::fixtures::{
     SnapshotWaitError, TestWalletError, TestWalletFixture, create_test_wallet, wait_for_snapshot,
@@ -118,8 +121,117 @@ async fn a_chunk_whose_roots_went_uncompared_publishes_no_observation() -> Resul
     Ok(())
 }
 
+#[tokio::test]
+async fn a_restarted_driver_verifies_a_wallet_already_at_tip() -> Result<(), TestError> {
+    let (fixture, chain, tip) = wallet_scanned_to_tip().await?;
+    let driver = SyncDriver::new(
+        fixture.wallet,
+        chain,
+        SyncDriverOptions::default().with_poll_interval_ms(60_000),
+    )?;
+    let handle = driver.sync_continuously();
+    let mut snapshots = handle.observe_status();
+    let waiting = wait_for_snapshot(&mut snapshots, |snapshot| {
+        snapshot.phase == SyncDriverPhase::Waiting
+    })
+    .await?;
+    assert_eq!(
+        waiting
+            .last_observation
+            .map(|observation| observation.scanned_to_height),
+        Some(tip),
+    );
+    handle.close().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_restarted_driver_detects_a_replaced_tip_even_with_empty_trees() -> Result<(), TestError>
+{
+    let (fixture, chain, tip) = wallet_scanned_to_tip().await?;
+    chain.handle().reorg_silently(tip, tip);
+    let driver = SyncDriver::new(
+        fixture.wallet,
+        chain,
+        SyncDriverOptions::default()
+            .with_poll_interval_ms(60_000)
+            .with_recovery_policy(
+                SyncRecoveryPolicy::default().with_fault_backoff_initial_ms(5_000),
+            ),
+    )?;
+    let handle = driver.sync_continuously();
+    let mut snapshots = handle.observe_status();
+    let faulted = wait_for_snapshot(&mut snapshots, |snapshot| {
+        snapshot.last_fault.is_some() || snapshot.phase == SyncDriverPhase::Waiting
+    })
+    .await?;
+    assert!(
+        faulted
+            .last_fault
+            .as_ref()
+            .is_some_and(|fault| fault.repair == zally_wallet::SyncRepair::Rewind)
+    );
+    assert_eq!(faulted.last_observation, None);
+    handle.close().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_restarted_driver_withholds_an_observation_without_a_pool_root() -> Result<(), TestError>
+{
+    let (fixture, chain, tip) = wallet_scanned_to_tip().await?;
+    let epoch = chain.current_epoch().await.map_err(WalletError::from)?;
+    let mut tree_state = chain
+        .tree_state_at(epoch, tip)
+        .await
+        .map_err(WalletError::from)?;
+    let mut sapling =
+        CommitmentTree::<sapling::Node, { sapling::NOTE_COMMITMENT_TREE_DEPTH }>::empty();
+    assert!(sapling.append(sapling::Node::empty_leaf()).is_ok());
+    tree_state.sapling_final_state_bytes.clear();
+    zcash_primitives::merkle_tree::write_commitment_tree(
+        &sapling,
+        &mut tree_state.sapling_final_state_bytes,
+    )?;
+    chain.handle().serve_tree_state(tree_state);
+
+    let driver = SyncDriver::new(
+        fixture.wallet,
+        chain,
+        SyncDriverOptions::default().with_poll_interval_ms(60_000),
+    )?;
+    let handle = driver.sync_continuously();
+    let mut snapshots = handle.observe_status();
+    let waiting = wait_for_snapshot(&mut snapshots, |snapshot| {
+        snapshot.phase == SyncDriverPhase::Waiting
+    })
+    .await?;
+    assert_eq!(waiting.scanned_height, Some(tip));
+    assert_eq!(waiting.last_observation, None);
+    handle.close().await?;
+    Ok(())
+}
+
+async fn wallet_scanned_to_tip()
+-> Result<(TestWalletFixture, Arc<MockChainSource>, BlockHeight), TestError> {
+    let fixture = create_test_wallet().await?;
+    let chain = Arc::new(MockChainSource::new(fixture.wallet.network()));
+    let chain_handle = chain.handle();
+    chain_handle.serve_compact_blocks();
+    let tip = BlockHeight::from(50);
+    chain_handle.advance_tip(tip);
+    assert_eq!(
+        fixture.wallet.sync(chain.as_ref()).await?.scanned_to_height,
+        tip
+    );
+    assert_eq!(fixture.wallet.sync(chain.as_ref()).await?.block_count, 0);
+    Ok((fixture, chain, tip))
+}
+
 #[derive(Debug, thiserror::Error)]
 enum TestError {
+    #[error("frontier serialization failed: {0}")]
+    Frontier(#[from] std::io::Error),
     #[error("test wallet error: {0}")]
     Fixture(#[from] TestWalletError),
     #[error("wallet error: {0}")]

@@ -22,7 +22,7 @@ def check_release_exception(check, status):
     ).strip() != "false":
         return status
     tag = subprocess.run(
-        ["git", "show-ref", "--verify", "--quiet", "refs/tags/v0.2.3"],
+        ["git", "show-ref", "--verify", "--quiet", "refs/tags/v0.3.0"],
         check=False,
     )
     if tag.returncode != 1:
@@ -32,7 +32,7 @@ def check_release_exception(check, status):
             ["cargo", "metadata", "--locked", "--no-deps", "--format-version", "1"]
         )
     )
-    if {crate["version"] for crate in workspace["packages"]} != {"0.2.3"}:
+    if {crate["version"] for crate in workspace["packages"]} != {"0.3.0"}:
         return status
     lockfile = tomllib.loads(Path("Cargo.lock").read_text())
     sqlite = [crate for crate in lockfile["package"] if crate["name"] == "libsqlite3-sys"]
@@ -47,9 +47,9 @@ def check_release_exception(check, status):
     if config.count(ignore) != 1:
         return status
     exception = (
-        '    { id = "RUSTSEC-2026-0459", reason = "Owner-approved for v0.2.3 release work only" },\n'
+        '    { id = "RUSTSEC-2026-0459", reason = "Owner-approved for v0.3.0 release work only" },\n'
     )
-    print("Rechecking all dependency policy with the v0.2.3 SQLite exception.", flush=True)
+    print("Rechecking all dependency policy with the v0.3.0 SQLite exception.", flush=True)
     with TemporaryDirectory() as directory:
         path = Path(directory) / "deny.toml"
         path.write_text(config.replace(ignore, ignore + exception, 1))

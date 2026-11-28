@@ -72,13 +72,13 @@ orchard = "=0.16.0"
 sapling = { package = "sapling-crypto", version = "0.9" }
 zip321 = "=0.10.0"
 zip32 = "0.3"
-shardtree = "=0.8.0"
-incrementalmerkletree = "=0.9.0"
+shardtree = "=0.8.1"
+incrementalmerkletree = "=0.9.1"
 
 # Optional chain-plane backend. The `zinder` cargo feature on zally-chain pulls these
 # crates from their crates.io releases.
-zinder-client = { version = "=0.23.0", default-features = false }
-zinder-core = { version = "=0.23.0", default-features = false }
+zinder-client = { version = "=0.29.0", default-features = false }
+zinder-core = { version = "=0.29.0", default-features = false }
 
 # Async runtime and concurrency.
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "fs", "io-util"] }

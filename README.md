@@ -33,7 +33,7 @@ Live-node tests (T3) run on demand:
 ZALLY_TEST_LIVE=1 ZALLY_NETWORK=regtest cargo nextest run --profile=ci-live --run-ignored=all
 ```
 
-The [v0.2.3 release notes](CHANGELOG.md#023) describe the scoped SQLite
+The [v0.3.0 release notes](CHANGELOG.md#sqlite-security) describe the scoped SQLite
 exception and the policy command for that release.
 
 ## Integrate Zally

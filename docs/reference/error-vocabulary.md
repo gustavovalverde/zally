@@ -57,7 +57,7 @@ Only `retryable` moves the breaker's failure counter, and only a call that compl
 | `BlockHeightAboveVisibleTip` | `not_retryable` | Requested height is above the epoch's visible tip; acquire a new `ChainEpoch`. |
 | `NetworkMismatch` | `requires_operator` | The source serves a different network than the caller asked for. |
 | `CapabilitiesUnavailable` | `requires_operator` | The endpoint does not advertise every capability required for event-driven native sync. |
-| `ContractRevisionUnsupported` | `requires_operator` | The endpoint contract revision is older than the linked `zinder-client` requires (revision 8 for `zinder-client` 0.23.0). |
+| `ContractRevisionUnsupported` | `requires_operator` | The endpoint contract revision is older than the linked `zinder-client` requires (revision 8 for `zinder-client` 0.29.0). |
 | `ChainEpochPinUnavailable` | `restartable` | The pinned epoch expired; restart the wallet sync against a fresh epoch. |
 | `ChainEventCursorExpired` | `restartable` | Reconcile the wallet against a fresh epoch, then subscribe from the earliest retained event. |
 | `ChainEventCursorInvalid` | `not_retryable` | The source did not issue the resume cursor; discard it and subscribe from the earliest retained event. |
@@ -116,7 +116,7 @@ Returned by `TransactionHeader::check_mineable` and carried by `WalletError::Tra
 | `FinalizedPcztConflict` | `not_retryable` | A transaction ID is already bound to different finalized PCZT bytes. |
 | `PcztLockOwnerMissing` | `not_retryable` | A PCZT supplied for abandonment was not created by this Zally storage and lacks its owner-scoped recovery token. |
 | `PcztLockOwnerMalformed` | `not_retryable` | A PCZT carries a Zally lock-owner field that is not exactly 32 bytes. |
-| `ChainReorgDetected` | `retryable` | Scanner input diverged from persisted chain state and needs rollback. |
+| `ChainReorgDetected` | `retryable` | The source block history diverged from persisted wallet state and needs rollback. |
 | `TransparentOutputNotRecognized` | `not_retryable` | A chain source returned a transparent output script Zally cannot map. |
 | `TransparentOutputValueOutOfRange` | `not_retryable` | A chain source returned a transparent output value outside the zatoshis range. |
 | `ProposalRejected` | Follows `ProposalRejectionKind` | librustzcash refused to build a proposal or transaction; `kind` says why. |

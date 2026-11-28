@@ -2,7 +2,7 @@
 
 | Field | Value |
 |-------|-------|
-| Status | Accepted on 2026-07-04; amended on 2026-07-27, 2026-10-14, 2026-10-27, and 2026-11-20 |
+| Status | Accepted on 2026-07-04; amended on 2026-07-27, 2026-10-14, 2026-10-27, 2026-11-20, and 2026-11-28 |
 | Product | Zally |
 | Domain | librustzcash dependency versioning, source topology, NU7 network plumbing |
 | Related | [ADR-0001 Workspace crate boundaries](0001-workspace-crate-boundaries.md); [ADR-0001 Zinder-only ChainSource](0001-zinder-only-chain-source.md); [Public interfaces](../architecture/public-interfaces.md) |
@@ -15,7 +15,7 @@ The `0.11.0-pre.0` prereleases encoded unified viewing keys and unified addresse
 
 ## Decision
 
-1. **The wallet plane uses one librustzcash cohort.** The workspace pins `zcash_client_backend 0.25.0`, `zcash_client_sqlite 0.23.0`, `zcash_keys 0.17.0`, `zcash_primitives 0.31.1`, `zcash_protocol 0.11.0`, `zcash_address 0.14.0`, `zcash_proofs 0.31.0`, `zcash_transparent 0.11.1`, `pczt 0.10.0`, `zip321 0.10.0`, `orchard 0.16.0`, `sapling-crypto 0.9`, `zip32 0.3`, `shardtree 0.8.0`, and `incrementalmerkletree 0.9.0`. These versions are compatible as one cohort. Keep concrete type boundaries on the selected versions.
+1. **The wallet plane uses one librustzcash cohort.** The workspace pins `zcash_client_backend 0.25.0`, `zcash_client_sqlite 0.23.0`, `zcash_keys 0.17.0`, `zcash_primitives 0.31.1`, `zcash_protocol 0.11.0`, `zcash_address 0.14.0`, `zcash_proofs 0.31.0`, `zcash_transparent 0.11.1`, `pczt 0.10.0`, `zip321 0.10.0`, `orchard 0.16.0`, `sapling-crypto 0.9`, `zip32 0.3`, `shardtree 0.8.1`, and `incrementalmerkletree 0.9.1`. These versions are compatible as one cohort. Keep concrete type boundaries on the selected versions.
 
 2. **Registry sources are authoritative.** Zally does not patch librustzcash, Orchard, shardtree, or incrementalmerkletree. A future unpublished fix requires evidence that no compatible registry cohort contains it and a time-bounded ADR amendment naming the upstream exit condition.
 
@@ -25,7 +25,7 @@ The `0.11.0-pre.0` prereleases encoded unified viewing keys and unified addresse
 
 5. **PCZT support is a wire contract, not a crate-version label.** Zally parses PCZT v1 and v2 and serializes the minimal version capable of representing the transaction. Ironwood and transaction v6 require PCZT v2. `Capability::PcztV1AndV2` advertises the supported wire encodings without exposing the `pczt` crate release number as a product capability.
 
-6. **Zinder remains a separately pinned product dependency.** `zally-chain` uses the `zinder-client` and `zinder-core` 0.23.0 registry releases for native WalletQuery. The client requires Rust 1.100 and a server at native contract revision 8 or later. Zinder and the wallet share `zcash_protocol 0.11.0`, `zcash_address 0.14.0`, and `zcash_encoding 0.5.1`. Hosts that pass an `EndpointBackedIndex` to `from_chain_index` must use Zally's version of `zinder-client`. The wallet, storage, and PCZT interfaces use librustzcash types. The dependency policy allows only registry sources.
+6. **Zinder remains a separately pinned product dependency.** `zally-chain` uses the `zinder-client` and `zinder-core` 0.29.0 registry releases for native WalletQuery. The client requires Rust 1.100 and a server at native contract revision 8 or later. Zinder and the wallet share `zcash_protocol 0.11.0`, `zcash_address 0.14.0`, and `zcash_encoding 0.5.1`. Hosts that pass an `EndpointBackedIndex` to `from_chain_index` must use Zally's version of `zinder-client`. The wallet, storage, and PCZT interfaces use librustzcash types. The dependency policy allows only registry sources.
 
 7. **Network activation remains explicit.** Regtest controls NU7 through Zally's local network parameters. Testnet and Mainnet follow upstream `TestNetwork` and `MainNetwork`, where NU7 activates at heights 4,465,026 and 3,543,405. Zally never defines an activation height of its own. Consensus branch, transaction version, and the default expiry delta (40 blocks before NU7, 120 from NU7) come from the selected cohort.
 
@@ -64,3 +64,4 @@ The `0.11.0-pre.0` prereleases encoded unified viewing keys and unified addresse
 - 2026-11-13: Moved the Zinder client crates to their 0.10.0 releases, which require native contract revision 8 and share Zally's `zcash_protocol`, `zcash_address`, and `zcash_encoding` releases, removing the duplicate copies.
 - 2026-11-20: Pinned Zinder client/core 0.21.0, retained native contract revision 8, and raised Rust to 1.100. Advanced only the required `zcash_primitives` 0.31.1 and `zcash_transparent` 0.11.1 patches; retained the wallet SDK and database cohort.
 - 2026-11-23: Advanced the Zinder client crates to 0.23.0 and retained the revision-8 native server floor.
+- 2026-11-28: Advanced the Zinder client crates to 0.29.0 and kept the revision-8 server floor. Advanced the published shardtree and incrementalmerkletree patch releases.
